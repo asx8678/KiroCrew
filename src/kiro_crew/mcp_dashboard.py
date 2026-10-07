@@ -2961,15 +2961,20 @@ def _run_session_status(args: dict[str, Any], ctx: ToolContext) -> str:
         if quality_notes:
             empty += " " + " ".join(quality_notes)
         return empty
+    # One footnote per status that occurs, not the explanation on every row.
+    _GONE_NOTE = "gone: the crew log has it, the dashboard does not (closed, archived, or lost)"
+    _UNKNOWN_NOTE = (
+        "unknown: you created it; neither a live session nor the crew log " "accounts for it"
+    )
     status_lines = [f"\U0001f4cb {len(rows)} session(s) you stood up:"]
+    gone_seen = False
+    unknown_seen = False
     for row in rows:
         target = str(row.get("target", ""))
         status = str(row.get("status", ""))
         if status == "gone":
-            status_lines.append(
-                f"  \U0001faa6 `{target}` — gone (the crew log has it, the "
-                "dashboard does not: closed, archived, or lost)"
-            )
+            gone_seen = True
+            status_lines.append(f"  \U0001faa6 `{target}` — gone")
             continue
         title = str(row.get("title", ""))
         depth = int(row.get("queue_depth", 0) or 0)
@@ -2980,13 +2985,15 @@ def _run_session_status(args: dict[str, Any], ctx: ToolContext) -> str:
             # one status that means no decision is needed -- for a row whose
             # actual meaning is the opposite: nothing here knows whether this
             # session finished or was lost.
-            status_lines.append(
-                f"  \u2753 `{target}` ({title}) — unknown (you created it; "
-                "neither a live session nor the crew log accounts for it)"
-            )
+            unknown_seen = True
+            status_lines.append(f"  \u2753 `{target}` ({title}) — unknown")
             continue
         mark = {"working": "\U0001f503", "queued": "\u23f8\ufe0f"}.get(status, "\U0001f4a4")
         status_lines.append(f"  {mark} `{target}` ({title}) — {status}{queued}")
+    if gone_seen:
+        status_lines.append(f"  {_GONE_NOTE}")
+    if unknown_seen:
+        status_lines.append(f"  {_UNKNOWN_NOTE}")
     status_lines.extend(quality_notes)
     return redact("\n".join(status_lines))
 

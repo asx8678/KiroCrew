@@ -928,6 +928,52 @@ class TestWorkflowListCancelRerun:
 # ── skill_search / register_hook / read_slack_profile / knowledge_dedup ───
 
 
+class TestListRenderersStateInstructionsOnce:
+    """TOOL-15: list results state each instruction once — one header line,
+    footnotes only when a gone/unknown row is present, plain rows."""
+
+    def test_session_status_explains_gone_and_unknown_once(self):
+        from types import SimpleNamespace
+
+        from kiro_crew.mcp_dashboard import _run_session_status
+
+        rows = []
+        for i in range(6):
+            rows.append({"target": f"s{i}", "status": "working", "title": f"t{i}"})
+        for i in range(4):
+            rows.append({"target": f"g{i}", "status": "gone"})
+        for i in range(2):
+            rows.append({"target": f"u{i}", "status": "unknown", "title": f"u{i}"})
+
+        class _Client:
+            @staticmethod
+            def get(path, **_kw):
+                return {"sessions": rows, "tree": "readable", "history": "readable"}
+
+        out = _run_session_status({}, SimpleNamespace(client=_Client(), caller_key="k"))
+        assert out.count("the crew log has it, the dashboard does not") == 1
+        assert out.count("neither a live session nor the crew log accounts") == 1
+        assert out.count("— gone") == 4
+        assert out.count("— unknown") == 2
+        assert all(f"g{i}" in out for i in range(4))
+
+    def test_session_status_with_no_gone_rows_carries_no_gone_footnote(self):
+        from types import SimpleNamespace
+
+        from kiro_crew.mcp_dashboard import _run_session_status
+
+        rows = [{"target": "s0", "status": "working", "title": "t0"}]
+
+        class _Client:
+            @staticmethod
+            def get(path, **_kw):
+                return {"sessions": rows, "tree": "readable", "history": "readable"}
+
+        out = _run_session_status({}, SimpleNamespace(client=_Client(), caller_key="k"))
+        assert "gone" not in out
+        assert "unknown" not in out
+
+
 class TestSkillSearch:
     """A session-bound call searches through the gateway (project scope); a
     session-less CLI call falls back to the local loader."""
@@ -1003,9 +1049,28 @@ class TestSkillSearch:
         assert "Available skills (search, offset 0, 1 results)" in out
         # Whitespace in the description is collapsed.
         assert "Monitor a PR" in out
-        assert "key='kirocrew-dev/babysit'" in out
-        assert "$kirocrew-dev/babysit" in out
+        # TOOL-15: the load instruction is stated ONCE in the header, never
+        # repeated per row.
+        assert out.count("skill_search(action='read'") == 1
+        assert "load any: skill_search(action='read', key=KEY)" in out
         self._assert_gateway_query(seen, query="babysit", limit=20)
+
+    def test_many_matches_state_the_load_instruction_once(self, monkeypatch: pytest.MonkeyPatch):
+        """TOOL-15: a 20-row result carries one load line, and every key still
+        appears — the per-row copy measured -32% of output tokens."""
+        matches = [
+            {
+                "name": f"skill{i}",
+                "key": f"dir/skill{i}",
+                "description": f"Does thing {i}",
+                "path": f"/skills/dir/skill{i}/SKILL.md",
+            }
+            for i in range(20)
+        ]
+        self._gateway(monkeypatch, matches)
+        out = _call_tool("skill_search", {"query": "thing"})
+        assert out.count("skill_search(action='read'") == 1
+        assert all(f"dir/skill{i}" in out for i in range(20))
 
     def test_confined_match_renders_its_body_instead_of_a_path(
         self, monkeypatch: pytest.MonkeyPatch
