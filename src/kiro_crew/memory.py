@@ -38,7 +38,10 @@ from kiro_crew._sqlite_compat import (
     sqlite3,
 )
 from kiro_crew.config.loader import config_dir
-from kiro_crew.context_assembly.budget import _MEMORY_PROJECTS_CAP
+from kiro_crew.context_assembly.budget import (
+    _MEMORY_PROJECTS_CAP,
+    _PREFS_STARTUP_CAP,
+)
 from kiro_crew.memory_recall import recall_terms
 from kiro_crew.memory_startup import require_memory_ready
 from kiro_crew.memory_stores import named_store_operation
@@ -183,6 +186,12 @@ def normalize_projects_document(content: str, *, today: str) -> str:
     if content.strip().startswith("# Active Projects"):
         return content.strip() + "\n"
     return f"# Active Projects\n\n_Updated: {today}_\n\n{content}\n"
+
+
+# Warned-once flag for write_preferences: the startup injection cap is a
+# session-start concern (see store_admission), not a write gate, so the
+# writer reports the overflow once per process instead of on every write.
+_prefs_startup_warned = False
 
 
 def _cap_text(text: str, limit: int) -> str:
@@ -414,6 +423,21 @@ class MemoryStore:
             # after release lets writer B's file land while writer A's
             # index write runs last — file says B, search returns A.
             self._index_file(self._preferences_file, content)
+        # Startup injects at most the pref.* rows' allowance (see
+        # store_admission: min(caps.prefs_startup, ceiling)), so a file past
+        # it is only ever partially injected. The file itself keeps every
+        # byte; warn the writer once per process so an agent-grown file is
+        # noticed instead of silently truncated at every session start.
+        global _prefs_startup_warned
+        if not _prefs_startup_warned and len(content) > _PREFS_STARTUP_CAP:
+            _prefs_startup_warned = True
+            logger.warning(
+                "Preferences file exceeds the startup injection allowance: "
+                "chars=%d cap=%d; only the head is injected at session start "
+                "(the file itself keeps every byte).",
+                len(content),
+                _PREFS_STARTUP_CAP,
+            )
         return True
 
     @named_store_operation
