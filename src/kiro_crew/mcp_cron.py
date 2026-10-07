@@ -2060,6 +2060,13 @@ def _list_tools() -> list[dict[str, Any]]:
                         "avoids unbounded context growth. Set True (or omit) for "
                         "conversational reminders that should remember prior runs.",
                     },
+                    "auto_pause_after": {
+                        "type": "number",
+                        "description": "Consecutive failed runs before this job "
+                        "auto-pauses. 0 = never auto-pause; omit or null = the "
+                        "global default (5). Failures caused by an expired "
+                        "sign-in never count toward auto-pause in any case.",
+                    },
                     "minimal_context": {
                         "type": "boolean",
                         "description": "When true, skip memory, lessons, skills, and "
@@ -2183,6 +2190,13 @@ def _list_tools() -> list[dict[str, Any]]:
                     "persistent_session": {
                         "type": "boolean",
                         "description": "Whether this cron reuses one agent session across runs.",
+                    },
+                    "auto_pause_after": {
+                        "type": "number",
+                        "description": "Consecutive failed runs before this job "
+                        "auto-pauses. 0 = never auto-pause; null = reset to the "
+                        "global default (5). Failures caused by an expired "
+                        "sign-in never count toward auto-pause in any case.",
                     },
                     "minimal_context": {
                         "type": "boolean",
@@ -2510,6 +2524,7 @@ def _render_cron_list_json(jobs: list[Any]) -> str:
             "schedule": format_schedule(job.schedule, tz_name=job.timezone or ""),
             "every_secs": getattr(job.schedule, "every_secs", None),
             "minimal_context": bool(job.minimal_context),
+            "auto_pause_after": job.auto_pause_after,
             "persistent_session": bool(job.persistent_session),
             "hide_in_chat": bool(job.hide_in_chat),
             "message": message[:_JSON_MESSAGE_LEN],
@@ -3480,6 +3495,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             return _unidentified_caller_refusal("cron_add")
         persistent_session = args.get("persistent_session")
         minimal_context = args.get("minimal_context")
+        auto_pause_after = args.get("auto_pause_after")
         hide_in_chat = args.get("hide_in_chat")
         strict_schedule = args.get("strict_schedule")
         timeout_val = args.get("timeout", 0)
@@ -3522,6 +3538,13 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                 minimal_context=minimal_context if isinstance(minimal_context, bool) else False,
                 timeout=timeout_val or 0,
                 timeout_secs=timeout_secs_val or 0,
+                auto_pause_after=(
+                    int(auto_pause_after)
+                    if isinstance(auto_pause_after, (int, float))
+                    and not isinstance(auto_pause_after, bool)
+                    and float(auto_pause_after).is_integer()
+                    else None
+                ),
             )
         except CronStoreBusy:
             return "Error: cron store busy, please retry"
@@ -3611,6 +3634,20 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             kwargs["folder_id"] = fid
         if "persistent_session" in args:
             kwargs["persistent_session"] = args["persistent_session"]
+        if "auto_pause_after" in args:
+            apa = args["auto_pause_after"]
+            # None resets to the global default; a whole number sets the
+            # per-job threshold (range-checked in apply_job_update). A
+            # non-numeric non-null value is refused rather than silently
+            # reinterpreted, so a typo cannot quietly disable the guard.
+            if apa is None or (
+                isinstance(apa, (int, float))
+                and not isinstance(apa, bool)
+                and float(apa).is_integer()
+            ):
+                kwargs["auto_pause_after"] = int(apa) if apa is not None else None
+            else:
+                return "Error: auto_pause_after must be a whole number or null"
         if "minimal_context" in args:
             mc = args["minimal_context"]
             if isinstance(mc, bool):

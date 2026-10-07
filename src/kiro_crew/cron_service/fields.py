@@ -129,6 +129,7 @@ def build_job(
     minimal_context: bool = False,
     timeout: int = 0,
     timeout_secs: int = 0,
+    auto_pause_after: int | None = None,
 ) -> CronJob:
     """Validate inputs and construct the :class:`CronJob` (no I/O, no lock).
 
@@ -208,6 +209,24 @@ def build_job(
                 "the subprocess keeps running while the next wake launches "
                 "a duplicate."
             )
+    # Per-job auto-pause threshold: None = the global default, 0 = never
+    # auto-pause. Validated HERE, beside every other creation field, so no
+    # create surface can persist an unbounded or mistyped threshold. bool is
+    # rejected explicitly: True is an int in Python but means nothing as a
+    # failure count, and a JSON schema can deliver one.
+    if auto_pause_after is not None:
+        _apa = auto_pause_after
+        if (
+            isinstance(_apa, bool)
+            or not isinstance(_apa, (int, float))
+            or (isinstance(_apa, float) and not _apa.is_integer())
+        ):
+            raise ValueError(
+                f"auto_pause_after must be a whole number or null, got {auto_pause_after!r}"
+            )
+        _apa = int(_apa)
+        if not 0 <= _apa <= 10000:
+            raise ValueError(f"auto_pause_after must be within 0..10000, got {_apa}")
     if timezone and not is_valid_timezone(timezone):
         raise ValueError(f"Invalid timezone: {timezone!r}")
     skip_dates = skip_dates or []
@@ -257,6 +276,7 @@ def build_job(
         minimal_context=minimal_context,
         timeout=timeout,
         timeout_secs=int(timeout_secs) if timeout_secs else seams._JOB_TIMEOUT_SECS,
+        auto_pause_after=(int(auto_pause_after) if auto_pause_after is not None else None),
     )
 
 
@@ -358,6 +378,28 @@ def apply_job_update(
             raise ValueError(f"Invalid timeout: {kwargs['timeout']!r}") from e
         if not 0 <= _tsub <= 86400:
             raise ValueError(f"timeout must be within 0..86400, got {_tsub}")
+    # Per-job auto-pause threshold. Same pre-mutation position as the budget
+    # checks above: a rejected value raises before any field assignment lands.
+    # An explicit None RESETS to the global default; 0 opts the job out of
+    # auto-pause entirely. Both spellings are why the sentinel is a separate
+    # flag rather than the parsed value itself.
+    _apa: int | None = None
+    _apa_set = False
+    if "auto_pause_after" in kwargs:
+        _apa_set = True
+        _apa_raw = kwargs["auto_pause_after"]
+        if _apa_raw is None:
+            _apa = None
+        else:
+            if (
+                isinstance(_apa_raw, bool)
+                or not isinstance(_apa_raw, (int, float))
+                or (isinstance(_apa_raw, float) and not _apa_raw.is_integer())
+            ):
+                raise ValueError(f"Invalid auto_pause_after: {_apa_raw!r}")
+            _apa = int(_apa_raw)
+            if not 0 <= _apa <= 10000:
+                raise ValueError(f"auto_pause_after must be within 0..10000, got {_apa}")
     # Vault secret grant: validated with the other pre-mutation
     # checks so a rejected grant cannot strand earlier field
     # mutations. An empty dict revokes (clears the pin too); a
@@ -511,6 +553,10 @@ def apply_job_update(
         job.timeout_secs = _tsecs
     if _tsub is not None:
         job.timeout = _tsub
+    # Per-job auto-pause threshold: the only writer after creation, so an
+    # existing job is not stuck on its creation-time value.
+    if _apa_set:
+        job.auto_pause_after = _apa
 
     # Schedule changes (already validated above)
     if "cron_expr" in kwargs and kwargs["cron_expr"]:
