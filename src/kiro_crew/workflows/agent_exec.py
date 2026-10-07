@@ -33,6 +33,7 @@ import logging
 import time
 from typing import Any, Callable, Optional
 
+from kiro_crew.effort import is_valid_effort
 from kiro_crew.llm_helpers import ToolApprovalPolicy, provider_last_turn_usage, stream_and_collect
 from kiro_crew.security import redact
 
@@ -164,6 +165,19 @@ def build_agent_fn(
             cwd=opts.get("cwd"),
             app=app,
         )
+        # WF-5: honor ctx.agent(effort=...) — validate, then thread to the
+        # session as the per-call override the chat path already uses. An
+        # invalid value warns and falls back to the factory's effort (the
+        # call still runs; only the effort pin is dropped).
+        _effort = str(opts.get("effort") or "").strip()
+        if _effort and not is_valid_effort(_effort):
+            logger.warning(
+                "workflow step effort=%r invalid (run=%s); using the default effort",
+                _effort,
+                run_id,
+            )
+            _effort = ""
+
         # Per-call isolated session by default; caller-named session when session=.
         session = opts.get("session")
         ephemeral = session is None
@@ -179,6 +193,7 @@ def build_agent_fn(
             model=opts.get("model") or default_model,
             cwd=step_cwd or cwd,
             extra_env=extra_env,
+            reasoning_effort_override=_effort,
         )
         # Wall clock for THIS agent turn only (not the whole workflow run):
         # acp leaves TurnUsage.duration_ms at 0, so without this the row's

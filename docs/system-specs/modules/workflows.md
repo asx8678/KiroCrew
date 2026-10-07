@@ -159,10 +159,13 @@ Semantics, from `runner._RunContext.agent`:
 adapters read `session`, `agent`, `model` and `cwd`; `label` and `phase` are
 consumed by the runner for the event stream; `schema` is consumed by the runner.
 
-> Open question: `effort` and the per-call `nudge` dict are part of the frozen
-> signature and reach `opts`, but neither shipped `agent_fn`
-> (`agent_exec.build_agent_fn`, `agent_pool.build_pooled_agent_fn`) reads them, so
-> today they have no effect. Either wire them or document them as reserved.
+> Resolved (WF-5): ``effort`` is wired on both shipped ``agent_fn`` adapters —
+> validated per call with ``is_valid_effort`` (an invalid value warns and falls
+> back to the factory's effort) and threaded to ``get_or_create`` as
+> ``reasoning_effort_override``; on the pooled adapter the effort joins the
+> warm-worker identity key ``(agent, model, cwd, effort)``, so a worker built
+> at one effort never serves a call that asked for another. ``nudge`` remains
+> reserved (the separate ``ctx.nudge()`` method is the wired path).
 
 ### Scheduling combinators
 
