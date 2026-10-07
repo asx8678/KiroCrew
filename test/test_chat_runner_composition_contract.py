@@ -652,6 +652,30 @@ def _member(name: str) -> tuple[object, str]:
     return obj, "value"
 
 
+def test_connection_drops_get_a_wall_clock_budget_5xx_keeps_the_flat_one(monkeypatch) -> None:
+    """SES-9: _transient_retry_budget_left splits by error class — a throttle or
+    plain 5xx keeps TRANSIENT_RETRIES, a connection-class drop keeps earning
+    re-prompts for CONNECTION_RETRY_SECS measured from its first failure."""
+    from types import SimpleNamespace
+
+    import kiro_crew.dashboard.chat_runner as cr
+
+    slot = SimpleNamespace(_transient_5xx_retries=3, _transient_conn_retry_started=100.0)
+    now = {"t": 100.0 + 45.0}  # 45 s into the drop: inside the ~75 s window
+    monkeypatch.setattr(cr.time, "monotonic", lambda: now["t"])
+
+    assert cr._transient_retry_budget_left(slot, RuntimeError("LLM dispatch failure")) is True
+    assert cr._transient_retry_budget_left(slot, RuntimeError("connection reset by peer")) is True
+    # A plain 5xx at a spent flat budget gets nothing, even mid-window.
+    assert cr._transient_retry_budget_left(slot, RuntimeError("internal server error")) is False
+    # Past the window the drop gives up too.
+    now["t"] = 100.0 + 80.0
+    assert cr._transient_retry_budget_left(slot, RuntimeError("LLM dispatch failure")) is False
+    # Under the flat count everything retries as before.
+    slot._transient_5xx_retries = 2
+    assert cr._transient_retry_budget_left(slot, RuntimeError("internal server error")) is True
+
+
 @pytest.mark.parametrize(
     ("owner", "name", "kind", "signature"),
     [(owner, *row) for owner, rows in _BASE_SURFACE.items() for row in rows],

@@ -2799,6 +2799,7 @@ class _ChatSlot:
         "_tool_stall_retries",
         "_tool_stall_exhausted_emitted",
         "_transient_5xx_retries",
+        "_transient_conn_retry_started",
         "_infra_retries",
         "_fallback_candidate_idx",
         "_fallback_walked",
@@ -3549,6 +3550,10 @@ class _ChatSlot:
         # ConnectionReset) retries on the interactive stream path. Distinct
         # budget from prompt-busy / pipe-death; reset on a completed turn.
         self._transient_5xx_retries: int = 0
+        # SES-9: when the current connection-class retry window opened
+        # (time.monotonic()), or None. A live monotonic reading, never
+        # persisted; cleared beside the retry counter it budgets.
+        self._transient_conn_retry_started: float | None = None
         # L1 gateway-capacity retries: how many times THIS cycle waited out an
         # infrastructure refusal of a tool call (the ladder owns the budget; this
         # is the slot-visible count the health panel classifies as recovering).

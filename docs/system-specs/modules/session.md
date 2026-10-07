@@ -4403,7 +4403,17 @@ model-fallback threshold, so spending it here shortens the next real 5xx ladder,
 inflates its backoff seed and brings the swap onto `agent.fallback_model` that
 many errors closer -- over a wait the model had no part in. Like the transient
 budget it is cleared on a landed turn AND on every arm that ends the turn without
-re-queuing.
+re-queueing. The transient ladder itself is split by error class (SES-9):
+throttles and plain 5xx keep the flat `TRANSIENT_RETRIES` (3), while a
+CONNECTION-CLASS drop (dispatch failure, connection reset, ECONNRESET) earns a
+wall-clock budget — `CONNECTION_RETRY_SECS` (75 s) measured from its first
+failure, with the per-attempt backoff capped at 15 s — on the dashboard arm,
+`stream_and_collect` Case 2 and the sub-agent ladder alike, because its
+pre-token re-prompts fail before any token streams and cost nothing: a short
+network drop must not end the turn. Past the window the turn fails with the
+give-up text on a still-resumable session, and every retry still counts toward
+the ladder's counter so the escalation and per-cycle resets see an honest
+count.
 
 On `escalate` the runner stops retrying and says so, and marks the run spent
 (`_l1_escalated`) -- distinct from `_recovering_infra`, which also suppresses

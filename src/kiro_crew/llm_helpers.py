@@ -290,6 +290,49 @@ def transient_retry_delay(attempt: int) -> float:
     return base + _JITTER_RNG.random() * 0.25 * base
 
 
+#: Markers of a CONNECTION-CLASS failure: the backend process is alive and the
+#: model never saw the prompt — the network path between them dropped. These
+#: are the errors whose pre-token re-prompts cost nothing (SES-9), so they earn
+#: a wall-clock budget rather than the flat attempt count throttles and 5xx
+#: keep: a laptop that sleeps its Wi-Fi for a minute must not lose the turn.
+_CONNECTION_MARKERS = (
+    "connection reset",
+    "connectionreset",
+    "econnreset",
+    "dispatch failure",
+    "dispatchfailure",
+)
+
+#: SES-9: how long a pre-token connection-class failure keeps earning re-prompts
+#: on the live session, measured from the FIRST such failure. Sized for an
+#: ordinary network drop — an elevator ride, a VPN re-handshake — not for an
+#: outage: past it the turn fails with the usual give-up text and the session
+#: stays resumable.
+CONNECTION_RETRY_SECS = 75.0
+
+#: SES-9: cap on any one connection-class backoff, so the wall-clock budget is
+#: spent in roughly eight probes instead of three doublings (the uncapped
+#: curve reaches 32s by attempt 6 and would sleep most of the budget away).
+CONNECTION_RETRY_DELAY_CAP = 15.0
+
+
+def is_connection_class_error(msg: str) -> bool:
+    """True iff *msg* (a formatted error string) marks a connection-class drop."""
+    low = str(msg).lower()
+    return any(m in low for m in _CONNECTION_MARKERS)
+
+
+def acp_error_is_connection(exc: BaseException) -> bool:
+    """True iff *exc* is a connection-class transport drop (SES-9)."""
+    return is_connection_class_error(str(exc))
+
+
+def connection_retry_delay(attempt: int) -> float:
+    """Backoff for the *attempt*-th connection-class retry: the shared curve
+    capped (SES-9), so the wall-clock budget buys ~8 probes."""
+    return min(transient_retry_delay(attempt), CONNECTION_RETRY_DELAY_CAP)
+
+
 def first_advertised_fallback(advertised: Any, rejected: str | None) -> str | None:
     """First advertised model that is neither *rejected* nor ``"auto"``.
 
@@ -2457,6 +2500,10 @@ async def stream_and_collect(
         The complete response text.
     """
     transient_attempts = 0
+    # SES-9: when the current connection-class retry window opened. None until
+    # the first connection-class failure; a live monotonic reading, closure-local
+    # because the whole ladder is one call's state.
+    conn_retry_started: float | None = None
     _model_fallback_attempted = False
     attempt = 0
     _fb_chain = tuple(
@@ -2651,13 +2698,27 @@ async def stream_and_collect(
                 and not result_text
                 and not _turn_tool_activity
                 and acp_error_is_transient(exc)
-                and transient_attempts < _TRANSIENT_RETRIES
+                and (
+                    transient_attempts < _TRANSIENT_RETRIES
+                    # SES-9: a connection-class drop earns a wall-clock budget
+                    # instead of the flat count — its re-prompts fail before any
+                    # token streams and cost nothing.
+                    or (
+                        acp_error_is_connection(exc)
+                        and (
+                            conn_retry_started is None
+                            or time.monotonic() - conn_retry_started < CONNECTION_RETRY_SECS
+                        )
+                    )
+                )
             ):
                 transient_attempts += 1
-                # Exponential backoff with per-process jitter (see _JITTER_RNG):
-                # deterministic within a process for tests, uniform across the
-                # fleet so co-located peers don't retry in lockstep.
-                delay = transient_retry_delay(transient_attempts)
+                if acp_error_is_connection(exc):
+                    if conn_retry_started is None:
+                        conn_retry_started = time.monotonic()
+                    delay = connection_retry_delay(transient_attempts)
+                else:
+                    delay = transient_retry_delay(transient_attempts)
                 logger.warning(
                     "Transient backend error (attempt %d/%d), retrying in %.1fs: %s",
                     transient_attempts,

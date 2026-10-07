@@ -564,6 +564,66 @@ class TestStreamAndCollectTransient:
         provider.cancel.assert_awaited_once()
         provider.shutdown.assert_not_awaited()
 
+    _CONN_DROP = "LLM dispatch failure: connection reset by peer"
+
+    @pytest.mark.asyncio
+    async def test_connection_drop_outlives_the_flat_budget_then_succeeds(self) -> None:
+        """SES-9: a connection-class drop re-prompts on a wall-clock budget, not
+        the flat TRANSIENT_RETRIES — five straight failures (past the flat 3)
+        still land the call once the network comes back."""
+        call_count = 0
+
+        async def _stream(msg):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 5:
+                raise AcpError(self._CONN_DROP)
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="recovered")
+            yield LLMEvent(kind=EVENT_COMPLETE)
+
+        provider = AsyncMock()
+        provider.cancel = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.stream = _stream
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await stream_and_collect(provider, "test")
+
+        assert result == "recovered"
+        assert call_count == 6, "the connection budget must outlive the flat 3"
+
+    @pytest.mark.asyncio
+    async def test_connection_drop_past_the_window_raises(self) -> None:
+        """SES-9: past CONNECTION_RETRY_SECS the drop gives up with the usual
+        transient error — the budget is a minute-scale window, not an outage
+        allowance."""
+        import kiro_crew.llm_helpers as lh
+
+        calls = {"n": 0, "t": 0.0}
+
+        async def _stream(msg):
+            calls["n"] += 1
+            calls["t"] += 30.0  # the drop lasts longer than the budget
+            raise AcpError(self._CONN_DROP)
+            yield  # pragma: no cover
+
+        def fake_monotonic():
+            return calls["t"]
+
+        provider = AsyncMock()
+        provider.cancel = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.stream = _stream
+
+        with (
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch.object(lh.time, "monotonic", side_effect=fake_monotonic),
+            pytest.raises(AcpError),
+        ):
+            await stream_and_collect(provider, "test")
+
+        assert calls["n"] >= 3, "the budget bought retries past the flat count"
+
     @pytest.mark.asyncio
     async def test_transient_exhausts_budget_then_raises(self) -> None:
         """Persistent transient failure raises AFTER exhausting the retry budget.
