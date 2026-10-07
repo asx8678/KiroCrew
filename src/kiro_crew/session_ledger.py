@@ -73,6 +73,8 @@ import os
 import re
 import shutil
 import time
+
+from kiro_crew import image_refs
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, NamedTuple
@@ -2413,7 +2415,17 @@ def render_snapshot(slot_key: str) -> str:
         why = f" (rejected: {_field(item['rejected_because'])})" if item["rejected_because"] else ""
         lines.append(f"tried: {_field(item['approach'])}{why}")
     for k, v in state["artifacts"].items():
-        lines.append(f"artifact {k}: {_field(v)}")
+        # build_prompt_blocks scans the whole outgoing cycle message and
+        # inlines every readable image path it finds, so a bare artifact path
+        # re-attached the same picture on EVERY monitor/auto-nudge cycle (and
+        # each copy then stayed in native history). The glued ``file:`` prefix
+        # is a form the attachment grammar cannot match on either platform
+        # (its lookbehind refuses a ':' before the path) while the path stays
+        # readable, so only a value that could be a picture needs it.
+        rendered = _field(v)
+        if image_refs._ANY_IMAGE_SUFFIX_RE.search(rendered):
+            rendered = f"file:{rendered}"
+        lines.append(f"artifact {k}: {rendered}")
     block = "\n".join(lines)
     if len(block) > _SNAPSHOT_MAX_CHARS:
         block = block[: _SNAPSHOT_MAX_CHARS - 1] + "…"
