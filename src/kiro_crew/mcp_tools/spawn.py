@@ -619,9 +619,11 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "resource_status",
             "description": (
-                "Check current host resource headroom BEFORE starting a heavy "
-                "step — a full test suite, a large build, or a big parallel "
-                "sub-agent wave. Returns available memory, CPU load, and an "
+                "Check current host resource headroom when a reading is needed — "
+                "when your context carries a `[RESOURCES]` line, after a heavy "
+                "step was killed, or before a full test suite, large build or big "
+                "parallel sub-agent wave in a run with no `[RESOURCES]` line. "
+                "Returns available memory, CPU load, and an "
                 "advisory posture (ample / tight / critical) plus the sub-agent "
                 "cap ACTUALLY in force right now against your configured max "
                 "(and why it is lower, when it is), so you can decide whether to "
