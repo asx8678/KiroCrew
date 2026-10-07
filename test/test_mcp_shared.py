@@ -955,6 +955,68 @@ def _slow_then_echo():
     not platform_compat.IS_POSIX,
     reason="worker-thread + select() interleave is POSIX-only",
 )
+class TestStdioLoopCallEnvelope:
+    """TOOL-23: a malformed tools/call params object is refused with -32602
+    rather than silently running the tool with defaults."""
+
+    def test_args_under_another_key_is_refused(self, monkeypatch):
+        harness = _LoopHarness(monkeypatch, lambda name, args: f"done:{name}")
+        try:
+            harness.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 401,
+                    "method": "tools/call",
+                    "params": {"name": "list_sessions", "input": {"limit": 1}},
+                }
+            )
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            rid, result, error = harness.responses[0]
+            assert rid == 401
+            assert result is None
+            assert error["code"] == -32602
+            assert "unknown key(s) ['input']" in error["message"]
+        finally:
+            harness.close()
+
+    def test_non_object_arguments_is_refused(self, monkeypatch):
+        harness = _LoopHarness(monkeypatch, lambda name, args: f"done:{name}")
+        try:
+            harness.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 402,
+                    "method": "tools/call",
+                    "params": {"name": "list_sessions", "arguments": "x"},
+                }
+            )
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            rid, result, error = harness.responses[0]
+            assert rid == 402
+            assert error["code"] == -32602
+            assert "arguments must be an object" in error["message"]
+        finally:
+            harness.close()
+
+    def test_omitted_arguments_still_runs_the_tool(self, monkeypatch):
+        harness = _LoopHarness(monkeypatch, lambda name, args: f"done:{name}")
+        try:
+            harness.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 403,
+                    "method": "tools/call",
+                    "params": {"name": "list_sessions"},
+                }
+            )
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            rid, result, error = harness.responses[0]
+            assert rid == 403
+            assert error is None
+        finally:
+            harness.close()
+
+
 class TestStdioLoopBusyQueue:
     def test_tools_call_while_busy_is_queued_and_answered_fifo(self, monkeypatch):
         import time
