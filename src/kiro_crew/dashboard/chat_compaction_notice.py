@@ -36,6 +36,7 @@ from kiro_crew.platform.governance_profiles import vet_and_audit
 from kiro_crew.session_compaction import (
     COMPACT_OUTCOME_CANCELLED,
     COMPACT_OUTCOME_COMPACTED,
+    COMPACT_OUTCOME_EPISODE_EXHAUSTED,
     COMPACT_OUTCOME_RECYCLED,
     COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE,
     COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS,
@@ -60,6 +61,14 @@ CHANNEL_COMPACT_WAITING_NOTICE = (
 CHANNEL_COMPACT_FAILED_NOTICE = (
     "Context reached {pct:.0f}% but auto-compact failed. It retries after a "
     "cooldown — send {cmd} to compact now, or {new_cmd} to start fresh."
+)
+#: The compaction episode is exhausted: repeated compactions could not free
+#: this context below the threshold, so the gate stopped retrying. Said once
+#: per episode.
+CHANNEL_COMPACT_EXHAUSTED_NOTICE = (
+    "Context stays at {pct:.0f}% — repeated auto-compacts could not free it "
+    "below the threshold, so the retries stopped. Start a new chat "
+    "({new_cmd}) or clear the session to continue with full headroom."
 )
 #: Shared tail of both restart notices. The successor's first turn IS built from a
 #: recent excerpt of the transcript (``ContextBuilder`` thread history), so the
@@ -129,6 +138,9 @@ def notice_text(
     if outcome == COMPACT_OUTCOME_CANCELLED:
         _, new_cmd = _MANUAL_COMMANDS.get(namespace, _DEFAULT_COMMANDS)
         return CHANNEL_COMPACT_CANCELLED_NOTICE.format(pct=pct, new_cmd=new_cmd)
+    if outcome == COMPACT_OUTCOME_EPISODE_EXHAUSTED:
+        _, new_cmd = _MANUAL_COMMANDS.get(namespace, _DEFAULT_COMMANDS)
+        return CHANNEL_COMPACT_EXHAUSTED_NOTICE.format(pct=pct, new_cmd=new_cmd)
     if not success:
         compact_cmd, new_cmd = _MANUAL_COMMANDS.get(namespace, _DEFAULT_COMMANDS)
         return CHANNEL_COMPACT_FAILED_NOTICE.format(pct=pct, cmd=compact_cmd, new_cmd=new_cmd)

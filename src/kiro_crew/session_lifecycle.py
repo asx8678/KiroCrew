@@ -17,7 +17,7 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, MutableMapping, MutableSet, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
@@ -582,6 +582,8 @@ class SessionLifecycleOwner(Protocol):
     _pool_health_task: asyncio.Task[Any] | None
 
     _compact_cooldown_until: MutableMapping[str, float]
+    _compact_episode_count: MutableMapping[str, int]
+    _compact_episode_fired: MutableSet[str]
     _compact_pending_verdict: MutableMapping[str, float]
     _cleanup_task: asyncio.Task[Any] | None
     _background_tasks: set[asyncio.Task[Any]]
@@ -1423,6 +1425,8 @@ class SessionLifecycleService:
             teardown_children = self._snapshot_parent_children(key) if ends_conversation else ()
             owner._advance_session_generation(key)
             owner._compact_cooldown_until.pop(key, None)
+            owner._compact_episode_count.pop(key, None)
+            owner._compact_episode_fired.discard(key)
             # ``clear_conversation`` means the conversation is being THROWN AWAY,
             # and the successor's replay is the one thing that can put it back.
             # Arming suppression here is what stops the reset that critical
@@ -1822,6 +1826,8 @@ class SessionLifecycleService:
             teardown_children = self._snapshot_parent_children(key)
             owner._advance_session_generation(key)
             owner._compact_cooldown_until.pop(key, None)
+            owner._compact_episode_count.pop(key, None)
+            owner._compact_episode_fired.discard(key)
             self._suppress_replay.discard(key)
             owner._compact_pending_verdict.pop(key, None)
             self._origin_links.pop(key, None)
@@ -2060,6 +2066,8 @@ class SessionLifecycleService:
                         del owner._sessions[key]
                         owner._advance_session_generation(key)
                         owner._compact_cooldown_until.pop(key, None)
+                        owner._compact_episode_count.pop(key, None)
+                        owner._compact_episode_fired.discard(key)
                         self._suppress_replay.discard(key)
                         self._origin_links.pop(key, None)
                         self.state.stop_requests.pop(key, None)
@@ -2414,6 +2422,8 @@ class SessionLifecycleService:
             teardown_children = self._snapshot_parent_children(key)
             owner._advance_session_generation(key)
             owner._compact_cooldown_until.pop(key, None)
+            owner._compact_episode_count.pop(key, None)
+            owner._compact_episode_fired.discard(key)
             self._suppress_replay.discard(key)
             owner._compact_pending_verdict.pop(key, None)
             self._origin_links.pop(key, None)
@@ -2482,6 +2492,8 @@ class SessionLifecycleService:
             teardown_children = self._snapshot_parent_children(key)
             owner._advance_session_generation(key)
             owner._compact_cooldown_until.pop(key, None)
+            owner._compact_episode_count.pop(key, None)
+            owner._compact_episode_fired.discard(key)
             self._suppress_replay.discard(key)
             owner._compact_pending_verdict.pop(key, None)
             self.state.stop_requests.pop(key, None)
@@ -2656,6 +2668,8 @@ class SessionLifecycleService:
             teardown_children = self._snapshot_parent_children(key)
             owner._advance_session_generation(key)
             owner._compact_cooldown_until.pop(key, None)
+            owner._compact_episode_count.pop(key, None)
+            owner._compact_episode_fired.discard(key)
             owner._compact_pending_verdict.pop(key, None)
             self._release_turn_ceiling(key, requested_key)
             # Store replay suppression atomically with the pop. Origin-link
@@ -2912,6 +2926,8 @@ class SessionLifecycleService:
                 owner._advance_session_generation(session_key)
             owner._sessions.clear()
             owner._compact_cooldown_until.clear()
+            owner._compact_episode_count.clear()
+            owner._compact_episode_fired.clear()
             self._suppress_replay.clear()
             owner._compact_pending_verdict.clear()
             # Same lock hold as the clear: the whole drained set is accounted for

@@ -1734,6 +1734,22 @@ class SessionManager:
         self._compaction_state.cooldown_until = value
 
     @property
+    def _compact_episode_count(self) -> dict[str, int]:
+        return self._compaction_state.episode_count
+
+    @_compact_episode_count.setter
+    def _compact_episode_count(self, value: dict[str, int]) -> None:
+        self._compaction_state.episode_count = value
+
+    @property
+    def _compact_episode_fired(self) -> set[str]:
+        return self._compaction_state.episode_fired
+
+    @_compact_episode_fired.setter
+    def _compact_episode_fired(self, value: set[str]) -> None:
+        self._compaction_state.episode_fired = value
+
+    @property
     def _compact_pending_verdict(self) -> dict[str, float]:
         return self._compaction_state.pending_verdict
 

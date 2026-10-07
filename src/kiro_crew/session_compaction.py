@@ -60,12 +60,26 @@ COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE = "restarted_uncompactable"
 #: A compaction failed and the restart is held: sub-agents still run on this session's
 #: process, and restarting it now would end them. Sent with ``success=False``.
 COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS = "waiting_for_subagents"
+#: A compaction episode is exhausted: this many consecutive compactions never
+#: landed below ``threshold - warn margin``, so further attempts are declined at
+#: the gate until a reset/remove/destroy or a healthy landing clears the episode.
+_COMPACT_EPISODE_EXHAUSTED_AFTER = 2
+#: Backoff ceiling for the ineffective-compaction cooldown (seconds). The base
+#: stays ``_COMPACT_FAILURE_COOLDOWN_SECS``; each episode level doubles it.
+_COMPACT_EPISODE_BACKOFF_MAX_SECS = 900.0
+
 #: The in-flight compaction was ended by a user Stop, not by the harness. Sent with
 #: ``success=False``. A separate value because the failure arm's other destination is
 #: a RECYCLE, and a Stop the user pressed must never read as "compaction didn't
 #: succeed, so the session was restarted": the session is not recycled on this
 #: outcome, the cooldown is armed and the next threshold reading retries.
 COMPACT_OUTCOME_CANCELLED = "cancelled"
+#: The compaction episode is exhausted: consecutive compactions never got this
+#: context below ``threshold - warn margin``, so the gate declines further
+#: attempts until a reset/remove/destroy or a healthy landing clears the
+#: episode. Sent with ``success=False``, once per episode; surfaces tell the
+#: user to start a new chat or /clear.
+COMPACT_OUTCOME_EPISODE_EXHAUSTED = "episode_exhausted"
 
 #: Fired when *key* enters or leaves the compacting set, with the new membership.
 CompactingCallback = Callable[[str, bool], None]
@@ -93,6 +107,12 @@ class CompactionState:
     #: holds at most the handful of keys recycling right now.
     uncompactable_recycles: set[str] = field(default_factory=set)
     cooldown_until: dict[str, float] = field(default_factory=dict)
+    #: Per-key compaction episode: consecutive compactions that never landed
+    #: below ``threshold - warn margin``. At ``_COMPACT_EPISODE_EXHAUSTED_AFTER``
+    #: the gate declines further attempts (see ``_judge_compact_effect``).
+    episode_count: dict[str, int] = field(default_factory=dict)
+    #: Keys whose one-per-episode ``episode_exhausted`` callback already fired.
+    episode_fired: set[str] = field(default_factory=set)
     pending_verdict: dict[str, float] = field(default_factory=dict)
     #: Per-session threshold overrides (folded key -> pct). A key absent here
     #: falls back to the published global (``cfg.session.autocompact_pct``).
@@ -598,6 +618,41 @@ class CompactionCoordinator:
                 cooldown_until - time.monotonic(),
             )
             return "cooldown"
+        if self.state.episode_count.get(key, 0) >= _COMPACT_EPISODE_EXHAUSTED_AFTER:
+            # The cooldown expired but the episode has not: two compactions in
+            # a row could not get this context below threshold - warn margin,
+            # and a third would summarize the same oversized window the same
+            # way. Decline until a reset/remove/destroy or a healthy landing
+            # ends the episode, and tell the user once per episode. No
+            # auto-reset here: a reset ends the conversation, and resets are
+            # deliberately limited to the measured >=95% immediate verdict.
+            if key not in self.state.episode_fired:
+                self.state.episode_fired.add(key)
+                self._deps.logger.warning(
+                    "Session %s compaction exhausted — context stays at %.1f%% "
+                    "after %d compaction(s) that could not free it below the "
+                    "threshold; start a new chat or /clear",
+                    key,
+                    pct,
+                    self.state.episode_count[key],
+                )
+                try:
+                    task = asyncio.create_task(
+                        self._owner._fire_compact_callback(
+                            key,
+                            pct,
+                            success=False,
+                            outcome=COMPACT_OUTCOME_EPISODE_EXHAUSTED,
+                        )
+                    )
+                    self._owner._background_tasks.add(task)
+                    task.add_done_callback(self._owner._background_tasks.discard)
+                except RuntimeError:
+                    # No running loop (a sync probe): the WARNING above still
+                    # names the outcome for the operator; only the callback
+                    # fire is skipped.
+                    pass
+            return "episode_exhausted"
         return None
 
     def _trigger_compaction(
@@ -1168,11 +1223,30 @@ class CompactionCoordinator:
         return floor if isinstance(floor, (int, float)) else None
 
     def _judge_compact_effect(self, key: str, pct_before: float, pct_after: float) -> bool:
-        """Arm damping for an ineffective drop and report critical context."""
+        """Arm damping for an ineffective drop and report critical context.
+
+        An EPISODE is a run of compactions that never landed below
+        ``threshold - warn margin``. Every verdict that does not land grows the
+        episode and backs the cooldown off exponentially (base x 2**(episode-1),
+        capped at ``_COMPACT_EPISODE_BACKOFF_MAX_SECS``); at
+        ``_COMPACT_EPISODE_EXHAUSTED_AFTER`` consecutive no-landing attempts
+        the gate declines further compactions until a reset/remove/destroy or
+        a healthy landing clears the episode. The old flat cooldown cleared on
+        any 5-point drop even when the reading stayed above the threshold, so
+        a compacted floor above the threshold re-triggered every cooldown
+        window indefinitely (measured: 11 compactions in 20 turns), each pass a
+        model-generated summarization of the same oversized window.
+        """
         freed = pct_before - pct_after
-        if freed < self._deps.compact_min_effect_pct_points:
-            self.state.cooldown_until[key] = (
-                time.monotonic() + self._deps.compact_failure_cooldown_secs
+        landed = (
+            pct_after < self.effective_autocompact_pct(key) - self._deps.context_warn_margin_pct
+        )
+        if freed < self._deps.compact_min_effect_pct_points or not landed:
+            self.state.episode_count[key] = self.state.episode_count.get(key, 0) + 1
+            level = self.state.episode_count[key] - 1
+            self.state.cooldown_until[key] = time.monotonic() + min(
+                self._deps.compact_failure_cooldown_secs * (2**level),
+                _COMPACT_EPISODE_BACKOFF_MAX_SECS,
             )
             still_critical = pct_after >= self._deps.post_compact_reset_pct
             verdict = (
@@ -1210,7 +1284,11 @@ class CompactionCoordinator:
                 verdict,
             )
             return still_critical
+        # Landed below threshold - warn margin: compaction did its job — end
+        # the episode and clear the cooldown.
         self.state.cooldown_until.pop(key, None)
+        self.state.episode_count.pop(key, None)
+        self.state.episode_fired.discard(key)
         return False
 
     async def _reset_still_critical(
