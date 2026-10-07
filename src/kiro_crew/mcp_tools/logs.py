@@ -56,12 +56,15 @@ def schemas() -> list[dict[str, Any]]:
                 "diagnostics bundle uses, so live tokens, Authorization headers "
                 "and auth cookies are stripped before you see them. Use it when "
                 "the backend rejected a turn, an ACP request errored, or you "
-                "need first-hand evidence of what kiro-cli did. `tail` bounds "
-                "the number of lines (default 200); `since` keeps lines at/after "
-                'a leading-timestamp prefix like "2026-09-06T16:". Output is '
-                "byte-capped per source AND bounded as a whole; when it does not "
-                "all fit, the OLDEST lines are dropped and the newest are kept, "
-                "with a note saying so. Returns the log text with one section "
+                "need first-hand evidence of what kiro-cli did. With no `tail` "
+                "the tool returns a bounded DEFAULT view: the newest ~50 lines "
+                "merged across sources under a 20,000-char budget — ask for "
+                "`tail=N` (up to 2000 lines/source) when you need more; explicit "
+                "requests keep the full 80,000-char ceiling. `since` keeps lines "
+                'at/after a leading-timestamp prefix like "2026-09-06T16:". '
+                "Output is byte-capped per source AND bounded as a whole; when it "
+                "does not all fit, the OLDEST lines are dropped and the newest are "
+                "kept, with a note saying so. Returns the log text with one section "
                 "per source, or a note when no logs exist."
             ),
             "inputSchema": {
