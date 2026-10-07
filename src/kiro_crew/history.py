@@ -3212,13 +3212,32 @@ class ConversationLog:
         come from one ``_read_messages`` call so the eligibility check costs no
         additional transcript read on the event loop.
         """
+        total, unconsolidated, _prompt_rows = self.consolidation_idle_counts(key)
+        return total, unconsolidated
+
+    def consolidation_idle_counts(self, key: str) -> tuple[int, int, int]:
+        """Return ``(total_messages, unconsolidated, prompt_rows)`` from ONE read.
+
+        The same single read :meth:`consolidation_counts` makes, with the third
+        element the number of prompt rows — everything but the display-only
+        roles, exactly :func:`kiro_crew.history_consolidation._prompt_rows`'s
+        filter — in the UNCONSOLIDATED tail. The idle sweep (LOOP-12) needs it
+        to refuse a whole LLM consolidation pass for a tail too short to learn
+        from, without a second transcript read on the event loop. Importing the
+        consolidator's filter here would be circular, so the roles are the same
+        frozenset re-imported from the module both read.
+        """
+        from kiro_crew.history_projection import DISPLAY_ONLY_ROLES
+
         messages = self._read_messages(key)
         offset = self._read_metadata(key).get("last_consolidated", 0)
         try:
             offset = int(offset or 0)
         except (TypeError, ValueError, OverflowError):
             offset = 0
-        return len(messages), max(0, len(messages) - offset)
+        tail = messages[offset:] if 0 <= offset <= len(messages) else []
+        prompt_rows = sum(1 for m in tail if m.get("role") not in DISPLAY_ONLY_ROLES)
+        return len(messages), max(0, len(messages) - offset), prompt_rows
 
     def consolidation_retry_state(
         self, key: str, message_count: int | None = None

@@ -61,7 +61,7 @@ def _restarted(
 async def _sweep_after_seed(consolidator: HistoryConsolidator) -> list[str]:
     started: list[str] = []
 
-    async def fake_consolidate(key: str, include_history: bool = True) -> None:
+    async def fake_consolidate(key: str, include_history: bool = True, **_: object) -> None:
         started.append(key)
         consolidator._running.discard(key)
 
@@ -139,7 +139,7 @@ async def test_a_seeded_backlog_drains_a_few_per_sweep_without_starving(tmp_path
     def counts(key: str) -> tuple[int, int]:
         return (3, 3)
 
-    async def fake_consolidate(key: str, include_history: bool = True) -> None:
+    async def fake_consolidate(key: str, include_history: bool = True, **_: object) -> None:
         started.append(key)
         consolidator._running.discard(key)
 
@@ -226,7 +226,7 @@ async def test_a_refused_seed_waits_an_idle_window_and_is_kept(tmp_path):
     consolidator._last_activity[LIVE] = 0.0
     consolidator._seeded_keys.add(LIVE)
 
-    async def refuse(key: str, include_history: bool = True) -> object:
+    async def refuse(key: str, include_history: bool = True, **_: object) -> object:
         consolidator._running.discard(key)  # as the real ``finally`` does
         return _CONSOLIDATION_REFUSED
 
