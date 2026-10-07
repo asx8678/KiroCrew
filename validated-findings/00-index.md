@@ -38,6 +38,15 @@ this session ends, so "ran a script" means re-measure with a fresh one.
 | CANT_VERIFY_HERE | 17 | 07-not-validated.md |
 | DECISION | 21 | 07-not-validated.md |
 
+**Completed (fixer pass)**
+
+Status of the items this fix pass resolved — details under each item's heading in the area files:
+
+- **Fixed on `main`** (commit in parentheses): SEC-1/2/3 (`c906d25`), SEC-4 (`3c28069`), SEC-9 (`4c8b7b8`), SEC-13 (`776f6fa`), SEC-17 (`9c892db`), SEC-18 (`fc55dc8`), REL-13 (`34da2f3`), REL-22 (`9c15511`), REL-45 (`96f8a14`).
+- **Doc part fixed, decision closed** (no code change): SEC-5 (`4740ae1`), SEC-6 (`3b23fb1`), SEC-8 (`d6e52fb`), SEC-10 (`b291147`), SEC-12 (`15feae0`).
+- **Covered by open upstream PRs** (diffs verified, not duplicated): SEC-14 → #17298, SEC-20 → #14747, SEC-15 → #17524, REL-12 → #17351, REL-18 → #17052, REL-24 → #16859.
+- **Decided, no code change**: SEC-19, SEC-22.
+
 **How to read an item**
 
 - **Severity** is 1–100.
