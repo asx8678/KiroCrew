@@ -457,15 +457,18 @@ from kiro_crew.hooks import (  # noqa: F401
 from kiro_crew.image_artifacts import register_images_off_loop
 from kiro_crew.llm_helpers import (  # noqa: F401
     _NO_PRIOR_STATS,
+    CONNECTION_RETRY_SECS,
     TRANSIENT_RETRIES,
     TURN_FALLBACK_ATTR,
     FallbackState,
     PromptBusyExhaustedError,
     _billing_stats,
+    acp_error_is_connection,
     acp_error_is_session_not_found,
     acp_error_is_transient,
     advance_fallback_candidate,
     configured_fallback_chain,
+    connection_retry_delay,
     fallback_rewound_transient_budget,
     first_advertised_fallback,
     pick_epoch_host,
@@ -1086,6 +1089,32 @@ def _refined_tool_row_content(existing: str, new_title: str) -> str | None:
 #: skipping both. Sized to a pipe write with margin, far below the 60s approval
 #: reporting margin, and applied inside the helper so every caller inherits it.
 _STEER_NOTICE_BOUND_SECS = STEER_NOTICE_BOUND_SECS
+
+
+def _transient_retry_budget_left(slot: Any, exc: BaseException) -> bool:
+    """Whether the pre-token transient ladder may re-prompt once more (SES-9).
+
+    Two budgets, by error class. Throttles and plain 5xx keep the flat
+    TRANSIENT_RETRIES they always had. A CONNECTION-CLASS drop — the backend
+    process is alive, the model never saw the prompt — instead earns a
+    wall-clock budget measured from its first failure, because every one of
+    its re-prompts fails before any token streams and costs nothing: a short
+    network drop on the order of a minute must not end the turn. Past the
+    window the arm goes false, the fallback-swap elif gets its turn, and the
+    bare-error path ends with the usual give-up text on a still-resumable
+    session. Every retry still counts toward the ladder's counter, so the
+    escalation and per-cycle reset logic see an honest count.
+    """
+    if slot._transient_5xx_retries < TRANSIENT_RETRIES:
+        return True
+    if not acp_error_is_connection(exc):
+        return False
+    started = getattr(slot, "_transient_conn_retry_started", None)
+    if started is None:
+        # A connection-class failure that never went through the arm's clock
+        # start (e.g. state rehydrated mid-drop): the window starts now.
+        return True
+    return (time.monotonic() - started) < CONNECTION_RETRY_SECS
 
 
 async def _steer_repeat_loop_notice(client: Any, notice: str) -> bool:
@@ -16873,6 +16902,7 @@ async def _run_chat(
             slot._stale_recovery_exhausted_emitted = False
             slot._tool_stall_exhausted_emitted = False
             slot._transient_5xx_retries = 0
+            slot._transient_conn_retry_started = None
             slot._infra_retries = 0
             # Same evidence, same reason, for the streak of deaths that belonged
             # to a process this slot was sharing rather than to the slot itself:
@@ -17719,7 +17749,7 @@ async def _run_chat(
         elif (
             not _turn_emitted
             and acp_error_is_transient(exc)
-            and slot._transient_5xx_retries < TRANSIENT_RETRIES
+            and _transient_retry_budget_left(slot, exc)
         ):
             # Transient backend 5xx (InternalServerError / DispatchFailure /
             # ConnectionReset, JSON-RPC -32603): the kiro-cli process is ALIVE —
@@ -17737,11 +17767,27 @@ async def _run_chat(
             # case the else escalates to a session destroy (poisoned
             # persisted conversation; see the escalation block there).
             slot._transient_5xx_retries += 1
+            # SES-9: the clock for a connection-class drop starts at its FIRST
+            # failure — including the ones inside the flat budget — so the
+            # wall-clock window measures the drop, not the overshoot.
+            if (
+                acp_error_is_connection(exc)
+                and getattr(slot, "_transient_conn_retry_started", None) is None
+            ):
+                slot._transient_conn_retry_started = time.monotonic()
             # Local curve, floored by the dependency coordinator's shared
             # cooldown for this provider scope (one schedule per scope, RFC
             # §4.4); a typed throttle is reported to the adaptive controller.
+            # Connection-class drops use the capped curve (SES-9): the
+            # wall-clock budget buys ~8 probes, not three doublings.
             _delay = _shared_dependency_delay(
-                exc, transient_retry_delay(slot._transient_5xx_retries), slot_key=slot.key
+                exc,
+                (
+                    connection_retry_delay(slot._transient_5xx_retries)
+                    if acp_error_is_connection(exc)
+                    else transient_retry_delay(slot._transient_5xx_retries)
+                ),
+                slot_key=slot.key,
             )
             logger.info(
                 "Transient backend 5xx in slot %s (attempt %d/%d) — re-prompting "
@@ -17822,6 +17868,7 @@ async def _run_chat(
                     # count left standing shortens the next real ladder, inflates
                     # its backoff seed and brings the fallback swap closer.
                     slot._transient_5xx_retries = 0
+                    slot._transient_conn_retry_started = None
                     slot._infra_retries = 0
                     slot._fallback_candidate_idx = 0
                     slot._fallback_walked = []
@@ -17927,6 +17974,7 @@ async def _run_chat(
                 # budget (premature fallback swap + spurious throttle notice)
                 # and a restore probe suppressed by the stale walk index.
                 slot._transient_5xx_retries = 0
+                slot._transient_conn_retry_started = None
                 slot._infra_retries = 0
                 slot._fallback_candidate_idx = 0
                 slot._fallback_walked = []
@@ -18518,6 +18566,7 @@ async def _run_chat(
                 _queue_recovery(0, message, kind=SYNTHETIC_RECOVERY_KIND)
                 # Fresh conversation ⇒ fresh ladder for the recovery cycle.
                 slot._transient_5xx_retries = 0
+                slot._transient_conn_retry_started = None
                 slot._infra_retries = 0
             else:
                 _err_text, _ = redact_exfiltration_urls(str(exc))
@@ -18619,6 +18668,7 @@ async def _run_chat(
                 # TRANSIENT_RETRIES. (_posttoken_retry_used needs no counterpart
                 # here: it is already refreshed at genuine-turn start.)
                 slot._transient_5xx_retries = 0
+                slot._transient_conn_retry_started = None
                 # Same NO-REQUEUE-exit rule for the L1 gateway-capacity count:
                 # without it a cycle whose L1 continuation died here leaves the
                 # slot reading "recovering" on the health panel until some later

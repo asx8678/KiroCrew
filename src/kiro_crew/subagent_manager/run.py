@@ -49,6 +49,7 @@ if TYPE_CHECKING:
         _SYSTEM_PREFIX,
         _TRANSIENT_CONTINUE_MSG,
         _TURN_LIMIT,
+        CONNECTION_RETRY_SECS,
         EVENT_AGENT_SWITCHED,
         EVENT_COMPLETE,
         EVENT_PERMISSION_REQUEST,
@@ -90,6 +91,7 @@ if TYPE_CHECKING:
         _timeout_context,
         _validate_agent,
         _vet_spawn_governance,
+        acp_error_is_connection,
         acp_error_is_transient,
         advance_fallback_candidate,
         agent_dir_for_display,
@@ -98,6 +100,7 @@ if TYPE_CHECKING:
         apply_completion_keep,
         classify_stop_reason,
         configured_fallback_chain,
+        connection_retry_delay,
         evict_completed_agents,
         extract_options,
         failure_name,
@@ -2691,6 +2694,9 @@ class RunEventCoordinator(ManagerComponent):
             (handled by _run's generic exception arm → error tombstone).
             """
             attempts = 0
+            # SES-9: when the current connection-class retry window opened — a
+            # live monotonic reading, closure-local like the counter it budgets.
+            conn_retry_started: float | None = None
             # One-shot post-activity allowance, mirroring the main path's
             # ``_posttoken_retry_used`` rule (dashboard/chat_runner.py ~L4324):
             # each continuation turn issued AFTER observed activity is an
@@ -2855,7 +2861,16 @@ class RunEventCoordinator(ManagerComponent):
                         if post_activity_attempts >= 1:
                             raise
                         post_activity_attempts += 1
-                    elif attempts >= TRANSIENT_RETRIES:
+                    elif attempts >= TRANSIENT_RETRIES and not (
+                        # SES-9: a connection-class drop earns a wall-clock
+                        # budget instead of the flat count — parity with the
+                        # dashboard arm and stream_and_collect Case 2.
+                        acp_error_is_connection(exc)
+                        and (
+                            conn_retry_started is None
+                            or _time.monotonic() - conn_retry_started < CONNECTION_RETRY_SECS
+                        )
+                    ):
                         # ── Throttle-exhaustion fallback chain ──
                         # Zero-activity budget spent: walk agent.fallback_model
                         # before surfacing (empty chain ⇒ raise exactly as
@@ -2916,7 +2931,12 @@ class RunEventCoordinator(ManagerComponent):
                         msg = full_message
                         continue
                     attempts += 1
-                    delay = transient_retry_delay(attempts)
+                    if acp_error_is_connection(exc):
+                        if conn_retry_started is None:
+                            conn_retry_started = _time.monotonic()
+                        delay = connection_retry_delay(attempts)
+                    else:
+                        delay = transient_retry_delay(attempts)
                     logger.warning(
                         "Subagent %s: transient backend error (attempt %d/%d), "
                         "retrying in %.1fs: %s",
