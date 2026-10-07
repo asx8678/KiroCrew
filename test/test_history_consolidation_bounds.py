@@ -298,6 +298,63 @@ class TestTheBudgetIsNotABehaviourChangeForOrdinarySessions:
         assert not c._tasks
 
 
+class TestPrefsOffsetOnEmptyConsolidation:
+    """CTX-24: an empty or undispatched preference-only pass must not advance
+    _prefs_offset, so the next eligible turn retries the window rather than
+    waiting for a whole new threshold of messages."""
+
+    @pytest.mark.asyncio
+    async def test_an_empty_prefs_pass_leaves_the_offset(self, tmp_path) -> None:
+        from kiro_crew.history_consolidation import _CONSOLIDATION_EMPTY
+
+        log = _log_with(tmp_path, [f"m{i}" for i in range(31)])
+        c = _make_consolidator(log, history_idle_secs=0)
+
+        async def _empty(key, include_history=False, **kw):
+            return _CONSOLIDATION_EMPTY
+
+        c._running.clear()
+        with patch.object(c, "_consolidate", side_effect=_empty):
+            c.maybe_consolidate(KEY)
+            await asyncio.gather(*list(c._tasks), return_exceptions=True)
+
+        assert (
+            c._prefs_offset.get(KEY, 0) == 0
+        ), "an empty pass must not mark the window consolidated"
+
+    @pytest.mark.asyncio
+    async def test_a_completed_prefs_pass_advances_the_offset(self, tmp_path) -> None:
+        log = _log_with(tmp_path, [f"m{i}" for i in range(31)])
+        c = _make_consolidator(log, history_idle_secs=0)
+
+        async def _done(key, include_history=False, **kw):
+            return None  # a real completed pass
+
+        c._running.clear()
+        with patch.object(c, "_consolidate", side_effect=_done):
+            c.maybe_consolidate(KEY)
+            await asyncio.gather(*list(c._tasks), return_exceptions=True)
+
+        assert c._prefs_offset.get(KEY, 0) == 31
+
+    @pytest.mark.asyncio
+    async def test_a_refused_prefs_pass_leaves_the_offset(self, tmp_path) -> None:
+        from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+        log = _log_with(tmp_path, [f"m{i}" for i in range(31)])
+        c = _make_consolidator(log, history_idle_secs=0)
+
+        async def _refused(key, include_history=False, **kw):
+            return _CONSOLIDATION_REFUSED
+
+        c._running.clear()
+        with patch.object(c, "_consolidate", side_effect=_refused):
+            c.maybe_consolidate(KEY)
+            await asyncio.gather(*list(c._tasks), return_exceptions=True)
+
+        assert c._prefs_offset.get(KEY, 0) == 0
+
+
 class TestTheIdleSweepNeedsAMinimumSpan:
     """LOOP-12: one new prompt row after an idle window is not a whole LLM pass.
 

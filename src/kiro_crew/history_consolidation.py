@@ -340,6 +340,23 @@ class _ConsolidationRefusedSentinel:
 _CONSOLIDATION_REFUSED = _ConsolidationRefusedSentinel()
 
 
+class _ConsolidationEmptySentinel:
+    """A preference-only pass whose model answer was empty or was never dispatched.
+
+    Distinct from ``None`` (a real completed pass) and from
+    ``_CONSOLIDATION_REFUSED`` (a refusal): the prefs done-callback must NOT
+    advance ``_prefs_offset`` on this sentinel (CTX-24), because doing so would
+    mark the window consolidated when nothing was extracted, and the next
+    extraction would wait for a whole new threshold of messages. The window
+    retries on the existing durable backoff.
+    """
+
+    __slots__ = ()
+
+
+_CONSOLIDATION_EMPTY = _ConsolidationEmptySentinel()
+
+
 class _LessonDeleteDecision(NamedTuple):
     """A consolidation lesson-delete decision plus the body it was read from.
 
@@ -1138,6 +1155,15 @@ class HistoryConsolidator:
                 # threshold of messages accumulates — silently dropping its
                 # preference/project extraction.
                 and fut.result() is not _CONSOLIDATION_REFUSED
+                # CTX-24: an empty or undispatched prefs pass must not advance
+                # the offset either — the window produced nothing, so the next
+                # eligible turn retries it on the durable backoff rather than
+                # waiting for a whole new threshold of messages.
+                and (
+                    not isinstance(fut.result(), _ConsolidationEmptySentinel)
+                    if fut.result() is not None
+                    else True
+                )
             ):
                 self._prefs_offset[k] = off
 
@@ -1821,7 +1847,11 @@ class HistoryConsolidator:
                 # on a widening interval instead of on every 60s tick.
                 if include_history:
                     await self._note_environment_failure(key, str(exc))
-                return None
+                    return None
+                # CTX-24: a prefs pass that never dispatched must not advance
+                # _prefs_offset — the done-callback skips the advance on this
+                # sentinel, so the window retries on the durable backoff.
+                return _CONSOLIDATION_EMPTY
             billed = True
             if not result:
                 # The turn reached the provider and produced nothing usable, so it
@@ -1832,7 +1862,10 @@ class HistoryConsolidator:
                 # and immediately after every restart. Charge the attempt.
                 if include_history:
                     await self._note_failed_attempt(key, attempted, "empty LLM result")
-                return None
+                    return None
+                # CTX-24: a prefs pass billed for nothing must not advance the
+                # offset either — same reasoning as the not-dispatched arm above.
+                return _CONSOLIDATION_EMPTY
 
             # A pending model result cannot authorize writes from a deleted or
             # edited transcript, or outrank a newer user turn. Appended assistant

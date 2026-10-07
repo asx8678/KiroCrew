@@ -1635,6 +1635,16 @@ async def run_bg_oneliner(
     """Stream a single prompt through an ephemeral background session and return
     the accumulated text.
 
+    **The shared-runtime ceiling (MOD-10):** every background one-liner runs on
+    ONE shared ``_bg`` session at a time — ``session/new`` is serialized on the
+    session's own semaphore, so a second one-liner that needs a cold start WAITS
+    for the first to finish starting. Once two handles are ACQUIRED, their
+    PROMPTS run concurrently (the drive is per-handle). This is the real
+    concurrency ceiling a new background caller inherits: not ``max_subagents``
+    but one cold start at a time, then parallel prompts. Queueing is measured,
+    not assumed: the gate reports ``queue_wait_ms`` through ``notify_start_queue``,
+    so contention is observable before it matters.
+
     ``start_priority`` orders the session's start; FOREGROUND only for a caller a
     person is waiting on (rule: ``kiro_crew.start_priority``). ``timeout`` bounds
     the DRIVE only -- see the acquisition below for why it must not be cancelled.
