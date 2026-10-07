@@ -343,7 +343,13 @@ Rules:
   ones, because a document that selects the check rollup hands its lifecycle
   facts to a missing Checks permission.
 - A partial failure degrades only the subjects it covers. One unreadable subject
-  must not fail the batch.
+  must not fail the batch. A supplemental read that fails does NOT inherit the
+  primary read's lifecycle: its error is decided by the same retryable-kind
+  rule a primary error obeys (LOOP-22) — TRANSIENT and RATE_LIMITED retry
+  until the provider-error streak trips, and every permanent kind
+  (authentication, authorization, not_found, setup) retires the watch as
+  BLOCKED on the first tick it is observed, leaving the readable primary
+  facts as the last recorded observation.
 - A refusal that names a spent BUDGET rather than a fault is retried on any other
   budget the provider meters separately, before it is charged. Every other failure
   is charged as it was: a missing subject is missing on both buckets and a rejected

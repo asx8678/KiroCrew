@@ -955,6 +955,45 @@ async def test_supplemental_provider_failures_advance_the_bounded_error_streak(t
 
 
 @pytest.mark.asyncio
+async def test_supplemental_non_retryable_error_retires_on_the_first_tick(tmp_path):
+    """LOOP-22: a supplemental AUTHORIZATION failure is permanent, so it obeys
+    the same retryable-kind rule a primary error does -- the readable primary
+    facts retire the watch as BLOCKED on tick 1 instead of burning the
+    provider-error budget on retries that cannot succeed (19 at a budget of
+    20). Supplemental TRANSIENT keeps retrying until the streak trips (pinned
+    by the test above)."""
+    service = AutoNudgeService(base_dir=tmp_path, on_monitor_tick=AsyncMock())
+    loop = await service.add_monitor(
+        slot_key="chat-1",
+        kind="github_pull_request",
+        target="https://github.com/acme/widgets/pull/7",
+        objective="review_ready",
+        cadence_secs=60,
+        budgets=MonitorBudgets(max_runtime_secs=600, max_provider_errors=20),
+        now=100.0,
+    )
+    assert loop.monitor is not None
+    result = _result(
+        MonitorObservationStatus.SUCCESS,
+        supplemental_error=ProviderErrorKind.AUTHORIZATION,
+    )
+
+    verdict = await service.apply_monitor_probe(
+        loop.id,
+        result,
+        now=120.0,
+        config_generation=loop.monitor.config_generation,
+    )
+
+    assert verdict.decision is MonitorDecision.STOP_BLOCKED
+    assert loop.monitor.provider_error_count == 1
+    assert loop.monitor.consecutive_provider_errors == 1
+    assert loop.monitor.last_observation == result.canonical
+    assert loop.monitor.outcome is MonitorOutcome.BLOCKED
+    service.stop()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_probe_publishes_the_durable_staged_state(tmp_path, monkeypatch):
     """Cancellation after snapshot durability cannot leave live state stale."""
     service = AutoNudgeService(base_dir=tmp_path, on_monitor_tick=AsyncMock())
