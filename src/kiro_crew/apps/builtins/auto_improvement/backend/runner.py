@@ -695,8 +695,22 @@ class RunSupervisor:
         with self._lock:
             if self._in_flight():
                 raise RuntimeError(f"a run is already active (run_id={self._state.run_id})")
+            # LOOP-27: reserve the START before the seconds-long _build_driver
+            # releases the lock, so a stop (the disable hook) that lands while
+            # the builder runs sees a reserved start instead of 'no active run',
+            # and the flag is armed for the second block's launch check. The
+            # stop REQUEST is only reset here — the one place a fresh start
+            # begins — never in the second block, where clearing it would
+            # launch a run a stop already refused.
+            self._reserved = True
+            self._stop_requested = False
 
-        driver = self._build_driver(config)
+        try:
+            driver = self._build_driver(config)
+        except BaseException:
+            with self._lock:
+                self._reserved = False
+            raise
         run_id = f"run-{int(time.time())}"
         # Bind this run's terminal-record path NOW, immediately after `_build_driver` bound the
         # driver's `archive_root` to `store.results_dir()`. Both name the active workspace, so
@@ -706,12 +720,25 @@ class RunSupervisor:
         record_path = _terminal_record_path()
 
         with self._lock:
-            # Re-check under the lock: two concurrent POSTs could both pass the probe
-            # above while the slow _build_driver ran outside it.
-            if self._in_flight():
+            # Re-check under the lock — but NOT via _in_flight(): our own
+            # reservation from the first block would trip it. A live thread is
+            # the only concurrent-start signal left (a second POST cannot get
+            # past the first block while this start holds the reservation).
+            if self._thread is not None and self._thread.is_alive():
+                self._reserved = False
                 raise RuntimeError(f"a run is already active (run_id={self._state.run_id})")
+            if self._stop_requested:
+                # LOOP-27: a stop landed while _build_driver ran — the request
+                # must win over this launch. Drop the built driver and report
+                # honestly; the caller's run never existed.
+                self._reserved = False
+                return {
+                    "run_id": None,
+                    "status": STATUS_IDLE,
+                    "stopped": True,
+                    "note": "stopped before launch",
+                }
             self._driver = driver
-            self._stop_requested = False
             self._state = RunState(
                 status=STATUS_RUNNING,
                 run_id=run_id,
@@ -1201,6 +1228,22 @@ class RunSupervisor:
             thread = self._thread
             driver = self._driver
             if thread is None or not thread.is_alive():
+                if self._reserved:
+                    # LOOP-27: a start is mid-_build_driver — treat the stop
+                    # request as if the thread were live, so the launch check
+                    # in start()'s second block refuses and the disable hook
+                    # learns the run will not spend.
+                    self._stop_requested = True
+                    self._state.status = STATUS_STOPPING
+                    self._state.activity.append(
+                        {"t": time.time(), "note": "stop requested (start in flight)"}
+                    )
+                    return {
+                        "status": STATUS_STOPPING,
+                        "run_id": self._state.run_id,
+                        "stopped": False,
+                        "note": "stopping — a starting run will not launch",
+                    }
                 return {
                     "status": self._state.status,
                     "run_id": self._state.run_id,

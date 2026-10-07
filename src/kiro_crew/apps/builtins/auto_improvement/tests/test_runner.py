@@ -174,7 +174,10 @@ def supervisor() -> R.RunSupervisor:
 # ── refusals ────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.skipif(not __import__('kiro_crew.sandbox', fromlist=['userns_available']).userns_available(), reason="requires unprivileged user namespaces (sandbox backend)")
+@pytest.mark.skipif(
+    not __import__("kiro_crew.sandbox", fromlist=["userns_available"]).userns_available(),
+    reason="requires unprivileged user namespaces (sandbox backend)",
+)
 class TestStartRefusals:
     def test_refuses_without_a_configured_repository(self, supervisor: R.RunSupervisor) -> None:
         with pytest.raises(ValueError, match="no repository configured"):
@@ -544,6 +547,55 @@ class TestStop:
         assert result["stopped"] is False
         assert result["note"] == "no active run"
 
+    def test_a_stop_during_build_driver_prevents_the_launch(
+        self, supervisor: R.RunSupervisor, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """LOOP-27: a stop (the disable hook) that lands while _build_driver
+        runs must prevent the worker from launching — the old race let the
+        start launch anyway, so a run started just before disable kept
+        spending after the app was off."""
+        clone = _tiny_repo(tmp_path / "clone")
+        builder_entered = threading.Event()
+        release_builder = threading.Event()
+        launched = threading.Event()
+        stop_result: dict[str, Any] = {}
+
+        class _CountingDriver:
+            def run(self, **_kw: Any) -> Any:
+                launched.set()
+                return _FakeStats()
+
+            def request_stop(self) -> None:
+                return None
+
+        def _slow_build(_cfg: dict[str, Any]) -> _CountingDriver:
+            builder_entered.set()
+            release_builder.wait(timeout=10.0)
+            return _CountingDriver()
+
+        monkeypatch.setattr(supervisor, "_build_driver", _slow_build)
+
+        start_thread = threading.Thread(target=lambda: supervisor.start({"clone": str(clone)}))
+        start_thread.daemon = True
+        start_thread.start()
+        assert builder_entered.wait(timeout=10.0), "the builder must be entered"
+
+        # The stop lands MID-BUILD: no live thread exists yet.
+        stop_result = supervisor.stop()
+        assert "stopping" in stop_result["note"], stop_result
+        assert stop_result["stopped"] is False
+        release_builder.set()
+        start_thread.join(timeout=10.0)
+
+        assert not launched.is_set(), "the worker launched despite the stop"
+        assert supervisor._thread is None or not supervisor._thread.is_alive()
+        assert not supervisor._reserved, "the reservation must clear on refusal"
+        # A later start may begin cleanly.
+        monkeypatch.setattr(supervisor, "_build_driver", lambda _cfg: _CountingDriver())
+        result = supervisor.start({"clone": str(clone)})
+        assert result["status"] == R.STATUS_RUNNING
+        supervisor.stop()
+
     def test_stop_signals_and_joins(
         self, supervisor: R.RunSupervisor, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -625,7 +677,10 @@ class TestSingleton:
 # ── end to end, with a fake agent ───────────────────────────────────────────
 
 
-@pytest.mark.skipif(not __import__('kiro_crew.sandbox', fromlist=['userns_available']).userns_available(), reason="requires unprivileged user namespaces (sandbox backend)")
+@pytest.mark.skipif(
+    not __import__("kiro_crew.sandbox", fromlist=["userns_available"]).userns_available(),
+    reason="requires unprivileged user namespaces (sandbox backend)",
+)
 class TestBoundedRunWithFakeAgent:
     """One real spine cycle, bounded, with the agent runner INJECTED as a fake."""
 
@@ -1011,13 +1066,7 @@ class TestCalibrationRespondsToStop:
         stopper.join(timeout=10.0)
         _join_calibration(supervisor)
 
-        ruler_path = (
-            store.data_dir()
-            / "repos"
-            / store.workspace_key(cfg)
-            / "ruler"
-            / "ruler.json"
-        )
+        ruler_path = store.data_dir() / "repos" / store.workspace_key(cfg) / "ruler" / "ruler.json"
         assert not ruler_path.is_file(), "a stopped calibration wrote a ruler.json"
 
     def test_stopping_a_recalibration_preserves_the_prior_ruler(
@@ -1036,13 +1085,7 @@ class TestCalibrationRespondsToStop:
         # reads the live-config workspace) inspects the ruler this test seeds.
         (store.data_dir() / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
 
-        ruler_path = (
-            store.data_dir()
-            / "repos"
-            / store.workspace_key(cfg)
-            / "ruler"
-            / "ruler.json"
-        )
+        ruler_path = store.data_dir() / "repos" / store.workspace_key(cfg) / "ruler" / "ruler.json"
         ruler_path.parent.mkdir(parents=True, exist_ok=True)
         # A prior, fully-proven ruler from an earlier calibration.
         prior = {"status": "calibrated"}
@@ -1072,9 +1115,9 @@ class TestCalibrationRespondsToStop:
         _join_calibration(supervisor)
 
         assert ruler_path.is_file(), "the prior ruler.json was destroyed by a stopped recalibration"
-        assert json.loads(ruler_path.read_text(encoding="utf-8")) == prior, (
-            "the prior ruler was mutated by a stopped recalibration"
-        )
-        assert progress_mod.ruler_calibrated() is True, (
-            "the workspace stopped reporting calibrated after a stopped recalibration"
-        )
+        assert (
+            json.loads(ruler_path.read_text(encoding="utf-8")) == prior
+        ), "the prior ruler was mutated by a stopped recalibration"
+        assert (
+            progress_mod.ruler_calibrated() is True
+        ), "the workspace stopped reporting calibrated after a stopped recalibration"
