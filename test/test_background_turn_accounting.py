@@ -71,6 +71,30 @@ class TestBackgroundTurnAccounting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persist.await_args.kwargs["surface"], "bg:consolidation")
         self.assertEqual(persist.await_args.args[2].credits, 3.5)
 
+    async def test_the_row_names_the_served_model(self):
+        """USE-8: a kiro background session that inherits its default reports
+        served_model="auto" with an empty _model — the row must file under
+        "auto" (what the crew log gets), never "" (which the Spend page reads
+        as "unknown")."""
+        client = _Client()
+        client.served_model = "auto"
+        sessions = _Sessions(client)
+        with patch(_USAGE_TARGET) as persist:
+            async with background_turn(sessions, task="consolidation") as bg:
+                bg.begin_turn(3.5)
+
+        self.assertEqual(persist.await_args.args[1], "auto")
+
+    async def test_the_row_names_a_concrete_served_model(self):
+        client = _Client()
+        client.served_model = "some-model-id"
+        sessions = _Sessions(client)
+        with patch(_USAGE_TARGET) as persist:
+            async with background_turn(sessions, task="auto-title") as bg:
+                bg.begin_turn(1.0)
+
+        self.assertEqual(persist.await_args.args[1], "some-model-id")
+
     async def test_the_row_names_the_backend_that_served_the_turn(self):
         """Left unset the row lands with provider="" and drops out of the usage
         page's provider and provider-model breakdowns, so the spend is recorded
