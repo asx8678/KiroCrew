@@ -420,6 +420,16 @@ class _PumpMixin(ManagerComponent):
         # run: it is held where a stop can find it, and every await is followed
         # by a check that no stop took it (``_undurable_in_dispatch``).
         agent_id = str(params.get("_preassigned_id") or "")
+        # A row whose refusal was announced but whose terminal store write
+        # has not committed must never dispatch. The pump is the one caller
+        # that can AWAIT the durable re-finish, so each drain retries the
+        # terminal write; the tombstone clears the moment one commits, and a
+        # store still wedged just re-tries on the next drain -- the row never
+        # starts in between.
+        _refused_reason = admission.refused_row_reason(agent_id)
+        if _refused_reason:
+            await admission.taskq_fail_async(agent_id, _refused_reason)
+            return None
         undurable = self._is_undurable(params, store)
         in_dispatch = self._manager._undurable_in_dispatch
         if undurable:

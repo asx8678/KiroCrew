@@ -3513,6 +3513,14 @@ class SubagentManager:
         # Strong refs to in-flight shielded terminal reports (see
         # `_spawn_terminal_report`); drained in `cancel_all`.
         self._report_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # Refusals whose terminal store write could not commit (a locked or
+        # unwritable task store): the row sits queued/admitted on disk while
+        # its caller was already told "refused", so the pump and the boot
+        # reconciler must treat it as terminal. agent id -> refusal reason;
+        # cleared the moment a later write commits the row terminal (the
+        # pump's durable re-finish). Manager-owned like `_report_tasks`
+        # because the coordinator is stateless by contract.
+        self._refused_rows: dict[str, str] = {}
         # follow_up watchers (spawn_steer mode="follow_up"), keyed by run id.
         # Manager-OWNED on purpose: these tasks can spawn a brand-new run
         # (continue_conversation), so per this module's containment contract

@@ -286,7 +286,14 @@ same step (`_refuse_row` -> `taskq_fail`): a drained row, and a row `spawn_async
 committed before the read (`_store_accepted`, the default persistent path). A
 committed row is failed the same way when gateway admission closes during the
 read, so a row the caller was told was refused never runs once admission
-reopens. `spawn_async` hands the re-entry the parent's declaration and the
+reopens. When that terminal `finish` write itself cannot commit (a locked or
+unwritable task store), the refusal is tombstoned in memory on the manager
+(`_refused_rows`, agent id -> reason): the pump re-runs the durable
+`taskq_fail_async` on every drain that picks the row -- so the row never starts
+and the write is retried until the store recovers -- and the boot reconciler's
+probe (`taskq_boot_probe`, the `artifact_probe` the store open passes) answers
+FAILED for a tombstoned row instead of requeueing it, so refused work never
+runs later on any path. `spawn_async` hands the re-entry the parent's declaration and the
 agent check it read off the loop (`_parent_spawn_policy`, `_agent_check`), so
 neither the allowlist vet nor agent validation scans the agents directory on the
 loop. A spawn with no row to write (non-persistent, or the task queue off) runs
