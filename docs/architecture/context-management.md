@@ -212,7 +212,7 @@ it adds:
 | Block | Source | When |
 |---|---|---|
 | `[RUNTIME]` refresh | trusted `runtime_source` | every follow-up; a channel turn also re-asserts the diff-block mandate |
-| Channel history | `channel_history.context_for` | group-channel turns, except a thread turn that carries `[SLACK THREAD REPLIES]` |
+| Channel history | `channel_history.context_for` | group-channel turns, except a thread turn that carries `[SLACK THREAD REPLIES]`; a thread turn sends only buffered messages the session has not been shown yet (a per-(session, thread) watermark, reset on a new session and after compaction, committed at the turn seam like the skill-body record), never the current incoming message, with absolute `HH:MM` stamps |
 | `[SLACK THREAD CONTEXT]` | thread parent / metadata | Slack threads |
 | `[SLACK THREAD REPLIES]` | `slack/thread_replies.py`, fenced as untrusted | a Slack thread turn with replies it has not seen |
 | `[PROJECT]` | the slot's project dir | every turn, `project` group |

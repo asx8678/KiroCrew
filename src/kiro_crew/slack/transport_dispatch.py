@@ -786,6 +786,11 @@ async def handle_message_transport(
                     parent_prompt_text(_thread_parent) if _thread_parent is not None else None
                 ),
                 thread_replies_text=_thread_replies.text if _thread_replies else None,
+                # The ts of the incoming message: the channel-history fallback
+                # excludes this entry (the turn text is the same message) and
+                # commits the per-thread watermark from it, so the buffered
+                # thread tail is sent to the session exactly once.
+                current_msg_ts=msg_ts,
                 # The user's row already landed at receipt above. Without this the
                 # history fallback replays it as the thread's history, ahead of
                 # the same text as the current request.

@@ -7,7 +7,111 @@ import time
 
 import pytest
 
+import re
+
 from kiro_crew.channel_history import ChannelHistory
+
+
+class TestThreadWatermarkDedup:
+    """The thread fallback sends each buffered message to a session exactly once.
+
+    Mirrors the Done-when from the finding: ten thread turns over a 20-message
+    buffered thread, the owner's message pushed before each build, no
+    thread_replies_text. A turn with nothing new carries no channel block at
+    all; another user's reply appears exactly once; the owner's own text never
+    appears inside the block; no relative '(... ago)' strings appear.
+    """
+
+    @staticmethod
+    def _builder():
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from kiro_crew.channel_history import ChannelHistory as _CH
+        from kiro_crew.context import ContextBuilder
+        from kiro_crew.learn import LessonStore
+        from kiro_crew.memory import MemoryStore
+        from kiro_crew.skills import SkillsLoader
+
+        tmp = Path(tempfile.mkdtemp(prefix="kc-ctx6-"))
+        os.environ.setdefault("KIRO_HOME", str(tmp / "kiro"))
+        history = _CH()
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp / "ws"),
+            skills=SkillsLoader(skills_path=tmp / "skills", install_builtins=False),
+            hooks=None,
+            lessons=LessonStore(base_dir=tmp / "lessons"),
+            channel_history=history,
+            bot_name="Kiro",
+        )
+        return builder
+
+    def test_ten_thread_turns_send_each_message_once(self):
+        builder = self._builder()
+        history = builder.channel_history
+        thread_ts = "1000.0001"
+        # Twenty buffered thread replies from another user.
+        for i in range(20):
+            history.push(
+                "C1",
+                "bob",
+                f"reply {i}",
+                thread_ts=thread_ts,
+                msg_ts=f"{1000 + i}.5",
+            )
+        seen_blocks: list[str] = []
+        for turn in range(1, 11):
+            owner_ts = f"{1021 + turn}.0"
+            # The owner's message lands at receipt, before the prompt build.
+            history.push("C1", "alice", f"owner turn {turn}", thread_ts=thread_ts, msg_ts=owner_ts)
+            text, _hook = builder.build_message(
+                f"owner turn {turn}",
+                turn == 1,
+                session_key="slack:C1:t",
+                channel_id="C1",
+                thread_ts=thread_ts,
+                current_msg_ts=owner_ts,
+            )
+            if "[Recent channel messages" in text:
+                start = text.index("[Recent channel messages")
+                end = text.index("[End of channel context]", start)
+                block = text[start:end]
+            else:
+                block = ""
+            seen_blocks.append(block)
+
+        # Turn 1 (new session) shows the buffered replies.
+        assert "reply 0" in seen_blocks[0] and "reply 19" in seen_blocks[0]
+        # Turn 2: nothing new arrived — no channel block at all.
+        assert seen_blocks[1] == ""
+        # A reply that lands between turns 3 and 4 appears exactly once.
+        history.push("C1", "bob", "mid reply", thread_ts=thread_ts, msg_ts="1040.5")
+        text4, _ = builder.build_message(
+            "owner turn 4b",
+            False,
+            session_key="slack:C1:t",
+            channel_id="C1",
+            thread_ts=thread_ts,
+            current_msg_ts="1041.0",
+        )
+        assert text4.count("mid reply") == 1
+        # Turn 5 without it: gone.
+        text5, _ = builder.build_message(
+            "owner turn 5",
+            False,
+            session_key="slack:C1:t",
+            channel_id="C1",
+            thread_ts=thread_ts,
+            current_msg_ts="1042.0",
+        )
+        assert "mid reply" not in text5
+        # The owner's own text never appears inside the channel block.
+        for block in seen_blocks:
+            assert "owner turn" not in block
+        # Absolute times only: no relative ages.
+        for block in seen_blocks:
+            assert " ago)" not in block
 
 
 class TestChannelHistory:
@@ -116,12 +220,11 @@ class TestChannelHistory:
         assert "x" * 301 not in ctx
 
     def test_age_formatting(self):
-        """Age strings show seconds for recent, minutes for older."""
+        """Lines carry an absolute HH:MM wall-clock stamp, not a relative age."""
         h = ChannelHistory()
         h.push("C1", "alice", "just now")
-        # Recent message should show "Xs ago"
         ctx = h.context_for("C1")
-        assert "s ago" in ctx
+        assert re.search(r"\(\d{2}:\d{2}\)", ctx), ctx
 
 
 class TestThreadIsolation:

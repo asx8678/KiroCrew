@@ -1901,6 +1901,14 @@ class ContextBuilder:
         # the entry did not exist before this build (rollback removes it).
         self._sent_skill_bodies_undo: dict[str, dict[str, str | None]] = {}
         self._sent_skill_bodies_lock = threading.Lock()
+        # session_key_digest -> {thread_ts: watermark msg_ts}: the last Slack
+        # thread message a session has been shown through the channel-history
+        # fallback. Bounded like the skill-body record (same eviction shape:
+        # a dropped key re-sends the thread, never drops a message).
+        self._thread_channel_watermarks: dict[str, dict[str, str]] = {}
+        # session_key_digest -> {thread_ts: prior watermark | None}, the single
+        # most recent build's undo entry; None means it did not exist before.
+        self._thread_watermark_undo: dict[str, dict[str, str | None]] = {}
         if bot_name:
             self._bot_name = bot_name
         else:
@@ -2124,18 +2132,66 @@ class ContextBuilder:
         key = self._cap_memo_key(session_key)
         with self._sent_skill_bodies_lock:
             undo = self._sent_skill_bodies_undo.pop(key, None)
-            if not undo:
-                return
-            sent = self._sent_skill_bodies.get(key)
-            if sent is None:
-                # The record was evicted or reset since the build; nothing of
-                # this build survives to undo.
-                return
-            for skey, prior in undo.items():
-                if prior is None:
-                    sent.pop(skey, None)
-                else:
-                    sent[skey] = prior
+            if undo:
+                sent = self._sent_skill_bodies.get(key)
+                if sent is not None:
+                    # An evicted or reset record leaves nothing of this build
+                    # to undo; the watermark below still settles.
+                    for skey, prior in undo.items():
+                        if prior is None:
+                            sent.pop(skey, None)
+                        else:
+                            sent[skey] = prior
+            # The same settle also restores this build's thread watermark: a
+            # prompt that never reached the provider window showed nobody
+            # anything, so the next turn must re-send the thread messages it
+            # carried. The undo entry has the same shape and lifetime as the
+            # skill-body undo above.
+            wmark_undo = self._thread_watermark_undo.pop(key, None)
+            if wmark_undo:
+                marks = self._thread_channel_watermarks.setdefault(key, {})
+                for thread_ts, prior in wmark_undo.items():
+                    if prior is None:
+                        marks.pop(thread_ts, None)
+                    else:
+                        marks[thread_ts] = prior
+
+    def _reset_thread_watermark(self, session_key: str, thread_ts: str) -> None:
+        """Drop the thread watermark so the whole thread re-sends (new window)."""
+        key = self._cap_memo_key(session_key)
+        with self._sent_skill_bodies_lock:
+            self._thread_channel_watermarks.pop(key, None)
+            self._thread_watermark_undo.pop(key, None)
+
+    def _thread_watermark_since(self, session_key: str, thread_ts: str) -> str | None:
+        """The last msg_ts this session has been shown for *thread_ts*."""
+        key = self._cap_memo_key(session_key)
+        with self._sent_skill_bodies_lock:
+            return self._thread_channel_watermarks.get(key, {}).get(thread_ts)
+
+    def _commit_thread_watermark(self, session_key: str, thread_ts: str, watermark: str) -> None:
+        """Record the watermark this build showed, with an undo entry for the seam.
+
+        Same shape as the skill-body record: written at build time so the dedup
+        holds at every caller, undo-stashed so the turn seam
+        (:meth:`commit_skill_bodies` / :meth:`rollback_skill_bodies`) can keep
+        it when the turn landed or restore the prior value when it did not. An
+        empty watermark commits nothing (nothing new was shown; the thread
+        block was absent and the next turn must not widen either).
+        """
+        if not watermark:
+            return
+        key = self._cap_memo_key(session_key)
+        with self._sent_skill_bodies_lock:
+            marks = self._thread_channel_watermarks.setdefault(key, {})
+            undo = self._thread_watermark_undo.setdefault(key, {})
+            if thread_ts not in undo:
+                undo[thread_ts] = marks.get(thread_ts)
+            marks[thread_ts] = watermark
+            while len(self._thread_channel_watermarks) > self._SENT_SKILL_BODY_SESSIONS:
+                oldest = next(iter(self._thread_channel_watermarks))
+                self._thread_channel_watermarks.pop(oldest, None)
+                self._thread_watermark_undo.pop(oldest, None)
 
     def commit_skill_bodies(self, session_key: str | None) -> None:
         """Discard the current turn's rollback state after its turn LANDED.
@@ -2154,6 +2210,7 @@ class ContextBuilder:
         key = self._cap_memo_key(session_key)
         with self._sent_skill_bodies_lock:
             self._sent_skill_bodies_undo.pop(key, None)
+            self._thread_watermark_undo.pop(key, None)
 
     def _substitute_bot_name(self, prompt: str) -> str:
         """Replace {bot_name} placeholder in prompt text.
@@ -3028,6 +3085,7 @@ class ContextBuilder:
         request_prefix_context: str | None = None,
         exclude_last_n: int = 0,
         thread_replies_text: str | None = None,
+        current_msg_ts: str | None = None,
         folder_path: str | None = None,
         model_window: int | None = None,
         board_tags: list[tuple[str, str]] | None = None,
@@ -3067,6 +3125,15 @@ class ContextBuilder:
         pre-transform lengths. An out-parameter keeps the 2-tuple return that
         every existing caller unpacks; the list is caller-owned, so concurrent
         turns cannot interfere.
+
+        Pass *thread_replies_text* to fence the Slack thread-replies block as
+        untrusted content; when it is present the channel-history fallback leg
+        is skipped entirely.
+
+        Pass *current_msg_ts* — the Slack message ts of the incoming message —
+        so the channel-history thread fallback excludes that entry (the turn
+        text already carries it as the request) and advances the per-thread
+        watermark so later turns do not re-send messages this turn showed.
 
         Pass *skill_bodies_session* when the turn runs on a provider session but
         is built without that session's *session_key*: the record of skill
@@ -3454,7 +3521,34 @@ class ContextBuilder:
         # this app's own replies and those before the last turn are left out
         # here too, rather than shown twice through an unscreened path.
         if channel_id and self.channel_history and not (thread_ts and thread_replies_text):
-            ch_ctx = self.channel_history.context_for(channel_id, thread_ts=thread_ts) or None
+            # Thread turns keep a watermark per (session, thread): only
+            # buffered messages the session has NOT been shown are injected
+            # (before this, every no-replies turn re-sent the whole buffered
+            # tail, ~95% of it already sent the turn before). The current
+            # incoming message is excluded by ts — the turn text carries it
+            # as the request. The watermark resets on a new session and on
+            # re-injection (a compacted window cannot hold the thread) and
+            # commits with the same build-time-record/turn-seam-rollback
+            # pairing as the skill-body record, so a turn that never lands
+            # re-sends.
+            _since_ts: str | None = None
+            if thread_ts and session_key:
+                if is_new_session or needs_reinjection:
+                    self._reset_thread_watermark(session_key, thread_ts)
+                _since_ts = self._thread_watermark_since(session_key, thread_ts)
+            _watermark: list[str] = []
+            ch_ctx = (
+                self.channel_history.context_for(
+                    channel_id,
+                    thread_ts=thread_ts,
+                    since_ts=_since_ts,
+                    exclude_ts=current_msg_ts,
+                    watermark_out=_watermark,
+                )
+                or None
+            )
+            if thread_ts and session_key and _watermark:
+                self._commit_thread_watermark(session_key, thread_ts, _watermark[0])
             if ch_ctx:
                 # Group-channel context is authored by other users — scrub the
                 # primary boundary markers so it cannot forge a prompt boundary.

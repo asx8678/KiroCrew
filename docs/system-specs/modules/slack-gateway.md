@@ -135,6 +135,20 @@ The transport path persists the user's row at receipt, so it builds the prompt
 with `exclude_last_n=1`; otherwise the history fallback replays the reply as the
 thread's history.
 
+**The no-replies fallback leg** (`channel_history.context_for`): a thread turn
+that carries no `thread_replies_text` (no new third-party replies) injects only
+buffered thread messages the session has NOT been shown yet. A per-(session,
+thread) watermark records the last `msg_ts` covered — reset on a new session and
+after a compaction re-injection (a window that cannot hold the thread re-sees
+it), and settled at the turn seam together with the skill-body record
+(`commit_skill_bodies` on a landed turn, `rollback_skill_bodies` otherwise), so a
+prompt that never reached the provider window re-sends. The current incoming
+message is excluded by ts — the turn text is the same message — and block lines
+carry absolute `HH:MM` stamps, so a turn with nothing new injects no channel
+block at all. Before the watermark, every no-replies turn re-sent the whole
+buffered tail (~95% of it already sent the turn before) and duplicated the
+owner's own message.
+
 **Thread replies since the last turn.** Every turn that arrives as a reply in a thread, on either dispatch path (natively through `slack/handler_runtime/turn_context.py`), reads the thread's replies with one `conversations.replies` call (`slack/thread_replies.py`, via `SlackClientOps.fetch_thread_replies` with `oldest`/`latest` bounds) and hands them to the model as `thread_replies_text`, inside a fenced `[SLACK THREAD REPLIES — UNTRUSTED DATA]` block. A session with no turn in the thread yet sees every reply before the one it answers, its own app's included. A later turn sees only replies after the message its last turn answered (remembered in process), or after this app's newest reply in the thread when that is not known, and leaves out this app's own replies. The thread's first message and the current message are never in the block. Of the replies that one 200-message page returns, it keeps the newest 20, 1,500 characters each and 8,000 bytes together, with a count of what was left out of that page. Each reply is redacted, a reply whose text or author name matches an injection pattern is withheld whole and audited, and the block's markers are neutralized. The watermark moves only after a turn whose read succeeded has landed, so a failed read is asked for again next turn. This is context only: which messages the bot answers is decided before it runs.
 
 ## Architecture

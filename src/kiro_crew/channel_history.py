@@ -15,6 +15,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -106,7 +107,14 @@ class ChannelHistory:
             except OSError:
                 logger.warning("Failed to remove history file %s", path, exc_info=True)
 
-    def push(self, channel_id: str, user: str, text: str, thread_ts: str | None = None, msg_ts: str | None = None) -> None:
+    def push(
+        self,
+        channel_id: str,
+        user: str,
+        text: str,
+        thread_ts: str | None = None,
+        msg_ts: str | None = None,
+    ) -> None:
         """Record a message in the channel buffer.
 
         Called on every message event in the gateway, not just @mentions.
@@ -127,20 +135,42 @@ class ChannelHistory:
         self._evict(buf, channel_id)
 
         # Build entry — observe channels use wall clock for persistence
-        wall_ts = time.time() if is_observe else None
-        entry = HistoryEntry(user=user, text=text, thread_ts=thread_ts, msg_ts=msg_ts, wall_ts=wall_ts)
+        # Every entry carries wall clock: observe mode persists it, and the
+        # renderer's absolute HH:MM needs it in normal mode too.
+        wall_ts = time.time()
+        entry = HistoryEntry(
+            user=user, text=text, thread_ts=thread_ts, msg_ts=msg_ts, wall_ts=wall_ts
+        )
         buf.append(entry)
 
         # Persist to disk for observe channels
         if is_observe:
             self._append_to_disk(channel_id, entry)
 
-    def context_for(self, channel_id: str, thread_ts: str | None = None) -> str:
+    def context_for(
+        self,
+        channel_id: str,
+        thread_ts: str | None = None,
+        since_ts: str | None = None,
+        exclude_ts: str | None = None,
+        watermark_out: list[str] | None = None,
+    ) -> str:
         """Format recent messages for injection into LLM context.
 
         When *thread_ts* is provided, messages are split into current-thread
         and other-thread sections so the LLM can distinguish them.
         Returns empty string if no relevant history exists.
+
+        *since_ts* filters a thread view to messages the session has NOT been
+        shown yet: entries with ``msg_ts <= since_ts`` are dropped, so a thread
+        turn no longer re-sends the whole buffered tail every turn (measured:
+        ~95% of the block was already sent the turn before). *exclude_ts* drops
+        the single entry whose ``msg_ts`` matches — the current incoming
+        message, which the turn text already carries as the request. When
+        *watermark_out* is given, the newest ``msg_ts`` the returned block
+        actually included is appended to it (the value the caller should show
+        "up to" next turn); entries that cannot be ordered (no/bad ``msg_ts``)
+        are kept and never move the watermark.
         """
         buf = self._channels.get(channel_id)
         if not buf:
@@ -152,15 +182,15 @@ class ChannelHistory:
         if not buf:
             return ""
 
-        now_mono = time.monotonic()
         now_wall = time.time()
 
         def _fmt(entry: HistoryEntry) -> str:
-            if entry.wall_ts is not None:
-                ago = int(now_wall - entry.wall_ts)
-            else:
-                ago = int(now_mono - entry.timestamp)
-            age_str = f"{ago}s ago" if ago < 60 else f"{ago // 60}m ago"
+            # Absolute HH:MM, not a relative age: a re-rendered line must be
+            # byte-identical to its first send (the thread watermark dedup
+            # compares nothing, but the provider window holds both copies,
+            # and '(1m ago)' drifts between them for the same message).
+            clock = entry.wall_ts if entry.wall_ts is not None else now_wall
+            age_str = datetime.fromtimestamp(clock).strftime("%H:%M")
             text = entry.text[:300]
             if len(entry.text) > 300:
                 text += "\u2026"
@@ -171,7 +201,50 @@ class ChannelHistory:
         if thread_ts:
             # Include messages whose msg_ts matches thread_ts — this captures the
             # thread parent, whose own thread_ts is None until it receives a reply.
-            current = [_fmt(e) for e in buf if e.thread_ts == thread_ts or e.msg_ts == thread_ts]
+            def _ts_value(ts: str | None) -> float | None:
+                if not ts:
+                    return None
+                try:
+                    return float(ts)
+                except (TypeError, ValueError):
+                    return None
+
+            _since_v = _ts_value(since_ts)
+            _exclude_v = _ts_value(exclude_ts)
+
+            def _shown(entry: HistoryEntry) -> bool:
+                # An entry with no parsable msg_ts cannot be ordered against
+                # the watermark: keep it (no data to filter on) rather than
+                # silently drop a message the session may never have seen.
+                ts_v = _ts_value(entry.msg_ts)
+                if ts_v is None:
+                    return True
+                if _exclude_v is not None and ts_v == _exclude_v:
+                    return False
+                if _since_v is not None and ts_v <= _since_v:
+                    return False
+                return True
+
+            entries = [
+                e for e in buf if (e.thread_ts == thread_ts or e.msg_ts == thread_ts) and _shown(e)
+            ]
+            if watermark_out is not None:
+                # The newest msg_ts the block covered, INCLUDING the excluded
+                # current message: the turn text carries it as the request, so
+                # the next turn must not surface it through the buffer either.
+                # Entries that cannot be ordered never move it.
+                ordered = [
+                    (_ts_value(e.msg_ts), e.msg_ts)
+                    for e in entries
+                    if e.msg_ts and _ts_value(e.msg_ts) is not None
+                ]
+                if _exclude_v is not None and exclude_ts:
+                    ordered.append((_exclude_v, exclude_ts))
+                if ordered:
+                    watermark_out.append(max(ordered, key=lambda pair: pair[0])[1])
+                else:
+                    watermark_out.append(since_ts or "")
+            current = [_fmt(e) for e in entries]
             if not current:
                 return ""
             return (

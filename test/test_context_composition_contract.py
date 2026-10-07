@@ -542,11 +542,14 @@ def _session_context_member_mode(rig: _Rig) -> str:
 
 
 def _background_overflow(rig: _Rig) -> str:
-    """Preferences past the startup allowance are capped (head + notice), so the
-    background blocks the old uncapped preferences crowded out are admitted."""
+    """Preferences under the startup allowance inject whole, and the background
+    blocks fit beside them. (The over-allowance cap is pinned by
+    test_preferences_past_the_startup_allowance_keep_their_head_and_name_the_file
+    with env-independent assertions: the capped block's exact bytes depend on the
+    operator's tmp path length, so no golden may pin them.)"""
     rig.seed_memory()
     rig.memory._preferences_file.write_text(
-        "# Preferences\n" + "Keep this standing preference.\n" * 1_000,
+        "# Preferences\n" + "Keep this standing preference.\n" * 200,
         encoding="utf-8",
         newline="\n",
     )
@@ -681,14 +684,14 @@ _SCENARIOS = {
 #: recorded before the assembly moved into owners.
 _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
     "background_overflow": (
-        "677e0b75a1aaa77fef9a3efa0499852de97dee0e2bb43be22461f86693230e09",
+        "5a8829530d298a892a71619de91cd675366f1c51d3038521dc574975d022a465",
         [
             ("unclassified", 64),
             ("agent_identity", 25),
             ("surface", 197),
             ("workspace_identity", 371),
             ("docs_pointer", 235),
-            ("memory", 13033),
+            ("memory", 7013),
             ("memory_tools", 425),
             ("lessons", 179),
         ],
@@ -1247,6 +1250,18 @@ _BUILDER_MEMBERS: dict[str, tuple[str, str]] = {
     ),
     "_forget_shown_lessons": ("method", "(self, session_key: 'str') -> 'None'"),
     "_live_cap_figure": ("static", "() -> 'str'"),
+    "_commit_thread_watermark": (
+        "method",
+        "(self, session_key: 'str', thread_ts: 'str', watermark: 'str') -> 'None'",
+    ),
+    "_reset_thread_watermark": (
+        "method",
+        "(self, session_key: 'str', thread_ts: 'str') -> 'None'",
+    ),
+    "_thread_watermark_since": (
+        "method",
+        "(self, session_key: 'str', thread_ts: 'str') -> 'str | None'",
+    ),
     "_live_shown_lessons": ("method", "(self, session_key: 'str') -> '_ShownLessons'"),
     "_load_agent_prompt": (
         "static",
@@ -1269,7 +1284,7 @@ _BUILDER_MEMBERS: dict[str, tuple[str, str]] = {
     ),
     "build_message": (
         "method",
-        "(self, text: 'str', is_new_session: 'bool', session_key: 'str | None' = None, channel_id: 'str | None' = None, interactive: 'bool' = True, agent: 'str | None' = None, resumed: 'bool' = False, thread_ts: 'str | None' = None, workspace: 'str | None' = None, project: 'str | None' = None, memory_store: 'str | None' = None, user_display_name: 'str | None' = None, compressed_history: 'str | None' = None, mode: 'str' = '', blocks_reads: 'bool' = False, action_context: 'str | None' = None, thread_parent_text: 'str | None' = None, thread_meta: 'str | None' = None, provider_type: 'str' = 'acp', minimal_context: 'bool' = False, *, runtime_source: 'str | None' = None, request_prefix_context: 'str | None' = None, exclude_last_n: 'int' = 0, thread_replies_text: 'str | None' = None, folder_path: 'str | None' = None, model_window: 'int | None' = None, board_tags: 'list[tuple[str, str]] | None' = None, user_text_range: 'tuple[int, int] | None' = None, user_span_out: 'list[int] | None' = None, needs_reinjection: 'bool' = False, context_groups: 'frozenset[str] | None' = None, member: 'str' = '', execution_context: 'Any' = None, context_provider: \"'ContextPromptProvider | None'\" = None, steering_dirs: 'tuple[str, ...]' = ()) -> 'tuple[str, HookResult]'",
+        "(self, text: 'str', is_new_session: 'bool', session_key: 'str | None' = None, channel_id: 'str | None' = None, interactive: 'bool' = True, agent: 'str | None' = None, resumed: 'bool' = False, thread_ts: 'str | None' = None, workspace: 'str | None' = None, project: 'str | None' = None, memory_store: 'str | None' = None, user_display_name: 'str | None' = None, compressed_history: 'str | None' = None, mode: 'str' = '', blocks_reads: 'bool' = False, action_context: 'str | None' = None, thread_parent_text: 'str | None' = None, thread_meta: 'str | None' = None, provider_type: 'str' = 'acp', minimal_context: 'bool' = False, *, runtime_source: 'str | None' = None, request_prefix_context: 'str | None' = None, exclude_last_n: 'int' = 0, thread_replies_text: 'str | None' = None, current_msg_ts: 'str | None' = None, folder_path: 'str | None' = None, model_window: 'int | None' = None, board_tags: 'list[tuple[str, str]] | None' = None, user_text_range: 'tuple[int, int] | None' = None, user_span_out: 'list[int] | None' = None, needs_reinjection: 'bool' = False, context_groups: 'frozenset[str] | None' = None, member: 'str' = '', execution_context: 'Any' = None, context_provider: \"'ContextPromptProvider | None'\" = None, steering_dirs: 'tuple[str, ...]' = ()) -> 'tuple[str, HookResult]'",
     ),
     "build_session_context": (
         "method",
