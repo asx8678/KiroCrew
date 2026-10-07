@@ -937,9 +937,9 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
         ],
     ),
     "session_replay_small_window": (
-        "c2049d8cdbe661153b343386c448bd07901f6ec823ca8f914c0c9afb850cb98c",
+        "d0878f49388acb6b155de2973bc89b7cf0c3f5ba7f8bc7950c37244d43437bda",
         [
-            ("unclassified", 11846),
+            ("unclassified", 14617),
         ],
     ),
     "skills_discovery": (

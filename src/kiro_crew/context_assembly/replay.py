@@ -200,12 +200,17 @@ _REPLAY_BUDGET_CHARS = (
     80_000  # 80K chars ≈ 20K tokens — fits alongside system context in 200K window
 )
 
-# Per-row ceiling for ``inject`` content inside a replay. Conversation rows are
-# uncapped here: they are the signal the replay exists to carry. An inject row
-# only has to say that a cron ran or a note was left, so a breadcrumb is enough,
-# and without a ceiling one chatty producer spends the whole tail-heavy budget on
-# itself and evicts real history. Sized above the p75 real inject row so typical
-# breadcrumbs pass through whole and only the outsized dumps are clipped.
+# Per-row ceiling for EVERY row inside a replay, mirroring
+# ``thread_history_text``'s scaled ``per_message`` cap. Conversation rows were
+# uncapped here, and the budget loop's ``and lines`` exemption admitted the
+# NEWEST row whole whatever its size — measured: a 300,000-char newest row
+# produced a 300,006-char replay against an 80,000 budget (16,000 on a 200K
+# window), and a large OLDER row ended the scan, keeping only the three rows
+# after it. Capped per row, one big row is clipped instead of evicting the
+# rest, and the inject rows below keep their own lower ceiling.
+_REPLAY_PER_ROW_CAP_CHARS = _budgets._PER_MESSAGE_CAP
+
+# Per-row ceiling for ``inject`` content inside a replay.
 _REPLAY_INJECT_CAP_CHARS = 2_000
 
 # Share of the replay budget ``inject`` rows may spend between them. Conversation
@@ -329,6 +334,14 @@ def replay_text(messages: list[dict], model_window: int | None) -> str:
     )
     replay_budget = round(_REPLAY_BUDGET_CHARS * factor)
     inject_cap = max(1, min(replay_budget, round(_REPLAY_INJECT_CAP_CHARS * factor)))
+    # Per-row ceiling that scales WITH the budget (mirroring
+    # thread_history_text), so a big row clips instead of eating the replay:
+    # bounded at the budget minus its own line framing, which also guarantees
+    # the newest row always fits.
+    per_row_cap = min(
+        round(_REPLAY_PER_ROW_CAP_CHARS * factor),
+        replay_budget - len("User: ") - len("…[truncated]"),
+    )
 
     # Reserved so conversation cannot be starved by breadcrumbs: inject rows spend
     # their own share and older ones are skipped, while the scan keeps looking for
@@ -342,12 +355,17 @@ def replay_text(messages: list[dict], model_window: int | None) -> str:
     for m in reversed(messages):
         role = m["role"].title()
         content = m.get("content", "")
+        if len(content) > per_row_cap:
+            content = content[:per_row_cap] + "…[truncated]"
         if m["role"] == "inject" and len(content) > inject_cap:
             content = content[:inject_cap] + "…[truncated]"
         line = f"{role}: {content}"
         if m["role"] == "inject" and inject_total + len(line) > inject_budget and lines:
             continue
-        if total + len(line) > replay_budget and lines:
+        # No ``and lines`` exemption: with every row clipped below the budget
+        # the newest row always fits, so the scan ends on budget rather than
+        # admitting one oversized row whole.
+        if total + len(line) > replay_budget:
             break
         lines.append(line)
         total += len(line) + 2  # +2 for separator
