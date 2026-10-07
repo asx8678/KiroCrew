@@ -1124,6 +1124,97 @@ class TestDocLevelDismissal:
         assert doc == "cron-and-scheduling.md"
 
 
+class TestRefreshWaitsForTheGates:
+    """UI-4: a stale-tips refresh runs only when a tip could actually be shown
+    (cadence gate open, no outstanding offered tip)."""
+
+    @staticmethod
+    def _rig(tmp_path, *, cadence_hours, offered, last_shown_ts, last_generated):
+        import types
+        from unittest.mock import MagicMock
+
+        from kiro_crew.tips import TipsCache, TipsState
+
+        cache = TipsCache()
+        state = TipsState(tips=[])
+        state.offered = offered
+        state.last_shown_ts = last_shown_ts
+        state.last_generated = last_generated
+        cache.state = state
+        app_state = types.SimpleNamespace(_tips_cache=cache)
+        cfg = MagicMock()
+        cfg.dashboard.tips_enabled = True
+        cfg.dashboard.tips_cadence_hours = cadence_hours
+        cfg.dashboard.tips_snooze_hours = 48.0
+        cfg.dashboard.tips_recency_decay = 0.6
+        return cache, app_state, cfg
+
+    @staticmethod
+    async def _get(app_state, cfg, tmp_path):
+        from aiohttp.test_utils import make_mocked_request
+
+        from kiro_crew.tips import api_tips_next
+
+        calls = []
+
+        async def _count(*a, **k):
+            calls.append(1)
+            return None
+
+        with (
+            patch.dict(os.environ, {"KIROCREW_HOME": str(tmp_path)}),
+            patch("kiro_crew.tips.KiroCrewConfig") as mock_cls,
+            patch("kiro_crew.tips.maybe_refresh", _count),
+        ):
+            mock_cls.load.return_value = cfg
+            req = make_mocked_request("GET", "/api/tips/next")
+            req.app["state"] = app_state
+            resp = await api_tips_next(req)
+            body = json.loads(resp.body)
+        return calls, body
+
+    @pytest.mark.asyncio
+    async def test_cadence_closed_and_stale_tips_means_no_refresh(self, tmp_path) -> None:
+        import time as _time
+
+        _, app_state, cfg = self._rig(
+            tmp_path,
+            cadence_hours=24.0,
+            offered=None,
+            last_shown_ts=_time.time(),  # shown moments ago: the gate is CLOSED
+            last_generated=0.0,
+        )
+        calls, body = await self._get(app_state, cfg, tmp_path)
+        assert body["tip"] is None and body["glow"] is False
+        assert calls == [], "a closed cadence gate must not pay a refresh"
+
+    @pytest.mark.asyncio
+    async def test_an_outstanding_offered_tip_means_no_refresh(self, tmp_path) -> None:
+        offered = {
+            "id": "t1",
+            "feature": "F",
+            "title": "T",
+            "body": "B",
+            "why": "W",
+            "doc": "",
+            "cta_prompt": "",
+        }
+        _, app_state, cfg = self._rig(
+            tmp_path, cadence_hours=0.0, offered=offered, last_shown_ts=0.0, last_generated=0.0
+        )
+        calls, body = await self._get(app_state, cfg, tmp_path)
+        assert body["tip"]["id"] == "t1" and body["glow"] is True
+        assert calls == [], "re-serving an offered tip must not pay a refresh"
+
+    @pytest.mark.asyncio
+    async def test_cadence_open_and_stale_tips_refreshes_once(self, tmp_path) -> None:
+        _, app_state, cfg = self._rig(
+            tmp_path, cadence_hours=0.0, offered=None, last_shown_ts=0.0, last_generated=0.0
+        )
+        calls, _ = await self._get(app_state, cfg, tmp_path)
+        assert len(calls) == 1, "an open gate with stale tips must refresh exactly once"
+
+
 class TestSingleOfferConcurrency:
     """Codex round-5: concurrent GET /api/tips/next must serve ONE offered tip.
 
