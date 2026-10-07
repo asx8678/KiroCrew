@@ -110,10 +110,10 @@ def _is_single_emoji(s: str) -> bool:
     return clusters == 1
 
 
-# "auto" = inherit the session's governed default (run_bg_oneliner skips the
-# override for auto). A hardcoded model id 400s on accounts/partitions that do
-# not serve it.
-_FOLDER_ICON_MODEL = "auto"
+# No model is passed: the one-liner inherits the background session's spec
+# model, which honors an operator's agent.role_models.background pin (a
+# hardcoded id is not governance-aware and 400s on accounts/partitions that do
+# not serve it; the old literal "auto" OVERRODE the pin at the wire).
 
 
 # Folder color palette — the identity mark a user picks for a folder in the
@@ -196,9 +196,9 @@ async def generate_emoji_for_name(state: DashboardState, name: str) -> str:
     async with _folder_icon_lock:
         try:
             text = await run_bg_oneliner(
+                # No model: inherit the pinned background spec model.
                 state.sessions,
                 prompt,
-                model=_FOLDER_ICON_MODEL,
                 sel_source="chat_folders",
                 timeout=30,
             )

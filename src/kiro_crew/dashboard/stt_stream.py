@@ -147,12 +147,14 @@ _CODE_VOCABULARY_REJECTED = "stt_transcribe_vocabulary_rejected"
 # ── Semantic endpointing (stt.endpointing, default off) ──
 # On each stable Transcribe `final`, a fast background model judges whether the
 # user has finished a complete request; a COMPLETE verdict emits an `endpoint`
-# frame so the frontend can auto-submit. "auto" inherits the session's governed
-# default (run_bg_oneliner skips the override for auto) — a hardcoded model id
-# 400s on accounts/partitions that do not serve it.
+# frame so the frontend can auto-submit. No model is passed: the one-liner
+# inherits the background session's spec model, which honors an operator's
+# agent.role_models.background pin (the old literal "auto" OVERRODE the pin at
+# the wire; a hardcoded model id 400s on accounts/partitions that do not serve
+# it).
 # Debounced so mid-utterance finals don't each fire a model call, and
 # single-flight so at most one bg call runs at once.
-_ENDPOINT_MODEL = "auto"
+_ENDPOINT_MODEL = None  # no model: inherit the pinned background spec model
 _ENDPOINT_DEBOUNCE_SECS = 0.35
 _ENDPOINT_TIMEOUT_SECS = 5.0
 _ENDPOINT_PROMPT = (
@@ -332,7 +334,7 @@ class _Endpointer:
         ws: web.WebSocketResponse,
         sessions: object,
         *,
-        model: str = _ENDPOINT_MODEL,
+        model: str | None = _ENDPOINT_MODEL,
         debounce: float = _ENDPOINT_DEBOUNCE_SECS,
         timeout: float = _ENDPOINT_TIMEOUT_SECS,
         can_submit: Callable[[], bool] | None = None,

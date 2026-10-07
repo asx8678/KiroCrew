@@ -242,7 +242,7 @@ _CONTRADICTION_PROMPT = (
     "Respond with exactly one word: CONTRADICTORY, COMPLEMENTARY, or UNRELATED."
 )
 
-_CONTRADICTION_MODEL = "auto"  # inherit the governed default; a hardcoded id 400s where unavailable
+_CONTRADICTION_MODEL = None  # no model: inherit the pinned background spec model
 # Per-candidate cap on the background contradiction verdict. The sweep runs
 # fire-and-forget after the lesson is already persisted, so this bounds a hung
 # model call rather than gating the write path.
