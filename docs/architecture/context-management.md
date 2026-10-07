@@ -323,10 +323,13 @@ on its next match, never drops the skill.
   the driver's landed result. `test/test_skill_body_dedup.py` pins both outcomes.
 - **Confined skills are exempt.** A confined project skill takes the body path on
   every match.
-- **Known soft failure.** A backend that trims or compacts its own window out of
-  band does not arm the reset, so the next match of a recorded skill gets its
-  pointer line rather than its body. The agent still learns the skill applies and
-  can read it.
+- **Backend self-compaction is covered too (CTX-12).** Every multi-turn loop
+  that delegates to the shared `TurnDriver` arms the re-injection flag when the
+  backend reports a completed compaction mid-turn: the driver records
+  `compaction_completed`, and the turn bracket's settle seam marks the session
+  before the re-arm and skill-body settle — the same order the heartbeat uses —
+  so the next turn restores the session-start contract AND resets the skill-body
+  record (a compacted-out body re-sends as a body, not a pointer).
 
 ### What comes back after compaction
 

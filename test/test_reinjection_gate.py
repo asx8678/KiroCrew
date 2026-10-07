@@ -156,6 +156,81 @@ def _compacting_modules() -> dict[str, ast.Module]:
     return found
 
 
+def test_a_backend_compaction_reported_mid_turn_arms_reinjection():
+    """CTX-12: a multi-turn loop whose driver observed a COMPLETED backend
+    compaction arms the one-shot flag at the turn seam — the contract the
+    dashboard runner and heartbeat already kept, now shared by every
+    transport that delegates to the driver."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from kiro_crew.messaging.driver import TurnDriver
+    from kiro_crew.messaging.turn_bracket import TurnBracket, consume_reinjection
+    from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
+
+    marked: list[str] = []
+
+    class Sessions:
+        """A one-shot flag with real state, not a pair of stubs."""
+
+        def __init__(self) -> None:
+            self.armed = False
+
+        def consume_needs_reinjection(self, key: str) -> bool:
+            if self.armed:
+                self.armed = False
+                return True
+            return False
+
+        def mark_needs_reinjection(self, key: str) -> None:
+            self.armed = True
+            marked.append(key)
+
+    sessions = Sessions()
+    key = "slack:C1"
+
+    class Provider:
+        async def stream(self, message: str):
+            yield SimpleNamespace(
+                kind="compaction_status", text="completed", title="", context_usage_pct=42.0
+            )
+            yield SimpleNamespace(kind=EVENT_TEXT_CHUNK, text="done")
+            yield SimpleNamespace(kind=EVENT_COMPLETE, stop_reason="end_turn")
+
+    class Renderer:
+        async def dispatch(self, event):
+            return None
+
+        async def on_turn_start(self):
+            return None
+
+    async def run():
+        driver = TurnDriver(Provider(), Renderer())
+        await driver.run("go")
+        return driver
+
+    driver = asyncio.run(run())
+    assert driver.compaction_completed is True
+
+    bracket = TurnBracket(sessions, None, key)
+    assert bracket.take_reinjection() is False  # nothing armed before this turn
+    bracket.landed(driver)
+    bracket.settle()
+    assert marked == [key], "the settle seam must arm the flag"
+    assert consume_reinjection(sessions, key) is True
+
+    # A turn with NO compaction report arms nothing.
+    marked.clear()
+    quiet = SimpleNamespace(
+        completion_observed=True, last_stop_reason="end_turn", compaction_completed=False
+    )
+    bracket2 = TurnBracket(sessions, None, key)
+    bracket2.take_reinjection()  # nothing is armed: the first settle's flag was consumed above
+    bracket2.landed(quiet)
+    bracket2.settle()
+    assert marked == [], "a turn without a backend compaction arms nothing"
+
+
 def test_every_compacting_turn_loop_consumes_needs_reinjection():
     modules = _compacting_modules()
     # A positive control: a renamed trigger must not quietly empty the gate.
