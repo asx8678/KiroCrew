@@ -39,6 +39,7 @@ from kiro_crew.sel import SecurityEvent, SecurityEventLog
 
 from .redaction import (
     _contains_fixed_credential,
+    _fold_view,
     _text_contains_bare_secret,
     redact_credentials,
 )
@@ -1397,7 +1398,13 @@ def redact_exfiltration_urls_with_records(
     records: list[dict] = []
     seen: set[str] = set()
     overflow = 0
-    for match in _URL_RE.finditer(text):
+    # The URL scan runs on the FOLD-folded subject, so a URL an invisible
+    # code point splits still matches; the slice replaced below is the
+    # ORIGINAL span, separators included, so nothing the eye read as one
+    # address survives. ``index_map`` is None on ordinary text -- the exact
+    # pre-fold path.
+    subject, index_map = _fold_view(text)
+    for match in _URL_RE.finditer(subject):
         domain = match.group(1)
         path_and_query = match.group(3) or ""
         port = match.group(2) or ""
@@ -1415,6 +1422,9 @@ def redact_exfiltration_urls_with_records(
             continue
         warnings.append(warning)
         matched = match.group(0)
+        if index_map is not None:
+            s_f, e_f = match.span()
+            matched = text[index_map[s_f] : index_map[e_f - 1] + 1]
         # replace() rewrites every occurrence of this exact URL, and the loop can
         # revisit it, so the record set is keyed by the matched string.
         result = result.replace(matched, f"{EXFILTRATION_REDACTION_TAG_PREFIX}{domain}]")
