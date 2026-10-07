@@ -784,6 +784,39 @@ class TestWorkflowResultSummaryAndPaging:
         monkeypatch.setattr(wf.mcp_core, "_get", lambda *a, **k: payload)
         return wf
 
+    def test_events_are_projected_compact_for_the_model(self, monkeypatch):
+        """TOOL-16: run_id once, HH:MM:SS timestamps, no result_summary when
+        agent_results carries the results, no empty-string data keys."""
+        wf = self._stub(
+            monkeypatch,
+            events=[
+                {
+                    "run_id": "r9",
+                    "seq": i,
+                    "ts": "2026-10-07T13:14:15.123456+00:00",
+                    "type": "agent_finished",
+                    "data": {"result_summary": "x" * 120, "label": "a" + str(i), "extra": ""},
+                }
+                for i in range(28)
+            ],
+            agent_errors={},
+            result="ok",
+            agent_results={f"a{i}": "full result " + str(i) for i in range(6)},
+        )
+        out = wf.workflow_result(
+            "workflow_result", {"run_id": "r9", "section": "events", "limit": 200}
+        )
+        body = json.loads(out)
+        # run_id appears once per response (the top level), never per event.
+        assert out.count("r9") == 1
+        # Every event timestamp is HH:MM:SS.
+        for ev in body["events"]:
+            assert len(ev["t"]) == 8
+        # result_summary is dropped (agent_results carries the results).
+        assert "result_summary" not in out
+        # Empty-string data keys are dropped.
+        assert "extra" not in out
+
     def test_the_default_summary_is_bounded_and_failures_come_first(self, monkeypatch):
         wf = self._stub(
             monkeypatch,
@@ -927,7 +960,7 @@ class TestWorkflowStatusAndResult:
             "status": "failed",
             "result": None,
             "error": "no return value",
-            "events": [{"phase": "a"}],
+            "events": [{"run_id": "r1", "seq": 0, "ts": "2026-10-07T13:14:15.123456+00:00", "type": "phase_started", "data": {"phase": "a"}}],
             "partial_results": {"agent1": "half done"},
             "agent_errors": {"agent2": "timed out"},
         }
@@ -935,7 +968,11 @@ class TestWorkflowStatusAndResult:
             payload = json.loads(_call_tool("workflow_result", {"run_id": "r1"}))
         assert payload["partial_results"] == {"agent1": "half done"}
         assert payload["agent_errors"] == {"agent2": "timed out"}
-        assert payload["events"] == [{"phase": "a"}]
+        # TOOL-16: events are projected compact for the model — seq/HH:MM:SS/
+        # type/data, no per-event run_id.
+        assert payload["events"] == [
+            {"seq": 0, "t": "13:14:15", "type": "phase_started", "data": {"phase": "a"}}
+        ]
 
     def test_result_omits_absent_partial_sections(self):
         snap = {"run_id": "r1", "status": "finished", "result": "ok", "events": []}

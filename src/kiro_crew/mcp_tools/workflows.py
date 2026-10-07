@@ -379,6 +379,35 @@ _WORKFLOW_RESULT_EVENT_TAIL = 20  # events the summary carries (TOOL-7)
 _WORKFLOW_RESULT_PAGE_DEFAULT = 200  # default page for section= paging
 
 
+def _project_workflow_event(ev: Any, *, drop_result_summary: bool) -> dict[str, Any]:
+    """MODEL-FACING compaction of one event (TOOL-16). The journal, resume and
+    the dashboard keep WorkflowEvent.to_json whole; this projection runs only
+    inside workflow_result's rendering, where every event repeating run_id and
+    a 32-char microsecond timestamp measured -53% of the tool's output tokens:
+
+    * the per-event run_id is omitted (the top-level run_id stays);
+    * the timestamp is cut to HH:MM:SS (ts[11:19]);
+    * empty string values in data are dropped;
+    * result_summary is dropped when agent_results is present — it repeats the
+      first 120 chars of a result the same response carries in full.
+    """
+    if not isinstance(ev, dict):
+        return ev
+    data = ev.get("data") or {}
+    if not isinstance(data, dict):
+        data = {"data": data}
+    if drop_result_summary:
+        data = {k: v for k, v in data.items() if k != "result_summary"}
+    data = {k: v for k, v in data.items() if v != ""}
+    ts = str(ev.get("ts", ""))
+    return {
+        "seq": ev.get("seq"),
+        "t": ts[11:19],
+        "type": ev.get("type"),
+        "data": data,
+    }
+
+
 def workflow_result(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, WORKFLOW_RESULT_SCHEMA)
     run_id = args.get("run_id", "")
@@ -407,7 +436,14 @@ def workflow_result(name: str, args: dict[str, Any]) -> str:
     # MUST be projected here: when a run ends without a usable return value they
     # are the only surviving output, and the completion message points the reader
     # at this tool to read them.
-    events = _redact_obj(d.get("events", []))
+    # TOOL-16: project each event for the MODEL copy — the per-event run_id,
+    # microsecond timestamps and duplicated summaries measured -53% of this
+    # tool's output tokens. _redact_obj runs on the raw snapshot FIRST so every
+    # projected field is still redacted; the journal and the dashboard keep the
+    # whole to_json shape.
+    _raw_events = _redact_obj(d.get("events", []))
+    _has_results = bool(d.get("agent_results"))
+    events = [_project_workflow_event(ev, drop_result_summary=_has_results) for ev in _raw_events]
     if section == "events":
         page = events[offset : offset + max(1, limit)]
         wf_payload: dict[str, Any] = {
