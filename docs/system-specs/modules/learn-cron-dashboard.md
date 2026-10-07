@@ -2371,7 +2371,15 @@ cost opt-in was ever enabled. Later toggles
 retain the same instance and budgets, and disabling the model path does not discard a
 derived card. Cleanup disables and awaits its worker.
 Enabling queues eligible open sessions, and post-restore startup does the same
-when enabled. Only a ROOT session is eligible for a MODEL card (`is_root_session`: no
+when enabled. Each published card is PERSISTED under its slot history key in
+`dynamic_card_store.json` (bounded to the publisher's capacity) beside a
+sha256 digest of the card SOURCE the model saw — redacted evidence rows,
+folded reads, tool record, and the source stamp (rotation generation + chained
+keys) (LOOP-14). A restore seed whose freshly built digest equals the stored
+one republishes the stored card with no model call and no attempt against the
+hourly budget, so a restart with unchanged histories costs nothing; a rewritten
+transcript moves the stamp, and any real change moves the rows or the folds, so
+both regenerate. Only a ROOT session is eligible for a MODEL card (`is_root_session`: no
 `created_by` and no session-tree parent, so an adopted worker is excluded too): every
 attempt comes from the one shared hourly budget, so a fan-out would otherwise spend it on
 workers and starve the session a person follows. A worker's MODEL card read answers

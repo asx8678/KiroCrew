@@ -698,6 +698,116 @@ async def test_edit_boundary_preserves_card_until_real_rewrite(
 
 
 @pytest.mark.asyncio
+async def test_restart_republishes_unchanged_cards_without_model_calls(monkeypatch, tmp_path):
+    """LOOP-14: a restart re-seeds every restored slot, and a slot whose card
+    source (redacted evidence window + folded reads) is unchanged since its
+    last STORED card is republished from the store with no model call. A slot
+    whose history really changed regenerates."""
+    from kiro_crew.dashboard import card_lifecycle
+
+    monkeypatch.setattr(card_lifecycle, "config_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        card_lifecycle,
+        "_read_card_folds",
+        lambda key: {
+            "status": {"lifecycle": "open", "turns_completed": 2},
+            "usage": {},
+            "approvals": {},
+            "work": {"items": [{"state": "open", "status": "progress"}], "omitted": 0},
+        },
+    )
+    monkeypatch.setattr(card_lifecycle, "_layout_hides_a_fact", lambda html: False)
+    monkeypatch.setattr(
+        card_lifecycle, "_read_card_tools", lambda key, reads: {"units_whole": True, "units": []}
+    )
+
+    class Log:
+        @contextmanager
+        def publication_hold(self, key):
+            yield
+
+        def session_mtime(self, key):
+            return 1
+
+        def rotation_generation(self, key):
+            return 0
+
+        def chained_keys(self, key):
+            return [key]
+
+        def derive_recent(self, key, max_messages, roles=None):
+            rows = by_history[key].messages
+            if roles:
+                rows = [r for r in rows if r.get("role") in roles]
+            return rows[-max_messages:]
+
+    def make_slot(key):
+        return SimpleNamespace(
+            key=key,
+            _dashboard_card_identity=f"owner-{key}",
+            memory_mode="persistent",
+            messages=[{"role": "user", "content": f"Build {key}"}],
+        )
+
+    slots = {key: make_slot(key) for key in ("a", "b", "c")}
+    # The log doubles receive the TRANSCRIPT key (slot_history_key), not the
+    # slot key, so the evidence lookup maps through the same resolution.
+    by_history = {card_lifecycle.slot_history_key(slot): slot for slot in slots.values()}
+    state = SimpleNamespace(
+        _slots=dict(slots),
+        conversation_log=Log(),
+        flush_slot_now=lambda slot: None,
+        sessions=object(),
+        _background_tasks=set(),
+        broadcast_ws_owners=lambda *args: None,
+    )
+    cfg = SimpleNamespace(
+        agent=SimpleNamespace(resolve_model=lambda role: "auto"),
+        dashboard=SimpleNamespace(dynamic_dashboard_cards=True, language=""),
+    )
+    monkeypatch.setattr(card_lifecycle.KiroCrewConfig, "load", lambda: cfg)
+
+    calls: list[str] = []
+
+    async def generate(sessions, prompt, **kwargs):
+        key = kwargs.get("crew_log_session_key", "").split(":", 1)[-1]
+        calls.append(key)
+        return json.dumps(
+            {"html": "<p data-dashboard-field=lede></p>", "data": {"lede": f"card {key}"}}
+        )
+
+    monkeypatch.setattr(card_lifecycle, "run_bg_oneliner", generate)
+
+    first = card_lifecycle.CardLifecycle(state, enabled=True)
+    first.publisher.budget = CardBudget(debounce=0, per_session=0)
+    for slot in slots.values():
+        first.notify(slot, "done")
+    await asyncio.wait_for(first.worker, 5)
+    state_after = {
+        k: (e.pending, e.failed, e.payload is not None) for k, e in first.publisher.entries.items()
+    }
+    assert len(calls) == 3, f"calls={calls} state={state_after}"
+
+    # Restart: a new lifecycle over the same store, entries lost from memory.
+    second = card_lifecycle.CardLifecycle(state, enabled=True)
+    second.publisher.budget = CardBudget(debounce=0, per_session=0)
+    for slot in slots.values():
+        second.notify(slot, "restored")
+    await asyncio.wait_for(second.worker, 5)
+    assert len(calls) == 3  # unchanged histories cost zero model calls
+    for key, slot in slots.items():
+        card = (await second.read(slot))["card"]
+        assert card is not None
+        assert card["data"]["lede"] == f"card {key}"  # the stored card, shown
+
+    # A real change regenerates: one appended message moves one slot's source.
+    slots["b"].messages.append({"role": "user", "content": "One more thing"})
+    second.notify(slots["b"], "activity")
+    await asyncio.wait_for(second.worker, 5)
+    assert len(calls) == 4
+
+
+@pytest.mark.asyncio
 async def test_generation_is_session_scoped_bounded_and_get_is_free(lifecycle, monkeypatch):
     from kiro_crew.dashboard import card_lifecycle
 
