@@ -12,9 +12,7 @@
   },
   "prompt": "file://{ENGINE_ROOT}/mcp-local/acp-agent-prompts/vibe-agent.md",
   "resources": [
-    "file://{ENGINE_ROOT}/skill/references/workflows/create-new-1-briefing.md",
     "file://{ENGINE_ROOT}/skill/references/workflows/create-new-1-outline.md",
-    "file://{ENGINE_ROOT}/skill/references/workflows/create-new-1-art-direction.md",
     "file://{APP_PROMPTS}/spec-studio.md"
   ],
   "tools": [
