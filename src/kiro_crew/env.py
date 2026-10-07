@@ -823,9 +823,20 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
         if (e := _validated_bin_dir(d.format(home=resolved_home, mise_data=mise_data)))
     ]
     extra += _node_all_bin_dirs(resolved_home, mise_data)
-    parts = extra + ([base_path] if base_path else [])
+    # A well-known directory already ON the caller's PATH stays where the caller
+    # put it: prepending it again would duplicate the entry and move it ahead of
+    # directories the user deliberately ordered first (a devshell or virtualenv
+    # bin placed before Homebrew's, say). Only directories MISSING from the
+    # inherited PATH are prepended, and ahead of it on purpose: a systemd launch
+    # whose base PATH carries a stale /usr/bin node is the documented reason the
+    # missing ones go first. ``_dedup_dirs`` then folds any duplicates the base
+    # itself carried, so every directory appears exactly once in the result.
+    base_parts = [p for p in base_path.split(os.pathsep) if p] if base_path else []
+    on_base = {os.path.normcase(os.path.normpath(p)) for p in base_parts}
+    parts = [e for e in extra if os.path.normcase(os.path.normpath(e)) not in on_base]
+    parts += base_parts
     parts.append(str(Path(sys.executable).parent))
-    return os.pathsep.join(parts)
+    return os.pathsep.join(_dedup_dirs(parts))
 
 
 #: How many directories :func:`describe_search_path` names before truncating.
