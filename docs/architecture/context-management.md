@@ -169,9 +169,14 @@ seconds.
 - **Thread history has its own window-scaled allowance**, and keeps its framing
   plus the newest tail rather than vanishing.
 - **The model-safe ceiling** on protected content is
-  `max(3 × the base, window_tokens × 4.0 × 0.125)` (`_PROTECTED_CONTEXT_FLOOR` is
-  the base tripled; `_PROTECTED_CONTEXT_CHARS_PER_TOKEN` and
-  `_PROTECTED_CONTEXT_WINDOW_FRACTION` are the two factors). Over it, lessons
+  `min(3 × the base, window_tokens × 4.0 × 0.125)` (CTX-9: the 99K
+  `_PROTECTED_CONTEXT_FLOOR` is a FIXED absolute cap — auto, empty and
+  unregistered ids all resolve to the 1M reference window, and a window-scaled
+  maximum let 500K chars of protected text into a session whose live window
+  could be 200k, alone past the 70% compaction point. A window KNOWN to be
+  smaller than the floor still scales the ceiling down, which is what
+  `_PROTECTED_CONTEXT_CHARS_PER_TOKEN` and
+  `_PROTECTED_CONTEXT_WINDOW_FRACTION` are still for). Over it, lessons
   fall back to the ordinary lessons budget (`caps.lessons`, still bounded by the
   ceiling) and re-render smaller, highest-ranked complete entries first;
   preferences are kept from their head with an in-prompt notice naming the file.

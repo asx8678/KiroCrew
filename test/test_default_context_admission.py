@@ -186,6 +186,45 @@ class TestProtectedContextCeiling:
         assert str(memory._preferences_file) in text
         assert "[CURRENT DATE]" in text
 
+    def test_an_oversized_preferences_file_at_the_auto_window_is_cut_at_the_floor(
+        self, rig, monkeypatch, caplog
+    ):
+        """CTX-9: at the auto/unknown window (the 1M reference) the protected
+        ceiling is the fixed 99K floor, so a 150K preferences file keeps its
+        head plus the omission notice under the floor — never the 500K a
+        window-scaled ceiling allowed — and the cut is logged naming the bound."""
+        import logging
+
+        builder, memory, _, _, _ = rig
+        real_caps = ctx._resolve_caps(1_000_000)
+        # The startup allowance binds first for any real file; raise it so the
+        # model-safe ceiling itself is the bound under test.
+        monkeypatch.setattr(
+            ctx,
+            "_resolve_caps",
+            lambda window: dataclasses.replace(real_caps, prefs_startup=600_000),
+        )
+        line = "OVERSIZED AUTO-WINDOW PREFERENCE LINE.\n"
+        preference = line * (150_000 // len(line) + 10)
+        memory.write_preferences(preference)
+
+        with caplog.at_level(logging.WARNING):
+            text = builder.build_session_context(
+                session_key="dashboard:synthetic", model_window=None
+            )
+
+        assert "OVERSIZED AUTO-WINDOW PREFERENCE LINE." in text
+        assert "chars of preferences above the model-safe protected-content ceiling" in text
+        # The rendered preference block (head + notice) stays under the floor.
+        rendered = text.split("OVERSIZED AUTO-WINDOW PREFERENCE LINE.", 1)[1]
+        assert rendered.find("[Context budget: omitted") > 0
+        assert len(rendered.split("[Context budget: omitted", 1)[0]) < 99_000
+        assert any(
+            "model-safe protected-content ceiling" in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
     def test_preferences_below_the_ceiling_carry_no_notice(self, rig):
         builder, memory, _, _, _ = rig
         preference = "COMPLETE PREFERENCE LINE.\n" * 300
@@ -295,7 +334,10 @@ class TestAdmissionAndSkills:
         caps = ctx._resolve_caps(window)
         assert caps.skills == ctx._resolve_caps(None).skills
         assert caps.max_context == ctx._CONTEXT_BUDGET_BASE
-        assert caps.protected_context == max(
+        # CTX-9: the protected ceiling is a FIXED absolute cap — the floor — for
+        # any window at or above it, and scales DOWN only for a window known to
+        # be smaller. A bigger window never buys more protected room.
+        assert caps.protected_context == min(
             ctx._PROTECTED_CONTEXT_FLOOR,
             int(
                 ctx._effective_window(window)

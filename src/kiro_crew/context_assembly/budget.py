@@ -204,7 +204,14 @@ def _resolve_caps_cached(window: int) -> _ResolvedCaps:
             _COMPRESSED_HISTORY_CAP * max(0.2, window / _REFERENCE_WINDOW_TOKENS)
         ),
         preamble_headroom=_scaled(_PREAMBLE_HEADROOM),
-        protected_context=max(
+        # CTX-9: the protected ceiling is a FIXED absolute cap — the 99K floor —
+        # never a window-scaled multiple of it. auto, empty and unregistered ids
+        # all resolve to the 1M reference window, so the old max() let 500K
+        # chars (about 125k tokens) of protected text into a session whose live
+        # window could be 200k, alone past the 70% compaction point. A window
+        # KNOWN to be smaller than the floor still scales down (min, not the
+        # floor outright), so a small-window model keeps its proportional headroom.
+        protected_context=min(
             _PROTECTED_CONTEXT_FLOOR,
             int(window * _PROTECTED_CONTEXT_CHARS_PER_TOKEN * _PROTECTED_CONTEXT_WINDOW_FRACTION),
         ),

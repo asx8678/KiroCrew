@@ -259,7 +259,8 @@ def session_memory_parts(
                         f"read {memory._preferences_file} for the complete file.]\n"
                     )
                     logger.warning(
-                        "Preferences exceed startup bound: chars=%d room=%d; " "keeping the head",
+                        "Preferences exceed %s: chars=%d room=%d; keeping the head",
+                        bound,
                         len(memory_ctx),
                         room,
                     )
