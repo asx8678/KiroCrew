@@ -288,7 +288,7 @@ def _decide_effect(
     # Any non-actionable outcome settles the subject, so no window stays open.
     _close_window(state, now=now)
     if observation.supplemental_provider_error is not None:
-        return _supplemental_provider_error_decision(state, state.budgets)
+        return _supplemental_provider_error_decision(state, observation, state.budgets)
     if observation.status is MonitorObservationStatus.SUCCESS:
         if observation.head_changed:
             return MonitorDecision.WAKE_ACTIONABLE
@@ -382,7 +382,7 @@ def _coalesce_actionable(
         # Every condition is inside its re-alert interval, so this wake could
         # tell the owner nothing the last one did not.
         if observation.supplemental_provider_error is not None:
-            return _supplemental_provider_error_decision(state, state.budgets)
+            return _supplemental_provider_error_decision(state, observation, state.budgets)
         return MonitorDecision.NO_CHANGE
 
     window_was_open = bool(state.coalesce_windows)
@@ -610,9 +610,24 @@ def _provider_error_decision(
 
 def _supplemental_provider_error_decision(
     state: MonitorState,
+    observation: MonitorObservation,
     budgets: MonitorBudgets,
 ) -> MonitorDecision:
-    """Retry incomplete secondary evidence before retiring the readable target."""
+    """Retry incomplete secondary evidence before retiring the readable target.
+
+    A supplemental error obeys the SAME retryable-kind rule a primary one
+    does (LOOP-22): an authentication, authorization, not_found or setup
+    failure will fail identically on the next tick, so burning the
+    provider-error budget on it -- 19 API calls at the maximum budget of 20
+    -- buys nothing and only delays the same STOP_BLOCKED retirement. The
+    watch with readable primary facts retires as BLOCKED on the first tick
+    instead; the primary evidence stays what the last readable tick recorded.
+    Only TRANSIENT and RATE_LIMITED retry, and they do so until the streak
+    trips, exactly as a primary error of the same kind would.
+    """
+    error = observation.supplemental_provider_error
+    if error is not None and error not in _RETRYABLE_PROVIDER_ERRORS:
+        return MonitorDecision.STOP_BLOCKED
     if state.consecutive_provider_errors + 1 >= budgets.max_provider_errors:
         return MonitorDecision.STOP_BLOCKED
     return MonitorDecision.RETRY_PROVIDER
