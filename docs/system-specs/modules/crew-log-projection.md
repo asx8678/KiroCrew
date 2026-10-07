@@ -1060,7 +1060,16 @@ dashboard state exists, so the crew log names no dashboard symbol. The conductor
 pull-forward (`conductor_wake`, registered at `AutoNudgeService.start`) is the second
 subscriber: on a `work` fold's event it diffs each item's `last_report_at` against the
 board it last saw and pulls the conductor's armed work-ledger loop forward for the items
-that moved -- the event's `key` is the conductor's board, so it reads no binding. A push
+that moved -- the event's `key` is the conductor's board, so it reads no binding.
+A conductor that binds work always HAS such a loop: the bind path's patrol
+backstop (`work_ledger._arm_conductor_patrol_backstop`, LOOP-19) arms one
+through the same authorized chokepoint `monitor_start` uses
+(`authorize_and_add_nudge`) when -- and only when -- the slot has no active
+work-ledger loop: gated, `watch="work-ledger"`, a 600 s interval (inside the
+skill's 300-900 band), one transcript notice row, idempotent (a second bind
+finds the loop and arms nothing), and best-effort (a refused or impossible arm
+never fails a bind that already succeeded). The conductor's own `monitor_start`
+remains the primary path and overrides nothing. A push
 arms the tick at a 30 s SETTLE window rather than immediately, so reports from
 different workers that land inside the window share ONE wake turn (each later push
 re-arms the same pending tick out to its own settle stamp, and the tick that runs
