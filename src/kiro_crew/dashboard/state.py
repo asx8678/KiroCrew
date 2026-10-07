@@ -4947,9 +4947,9 @@ class _ChatSlot:
         """Drop finalized stream chunks from the transcript and live queue."""
         return self._buffers.purge_chunks(self)
 
-    def append_pending_context(self, entry: dict[str, Any]) -> None:
-        """Append one live context entry after expiry pruning and FIFO eviction."""
-        self._buffers.append_pending_context(
+    def append_pending_context(self, entry: dict[str, Any]) -> bool:
+        """Append one live context entry after expiry pruning; False = ceiling."""
+        return self._buffers.append_pending_context(
             self,
             entry,
             max_pending_context=_MAX_PENDING_CONTEXT,

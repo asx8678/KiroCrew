@@ -687,16 +687,24 @@ class SlotBufferCoordinator:
         *,
         max_pending_context: int,
         entry_expired: Callable[[dict[str, Any], float], bool],
-    ) -> None:
+    ) -> bool:
+        """Append one entry; returns False when the queue is at its ceiling.
+
+        CTX-30: a full queue REFUSES the append rather than silently evicting
+        the oldest entry — a producer posting past the ceiling learns it was
+        not queued (the HTTP caller returns 429 capacity_reached), so one
+        app's burst cannot displace another producer's already-queued context.
+        """
         now = time.time()
         if entry_expired(entry, now):
-            return
+            return True
         slot._pending_context[:] = [
             current for current in slot._pending_context if not entry_expired(current, now)
         ]
-        while len(slot._pending_context) >= max_pending_context:
-            slot._pending_context.pop(0)
+        if len(slot._pending_context) >= max_pending_context:
+            return False
         slot._pending_context.append(entry)
+        return True
 
     @staticmethod
     def drop_foreign_authorized_notes(
