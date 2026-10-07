@@ -1313,6 +1313,24 @@ class TestSemanticContext:
         assert "[Semantic Memory" in ctx
         assert "[End of semantic memory]" in ctx
 
+    def test_non_ascii_values_render_unescaped(self, tmp_path: Path, opened) -> None:
+        """CTX-11: dict/list values render with ensure_ascii=False, so a CJK
+        value reaches the prompt verbatim instead of \\uXXXX escapes that
+        inflated it ~4.3x (strings were always fine via str(val))."""
+        import json
+
+        store = opened(VectorMemoryStore(db_path=tmp_path / "mem.db"))
+        store.init()
+        value = {"偏好": "用户喜欢简洁的回答"}
+        store.set_semantic("user.x", value, 1.0, "user_explicit")
+        ctx = store.get_semantic_context()
+        assert "用户喜欢简洁的回答" in ctx  # verbatim, not escaped
+        line = next(ln for ln in ctx.splitlines() if "user.x" in ln)
+        val_part = line.split(": ", 1)[1]
+        assert "\\u" not in val_part
+        plain = json.dumps(value, ensure_ascii=False)
+        assert len(val_part) <= 1.1 * len(plain)
+
     def test_respects_cap(self, tmp_path: Path, opened) -> None:
         store = opened(VectorMemoryStore(db_path=tmp_path / "mem.db"))
         store.init()
