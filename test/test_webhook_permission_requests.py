@@ -34,6 +34,7 @@ from kiro_crew.acp.types import (
 from kiro_crew.dashboard.handlers import usage
 from kiro_crew.dashboard.handlers.hooks import (
     _EVENT_PERMISSION_REQUEST_KIND,
+    _hook_mcp_spawn_notice,
     _run_hook_inner,
 )
 from kiro_crew.hooks import TOOL_ALLOW, TOOL_AUTO_APPROVE, TOOL_DENY, ToolHookResult
@@ -163,7 +164,7 @@ def _drive(
         gate_result = ToolHookResult(action=gate_action)
     gate = _FakeGate(gate_result) if gate_result is not None else None
     builder = _FakeContextBuilder(gate) if gate is not None else None
-    result_text = asyncio.run(
+    result_text, _names = asyncio.run(
         asyncio.wait_for(
             _run_hook_inner(_FakeState(client, builder), "hook:test:9790", "go", None),
             timeout=_PROMPT_BOUND_S,
@@ -174,6 +175,57 @@ def _drive(
 
 def _denial_rows(sel: _RecordingSel) -> list[dict]:
     return [r for r in sel.tool_rows if r.get("outcome") == "denied"]
+
+
+def test_mcp_problem_names_are_read_and_notice_is_prepended(monkeypatch):
+    """SES-14: a webhook run whose MCP servers failed to start reads the
+    session's MCP report through the provider contract, and the names-only
+    summary reaches both the notice prepended to the turn and the caller."""
+    from types import SimpleNamespace
+
+    class _McpClient(_FakeClient):
+        def mcp_session_report(self):
+            report = SimpleNamespace()
+            report.problem_summary = lambda include_reasons=True: (
+                "kirocrew-core (init failed)" if include_reasons else "kirocrew-core"
+            )
+            return report
+
+    sel = _RecordingSel()
+    import kiro_crew.dashboard.handlers as handlers_pkg
+
+    monkeypatch.setattr(handlers_pkg, "sel", lambda: sel)
+    monkeypatch.setattr(usage, "_write_token_record", lambda _record, _now: None)
+
+    client = _McpClient()
+    result_text, names = asyncio.run(
+        asyncio.wait_for(
+            _run_hook_inner(_FakeState(client, None), "hook:test:mcp", "go", None),
+            timeout=_PROMPT_BOUND_S,
+        )
+    )
+    assert names == "kirocrew-core"
+    assert "hello world" in result_text
+
+    notice = _hook_mcp_spawn_notice(names)
+    assert "kirocrew-core" in notice
+    assert "BEGIN_UNTRUSTED_MCP" in notice
+
+    class _HealthyClient(_FakeClient):
+        def mcp_session_report(self):
+            report = SimpleNamespace()
+            report.problem_summary = lambda include_reasons=True: ""
+            return report
+
+    healthy = _HealthyClient()
+    result, names2 = asyncio.run(
+        asyncio.wait_for(
+            _run_hook_inner(_FakeState(healthy, None), "hook:test:ok", "go", None),
+            timeout=_PROMPT_BOUND_S,
+        )
+    )
+    assert names2 == ""
+    assert "hello world" in result
 
 
 def test_no_gate_rejects_audits_and_still_returns_text(monkeypatch):
@@ -339,7 +391,7 @@ def test_unauditable_auto_approve_is_denied(monkeypatch):
 
     client = _FakeClient()
     builder = _FakeContextBuilder(_FakeGate(ToolHookResult(action=TOOL_AUTO_APPROVE)))
-    result_text = asyncio.run(
+    result_text, _names = asyncio.run(
         asyncio.wait_for(
             _run_hook_inner(_FakeState(client, builder), "hook:test:9790", "go", None),
             timeout=_PROMPT_BOUND_S,
