@@ -1024,7 +1024,10 @@ def get_semantic_context(
         except (json.JSONDecodeError, TypeError):
             val = r["value_json"]
         # Format complex values as JSON, simple values as-is
-        val_str = json.dumps(val) if isinstance(val, (dict, list)) else str(val)
+        # (ensure_ascii=False — CTX-11: dict/list values reach the prompt as
+        # their real characters, matching the pref.* rows and the persisted
+        # bytes, instead of 6-char \\uXXXX escapes that inflate CJK ~4.3x)
+        val_str = json.dumps(val, ensure_ascii=False) if isinstance(val, (dict, list)) else str(val)
         line = f"{store._fact_label(dict(r))}: {val_str}"
         if total + len(line) > cap:
             if store.algorithm_version == "v2":
