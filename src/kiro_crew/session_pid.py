@@ -5582,8 +5582,12 @@ def get_session_rss_mb(
     walk (see ``_build_child_map``), so it delegates to
     ``platform_compat.proc_rss_tree_mb_for_pid``, which sums only
     lineage-validated descendants; without that the ceiling measured every tree
-    as 0 MiB there and no session was ever recycled. macOS has no ctypes-only
-    per-pid RSS path, so it returns 0 and the ceiling stays inert.
+    as 0 MiB there and no session was ever recycled. macOS walks the same tree
+    the ACP process probe uses (``acp.runtime_process_tree._get_rss_tree_mb``:
+    a memoized ps snapshot for the descendant edges, each pid measured by its
+    phys_footprint with ps RSS as the fallback) — before REL-18 it returned 0
+    and both RSS ceilings (the opt-in session ceiling and the always-on
+    background-runtime fallback) stayed inert there.
 
     *exclude_pids* is honoured on the ``/proc`` route. The Windows route derives
     its own validated descendant set, so a caller that needs a subtree barrier
@@ -5591,6 +5595,21 @@ def get_session_rss_mb(
     """
     if platform_compat.IS_WINDOWS and proc_root is None:
         tree_mb = platform_compat.proc_rss_tree_mb_for_pid(pid)
+        return 0 if tree_mb is None else int(tree_mb)
+    if sys.platform == "darwin":
+        # REL-18: macOS previously returned 0, so BOTH RSS ceilings (the
+        # opt-in session.watchdog_rss_max_mb and the always-on background
+        # runtime's 1536 MiB fallback) never fired there. The macOS-capable
+        # tree reading already existed for the ACP process-tree probe
+        # (acp/runtime_process_tree._get_rss_tree_mb: ps whole-machine
+        # snapshot memoized per walk, each pid measured by its
+        # phys_footprint with ps RSS as the fallback) — reuse it rather than
+        # a second, diverging walk. exclude_pids is honoured only on the
+        # /proc route, as on Windows: the ps route derives its own
+        # descendant set and has no subtree barrier.
+        from kiro_crew.acp.runtime_process_tree import _get_rss_tree_mb
+
+        tree_mb = _get_rss_tree_mb(pid)
         return 0 if tree_mb is None else int(tree_mb)
     if sys.platform != "linux":
         return 0
