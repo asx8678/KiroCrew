@@ -1,6 +1,7 @@
 {
   "name": "pptx-maker-composer",
   "description": "Slide composer for the presentation engine. Writes slide JSON, builds the .pptx, measures it and polishes autonomously. Runs as a sub-agent with no user interaction.",
+  "includeMcpJson": false,
   "mcpServers": {
     "sdpm": {
       "command": "{UV_BIN}",

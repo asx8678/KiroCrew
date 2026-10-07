@@ -54,6 +54,10 @@ def _install_lite_agent_fallback() -> None:
         "tools": [],
         "mcpServers": {},
         "prompt": "",
+        # kiro-cli defaults an absent key to True and would spawn every
+        # server in the user-level mcp.json; the lite agent has no tools,
+        # so those processes are pure startup cost on every background call.
+        "includeMcpJson": False,
     }
     agent_mod._atomic_json_write(lite_path, lite_config)
     # Cheap model for the claude_code (CC) provider. kiro-cli resolves the lite

@@ -1,6 +1,7 @@
 {
   "name": "pptx-maker-spec",
   "description": "Spec-driven presentation agent. Runs the briefing, outline and art-direction conversation, then delegates slide composition to pptx-maker-composer.",
+  "includeMcpJson": false,
   "mcpServers": {
     "sdpm": {
       "command": "{UV_BIN}",
