@@ -1869,9 +1869,31 @@ def _run_stdio_dispatch_loop(
             respond(req_id, {})
         elif method == "tools/call":
             tool_name = params.get("name", "")
+            # TOOL-23: a call whose params are malformed is refused rather than
+            # silently run with defaults. MCP permits OMITTING ``arguments`` for
+            # a no-arg tool, and ``_meta`` carries routing identity — everything
+            # else (an ``input``/``args`` spelling, a non-object ``arguments``)
+            # is a non-conforming client, and a tool whose fields are all
+            # optional would otherwise run with defaults the caller never sent.
+            _unknown_params = sorted(k for k in params if k not in {"name", "arguments", "_meta"})
             tool_args = params.get("arguments", {})
             if not isinstance(tool_args, dict):
                 tool_args = {}
+            if _unknown_params or not isinstance(params.get("arguments", {}), dict):
+                if req_id is not None:
+                    respond(
+                        req_id,
+                        None,
+                        error={
+                            "code": JSONRPC_INVALID_PARAMS,
+                            "message": (
+                                "invalid tools/call params: "
+                                + (f"unknown key(s) {_unknown_params}; " if _unknown_params else "")
+                                + "arguments must be an object"
+                            ),
+                        },
+                    )
+                return
             # Verified per-call identity (pooled topology): gatewayd strips
             # any client-forged ``kirocrew.caller`` block and injects its own
             # on every forwarded call, so a block present here is
