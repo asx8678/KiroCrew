@@ -2765,6 +2765,17 @@ class SessionAllocationService:
                     # Stamped from the same local rather than re-resolved, which is
                     # what keeps the id sent and the id read identical.
                     session.requested_model = model or ""
+                    # SES-10: the allocation's effort override and caller env,
+                    # stamped like requested_model so a compaction restart or a
+                    # recycling reset can rebuild the SAME allocation instead
+                    # of resolving the effort from a crew pin and dropping the
+                    # env entirely. Env is memory-only by construction: it is
+                    # stamped here and never serialized, because a cron's
+                    # job.env can hold secrets.
+                    session.allocation_effort_override = (
+                        extra_factory_kwargs.get("reasoning_effort_override") or None
+                    )
+                    session.allocation_extra_env = dict(extra_env) if extra_env else None
                     session.loaded_capabilities = stamp
                     self.state.capability_failures.pop(key, None)
                     replay_needed = getattr(provider, "_history_replay_needed", False) is True

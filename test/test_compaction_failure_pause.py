@@ -121,6 +121,91 @@ async def _settle() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_a_compaction_restart_carries_the_allocation_effort_and_env():
+    """SES-10: the successor rebuilt after a failed /compact is allocated with
+    the predecessor's reasoning-effort override and caller extra_env — the
+    recycling reset shares allocation_identity, so the carry covers both."""
+    seen: list[dict] = []
+
+    def recording_factory(session_key=None, agent=None, channel_id=None, **kwargs):
+        seen.append(dict(kwargs))
+        m = AsyncMock()
+        m.cwd = ""
+        m.disown_work_dir = MagicMock()
+        m.memory_mode = "persistent"
+        m.is_process_alive = lambda: True
+        m.context_usage_pct = lambda: 0.0
+        m.context_window_tokens = lambda: 0
+        m.has_active_turn = lambda: False
+        m.runtime_abort_target = lambda: None
+        m.stream_command = MagicMock(side_effect=_no_events)  # the /compact fails
+        m.shutdown = AsyncMock(side_effect=lambda: None)
+        return m
+
+    mgr = SessionManager(KiroCrewConfig(), provider_factory=recording_factory)
+    await mgr.get_or_create(
+        "dashboard:chat-1",
+        reasoning_effort_override="high",
+        extra_env={"KIROCREW_APPROVAL_MODE": "auto"},
+    )
+    key = mgr._fold_key("dashboard:chat-1")
+    mgr.release(key)
+    mgr._session_map.set(key, "sid-parent")
+    session = mgr._sessions[key]
+    seen.clear()
+
+    assert await mgr._compact_in_place(key, session, 95.0) == "recycled"
+
+    assert seen, "no successor factory call was made"
+    assert seen[-1].get("reasoning_effort_override") == "high"
+    assert seen[-1].get("extra_env") == {"KIROCREW_APPROVAL_MODE": "auto"}
+    await mgr.close_all()
+
+
+@pytest.mark.asyncio
+async def test_a_recycling_reset_successor_carries_the_allocation_effort_and_env():
+    """SES-10, reset half: the recycling reset rebuilds from the same
+    allocation_identity, so its successor keeps the effort override and env a
+    queued entry is waiting on."""
+    seen: list[dict] = []
+
+    def recording_factory(session_key=None, agent=None, channel_id=None, **kwargs):
+        seen.append(dict(kwargs))
+        m = AsyncMock()
+        m.cwd = ""
+        m.disown_work_dir = MagicMock()
+        m.memory_mode = "persistent"
+        m.is_process_alive = lambda: True
+        m.context_usage_pct = lambda: 0.0
+        m.context_window_tokens = lambda: 0
+        m.has_active_turn = lambda: False
+        m.runtime_abort_target = lambda: None
+        m.shutdown = AsyncMock(side_effect=lambda: None)
+        return m
+
+    mgr = SessionManager(KiroCrewConfig(), provider_factory=recording_factory)
+    await mgr.get_or_create(
+        "dashboard:chat-1",
+        reasoning_effort_override="high",
+        extra_env={"KIROCREW_APPROVAL_MODE": "auto"},
+    )
+    key = mgr._fold_key("dashboard:chat-1")
+    # A queued entry behind the HELD turn is what makes the reset rescue (park)
+    # it and build the successor.
+    mgr.enqueue("dashboard:chat-1", "ts-1", "queued while the reset runs", session_key=key)
+    seen.clear()
+
+    await mgr.reset(key)
+    await _settle()
+
+    assert seen, "the reset built no successor"
+    assert seen[-1].get("reasoning_effort_override") == "high"
+    assert seen[-1].get("extra_env") == {"KIROCREW_APPROVAL_MODE": "auto"}
+    await mgr.close_all()
+
+
+@pytest.mark.asyncio
 async def test_restart_waits_for_a_shared_sub_agent_then_runs_when_it_finishes():
     mgr, key, runs, order, notices = await _setup()
     session = mgr._sessions[key]

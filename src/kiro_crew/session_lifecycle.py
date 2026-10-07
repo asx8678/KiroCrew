@@ -406,9 +406,13 @@ def allocation_identity(owner: Any, key: str, session: Any) -> dict[str, Any]:
 
     Shared by the reset successor and the compaction restart
     (``session_compaction._restart_held``) so the two cannot drift: agent,
-    approval policy, cwd, bound channel, the model the allocation selected and
-    the crew member. A caller's ``extra_env`` is not recorded on a session, so
-    it cannot be carried.
+    approval policy, cwd, bound channel, the model the allocation selected,
+    the crew member, and — since SES-10 — the allocation's reasoning-effort
+    override and caller ``extra_env``, both stamped on the session at
+    registration (memory-only for env; a cron's job.env can hold secrets, so
+    it is never persisted). Without the last two a restarted successor ran at
+    a crew-pinned effort instead of the caller's override and lost its env —
+    including a cron's ``KIROCREW_APPROVAL_MODE`` — for every harness.
     """
     return {
         "agent": getattr(session, "agent", "") or None,
@@ -417,6 +421,8 @@ def allocation_identity(owner: Any, key: str, session: Any) -> dict[str, Any]:
         "channel_id": owner.get_channel(key) or None,
         "model": getattr(session, "requested_model", "") or None,
         "crew_agent": getattr(session, "capability_member", "") or None,
+        "reasoning_effort_override": getattr(session, "allocation_effort_override", None),
+        "extra_env": getattr(session, "allocation_extra_env", None),
     }
 
 
