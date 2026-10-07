@@ -221,6 +221,33 @@ class TestClaim:
         auto_title.release_claim(_KEY)
         assert auto_title.try_claim(_KEY) is True
 
+    def test_a_conversation_exhausts_after_three_attempts(self):
+        """LOOP-11: SKIP verdicts and failures no longer retry forever.
+
+        Three claim+release cycles (a SKIP or a failure each time) exhaust
+        the key; the fourth claim is refused, so no further background turn
+        is spent on naming that conversation in this process."""
+        for i in range(auto_title.TITLE_MAX_ATTEMPTS):
+            assert auto_title.try_claim(_KEY) is True, i
+            auto_title.release_claim(_KEY)
+        assert auto_title.try_claim(_KEY) is False, "the 4th attempt must be refused"
+
+    def test_reset_clears_the_attempt_cap(self):
+        for _ in range(auto_title.TITLE_MAX_ATTEMPTS):
+            auto_title.try_claim(_KEY)
+            auto_title.release_claim(_KEY)
+        assert auto_title.try_claim(_KEY) is False
+        auto_title.reset()
+        assert auto_title.try_claim(_KEY) is True
+
+    def test_a_successful_title_clears_the_attempt_cap(self):
+        auto_title.try_claim(_KEY)
+        auto_title.release_claim(_KEY)
+        auto_title.release_claim(_KEY)
+        assert auto_title.try_claim(_KEY) is True
+        auto_title.mark_titled(_KEY, auto_title.TITLE_KIND_AUTO)
+        assert auto_title.try_claim(_KEY) is False  # titled: not exhausted
+
     def test_the_lru_evicts_the_least_recently_marked(self, monkeypatch):
         """Mutation: drop the ``popitem`` in ``mark_titled`` — red."""
         monkeypatch.setattr(auto_title, "TITLE_LRU_MAX", 1)

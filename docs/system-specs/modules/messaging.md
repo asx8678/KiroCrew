@@ -2980,7 +2980,11 @@ default install no Slack session was ever LLM-titled.
   when the refusal was the record already carrying a name, and whenever the state
   is UNKNOWN — pinned, or on that recheck — because a record that merely could
   not be read would otherwise bill a fresh naming turn on every following
-  exchange for as long as it stays damaged.
+  exchange for as long as it stays damaged. `release_claim` COUNTS the attempt
+  (LOOP-11): at `TITLE_MAX_ATTEMPTS` (3) the key is marked exhausted and
+  `try_claim` answers False from then on, so a conversation whose naming turn
+  keeps answering SKIP or failing spends no further background turns on
+  naming in that process. `reset()` and a title that lands clear the count.
 - **A person's name always wins, and it takes TWO guards** because they cover
   different windows. The in-process one (`TITLE_KIND_MANUAL` recorded on the claim)
   catches a rename that lands while the naming turn streams. The persisted one is
