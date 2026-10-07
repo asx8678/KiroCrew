@@ -159,6 +159,48 @@ def _names(rows: list[dict]) -> list[str]:
     return [r["model_name"] for r in rows]
 
 
+def _plain(rows: list[dict]) -> list[dict]:
+    """Rows without the entitlement key (for fail-open tests that do not pin it)."""
+    return [{k: v for k, v in r.items() if k != "entitlement"} for r in rows]
+
+
+@pytest.mark.asyncio
+async def test_no_live_kiro_session_marks_the_catalog_unverified():
+    """MOD-11: a cold gateway with no live kiro session serves the full
+    catalog, but each row carries entitlement:'unverified'."""
+    request = MagicMock()
+    request.app = {}  # KeyError -> the fail-open branch
+    models = [{"model_name": "auto"}, {"model_name": "claude-opus-5"}]
+    rows = await agents._entitled_kiro_models(request, [dict(m) for m in models])
+    assert _names(rows) == ["auto", "claude-opus-5"]
+    assert all(r.get("entitlement") == "unverified" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_a_live_session_that_advertised_nothing_marks_unverified():
+    """MOD-11: a live session with an empty advertised list also fails open
+    with the unverified tag."""
+    request = _request(_provider([]))
+    models = [{"model_name": "auto"}, {"model_name": "claude-opus-5"}]
+    rows = await agents._entitled_kiro_models(request, [dict(m) for m in models])
+    assert _names(rows) == ["auto", "claude-opus-5"]
+    assert all(r.get("entitlement") == "unverified" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_a_narrowed_catalog_has_no_entitlement_tag():
+    """MOD-11: a VERIFIED narrowing carries no unverified tag."""
+    request = _request(_provider([{"modelId": "auto"}, {"modelId": "claude-opus-5"}]))
+    models = [
+        {"model_name": "auto"},
+        {"model_name": "claude-opus-5"},
+        {"model_name": "claude-sonnet-5"},
+    ]
+    rows = await agents._entitled_kiro_models(request, [dict(m) for m in models])
+    assert _names(rows) == ["auto", "claude-opus-5"]
+    assert all(r.get("entitlement") is None for r in rows)
+
+
 @pytest.mark.asyncio
 async def test_advertised_narrows_the_catalog():
     # The free tier advertises auto + sonnet only: opus rows must not survive.
@@ -286,7 +328,7 @@ async def test_a_claude_session_never_narrows_the_kiro_picker():
             ]
         )
     )
-    assert await agents._entitled_kiro_models(request, CATALOG) == CATALOG
+    assert _plain(await agents._entitled_kiro_models(request, CATALOG)) == CATALOG
 
 
 @pytest.mark.asyncio
@@ -337,20 +379,20 @@ async def test_newest_session_with_no_list_falls_back_to_an_older_one():
 async def test_no_live_session_leaves_the_catalog_alone():
     # Nothing has initialized yet: entitlement is unknown, not "nothing".
     request = _request()
-    assert await agents._entitled_kiro_models(request, CATALOG) == CATALOG
+    assert _plain(await agents._entitled_kiro_models(request, CATALOG)) == CATALOG
 
 
 @pytest.mark.asyncio
 async def test_missing_state_leaves_the_catalog_alone():
     request = MagicMock()
     request.app = {}
-    assert await agents._entitled_kiro_models(request, CATALOG) == CATALOG
+    assert _plain(await agents._entitled_kiro_models(request, CATALOG)) == CATALOG
 
 
 @pytest.mark.asyncio
 async def test_backend_that_advertises_nothing_leaves_the_catalog_alone():
     request = _request(_provider([]))
-    assert await agents._entitled_kiro_models(request, CATALOG) == CATALOG
+    assert _plain(await agents._entitled_kiro_models(request, CATALOG)) == CATALOG
 
 
 @pytest.mark.asyncio
@@ -447,7 +489,7 @@ async def test_provider_without_getter_is_skipped_not_fatal():
 @pytest.mark.asyncio
 async def test_getter_raising_is_skipped_not_fatal():
     request = _request(_provider(None, raises=True))
-    assert await agents._entitled_kiro_models(request, CATALOG) == CATALOG
+    assert _plain(await agents._entitled_kiro_models(request, CATALOG)) == CATALOG
 
 
 @pytest.mark.asyncio
@@ -456,7 +498,7 @@ async def test_disjoint_advertised_set_fails_open():
     # mismatch, not an entitlement. Filtering there would empty the picker, so
     # the catalog is returned untouched.
     request = _request(_provider([{"modelId": "openrouter::z-ai/glm-5.3-flash"}]))
-    assert await agents._entitled_kiro_models(request, CATALOG) == CATALOG
+    assert _plain(await agents._entitled_kiro_models(request, CATALOG)) == CATALOG
 
 
 @pytest.mark.asyncio
@@ -464,7 +506,7 @@ async def test_malformed_advertised_entries_are_ignored():
     # advertised_model_ids tolerates junk; a list that yields no usable id is
     # the same as "advertised nothing".
     request = _request(_provider(["not-a-dict", {"no_model_id": 1}, {"modelId": ""}]))
-    assert await agents._entitled_kiro_models(request, CATALOG) == CATALOG
+    assert _plain(await agents._entitled_kiro_models(request, CATALOG)) == CATALOG
 
 
 # ── Read-path revalidation (item 1 of the follow-ups) ──

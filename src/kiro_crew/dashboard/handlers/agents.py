@@ -555,6 +555,19 @@ def _advertised_cc_models(request: web.Request, namespace: str) -> list[dict]:
     return []
 
 
+def _mark_unverified(models: list[dict]) -> list[dict]:
+    """Tag each row with entitlement:'unverified' (MOD-11).
+
+    Used on the deliberate FAIL-OPEN branches of the kiro-model narrowing: a
+    cold gateway with no live session, a session that advertised nothing, or a
+    snapshot that does not intersect the catalog. The picker still offers
+    the full catalog (hiding is worse than offering one too many), but each
+    row now says its availability is unconfirmed so the frontend can show a
+    hint instead of presenting every model as verified.
+    """
+    return [dict(m, entitlement="unverified") for m in models]
+
+
 async def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict]:
     """Narrow the ``--list-models`` catalog to what a live session advertises.
 
@@ -601,7 +614,7 @@ async def _entitled_kiro_models(request: web.Request, models: list[dict]) -> lis
         state: DashboardState = request.app["state"]
         providers = state.sessions.active_providers()
     except (KeyError, AttributeError):
-        return models
+        return _mark_unverified(models)
     advertised: list[str] = []
     catalog_ids = [m.get("model_name", "") for m in models]
     # Newest session first. `active_providers()` walks a dict of live sessions, so
@@ -649,7 +662,7 @@ async def _entitled_kiro_models(request: web.Request, models: list[dict]) -> lis
         advertised = ids
         break
     if not advertised:
-        return models
+        return _mark_unverified(models)
     advertises_auto = any(_normalize_model_key(i) == "auto" for i in advertised)
     offered: set[str] = {
         _normalize_model_key(m.get("model_name", ""))
@@ -692,7 +705,7 @@ async def _entitled_kiro_models(request: web.Request, models: list[dict]) -> lis
     if not advertises_auto and not any(
         _normalize_model_key(m.get("model_name", "")) != "auto" for m in kept
     ):
-        return models
+        return _mark_unverified(models)
     return kept
 
 
