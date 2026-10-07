@@ -6,7 +6,7 @@ import asyncio as _asyncio
 import functools as _functools
 import logging as _logging
 import time as _time
-from typing import TYPE_CHECKING, Any, Collection, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Sequence
 
 from kiro_crew.subagent_wait_reasons import (
     QUEUED_WAIT_EXPIRED_TEXT,
@@ -282,7 +282,7 @@ class _TaskqBridgeMixin(ManagerComponent):
             store = _taskq.open_default_store(
                 home,
                 window=max(1, window),
-                artifact_probe=self.taskq_artifact_probe,
+                artifact_probe=self.taskq_boot_probe,
                 journal_mode=journal_mode,
             )
         except _taskq.TaskStoreUnavailable as exc:
@@ -1087,9 +1087,24 @@ class _TaskqBridgeMixin(ManagerComponent):
         return int(waiting_outside) == 0
 
     def _post_store_write(
-        self, store: "_taskq.TaskStore", what: str, fn: Any, *args: Any, **kw: Any
+        self,
+        store: "_taskq.TaskStore",
+        what: str,
+        fn: Any,
+        *args: Any,
+        on_uncommitted: "Callable[[BaseException], None] | None" = None,
+        on_committed: "Callable[[], None] | None" = None,
+        **kw: Any,
     ) -> "_asyncio.Task[Any] | None":
         """Run a best-effort store write whose result nothing waits for.
+
+        ``on_uncommitted`` fires when the write cannot commit
+        (:class:`~kiro_crew.taskq.TaskStoreUnavailable` -- a locked or
+        momentarily unwritable store) on BOTH the inline and the posted path;
+        ``on_committed`` fires when it lands. They exist for the refusal
+        tombstone (``taskq_fail``): a row whose caller was told "refused"
+        must stay tombstoned until a write actually commits it terminal, not
+        merely until the write was attempted.
 
         On a running loop (with the off-loop pump on) the write is POSTED to
         the store's single writer thread (``TaskStore.post``) by this call,
@@ -1110,8 +1125,13 @@ class _TaskqBridgeMixin(ManagerComponent):
         if loop is None or not type(self).pump_off_loop:
             try:
                 fn(*args, **kw)
-            except _taskq.TaskStoreUnavailable:
+            except _taskq.TaskStoreUnavailable as exc:
                 _glue_logger.debug("taskq: %s write failed", what, exc_info=True)
+                if on_uncommitted is not None:
+                    on_uncommitted(exc)
+                return None
+            if on_committed is not None:
+                on_committed()
             return None
         try:
             posted = store.post(fn, *args, **kw)
@@ -1125,10 +1145,15 @@ class _TaskqBridgeMixin(ManagerComponent):
         async def _write() -> None:
             try:
                 await posted
-            except _taskq.TaskStoreUnavailable:
+            except _taskq.TaskStoreUnavailable as exc:
                 _glue_logger.debug("taskq: %s write failed", what, exc_info=True)
+                if on_uncommitted is not None:
+                    on_uncommitted(exc)
             except Exception:
                 _glue_logger.warning("taskq: %s write raised", what, exc_info=True)
+            else:
+                if on_committed is not None:
+                    on_committed()
 
         return self.track_store_task(loop.create_task(_write()))
 
@@ -1203,7 +1228,14 @@ class _TaskqBridgeMixin(ManagerComponent):
         if store is None:
             return
         self._post_store_write(
-            store, f"fail {agent_id}", store.finish, agent_id, _taskq.FAILED, error=reason
+            store,
+            f"fail {agent_id}",
+            store.finish,
+            agent_id,
+            _taskq.FAILED,
+            error=reason,
+            on_uncommitted=lambda exc: self._record_refused_row(agent_id, reason, exc),
+            on_committed=lambda: self._clear_refused_row(agent_id),
         )
 
     async def taskq_fail_async(self, agent_id: str, reason: str) -> bool:
@@ -1230,17 +1262,74 @@ class _TaskqBridgeMixin(ManagerComponent):
 
         for attempt in (1, 2):
             try:
-                return await _asyncio.to_thread(_finish)
-            except _taskq.TaskStoreUnavailable:
+                committed = await _asyncio.to_thread(_finish)
+            except _taskq.TaskStoreUnavailable as exc:
                 if attempt == 2:
                     _glue_logger.warning(
-                        "taskq: fail %s did not commit after retry; the row may "
-                        "be re-dispatched by the pump or boot reconcile",
+                        "taskq: fail %s did not commit after retry; tombstoning "
+                        "the row so the pump and boot reconcile will not "
+                        "dispatch refused work",
                         agent_id,
                         exc_info=True,
                     )
+                    self._record_refused_row(agent_id, reason, exc)
                     return False
+                continue
+            if committed:
+                self._clear_refused_row(agent_id)
+            return committed
         return False
+
+    def _record_refused_row(self, agent_id: str, reason: str, exc: "BaseException | None") -> None:
+        """Tombstone a refusal whose terminal store write has not committed.
+
+        The caller was already told "refused", so the row must never run:
+        the pump consults the tombstone before dispatch and re-runs the durable
+        fail each drain until it commits, and the boot reconciler's probe
+        finishes a tombstoned row FAILED rather than requeueing it. Cleared the
+        moment a write commits the row terminal. Idempotent: a repeat failure
+        of the same row refreshes the reason without re-warning.
+        """
+        registry = getattr(self._manager, "_refused_rows", None)
+        if registry is None:
+            return
+        if agent_id not in registry:
+            _glue_logger.warning(
+                "taskq: fail %s did not commit; tombstoning the row so the "
+                "pump and boot reconcile will not dispatch refused work",
+                agent_id,
+                exc_info=exc,
+            )
+        registry[agent_id] = reason
+
+    def _clear_refused_row(self, agent_id: str) -> None:
+        """Drop the tombstone once a write commits the row terminal."""
+        registry = getattr(self._manager, "_refused_rows", None)
+        if registry is not None:
+            registry.pop(agent_id, None)
+
+    def refused_row_reason(self, agent_id: str) -> str:
+        """The recorded refusal reason for a row whose terminal write has not
+        committed, or "" when the row is not tombstoned."""
+        registry = getattr(self._manager, "_refused_rows", None)
+        if not registry:
+            return ""
+        return str(registry.get(agent_id) or "")
+
+    def taskq_boot_probe(self, rec: "_taskq.TaskRecord") -> "str | None":
+        """Boot-reconcile probe: the refusal tombstones outrank the artifacts.
+
+        A row whose refusal was announced but whose terminal write never
+        committed must not come back as requeued work: the probe answers
+        FAILED for it so `reconcile_on_boot` settles the row instead of
+        handing it to the dispatcher. Rows the registry does not know keep
+        the artifact rules (:meth:`taskq_artifact_probe`).
+        """
+        if self.refused_row_reason(rec.id):
+            from kiro_crew import taskq as _taskq
+
+            return _taskq.FAILED
+        return self.taskq_artifact_probe(rec)
 
     def taskq_settle(self, info: SubagentInfo, *, row_settled: bool = False) -> None:
         """Write the run's terminal state from its record; fenced by generation.
