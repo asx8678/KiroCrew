@@ -564,6 +564,17 @@ zero value can never remove the ceiling, and any accepted value is floored at 60
 from config `agent.workflow_run_timeout_secs`; a per-run `timeout_secs` overrides
 it for that run only, through the same clamp.
 
+When a slot-bound workflow finishes, the result is injected into its chat slot
+and — unless `agent.workflow_completion_turn` is `'off'` — one parent-agent turn
+is enqueued on that slot to answer the request that prompted the workflow
+(`workflow_startup._wf_on_done`'s `_auto_turn`). `'off'` injects the result only:
+no model turn is spent, for workflows whose own result already is the
+deliverable. Default `'chat'`; read at gateway boot (a hot-apply takes effect
+on the next restart). The edited-rerun half of this cost — re-running every
+`ctx.agent()` call because call indices shifted, even when a call's prompt and
+opts are unchanged — remains open: it needs a prompt+opts-hash-keyed replay
+cache threaded through `AgentResultFn` metadata.
+
 The wall-clock guard uses `asyncio.wait({task}, timeout=)`, **not**
 `asyncio.wait_for`: with `wait_for`, a timeout that races task completion can leak
 the inner `CancelledError` to the caller. With `wait` the loop never cancels for

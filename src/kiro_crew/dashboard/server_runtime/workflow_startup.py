@@ -83,8 +83,18 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
                     logger.warning("workflow %s auto-turn failed", run_id, exc_info=True)
 
             try:
+                # 'off': the injected result IS the deliverable; no model turn.
+                # The callback (which is what enqueues the parent-agent turn)
+                # is simply not passed, so the injection path stays identical.
+                on_injected = _auto_turn if _wf_completion_turn == "chat" else None
+                if on_injected is None:
+                    logger.info(
+                        "workflow %s finished with completion_turn=off; injecting "
+                        "the result without a parent-agent turn",
+                        run_id,
+                    )
                 delivery = asyncio.create_task(
-                    inject_bound_workflow_result(state, run_id, snapshot, on_injected=_auto_turn)
+                    inject_bound_workflow_result(state, run_id, snapshot, on_injected=on_injected)
                 )
                 state._background_tasks.add(delivery)
                 delivery.add_done_callback(state._background_tasks.discard)
@@ -103,9 +113,15 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
         _wf_concurrency = 4
         # The run ceiling is unaffected by that and IS config-driven.
         _wf_timeout_secs: int | None = None
+        # completion_turn: whether a finished slot-bound workflow ALSO runs one
+        # parent-agent turn on that slot ('chat', the default) or just injects
+        # its result ('off' — no model turn). Read at boot; hot-apply takes
+        # effect on the next gateway restart.
+        _wf_completion_turn = "chat"
         try:
             cfg = await asyncio.to_thread(KiroCrewConfig.load)
             _wf_timeout_secs = int(cfg.agent.workflow_run_timeout_secs)
+            _wf_completion_turn = str(getattr(cfg.agent, "workflow_completion_turn", "chat"))
         except Exception:
             logger.debug("workflow run-ceiling config unavailable; using default", exc_info=True)
 
