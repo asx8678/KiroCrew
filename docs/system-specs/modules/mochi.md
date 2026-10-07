@@ -37,6 +37,19 @@ the reconcile tick re-arms it once a target answers.
 | `.../queue_file.py`, `.../queue_poller.py` | the behaviour queue (planned moves/moods/reminders) + the poller that executes it — a **file-based scheduler that lives beside core `cron.py`**, not on top of it |
 | `.../watchlist_file.py`, `.../watchlist_service.py` | watch items (add/cancel/remove/update), cross-process-locked RMW |
 | `.../pinned_files_service.py`, `.../stats_service.py`, `.../idle_manager.py` | pinned-file tracking, companion stats, idle/presence |
+
+**Hidden-pet gating (UI-2).** The owner loop gates the poller on SHELL
+presence (the Electron window exists), and the poller now also takes a
+`pet_visible` flag: while the pet has been hidden longer than a 5-minute
+grace (`_PET_HIDDEN_GRACE_MS` in `hooks.py`), plan/replan and freestyle-task
+spawns pause — the autonomous work nobody can see. Watch checks,
+missed-notify recovery, deterministic tasks and reminders stay on shell
+presence, exactly as before. This NARROWS the original's deliberate
+parity rule ("polling continues while hidden") to the spawn kinds that cost
+model turns; the poll loop itself keeps running, and a visible pet (or a
+hide within the grace — a space switch, a fullscreen app) changes nothing.
+Poller tests construct the flag explicitly; a poller built without one keeps
+the original parity behaviour.
 | `.../notification_gate.py` | leading-edge notify gate (merge window, silent mode, critical bypass) |
 | `.../agent_policy.py` | builds the per-agent MCP policy (grants + **neutralize**) |
 | `.../soul_loader.py` | persona text + rendered agent prompt |

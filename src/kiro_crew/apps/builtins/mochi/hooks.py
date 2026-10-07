@@ -262,6 +262,11 @@ class MochiRuntime:
             _PollerCallbacks(self),
             clock=_now_ms,
             budget_provider=self.activity_budget,
+            # UI-2: the pet-visible-or-recently-hidden flag, read per poll —
+            # a short hide is not an off switch, a sustained one is.
+            pet_visible=lambda: (
+                _now_ms() - self._last_presence_ms <= _PRESENCE_FRESH_MS + _PET_HIDDEN_GRACE_MS
+            ),
         )
         self._task: asyncio.Task[None] | None = None
         # Strong refs to in-flight polls (asyncio may GC unreferenced tasks);
@@ -1031,6 +1036,9 @@ class MochiRuntime:
         # Fire-and-forget from the poller's perspective; consume the outcome so a
         # failed write is logged instead of warning about an unretrieved exception.
         fut.add_done_callback(_report)
+
+
+_PET_HIDDEN_GRACE_MS = 5 * 60_000
 
 
 class _IdleCallbacks:

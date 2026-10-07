@@ -223,6 +223,7 @@ class QueuePoller:
         callbacks: Any,
         clock: Callable[[], int] | None = None,
         budget_provider: Callable[[], Any] | None = None,
+        pet_visible: Callable[[], bool] | None = None,
     ) -> None:
         self._queue_path = queue_path
         self._callbacks = callbacks
@@ -230,6 +231,10 @@ class QueuePoller:
         # poll). None preserves the vendored constants exactly — the ported
         # behaviour stays the differential-testing baseline.
         self._budget_provider = budget_provider
+        # UI-2: optional pet-visibility flag. None keeps the original parity
+        # behaviour (polling continues while hidden) — the vendored tests and
+        # any headless host that never wires presence keep it.
+        self._pet_visible = pet_visible
         self._clock: Callable[[], int] = clock or (lambda: int(time.time() * 1000))
 
         self._polling = False
@@ -544,7 +549,20 @@ class QueuePoller:
                 logger.exception("[QueuePoller] missed-notification recovery failed")
 
         # 6. Route check — plan / replan / execute.
+        # UI-2: plan/replan (and freestyle spawns below) pause while the pet
+        # has been hidden longer than the grace period — a sustained hide is
+        # the user's off switch for NEW autonomous work, and the deliberate
+        # original-parity rule ("polling continues while hidden") is
+        # narrowed to the work nobody can see. Watch checks, missed-notify
+        # recovery and deterministic tasks above stay on shell presence.
+        _pet_recently_visible = self._pet_visible is None or self._pet_visible()
         route = qf.route_poll(queue, now_ms=self._clock())
+        if route in ("plan", "replan") and not _pet_recently_visible:
+            # UI-2: sustained hide — no plan/replan spawn. The route is still
+            # consumed (return, as the visible branch does): freestyle tasks in
+            # an expired-plan queue wait for the pet to return, and the watch
+            # checks above already ran on shell presence.
+            return
         if route in ("plan", "replan"):
             if queue_modified:
                 queue = qf.cleanup_done_tasks(queue, now_ms=self._clock())
@@ -574,6 +592,11 @@ class QueuePoller:
         # 7. route == 'execute': freestyle agent tasks, serially.
         for task in due_tasks:
             if task.get("type") not in AGENT_TYPES:
+                continue
+            # UI-2: freestyle spawns pause on the same sustained-hide flag as
+            # plan/replan — the work nobody can see. The task stays due; the
+            # next poll after the pet returns picks it up.
+            if not _pet_recently_visible:
                 continue
             # UI-5: a task whose last spawn was refused is not due until its
             # retry_at passes; completed/absent tasks drop out of the map.
