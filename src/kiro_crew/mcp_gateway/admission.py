@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import logging
 import time
 from collections import deque
@@ -201,8 +202,20 @@ OnQueued = Callable[[QueuePosition], Awaitable[None]]
 OnSettle = Callable[[str], None]
 
 
+# Bounded aging: a background spawn that has waited this long is promoted
+# to interactive, so a stream of person-initiated sessions cannot starve
+# prewarm/pooled refills behind them forever.
+BACKGROUND_AGING_SECS = 300.0
+
+
 class SpawnGate:
-    """FIFO admission with a movable fixed capacity. Single event loop."""
+    """Priority admission with a movable fixed capacity. Single event loop.
+
+    Two priority classes: ``interactive`` (a person-initiated session start)
+    is granted ahead of ``background`` (prewarm, pooled refills), FIFO within
+    each class, with a background waiter aged to interactive after
+    :data:`BACKGROUND_AGING_SECS` so neither class starves the other.
+    """
 
     def __init__(
         self,
@@ -224,6 +237,7 @@ class SpawnGate:
         self._on_settle = on_settle
         self._in_flight = 0
         self._waiters: deque[_Waiter] = deque()
+        self._background_waiters: deque[_Waiter] = deque()
         self._closed = False
         self._watchers: set[asyncio.Task[None]] = set()
         self._outcomes: dict[str, int] = {o: 0 for o in _OUTCOMES}
@@ -281,26 +295,30 @@ class SpawnGate:
         deadline: Optional[float] = None,
         on_queued: Optional[OnQueued] = None,
         keepalive_secs: float = QUEUED_KEEPALIVE_SECS,
+        priority: str = "background",
     ) -> Permit:
-        """Wait for a slot in FIFO order and return its :class:`Permit`.
+        """Wait for a slot and return its :class:`Permit`.
 
+        ``priority="interactive"`` (a person-initiated session) is granted
+        ahead of queued ``background`` waiters (prewarm, pooled refills);
+        FIFO within each class. A background waiter is aged to interactive
+        after :data:`BACKGROUND_AGING_SECS`, so neither class starves.
         ``deadline`` is an absolute time on this gate's clock; ``None`` waits
         until admitted or closed. ``on_queued`` runs every ``keepalive_secs``
-        while queued and receives the waiter's current position; an exception
-        from it abandons the wait (the caller's connection is what usually fails
-        there, and there is nobody left to admit).
+        while queued.
         """
         if self._closed:
             raise SpawnGateClosed("spawn gate closed")
         now = self._clock()
-        if not self._waiters and self._in_flight < self._capacity:
+        queue = self._waiters if priority == "interactive" else self._background_waiters
+        if not self._waiters and not self._background_waiters and self._in_flight < self._capacity:
             self._in_flight += 1
             self._granted += 1
             return Permit(self, label, now)
 
         loop = asyncio.get_running_loop()
         waiter = _Waiter(loop.create_future(), label, now)
-        self._waiters.append(waiter)
+        queue.append(waiter)
         try:
             while True:
                 now = self._clock()
@@ -354,7 +372,7 @@ class SpawnGate:
 
     def _position_of(self, waiter: _Waiter) -> int:
         position = 0
-        for w in self._waiters:
+        for w in itertools.chain(self._waiters, self._background_waiters):
             if w.future.done():
                 continue
             position += 1
@@ -365,6 +383,8 @@ class SpawnGate:
     def _drop_waiter(self, waiter: _Waiter) -> None:
         with contextlib.suppress(ValueError):
             self._waiters.remove(waiter)
+        with contextlib.suppress(ValueError):
+            self._background_waiters.remove(waiter)
         if not waiter.future.done():
             waiter.future.cancel()
 
@@ -375,8 +395,25 @@ class SpawnGate:
     def _wake(self) -> None:
         if self._closed:
             return
-        while self._waiters and self._in_flight < self._capacity:
-            waiter = self._waiters.popleft()
+        # Age background waiters past the bound to the interactive queue,
+        # so a stream of person-initiated sessions cannot starve prewarm
+        # and pooled refills behind them indefinitely.
+        now = self._clock()
+        while self._background_waiters:
+            w = self._background_waiters[0]
+            if w.future.done():
+                self._background_waiters.popleft()
+                continue
+            if now - w.enqueued_at >= BACKGROUND_AGING_SECS:
+                self._background_waiters.popleft()
+                self._waiters.append(w)
+            else:
+                break
+        while self._in_flight < self._capacity:
+            queue = self._waiters if self._waiters else self._background_waiters
+            if not queue:
+                return
+            waiter = queue.popleft()
             if waiter.future.done():
                 continue
             self._in_flight += 1
