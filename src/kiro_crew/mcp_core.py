@@ -1618,17 +1618,21 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
     ``"unknown session"`` intact, so downstream matching is unaffected.
     """
     try:
-        raw = exc.read().decode("utf-8", "replace").strip()
+        # Bounded read: a hostile or broken server can return a body of any
+        # size, and only the first slice is ever used, so never buffer it all.
+        raw = exc.read(64 * 1024).decode("utf-8", "replace").strip()
     except Exception:
         raw = ""
     message = raw or str(exc)
     counted = False
     code = ""
+    structured = False
     if raw:
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, dict) and "error" in parsed:
                 message = str(parsed["error"])
+                structured = True
                 # Preserve api_spawn's "this rejection was already counted"
                 # marker (wave-liveness reconcile) — it must survive the
                 # error-body flattening or spawn_run would double-reconcile
@@ -1645,6 +1649,13 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
                     code = raw_code
         except Exception:
             pass
+    if not structured and len(message) > 300:
+        # A non-JSON body (a proxy's HTML error page, a stack trace) is
+        # server-controlled prose with no structure to match on: keep the head
+        # and name how much was dropped, so a 300 KB error page cannot become
+        # a 100k-char tool result (the transport's own ceiling). A JSON
+        # {error} body was extracted above and stays whole.
+        message = message[:300] + f"… ({len(message)} bytes)"
     message, _ = redact_exfiltration_urls(message)
     message, _ = redact_credentials(message)
     if code == "internal_auth_mismatch":

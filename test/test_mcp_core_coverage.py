@@ -97,6 +97,22 @@ class TestHttpErrorBody:
         err = _http_error(502, b"upstream exploded")
         assert _http_error_body(err)["error"] == "upstream exploded"
 
+    def test_an_oversized_non_json_body_is_capped_with_a_byte_count(self):
+        """TOOL-18: a proxy's HTML error page is server-controlled prose with
+        no structure to match on — keep the head and name the drop, so a huge
+        body cannot become a 100k-char tool result."""
+        body = b"<html>" + b"x" * 20_000 + b"</html>"
+        err = _http_error(502, body)
+        out = _http_error_body(err)["error"]
+        assert len(out) <= 400
+        assert out.startswith("<html>")
+        assert out.endswith(f"… ({len(body)} bytes)")
+
+    def test_a_json_error_body_stays_whole_past_the_cap(self):
+        long_message = "detailed but structured " * 40  # ~880 chars
+        err = _http_error(400, json.dumps({"error": long_message}).encode())
+        assert _http_error_body(err)["error"] == long_message
+
     def test_json_without_error_key_falls_back_to_raw_body(self):
         err = _http_error(400, b'{"detail": "nope"}')
         assert _http_error_body(err)["error"] == '{"detail": "nope"}'
