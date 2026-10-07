@@ -27,6 +27,7 @@ from kiro_crew.validation import (
     WORKFLOW_AUTHOR_SCHEMA,
     WORKFLOW_LIBRARY_LIST_SCHEMA,
     WORKFLOW_RERUN_SCHEMA,
+    WORKFLOW_RESULT_SCHEMA,
     WORKFLOW_RUN_ID_SCHEMA,
     WORKFLOW_RUN_SCHEMA,
     validate_tool_args,
@@ -130,15 +131,23 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "workflow_result",
             "description": (
-                "Get a workflow run's full result + event stream by run_id "
-                "(phases, per-agent outcomes, logs, final result). For a run that "
-                "ended without a usable return value, also returns the agent "
-                "payloads that completed first as `partial_results` and any "
-                "per-agent failure reasons as `agent_errors`."
+                "Get a workflow run's outcome by run_id. The default summary "
+                "returns status, the final result (capped ~8k chars), any "
+                "per-agent failure reasons and partial outputs, and the LAST 20 "
+                "events; call again with section='events' (or 'agent_results') "
+                "plus offset/limit to page through the rest."
             ),
             "inputSchema": {
                 "type": "object",
-                "properties": {"run_id": {"type": "string"}},
+                "properties": {
+                    "run_id": {"type": "string"},
+                    "section": {
+                        "type": "string",
+                        "enum": ["summary", "events", "agent_results"],
+                    },
+                    "offset": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1},
+                },
                 "required": ["run_id"],
             },
         },
@@ -365,9 +374,17 @@ def workflow_status(name: str, args: dict[str, Any]) -> str:
     )
 
 
+_WORKFLOW_RESULT_CAP_CHARS = 8_000  # final result cap in the summary (TOOL-7)
+_WORKFLOW_RESULT_EVENT_TAIL = 20  # events the summary carries (TOOL-7)
+_WORKFLOW_RESULT_PAGE_DEFAULT = 200  # default page for section= paging
+
+
 def workflow_result(name: str, args: dict[str, Any]) -> str:
-    args = validate_tool_args(args, WORKFLOW_RUN_ID_SCHEMA)
+    args = validate_tool_args(args, WORKFLOW_RESULT_SCHEMA)
     run_id = args.get("run_id", "")
+    section = args.get("section", "summary")
+    offset = int(args.get("offset", 0))
+    limit = int(args.get("limit", _WORKFLOW_RESULT_PAGE_DEFAULT))
     session_key, error = _workflow_identity()
     if not session_key:
         return _wf_return(name, error, outcome="error", session_key="")
@@ -389,24 +406,63 @@ def workflow_result(name: str, args: dict[str, Any]) -> str:
     # ``partial_results`` / ``agent_errors`` carry the same class of content and
     # MUST be projected here: when a run ends without a usable return value they
     # are the only surviving output, and the completion message points the reader
-    # at this tool to read them. Omitting them made that instruction a dead end.
-    # Oversize payloads are handled by the MCP gateway's existing result spill.
-    wf_payload: dict[str, Any] = {
-        "run_id": d.get("run_id"),
-        "status": d.get("status"),
-        "result": _redact_obj(d.get("result")),
-        "error": _redact_obj(d.get("error")),
-        "events": _redact_obj(d.get("events", [])),
-    }
-    if d.get("agent_results"):
-        wf_payload["agent_results"] = _redact_obj(d.get("agent_results"))
-    if d.get("partial_results"):
-        wf_payload["partial_results"] = _redact_obj(d.get("partial_results"))
-    if d.get("agent_errors"):
-        wf_payload["agent_errors"] = _redact_obj(d.get("agent_errors"))
+    # at this tool to read them.
+    events = _redact_obj(d.get("events", []))
+    if section == "events":
+        page = events[offset : offset + max(1, limit)]
+        wf_payload: dict[str, Any] = {
+            "run_id": d.get("run_id"),
+            "status": d.get("status"),
+            "events": page,
+            "events_total": len(events),
+            "events_offset": offset,
+            "has_more": offset + len(page) < len(events),
+        }
+    elif section == "agent_results":
+        results = _redact_obj(d.get("agent_results") or {})
+        keys = list(results.keys())[offset : offset + max(1, limit)]
+        wf_payload = {
+            "run_id": d.get("run_id"),
+            "status": d.get("status"),
+            "agent_results": {k: results[k] for k in keys},
+            "keys_total": len(results),
+            "has_more": offset + len(keys) < len(results),
+        }
+    else:
+        # TOOL-7: the default SUMMARY answers "what happened" in one bounded
+        # read — status, error, the failures and the partial outputs (the
+        # fields the completion message points here for) BEFORE any events,
+        # the final result capped, and the LAST events. The old shape
+        # serialized the whole event stream first with indent=2, and the
+        # transport's head-only 100k cut then dropped exactly the trailing
+        # agent_results/partial_results/agent_errors.
+        result = _redact_obj(d.get("result"))
+        if isinstance(result, str) and len(result) > _WORKFLOW_RESULT_CAP_CHARS:
+            result = (
+                result[:_WORKFLOW_RESULT_CAP_CHARS]
+                + f"… [result truncated, {len(result) - _WORKFLOW_RESULT_CAP_CHARS} "
+                "more chars]"
+            )
+        wf_payload = {
+            "run_id": d.get("run_id"),
+            "status": d.get("status"),
+            "result": result,
+            "error": _redact_obj(d.get("error")),
+        }
+        if d.get("partial_results"):
+            wf_payload["partial_results"] = _redact_obj(d.get("partial_results"))
+        if d.get("agent_errors"):
+            wf_payload["agent_errors"] = _redact_obj(d.get("agent_errors"))
+        wf_payload["events"] = events[-_WORKFLOW_RESULT_EVENT_TAIL:]
+        wf_payload["events_total"] = len(events)
+        wf_payload["paging"] = (
+            f"showing the last {min(len(events), _WORKFLOW_RESULT_EVENT_TAIL)} of "
+            f"{len(events)} events; call again with section='events' and "
+            "offset/limit to page through the rest"
+        )
     return _wf_return(
         "workflow_result",
-        json.dumps(wf_payload, indent=2, default=str),
+        json.dumps(wf_payload, ensure_ascii=False, default=str, separators=(",", ":")),
         session_key=session_key,
     )
 
