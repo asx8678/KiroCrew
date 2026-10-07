@@ -10702,9 +10702,35 @@ def _rewrite_notifications(notifications: list[dict[str, str]]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = [json.dumps(n) + "\n" for n in notifications[-_MAX_PERSISTED_NOTIFICATIONS:]]
-        path.write_text("".join(lines), encoding="utf-8")
+        # Atomic temp-file + rename: an in-place write_text truncates first,
+        # so a kill or ENOSPC partway leaves a truncated or empty history.
+        atomic_write(path, "".join(lines))
     except Exception:
-        logger.debug("Failed to rewrite notifications file", exc_info=True)
+        _notifications_persist_failure("rewrite")
+
+
+# Last monotonic time a notifications trim/rewrite failure was surfaced. A
+# persistently failing trim (unreadable rows, a permission change, a full
+# disk) fires on every append, so the first failure warns and the rest stay
+# quiet for the interval — visible to an operator, never a flood.
+_NOTIFICATIONS_PERSIST_WARN_INTERVAL = 300.0
+_NOTIFICATIONS_PERSIST_WARN_AT = 0.0
+
+
+def _notifications_persist_failure(context: str) -> None:
+    """Surface a notifications-history write failure, rate-limited.
+
+    Both the trim and the rewrite are best-effort by design (history is a
+    cache; delivery is the broadcast), but a failure an operator never sees
+    is a file that grows without bound and no record of why. First failure
+    and at most one per interval logs at WARNING with the exception attached.
+    """
+    global _NOTIFICATIONS_PERSIST_WARN_AT
+    now = time.monotonic()
+    if now - _NOTIFICATIONS_PERSIST_WARN_AT < _NOTIFICATIONS_PERSIST_WARN_INTERVAL:
+        return
+    _NOTIFICATIONS_PERSIST_WARN_AT = now
+    logger.warning("Notifications history %s failed", context, exc_info=True)
 
 
 def _maybe_trim_notifications(path: Path) -> None:
@@ -10759,9 +10785,11 @@ def _maybe_trim_notifications(path: Path) -> None:
             1, _MAX_PERSISTED_NOTIFICATIONS // _UNSERVABLE_NOTIFICATION_CAP_DIVISOR
         )
         kept = sorted(set(live[-_MAX_PERSISTED_NOTIFICATIONS:]) | set(unservable[-unservable_cap:]))
-        path.write_text("".join(lines[index] for index in kept), encoding="utf-8", newline="")
+        # Atomic for the same reason as _rewrite_notifications: the trim runs
+        # after every append, so a crash mid-rewrite costs the whole history.
+        atomic_write(path, "".join(lines[index] for index in kept), newline="")
     except Exception:
-        pass
+        _notifications_persist_failure("trim")
 
 
 def _fmt_duration(secs: int) -> str:
