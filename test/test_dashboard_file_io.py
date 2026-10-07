@@ -56,9 +56,11 @@ def home_patch(tmp_path):
     def fake_expanduser(p):
         return p.replace("~", str(tmp_path))
 
-    with patch("os.path.expanduser", side_effect=fake_expanduser), patch(
-        "os.path.realpath", side_effect=real_realpath
-    ), patch("pathlib.Path.home", return_value=tmp_path):
+    with (
+        patch("os.path.expanduser", side_effect=fake_expanduser),
+        patch("os.path.realpath", side_effect=real_realpath),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
         yield tmp_path
 
 
@@ -76,6 +78,50 @@ class TestFileRead:
                 outcome="success",
                 resources=str(tmp_file),
             )
+
+    @pytest.mark.asyncio
+    async def test_a_credential_straddling_the_cap_is_fully_redacted(
+        self, tmp_path, mock_sel, home_patch
+    ):
+        """SEC-14: the read redacts BEFORE the cap cut. A ghp_ token whose span
+        crosses the cap must not serve its first half unmasked — the probe
+        fetches a margin past the cap so the redactor sees the whole token."""
+        from kiro_crew.dashboard.handlers import files as files_handlers
+
+        cap = files_handlers._FILE_READ_CAP
+        token = "ghp_" + "A1b2C3d4E5f6G7h8I9j"
+        filler = "x" * (cap - 20)
+        body = filler + token + "y" * 400
+        target = tmp_path / "straddle.txt"
+        target.write_text(body, encoding="utf-8")
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/file-read?path={target}")
+            assert resp.status == 200
+            text = await resp.text()
+            assert "ghp_" not in text
+            assert "A1b2C3d4E5f6G7h8" not in text
+            assert "[REDACTED" in text or "REDACTED" in text
+            assert resp.headers.get("X-Truncated") == "true"
+            assert resp.headers.get("X-Redacted") == "true"
+
+    @pytest.mark.asyncio
+    async def test_a_clean_file_past_the_cap_is_served_uncut_with_no_redaction_header(
+        self, tmp_path, mock_sel, home_patch
+    ):
+        """The X-Redacted verdict still names the SERVED slice: a file with no
+        credentials reports no redaction even when the margin saw more text."""
+        from kiro_crew.dashboard.handlers import files as files_handlers
+
+        cap = files_handlers._FILE_READ_CAP
+        target = tmp_path / "clean.txt"
+        target.write_text("a" * (cap + 500), encoding="utf-8")
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/file-read?path={target}")
+            assert resp.status == 200
+            text = await resp.text()
+            assert "X-Redacted" not in resp.headers
+            assert resp.headers.get("X-Truncated") == "true"
+            assert len(text) >= cap  # the whole capped read arrived
 
     @pytest.mark.asyncio
     async def test_read_missing_path(self, mock_sel):
@@ -236,7 +282,9 @@ class TestFileRead:
         # an editable buffer over an archive, where a save is corruption. The
         # extension is answered first for exactly this class.
         f = tmp_path / "libthin.a"
-        f.write_bytes(b"!<thin>\n/               0           0     0     0       14        `\nmain.o/\n")
+        f.write_bytes(
+            b"!<thin>\n/               0           0     0     0       14        `\nmain.o/\n"
+        )
         assert b"\x00" not in f.read_bytes()
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get(f"/api/file-read?path={f}")
@@ -660,8 +708,7 @@ class TestFileWrite:
         # decide, and None there (Windows) is what keeps os.replace working
         # while any other handle is open. The kwarg itself must always be passed.
         handler_pins = (
-            files_mod.pinned_fs.supports_pinned_walk()
-            and aw.pinned_parent_replace_supported()
+            files_mod.pinned_fs.supports_pinned_walk() and aw.pinned_parent_replace_supported()
         )
         assert "preserve_access_control_from" in kwargs
         if handler_pins or aw.ACCESS_CONTROL_XATTRS_SUPPORTED:
@@ -772,7 +819,12 @@ class TestSendMessage:
             resp = await client.post("/api/send-message", json={"text": "hello"})
             assert resp.status == 200
             data = await resp.json()
-            assert data == {"ok": True, "slack": False, "session": False, "delivered_to": "notification"}
+            assert data == {
+                "ok": True,
+                "slack": False,
+                "session": False,
+                "delivered_to": "notification",
+            }
             state.notify.assert_called_once_with("agent", "Agent Message", "hello")
 
     @pytest.mark.asyncio
@@ -788,7 +840,13 @@ class TestSendMessage:
             )
             assert resp.status == 200
             data = await resp.json()
-            assert data == {"ok": True, "slack": True, "session": False, "delivered_to": "slack", "ts": "1712793600.000001"}
+            assert data == {
+                "ok": True,
+                "slack": True,
+                "session": False,
+                "delivered_to": "slack",
+                "ts": "1712793600.000001",
+            }
             state.notify.assert_called_once_with("agent", "Test", "hello")
             slack.open_dm.assert_called_once_with("U123")
             slack.post_message.assert_called_once_with(
@@ -845,7 +903,13 @@ class TestSendMessage:
             )
             assert resp.status == 200
             data = await resp.json()
-            assert data == {"ok": True, "slack": True, "session": False, "delivered_to": "slack", "ts": "1712793600.000001"}
+            assert data == {
+                "ok": True,
+                "slack": True,
+                "session": False,
+                "delivered_to": "slack",
+                "ts": "1712793600.000001",
+            }
             slack.post_blocks.assert_called_once_with(
                 "C123",
                 blocks,
@@ -914,11 +978,12 @@ class TestSendMessage:
         mock_job.session_key = "dashboard:chat-1-1712793600"
         state.crons.list_jobs = MagicMock(return_value=[mock_job])
         app = _make_send_app(state)
-        with patch(
-            "kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock
-        ) as mock_run, patch(
-            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"
-        ) as mock_rehydrate:
+        with (
+            patch("kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock) as mock_run,
+            patch(
+                "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"
+            ) as mock_rehydrate,
+        ):
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
                     "/api/send-message",
@@ -930,7 +995,12 @@ class TestSendMessage:
                 )
                 assert resp.status == 200
                 data = await resp.json()
-                assert data == {"ok": True, "slack": False, "session": True, "delivered_to": "session"}
+                assert data == {
+                    "ok": True,
+                    "slack": False,
+                    "session": True,
+                    "delivered_to": "session",
+                }
                 # Hot-path: in-memory slot found, no rehydrate needed.
                 state.get_slot.assert_called_once_with("chat-1-1712793600")
                 mock_rehydrate.assert_not_called()
@@ -1017,12 +1087,13 @@ class TestSendMessage:
         mock_job.session_key = "dashboard:chat-1-1712793600"
         state.crons.list_jobs = MagicMock(return_value=[mock_job])
         app = _make_send_app(state)
-        with patch(
-            "kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock
-        ) as mock_run, patch(
-            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async",
-            return_value=mock_slot,
-        ) as mock_rehydrate:
+        with (
+            patch("kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock) as mock_run,
+            patch(
+                "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async",
+                return_value=mock_slot,
+            ) as mock_rehydrate,
+        ):
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
                     "/api/send-message",
@@ -1031,7 +1102,12 @@ class TestSendMessage:
                 assert resp.status == 200
                 data = await resp.json()
                 # Session delivery succeeded — no Slack DM fallback.
-                assert data == {"ok": True, "slack": False, "session": True, "delivered_to": "session"}
+                assert data == {
+                    "ok": True,
+                    "slack": False,
+                    "session": True,
+                    "delivered_to": "session",
+                }
                 # Hot-path miss: get_slot called first, then rehydrate helper.
                 state.get_slot.assert_called_once_with("chat-1-1712793600")
                 mock_rehydrate.assert_called_once_with(state, "chat-1-1712793600")
@@ -1106,7 +1182,8 @@ class TestSendMessage:
         state.crons.list_jobs = MagicMock(return_value=[mock_job])
         app = _make_send_app(state)
         with patch(
-            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async", return_value=None
+            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async",
+            return_value=None,
         ) as mock_rehydrate:
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
@@ -1155,9 +1232,10 @@ class TestSendMessage:
         mock_job.session_key = "dashboard:chat-1-1712793600"
         state.crons.list_jobs = MagicMock(return_value=[mock_job])
         app = _make_send_app(state)
-        with patch(
-            "kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock
-        ) as mock_run, patch("kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"):
+        with (
+            patch("kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock) as mock_run,
+            patch("kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"),
+        ):
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
                     "/api/send-message",
@@ -1169,7 +1247,12 @@ class TestSendMessage:
                 )
                 assert resp.status == 200
                 data = await resp.json()
-                assert data == {"ok": True, "slack": False, "session": True, "delivered_to": "session"}
+                assert data == {
+                    "ok": True,
+                    "slack": False,
+                    "session": True,
+                    "delivered_to": "session",
+                }
                 state.get_slot.assert_called_once_with("chat-1-1712793600")
                 mock_run.assert_called_once()
 
