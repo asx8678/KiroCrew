@@ -2059,7 +2059,23 @@ real arguments** the ACP event carries:
   `raw_params["path"]` → `filesystem.read`.
 - `tool_kind == "edit"` + `raw_params["path"]` → `filesystem.write`.
 - `tool_kind == "fetch"` + `raw_params["url"]` → `network.egress` (the host is
-  extracted from the URL so the `host` matcher applies).
+  extracted from the URL so the `host` matcher applies). `_url_host` derives
+  that host the way a WHATWG URL parser — the standard the fetching client
+  follows — would: for the special schemes (`http`/`https`/`ws`/`wss`/`ftp`)
+  a `\` folds to `/`, every `/` run after the scheme is skipped, and the
+  authority ends at the first `/?#`, so `https:evil.com`, `http:/evil.com`
+  and `https://evil.com\@good.com/` all resolve `evil.com`, while
+  `https://good.com@evil.com/` still resolves `evil.com`. The extracted host
+  is then normalised the way the client normalises it: percent-decode, IPv4
+  canonical form (`0x7f.1` → `127.0.0.1`), IDNA mapping (`evil。com` →
+  `evil.com`), lowercase, one trailing `.` stripped (DNS reads `evil.com.` as
+  `evil.com`), IPv6 literals unwrapped to canonical compressed form — so a
+  deny list binds on every spelling of the host it names, in both ruleset
+  modes. A special-scheme URL whose host cannot be derived at all yields the
+  never-permittable `_UNCLASSIFIABLE_EGRESS_ITEM` marker (modelled on
+  `_TRUNCATED_SCAN_ITEM`): a governed allow-mode ceiling denies the
+  unverifiable fetch, while a targeted deny-mode ceiling keeps the documented
+  marker semantics — such a URL names no host any client would connect to.
 
 Because the item under test is that extracted host, a `host`-matcher pattern
 that carries a character or shape no host can hold never matches. The checks run
@@ -2067,8 +2083,10 @@ in this order, and the first to hold names the reason: a `/` (a scheme, a path o
 a CIDR mask), an `@` (userinfo), IPv6 brackets (the pattern starts with `[` and
 `_url_host` of the pattern yields an address holding a `:`, as `[::1]` and
 `[::1]:443` both yield `::1`; `_url_host` unwraps them, so the item never has
-them), or a port, meaning exactly one colon with a
-non-empty text before it and only digits after. Exactly one colon is what tells a
+them), a port, meaning exactly one colon with a
+non-empty text before it and only digits after, or a trailing `.`
+(extracted hosts have exactly one FQDN-marker dot stripped in
+`_normalize_host`, so an entry that still ends in one can never match). Exactly one colon is what tells a
 port from an IPv6 literal, which always has two or more, so a bare `::1` or
 `2001:db8::1` stays silent and so does a single-label `server`, while `server:443`
 warns. The text before the colon must also hold no `*`, `?` or `[`: a glob can
@@ -2076,10 +2094,10 @@ absorb a colon, so `*:443` matches the item `fe80::443` that
 `https://[fe80::443]/x` yields, and `*:443` or `web*:443` stays silent. Any other bracket is an fnmatch character class, which `_match_host`
 honours, so `[ab].example.com`, `[a:].example.com` or
 `web[0-9][0-9].corp.example` is live and stays silent: a colon inside a class
-does not make it IPv6, since `_url_host` finds no host in `[a:].example.com`. Otherwise deadness is read off the pattern, not off `_url_host`: that function cuts a
-bare IPv6 literal at its last colon (`::1` gives `:`) and a netloc at the first
-`?` (`api?.skills.sh` gives `api`), so comparing its output to the pattern would
-condemn live rules. The entry is dead: in deny mode the scope permits exactly what
+does not make it IPv6, since `_url_host` finds no host in `[a:].example.com`. Otherwise deadness is read off the pattern, not off `_url_host`: that function maps a
+bare IPv6 literal to the unclassifiable marker (`::1` does not round-trip to
+itself) and cuts a netloc at the first `?` (`api?.skills.sh` gives `api`), so
+comparing its output to the pattern would condemn live rules. The entry is dead: in deny mode the scope permits exactly what
 the operator wrote it to block, and in allow mode it refuses it.
 `ScopedRuleset.from_dict` therefore logs a warning (beside the Rule-1 dead-deny
 one) naming the scope and the entry's position, such as `deny[0]`. It never logs
