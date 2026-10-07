@@ -5,13 +5,15 @@ platform-native isolation, per tier:
 
 - ``standard`` (what the default ``"auto"`` resolves to) masks ``~/.gnupg``,
   ``~/.docker``, ``~/.azure``, ``~/.config/gcloud``, the crew vault and the
-  governance cache -- and DELIBERATELY leaves ``~/.aws``, ``~/.ssh`` and
-  ``~/.kube`` visible so the aws CLI, ``credential_process``, git-over-SSH and
-  kubectl keep working inside the agent (see ``_STANDARD_DIRS``). The file
-  tools still refuse those paths through ``is_sensitive_path``; a spawned
+  governance cache -- and DELIBERATELY leaves ``~/.aws``, ``~/.ssh``, ``~/.kube``,
+  ``~/.config/gh``, ``~/.npmrc``, ``~/.netrc`` and ``~/.git-credentials``
+  visible so the aws CLI, ``credential_process``, git-over-SSH, kubectl and the
+  gh/npm credential flows keep working inside the agent (see ``_STANDARD_DIRS``).
+  The file tools still refuse those paths through ``is_sensitive_path``; a spawned
   shell's ``open()`` is not fenced at this tier.
 - ``strict`` masks all of the above plus ``~/.aws``, ``~/.kube``,
-  ``~/.config/gh`` and ``~/.ssh`` (exposing only ``~/.ssh/known_hosts``).
+  ``~/.config/gh``, ``~/.ssh``, ``~/.npmrc``, ``~/.netrc`` and
+  ``~/.git-credentials`` (exposing only ``~/.ssh/known_hosts``).
 - ``cc`` is the Claude Code backend's tier: ``strict`` minus ``~/.ssh`` and
   ``~/.config/gh``, with a read-only copy of ``~/.aws/config`` exposed for
   Bedrock auth.
