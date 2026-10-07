@@ -294,6 +294,16 @@ _CREDENTIAL_PATTERNS_SANS_JWT = re.compile(
     _CREDENTIAL_PATTERNS.pattern.replace(f"|{JWT_MULTI_SEGMENT}", "", 1)
 )
 
+#: The multi-segment JWT branch alone, compiled to re-anchor a candidate that
+#: :func:`_multi_segment_jwt_spans` located by index arithmetic (see there
+#: for why the branch cannot be retried at every ``eyJ`` offset).
+_JWT_MULTI_RE = re.compile(JWT_MULTI_SEGMENT)
+
+#: A maximal run of the characters a multi-segment JWT can be made of. The
+#: branch cannot cross such a boundary, so its candidates are enumerable per
+#: run instead of retried at every offset of the whole text.
+_JWT_TOKEN_RUN_RE = re.compile(r"[A-Za-z0-9_.-]+")
+
 
 def _is_json_object_segment(segment: str) -> bool:
     """Whether *segment* base64url-decodes to a JSON object: JOSE, itsdangerous, Flask session."""
@@ -304,29 +314,103 @@ def _is_json_object_segment(segment: str) -> bool:
     return isinstance(header, dict)
 
 
-def _credential_matches(text: str) -> Iterator[re.Match[str]]:
-    """``_CREDENTIAL_PATTERNS.finditer(text)``, minus JWT-branch hits whose header is not JSON.
+def _multi_segment_jwt_spans(text: str) -> Iterator[tuple[int, int]]:
+    """Every span ``JWT_MULTI_SEGMENT`` matches, found without per-``eyJ`` rescans.
 
-    A rejected hit retries the other branches at its start, then resumes one character on,
-    so a credential nested inside the rejected span is still found. A header holding a
-    second ``eyJ`` stays a credential: rejecting it would rescan that header once per ``eyJ``.
+    Retrying that branch's regex at every ``eyJ`` offset is quadratic on a long
+    dot-less base64url run -- at each offset the engine walks
+    ``[A-Za-z0-9_-]+`` to the run's end and backtracks -- which froze the
+    dashboard's event loop for seconds on one crafted file read. A
+    multi-segment JWT cannot cross a maximal ``[A-Za-z0-9_.-]`` run, so each
+    run is walked once and its candidates are read off by index arithmetic:
+
+    * the first segment is the base64url chars from the ``eyJ`` to the next
+      ``.`` -- empty (no match) when that dot is immediate, absent (no match)
+      when the run holds no dot past the ``eyJ``;
+    * the greedy ``{2,4}`` dot-groups need one further dot and consume at most
+      four, so the match ends right before the fifth dot, or at the run's end
+      when it holds fewer.
     """
+    for run in _JWT_TOKEN_RUN_RE.finditer(text):
+        chunk = run.group()
+        if "." not in chunk:
+            # No separator anywhere in the run: no offset inside can match.
+            # This is the crafted shape that made the per-offset retry
+            # quadratic, answered here before any per-``eyJ`` work.
+            continue
+        base = run.start()
+        dots = [i for i, c in enumerate(chunk) if c == "."]
+        at = chunk.find("eyJ")
+        while at != -1:
+            j = bisect.bisect_left(dots, at + 3)
+            if j < len(dots) and dots[j] > at + 3 and len(dots) - j >= 2:
+                end = dots[j + 4] if len(dots) - j >= 5 else len(chunk)
+                yield (base + at, base + end)
+            at = chunk.find("eyJ", at + 1)
+
+
+def _credential_matches(text: str) -> Iterator[re.Match[str]]:
+    """Every pass-1 credential match, with the multi-segment JWT hits post-filtered.
+
+    A rejected hit -- its header is not a JSON object, so it matched on shape
+    alone (``honeyJar.example.com``) -- retries the other branches at its
+    start, then resumes one character on, so a credential nested inside the
+    rejected span is still found. A header holding a second ``eyJ`` stays a
+    credential: rejecting it would rescan that header once per ``eyJ``.
+
+    Two channels, merged in the combined alternation's own order. Every
+    branch except ``JWT_MULTI_SEGMENT`` comes from one
+    ``_CREDENTIAL_PATTERNS_SANS_JWT.finditer`` pass -- each of those branches
+    fails in constant time at a position it does not match. The multi-segment
+    JWT branch comes from :func:`_multi_segment_jwt_spans`, because letting
+    the engine retry its regex at every ``eyJ`` offset is quadratic on a long
+    dot-less run (see there). At a position both channels match, the JWT
+    branch wins: it precedes the link-token alternative in
+    ``_CREDENTIAL_PATTERNS``. A span a yielded match already claimed never
+    yields a second match -- the resume position skips it, exactly as the
+    combined search did.
+    """
+    sans = _CREDENTIAL_PATTERNS_SANS_JWT.finditer(text)
+    jwts = _multi_segment_jwt_spans(text)
     pos = 0
-    while (m := _CREDENTIAL_PATTERNS.search(text, pos)) is not None:
-        header = m.group().split(".", 1)[0]
-        if (
-            m.group().startswith("eyJ")
-            and m.group().count(".") >= 2
-            and header.find("eyJ", 1) == -1
-            and not _is_json_object_segment(header)
-        ):
-            alt = _CREDENTIAL_PATTERNS_SANS_JWT.match(text, m.start())
-            if alt is None:
-                pos = m.start() + 1
+    a: re.Match[str] | None = next(sans, None)
+    b: tuple[int, int] | None = next(jwts, None)
+    while True:
+        if a is not None and a.start() < pos:
+            a = next(sans, None)
+            continue
+        if b is not None and b[0] < pos:
+            b = next(jwts, None)
+            continue
+        if a is None and b is None:
+            return
+        if b is not None and (a is None or b[0] <= a.start()):
+            start = b[0]
+            group = text[start : b[1]]
+            header = group.split(".", 1)[0]
+            if (
+                group.count(".") >= 2
+                and header.find("eyJ", 1) == -1
+                and not _is_json_object_segment(header)
+            ):
+                # Shape-only hit: retry the other branches at its start, then
+                # resume one character on.
+                alt = _CREDENTIAL_PATTERNS_SANS_JWT.match(text, start)
+                if alt is None:
+                    pos = start + 1
+                    continue
+                yield alt
+                pos = max(alt.end(), alt.start() + 1)
                 continue
-            m = alt
-        yield m
-        pos = max(m.end(), m.start() + 1)
+            m = _JWT_MULTI_RE.match(text, start)
+            if m is None:  # unreachable: the spans mirror this regex
+                pos = start + 1
+                continue
+            yield m
+            pos = max(m.end(), m.start() + 1)
+            continue
+        yield a
+        pos = max(a.end(), a.start() + 1)
 
 
 def _contains_credential_pattern(text: str) -> bool:
