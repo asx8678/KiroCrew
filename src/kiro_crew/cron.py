@@ -4934,9 +4934,18 @@ class CronService:
         document = encode_store(self._jobs)
         # Atomic write: unique tmp → rename
         # Deferred import to avoid circular dependency (pre-existing)
-        from kiro_crew.atomic_write import atomic_write
+        from kiro_crew.atomic_write import atomic_write, fsync_dir
 
-        atomic_write(self._path, document)
+        # REL-24: durable against an OS crash / power loss, not just a process
+        # crash — atomic_write's temp+rename is atomic against a process death
+        # (the page cache survives) but the rename can reach disk before the
+        # data, leaving an empty or stale jobs file after a power cut. The
+        # directory fsync makes the rename itself durable; best_effort because
+        # some filesystems reject directory fsync (the helper documents the
+        # split). The save stays off the event loop: every caller holds the
+        # file lock, and fsync adds latency only to that locked writer.
+        atomic_write(self._path, document, fsync=True)
+        fsync_dir(self._path.parent, best_effort=True)
         # Refresh the (mtime_ns, size) fingerprint so _sync recognizes this as
         # our own write and does not reload it back over the in-memory state.
         self._record_fingerprint()

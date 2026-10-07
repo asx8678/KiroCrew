@@ -273,7 +273,7 @@ def migrate_legacy_member_schedules(store_dir: Path) -> list[str]:
     """
     from dataclasses import replace
 
-    from kiro_crew.atomic_write import atomic_write
+    from kiro_crew.atomic_write import atomic_write, fsync_dir
     from kiro_crew.config.loader import KiroCrewConfig
     from kiro_crew.cron_service.model import CronJob
     from kiro_crew.cron_service.store import _CRONS_FILE, cron_store_lock
@@ -336,7 +336,8 @@ def migrate_legacy_member_schedules(store_dir: Path) -> list[str]:
                 record["member_id"] = execution.member_id or ""
                 migrated.append(job.id)
             if migrated:
-                atomic_write(path, json.dumps(data, indent=2))
+                atomic_write(path, json.dumps(data, indent=2), fsync=True)
+                fsync_dir(path.parent, best_effort=True)
         return migrated
     except Exception:
         logger.warning("pre-identity member schedules were not upgraded", exc_info=True)
