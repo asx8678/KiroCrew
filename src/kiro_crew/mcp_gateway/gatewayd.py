@@ -1000,7 +1000,15 @@ async def _acquire_backend(
         slot: Any = None
         if admission is not None:
             permit = await admission.gate.acquire(
-                label=label, deadline=wait_deadline, on_queued=on_queued
+                label=label,
+                deadline=wait_deadline,
+                on_queued=on_queued,
+                # REL-36: a person-initiated session start (not a prewarm or
+                # pooled refill) takes the interactive priority class, so it
+                # is granted ahead of queued background spawns. The gate's
+                # aging (BACKGROUND_AGING_SECS) keeps background waiters from
+                # starving behind a stream of interactive arrivals.
+                priority="background" if prewarm else "interactive",
             )
             try:
                 charge = admission.budget.reserve(label=label, kind=charge_kind)

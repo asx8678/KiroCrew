@@ -267,7 +267,15 @@ class SpawnGate:
 
     @property
     def queued(self) -> int:
-        return sum(1 for w in self._waiters if not w.future.done())
+        """Total waiters across BOTH priority classes (REL-36)."""
+        return sum(1 for w in self._waiters if not w.future.done()) + sum(
+            1 for w in self._background_waiters if not w.future.done()
+        )
+
+    @property
+    def total_queued(self) -> int:
+        """Alias of :attr:`queued` — both classes counted."""
+        return self.queued
 
     @property
     def closed(self) -> bool:
