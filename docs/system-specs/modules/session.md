@@ -4241,8 +4241,12 @@ periodic sweep in `_cleanup_loop()` owns eviction: it calls
 owned by `pycache_gc.py`) on the maintenance executor, gated to at most once
 per `PYCACHE_GC_INTERVAL_SECS` because the prune walks the whole cache tree —
 far heavier than the sweep's ~5-minute tick. `_last_pycache_gc` starts `None`
-so the first tick after the first session starts prunes pre-existing bloat
-(`_cleanup_loop()` is launched by session registration, not gateway start),
+so the first tick after the loop starts prunes pre-existing bloat
+(`_cleanup_loop()` is started at gateway boot once the listener binds —
+`_kick_cleanup_loop` in `dashboard/server_runtime/maintenance.py`, closing
+the idle-gateway and exhausted-tmpfs gaps where no session ever arrives to
+start it — and re-ensured idempotently at session registration; `start_cleanup`
+starts the task only when none is live),
 and is stamped **before** the prune runs so a failing walk retries at GC
 cadence, not every tick. The traversal is anchored to no-follow directory
 handles (`O_NOFOLLOW | O_DIRECTORY` + `dir_fd`-relative unlink/rmdir), and

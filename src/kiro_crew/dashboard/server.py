@@ -251,6 +251,7 @@ from kiro_crew.dashboard.server_runtime.listener_claims import (  # noqa: F401
     _write_secret_file,
 )
 from kiro_crew.dashboard.server_runtime.maintenance import (  # noqa: F401
+    _kick_cleanup_loop,
     _kick_connections_warm_scavenge,
     _kick_knowledge_orphan_reclaim,
     _kick_local_decision_model,
@@ -2067,6 +2068,7 @@ async def start_dashboard(
     _kick_session_search_index(state)
     _kick_config_watch(app, state)
     _kick_local_decision_model(state)
+    _kick_cleanup_loop(state)
     # Same shape for the knowledge store's writer-locked orphan sweep: it left
     # the constructor (which runs pre-bind, on the loop) and runs here on a
     # worker thread once requests are already being served.
@@ -2643,6 +2645,7 @@ async def start_api_server(
     _kick_session_search_index(state)
     _kick_config_watch(app, state)
     _kick_local_decision_model(state)
+    _kick_cleanup_loop(state)
 
     logger.info("API-only server listening on %s:%d", bind_addr, port)
 
