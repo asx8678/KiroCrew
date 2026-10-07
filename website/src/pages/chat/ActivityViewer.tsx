@@ -1001,8 +1001,17 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
   const { data: wfRuns = [], isError: wfRunsError } = useQuery<WfRunRow[]>({
     queryKey: ['workflow-runs'],
     queryFn: () => api.workflowRuns().then(d => (Array.isArray(d?.runs) ? (d.runs as WfRunRow[]) : [])),
-    enabled: open,
-    refetchInterval: 2500,
+    // UI-6: poll only while the Workflows view is visible — `view` mode (the
+    // SidePanel strip) or the internal tab. Other views ride the
+    // workflow_run_event frames plus the 15 s heal tick — the poll was the only
+    // part of the pipeline that ran with no run moving.
+    enabled: open && (view ?? tab) === 'workflows',
+    refetchInterval: query => {
+      // And only while this slot has a run in flight; a terminal list has
+      // nothing left to learn from polling.
+      const rows = (query.state.data as WfRunRow[] | undefined) ?? []
+      return rows.some(r => r.status === 'running' && runBelongsToSlot(r.session_key, slot)) ? 2500 : false
+    },
   })
   const wfRunsForSlot = wfRuns.filter(r => runBelongsToSlot(r.session_key, slot))
   const wfRunningCount = wfRunsForSlot.filter(r => r.status === 'running').length
