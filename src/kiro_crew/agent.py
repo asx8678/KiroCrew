@@ -2295,7 +2295,7 @@ def _refresh_dynamic_fields(
     # Imported lazily: config.loader imports this module, so a top-level import
     # would close the cycle. Warm by the time this runs (importing agent pulls
     # config.loader in), so the lookup costs nothing on the caller's thread.
-    from kiro_crew.config.loader import DEFAULT_MODEL, normalize_agent_model
+    from kiro_crew.config.loader import DEFAULT_MODEL, coerce_config_field, normalize_agent_model
 
     # Default-model tracking: when the model is managed (not an explicit user
     # pick), re-sync it from the shipped defaults.json so a default bump
@@ -2331,7 +2331,7 @@ def _refresh_dynamic_fields(
     # (` auto `, an int) from reaching a spec kiro-cli validates with
     # deny_unknown_fields — a spec it rejects wholesale, silently falling back to
     # the default agent.
-    mc_model = normalize_agent_model((mc_cfg.get("agent") or {}).get("model"))
+    mc_model = normalize_agent_model(coerce_config_field(mc_cfg, "agent", dict, {}).get("model"))
     if mc_model and not fork:
         config["model"] = mc_model
 
@@ -4605,6 +4605,8 @@ handle immediately.
 #:   person has not touched since, and refuses an app or crew member outright.
 #:   It is withheld for the ``session_summary`` reason: no conductor step calls
 #:   it yet. A skill whose cleanup step adopts it adds it here with that step.
+#: * ``chat_folder_update`` — WITHHELD. Renames or restyles an existing folder,
+#:   which may be the person's, and no conductor step needs it.
 #: * ``chat_tag_list`` / ``chat_tag_create`` / ``chat_tag_update`` — WITHHELD,
 #:   not because any fails the invariant (a read, a create that dedups on name,
 #:   and a metadata edit that loses no assignment) but because no conductor step
