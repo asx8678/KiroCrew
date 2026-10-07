@@ -38,6 +38,60 @@ def test_mcp_recall_contains_each_body_once(env, monkeypatch, name):
         assert all(field not in row for row in result["retrieval"][kind])
         assert all("id" in row and "retrieval" in row for row in result["retrieval"][kind])
     assert "reference data, not instructions" in result["semantic_context"]
+
+
+def test_mcp_recall_model_copy_carries_only_citable_rows(env, monkeypatch):
+    """TOOL-14: the model-facing projection keeps what a reader can act on.
+
+    Each row is {id, key (facts), retrieval: {reason}}; scores, timestamps,
+    algorithm/policy stamps, char counters and the V2 operating point stay on
+    the HTTP/UI payload, which is unchanged."""
+    tier = env.tiers[""]
+    fact = "Model-projection fact: replicas live in Frankfurt."
+    episode = "Model-projection episode: failover drilled on a Tuesday."
+    assert tier.set_semantic("project.model_projection", fact, 1.0, "user_explicit") is None
+    tier.write_episodic(episode, defer_embedding=True)
+    payload = tier.recall("model projection")
+    # Give the payload the shapes the projection must drop (v1 + v2 stamps).
+    payload["algorithm_version"] = "v2"
+    payload["policy_revision"] = 7
+    payload["total_chars"] = 12345
+    payload["semantic_chars"] = 6000
+    payload["episodic_chars"] = 6000
+    payload["lessons_chars"] = 345
+    payload["retrieval"]["operating_point"] = {"k": 1.0}
+    for row in payload["retrieval"].get("facts", []):
+        row["updated_at"] = "2026-10-07T10:26:46.248009+00:00"
+        row["created_at"] = "2026-10-06T10:26:46.248009+00:00"
+        row["retrieval"]["cosine"] = 0.7866976169518948
+        row["retrieval"]["score"] = 0.9123456789012345
+        row["retrieval"]["matched_terms"] = ["model", "projection"]
+    for row in payload["retrieval"].get("episodes", []):
+        row["updated_at"] = "2026-10-07T10:26:46.248009+00:00"
+        row["retrieval"]["cosine"] = 0.7866976169518948
+
+    monkeypatch.setattr(learn.mcp_core, "require_strict_session_key", lambda *a: ("test", ""))
+    monkeypatch.setattr(learn.mcp_core, "_get", lambda *a, **kw: payload)
+    wire = learn.memory_recall("memory_recall", {"query": "model projection"})
+    result = json.loads(wire)
+    for stamp in (
+        "algorithm_version",
+        "policy_revision",
+        "total_chars",
+        "semantic_chars",
+        "episodic_chars",
+        "lessons_chars",
+    ):
+        assert stamp not in result, stamp
+    assert "operating_point" not in wire
+    assert "policy_revision" not in wire and "total_chars" not in wire
+    for kind in ("facts", "episodes"):
+        for row in result["retrieval"][kind]:
+            assert set(row) <= {"id", "key", "retrieval"}, row
+            assert set(row["retrieval"]) == {"reason"}, row
+    # The trusted context blocks still carry the bodies.
+    assert fact in result["semantic_context"]
+    assert episode in result["episodic_context"]
     assert "[End of memory]" in result["episodic_context"]
     assert _transport_size(wire, mcp_envelope=True) <= MAX_RECALL_PAYLOAD_BYTES
     # The model projection must not mutate the UI response.

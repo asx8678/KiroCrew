@@ -177,17 +177,49 @@ def _transport_size(encoded: str, *, mcp_envelope: bool = False) -> int:
 
 
 def _model_recall_payload(payload: dict) -> dict:
-    """Keep bodies in trusted context blocks and compact evidence beside them.
+    """Keep bodies in trusted context blocks and cite-able rows beside them.
 
     This is a per-call projection, not a second cache or a UI DTO mutation.
+    The model copy carries only what a reader needs to cite or re-ask a row:
+    its id (and key, for facts) and one ``retrieval.reason`` line. The rest of
+    the evidence — scores, microsecond timestamps, algorithm and policy
+    stamps, char counters, the V2 operating point — is retrieval plumbing the
+    dashboard and the audit trail read on the HTTP payload (measured: 689 of
+    1,041 tokens on the 5-fact fixture were diagnostics the model cannot act
+    on). ``retrieval`` stays present on every row, shrunk rather than deleted,
+    so a reader can still tell why a body was admitted.
     """
     result = {key: value for key, value in payload.items() if not key.endswith("_preview")}
+    # Budget plumbing and revision stamps, not model-facing facts. The
+    # bounding loop keeps using them on the full payload; only this copy
+    # drops them.
+    result.pop("algorithm_version", None)
+    result.pop("policy_revision", None)
+    result.pop("total_chars", None)
+    for kind in ("semantic", "episodic", "lessons"):
+        result.pop(f"{kind}_chars", None)
     retrieval = dict(result.get("retrieval") or {})
+    retrieval.pop("operating_point", None)
     for kind in ("facts", "episodes"):
-        retrieval[kind] = [
-            {key: value for key, value in row.items() if key not in {"snippet", "text"}}
-            for row in retrieval.get(kind, [])
-        ]
+        rows = []
+        for row in retrieval.get(kind, []):
+            kept: dict[str, Any] = {}
+            for name in ("id", "key"):
+                value = row.get(name)
+                if isinstance(value, str):
+                    kept[name] = value
+            evidence = row.get("retrieval")
+            shrunk: dict[str, Any] = {}
+            if isinstance(evidence, dict):
+                reason = evidence.get("reason")
+                if isinstance(reason, str):
+                    shrunk["reason"] = reason[:128]
+                elif "reason" in evidence:
+                    shrunk["reason"] = None
+            # Present on every row, shrunk rather than deleted.
+            kept["retrieval"] = shrunk
+            rows.append(kept)
+        retrieval[kind] = rows
     result["retrieval"] = retrieval
     return result
 

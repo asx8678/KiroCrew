@@ -1752,15 +1752,17 @@ cap yields no context. A separate 16 KiB transport budget counts JSON escaping
 and the MCP TextContent envelope, with 1 KiB reserved for ordinary RPC
 framing/request IDs. Caller-controlled arbitrarily large JSON-RPC IDs are
 outside this memory-data bound. The MCP boundary uses a model-facing projection:
-each body appears only once in its trusted reference context, evidence retains
-identifiers, scores, provenance and truncation flags without another body, and
-previews are omitted. Dashboard/UI payloads retain their existing shape. The
-final serializers recheck their actual representation after redaction,
-shortening snippets or omitting whole tail records and regenerating matching
-contexts and counts when necessary. Omitted records are reported in retrieval
-metadata. Episodic references carry their stable memory ids. The MCP transport
-derives the store from the caller's trusted binding; it accepts no model-selected
-store argument.
+each body appears only once in its trusted reference context, and a recall row
+keeps only what a reader needs to cite or re-ask it — the id (and key, for
+facts) and one `retrieval.reason` line; scores, microsecond timestamps,
+algorithm/policy stamps, char counters and the V2 operating point stay on the
+HTTP/UI payload, which retains its existing shape (the bounding loop keeps
+using them internally). Previews are omitted. Omitted records are reported in
+retrieval metadata. Episodic references carry their stable memory ids. The MCP
+transport derives the store from the caller's trusted binding; it accepts no
+model-selected store argument. The final serializers recheck their actual
+representation after redaction, shortening snippets or omitting whole tail
+records and regenerating matching contexts and counts when necessary.
 
 HTTP recall has one nine-second server-side monotonic work deadline, shorter
 than its ten-second MCP client timeout. Retrieval uses a bounded `mc-recall`
