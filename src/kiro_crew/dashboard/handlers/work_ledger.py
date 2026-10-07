@@ -1398,6 +1398,97 @@ def _find_slot(state: DashboardState, key: str):
     return None
 
 
+def _arm_conductor_patrol_backstop(state: DashboardState, conductor_key: str) -> None:
+    """LOOP-19: a conductor that just bound work always has a gated patrol.
+
+    Arming was prompt-only ("Always pass watch=\"work-ledger\""), so a conductor
+    that never called ``monitor_start`` left ``conductor_wake`` nothing to pull
+    forward -- worker reports reached nobody until a human prompted it. This is
+    the BACKSTOP, not the primary path: only when no active work-ledger loop
+    exists for the slot does it arm one, through the same authorized chokepoint
+    ``monitor_start`` uses, with the bounds the goal-conductor skill teaches
+    (600 s, inside the 300-900 band). The conductor's own ``monitor_start``
+    stays the primary path and overrides nothing: a second bind finds the loop
+    and arms nothing. Best-effort -- a backstop that cannot arm (no service, a
+    refused authorization) never fails a bind that already succeeded.
+    """
+    try:
+        from kiro_crew import autonudge
+        from kiro_crew.conductor_wake import work_ledger_loop_id
+
+        svc = autonudge.get_instance()
+        if svc is None or work_ledger_loop_id(svc, conductor_key):
+            return  # no service on this host, or a patrol is already armed
+    except Exception:
+        logger.debug("patrol backstop preflight failed for %s", conductor_key, exc_info=True)
+        return
+
+    async def _arm() -> None:
+        try:
+            from kiro_crew.autonudge_authz import authorize_and_add_nudge
+            from kiro_crew.dashboard.state import append_and_surface
+            from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+
+            loop_obj, error, status = await authorize_and_add_nudge(
+                svc=svc,
+                state=state,
+                source="dashboard",
+                slot_key=conductor_key,
+                message=(
+                    "Work-ledger patrol (auto-armed on first bind): read the work "
+                    "ledger for new worker reports and bound items, and pull work "
+                    "forward per the goal-conductor skill. Exit with autonudge_stop "
+                    "when the goal is closed."
+                ),
+                idle_secs=600,
+                watch="work-ledger",
+                gate=True,
+                initiator_slot_key=conductor_key,
+            )
+            # One transcript notice row, best-effort, for the same reason the
+            # directive applier writes one: an arm nobody announced reads as
+            # a loop that appeared from nowhere on the conductor's session.
+            slot = None
+            try:
+                slot = state.get_slot(conductor_key)
+            except Exception:
+                pass
+            if slot is not None:
+                if loop_obj is not None:
+                    text, _ = redact_exfiltration_urls(
+                        f"Automation loop armed: work-ledger patrol {getattr(loop_obj, 'id', '?')} "
+                        "(auto-armed on first bind; 600 s interval, gated)."
+                    )
+                    text, _ = redact_credentials(text)
+                else:
+                    text, _ = redact_exfiltration_urls(
+                        f"Automation loop NOT armed: work-ledger patrol backstop refused "
+                        f"({error} [status {status}])."
+                    )
+                    text, _ = redact_credentials(text)
+                append_and_surface(state, slot, "notice", text, "msg msg-info")
+            if loop_obj is None:
+                logger.info(
+                    "patrol backstop for %s refused: %s [%s]",
+                    conductor_key,
+                    error,
+                    status,
+                )
+        except Exception:
+            logger.debug("patrol backstop failed for %s", conductor_key, exc_info=True)
+
+    try:
+        import asyncio
+
+        # Fire-and-forget on the loop: the bind's response is already owed, and
+        # the arm (a store write) must not lengthen the caller's critical path.
+        task = asyncio.get_running_loop().create_task(_arm())
+        state._background_tasks.add(task)
+        task.add_done_callback(state._background_tasks.discard)
+    except Exception:
+        logger.debug("patrol backstop could not be scheduled for %s", conductor_key, exc_info=True)
+
+
 def _slot_open(state: DashboardState, key: str) -> bool:
     """Whether *key* still names an open slot. A blank key is never alive."""
     if not key:
@@ -1665,6 +1756,11 @@ async def api_work_ledger_record(request: web.Request) -> web.Response:
             "ok",
             resources=f"{action} {getattr(item, 'item_id', '') or ''}".strip(),
         )
+        if action == "bind" and item is not None:
+            # LOOP-19: the first successful bind is the moment a conductor has
+            # work to watch, and the moment the patrol backstop checks whether
+            # it already does. Idempotent by the loop lookup inside.
+            _arm_conductor_patrol_backstop(state, key)
         payload: dict[str, Any] = {"ok": True, "action": action}
         if item is not None:
             payload["item"] = item.to_dict()
