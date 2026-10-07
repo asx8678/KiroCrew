@@ -1620,6 +1620,36 @@ def _emit_context_section_timings(
         logger.debug("Context section metric emission failed", exc_info=True)
 
 
+#: CTX-16: a prompt override past this many characters is still used whole —
+#: truncating a contract changes its meaning — but one WARNING per (path, size)
+#: names its measured size, because the text is injected at every session start
+#: and again after every compaction. The shipped prompt is ~39K chars, so this
+#: budget is ~2.5x the ordinary contract.
+_PROMPT_OVERRIDE_WARN_CHARS = 100_000
+
+#: (path, size) pairs already warned about this process. The read runs on every
+#: session start, so without the dedupe an oversized override would log once per
+#: session instead of once ever.
+_prompt_size_warned: dict[tuple[str, int], None] = {}
+
+
+def _warn_on_oversized_prompt(pp: Path, size: int) -> None:
+    """Name an oversized prompt once per (path, size) per process (CTX-16)."""
+    if size <= _PROMPT_OVERRIDE_WARN_CHARS:
+        return
+    key = (str(pp), size)
+    if key in _prompt_size_warned:
+        return
+    _prompt_size_warned[key] = None
+    logger.warning(
+        "Prompt %s is %d chars (budget %d); using it whole — it is injected at "
+        "every session start and after every compaction",
+        pp,
+        size,
+        _PROMPT_OVERRIDE_WARN_CHARS,
+    )
+
+
 def _read_prompt_file(pp: Path) -> str:
     """Read the resolved agent prompt; a bad user override degrades to the shipped one.
 
@@ -1640,9 +1670,14 @@ def _read_prompt_file(pp: Path) -> str:
     in-sandbox agent may write, so a symlink planted there pointing at a
     credential file is refused (``PermissionError``, an ``OSError``) and degrades
     like any other unreadable override instead of entering the model context.
+
+    An override LARGER than ``_PROMPT_OVERRIDE_WARN_CHARS`` is still used whole —
+    the contract must not be truncated — but one WARNING per (path, size) names
+    its measured size, because it is injected at every session start and again
+    after every compaction (CTX-16).
     """
     try:
-        return safe_read_file(str(pp))
+        text = safe_read_file(str(pp))
     except (OSError, UnicodeDecodeError) as exc:
         fallback = _shipped_prompt()
         if fallback == pp:
@@ -1658,6 +1693,8 @@ def _read_prompt_file(pp: Path) -> str:
                 "Shipped prompt %s could not be read (%s); no agent prompt", fallback, exc2
             )
             return ""
+    _warn_on_oversized_prompt(pp, len(text))
+    return text
 
 
 class ContextBuilder:
