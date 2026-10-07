@@ -98,6 +98,7 @@ from kiro_crew.slack.files import (
     VOICE_MEMO_FAILED,
     VOICE_MEMO_TOO_LONG,
     VOICE_MEMO_UNAVAILABLE,
+    _LIMITS,
     is_voice_memo,
     process_slack_files,
     voice_memo_notes,
@@ -195,9 +196,7 @@ class _StopHold:
 
 #: Per orchestrator, the stops in flight on each session key. Overlapping stops share
 #: one hold, so the queue is put back, and drained, only when the LAST one settles.
-_stops_in_flight: weakref.WeakKeyDictionary[Any, dict[str, _StopHold]] = (
-    weakref.WeakKeyDictionary()
-)
+_stops_in_flight: weakref.WeakKeyDictionary[Any, dict[str, _StopHold]] = weakref.WeakKeyDictionary()
 
 
 def _key_busy(orch: GatewayOrchestrator, session_key: str) -> bool:
@@ -327,6 +326,56 @@ _background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
 #: One at a time is what the collector had before it was offloaded, when running
 #: on the loop serialized it by accident; this keeps that bound on purpose.
 _HOME_TAB_COLLECT_CONCURRENCY = 1
+
+#: ATT-4: the inline truncation note for an over-budget voice-memo transcript.
+#: ``<path>`` is replaced with the sidecar's real path at render time.
+_TRUNCATION_NOTE_TEMPLATE = (
+    "[transcript truncated: <n> of <total> chars omitted; full text at <path>]"
+)
+
+
+def _store_full_transcript(raw: str) -> object:
+    """Keep an over-budget transcript beside the attachments (ATT-4).
+
+    A 0700 staging dir under the system temp root — the same class of location
+    ``process_slack_files`` stages uploads in — so the session's own tools can
+    read the full text without widening any fence. Blocking; call off the loop.
+    """
+    import tempfile
+    from pathlib import Path
+
+    staging = Path(tempfile.mkdtemp(prefix="kirocrew-slack-transcript-"))
+    full = staging / "voice-memo-transcript.txt"
+    full.write_text(raw, encoding="utf-8")
+    return full
+
+
+def _bound_transcript_inline(raw: str) -> str:
+    """Cap the joined voice-memo transcript at the inline budget (ATT-4).
+
+    Under ``_LIMITS.max_text_inject`` the text passes through unchanged. Over
+    it, the full text is written to the sidecar (above) and the inline part
+    becomes a head+tail preview whose note names the omitted count, the
+    total, and the sidecar's path — a short memo stays verbatim and a long
+    one keeps its ends, which is where a conversation's sense lives.
+    """
+    if len(raw) <= _LIMITS.max_text_inject:
+        return raw
+    full_path = _store_full_transcript(raw)
+    omitted = len(raw) - _LIMITS.max_text_inject
+    note = (
+        _TRUNCATION_NOTE_TEMPLATE.replace("<n>", str(omitted))
+        .replace("<total>", str(len(raw)))
+        .replace("<path>", str(full_path))
+    )
+    # The note is computed first so the budget reserves its REAL filled
+    # length — a guessed reserve let the preview overshoot the cap.
+    keep = _LIMITS.max_text_inject - len(note) - 2
+    head = keep * 2 // 3
+    tail = keep - head
+    return f"{raw[:head]}\n{note}\n{raw[-tail:]}"
+
+
 _home_tab_collect_sem: asyncio.Semaphore | None = None
 
 
@@ -610,8 +659,7 @@ async def _handle_yolo(
         if orch.dashboard_state:
             orch.dashboard_state.push_slots_update()
         await respond(
-            f"🟢 YOLO mode *ON* ({describe_grant_lifetime()})"
-            f" — all tools auto-approved."
+            f"🟢 YOLO mode *ON* ({describe_grant_lifetime()})" f" — all tools auto-approved."
         )
     elif arg == "off":
         from kiro_crew.slack.handler import (
@@ -917,16 +965,22 @@ async def _handle_restart(
     """Restart the gateway process (owner-only, requires systemd supervisor)."""
     if not is_owner(caller_id):
         sel().log_tool_invocation(
-            session_key="", source="slack", tool_name="/kirocrew restart",
-            outcome="denied", resources=f"user={caller_id}",
+            session_key="",
+            source="slack",
+            tool_name="/kirocrew restart",
+            outcome="denied",
+            resources=f"user={caller_id}",
         )
         await respond("⛔ Only the owner can restart the gateway.")
         return
 
     if not os.environ.get("INVOCATION_ID"):
         sel().log_tool_invocation(
-            session_key="", source="slack", tool_name="/kirocrew restart",
-            outcome="denied", resources=f"user={caller_id},reason=no_supervisor",
+            session_key="",
+            source="slack",
+            tool_name="/kirocrew restart",
+            outcome="denied",
+            resources=f"user={caller_id},reason=no_supervisor",
         )
         await respond(
             "⛔ Restart requires a process supervisor (systemd). "
@@ -935,8 +989,11 @@ async def _handle_restart(
         return
 
     sel().log_tool_invocation(
-        session_key="", source="slack", tool_name="/kirocrew restart",
-        outcome="approved", resources=f"user={caller_id}",
+        session_key="",
+        source="slack",
+        tool_name="/kirocrew restart",
+        outcome="approved",
+        resources=f"user={caller_id}",
     )
     try:
         await respond("♻️ Restarting gateway…")
@@ -976,9 +1033,7 @@ async def _handle_restart(
             # NOT catch CancelledError (propagates to keep this 5s deadline
             # honest); a still-held lock from a pathological overrun is recovered
             # by the orphan reaper on next startup.
-            await asyncio.wait_for(
-                orch.sessions.close_all(drain_timeout=2.0), timeout=5.0
-            )
+            await asyncio.wait_for(orch.sessions.close_all(drain_timeout=2.0), timeout=5.0)
     except Exception:
         logger.debug("Session cleanup before restart failed", exc_info=True)
     # Flush the SEL audit queue: logging is async (background writer thread +
@@ -1298,9 +1353,7 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
             # list (e.g. 100+ skills) would overflow and make views.publish fail
             # with invalid_arguments, breaking the whole Home tab. Mirrors the
             # cron block's jobs[:15] guard below.
-            def _capped_names_section(
-                label: str, names: list[str], budget: int = 2900
-            ) -> dict:
+            def _capped_names_section(label: str, names: list[str], budget: int = 2900) -> dict:
                 total = len(names)
                 prefix = f"*{label} ({total}):* "
                 suffix_room = 24  # reserve for "  _…and N more_"
@@ -1320,13 +1373,9 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
                 return {"type": "section", "text": {"type": "mrkdwn", "text": line}}
 
             if servers:
-                blocks.append(
-                    _capped_names_section("MCP Integrations", [s.name for s in servers])
-                )
+                blocks.append(_capped_names_section("MCP Integrations", [s.name for s in servers]))
             if skills:
-                blocks.append(
-                    _capped_names_section("Skills", [s["name"] for s in skills])
-                )
+                blocks.append(_capped_names_section("Skills", [s["name"] for s in skills]))
             if not servers and not skills:
                 blocks.append(
                     {
@@ -1463,9 +1512,7 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
                         blocks.append(
                             {
                                 "type": "context",
-                                "elements": [
-                                    {"type": "mrkdwn", "text": "*Task runner*"}
-                                ],
+                                "elements": [{"type": "mrkdwn", "text": "*Task runner*"}],
                             }
                         )
                         blocks.extend(_build_sessions_blocks(taskrunner_rows, for_home_tab=True))
@@ -1710,7 +1757,9 @@ async def _handle_slash(orch: GatewayOrchestrator, payload: dict) -> None:
     user_match = re.search(r"<@([A-Z0-9]+)(?:\|([^>]+))?>", cmd_text)
     if user_match:
         _spawn(
-            _respond("⛔ Multi-user access is disabled. Only the owner can use Kiro Crew via Slack.")
+            _respond(
+                "⛔ Multi-user access is disabled. Only the owner can use Kiro Crew via Slack."
+            )
         )
         return
 
@@ -1747,9 +1796,7 @@ def _maybe_prompt_owner(orch: GatewayOrchestrator, event: dict) -> None:
 # cannot disagree about what is audio.
 
 
-def _voice_memo_context(
-    text: str, memos: int, transcribed: int, *, available: bool
-) -> str:
+def _voice_memo_context(text: str, memos: int, transcribed: int, *, available: bool) -> str:
     """*text* plus one visible note per voice memo that produced no words.
 
     A memo whose transcription is unavailable or failed would otherwise be dropped
@@ -2146,23 +2193,17 @@ def _extract_blocks_text(blocks: list[dict]) -> str:
                         sub_els = child.get("elements", [])
                         if not isinstance(sub_els, list):
                             sub_els = []
-                        inline = "".join(
-                            _render_rich_text_element(el) for el in sub_els
-                        )
+                        inline = "".join(_render_rich_text_element(el) for el in sub_els)
                         if inline:
                             parts.append(f"- {inline}")
                 elif el_type == "rich_text_quote":
                     # Quote blocks: prefix with "> "
-                    inline = "".join(
-                        _render_rich_text_element(el) for el in child_els
-                    )
+                    inline = "".join(_render_rich_text_element(el) for el in child_els)
                     if inline:
                         parts.append(f"> {inline}")
                 else:
                     # rich_text_section, rich_text_preformatted
-                    inline = "".join(
-                        _render_rich_text_element(el) for el in child_els
-                    )
+                    inline = "".join(_render_rich_text_element(el) for el in child_els)
                     if inline:
                         parts.append(inline)
         elif block_type == "section":
@@ -2191,10 +2232,12 @@ def _extract_blocks_text(blocks: list[dict]) -> str:
 # NOTE: These are best-effort, undocumented, English-only Slack placeholder strings.
 # They may change or be localized — recovery is best-effort for non-English workspaces.
 # No fuzzy/structural detection is attempted (out of scope; would change behavior broadly).
-_SLACK_BLOCK_FALLBACKS = frozenset({
-    "This message contains interactive elements.",
-    "This content can't be displayed.",
-})
+_SLACK_BLOCK_FALLBACKS = frozenset(
+    {
+        "This message contains interactive elements.",
+        "This content can't be displayed.",
+    }
+)
 
 #: A Slack user mention, ``<@U123>`` or ``<@U123|name>``; group 1 is the user id.
 _USER_MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>")
@@ -2732,6 +2775,11 @@ async def _route_message(
                     raw = "\n".join(transcripts)
                     raw, _ = redact_exfiltration_urls(raw)
                     raw, _ = redact_credentials(raw)
+                    # ATT-4: an explicit inline budget for the joined transcript
+                    # — the same max_text_inject cap file text obeys — with the
+                    # full text kept in a sidecar the session's own tools can
+                    # read.
+                    raw = _bound_transcript_inline(raw)
                     prefix = f"[Voice memo transcription]\n{raw}\n[End of transcription]"
                     text = f"{prefix}\n\n{text}" if text else prefix
                     _had_voice_input = True
@@ -2890,7 +2938,9 @@ async def _route_message(
                 metadata={"user": sender_id, "channel": channel},
             )
             return
-        note_user_stop(orch.sessions, orch.sessions.get_session_for_thread(session_key) or session_key)
+        note_user_stop(
+            orch.sessions, orch.sessions.get_session_for_thread(session_key) or session_key
+        )
         has_session = orch.sessions.has_session(session_key)
         # READ, not popped: the task is removed only once the cancel is known
         # to have gone through, below.
@@ -3077,6 +3127,7 @@ async def _route_message(
     #    (_handle_restart) which owns owner-check + supervisor guard, keeping
     #    a single source of truth for the restart logic. ──
     if clean_text.strip().lower() == "!restart":
+
         async def _restart_respond(text: str, **_kw: Any) -> None:
             if orch.slack:
                 await orch.slack.post_message(channel, text, thread_ts or msg_ts)

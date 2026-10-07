@@ -1305,6 +1305,34 @@ class TestVoiceReply:
         assert "piper_model" in eph[0]
         assert "ada credentials" not in eph[0]
 
+    def test_two_long_transcripts_are_capped_with_a_sidecar_note(self, monkeypatch, tmp_path):
+        """ATT-4: two 60,000-char memo transcripts join into at most the inline
+        cap of transcript text, plus a truncation note naming the omitted count
+        and a sidecar path that holds the full text."""
+        from kiro_crew.slack import events as ev
+
+        transcripts = ["A" * 60_000, "B" * 60_000]
+        joined = "\n".join(transcripts)
+        assert len(joined) > ev._LIMITS.max_text_inject  # over budget on purpose
+        bounded = ev._bound_transcript_inline(joined)
+        assert len(bounded) <= ev._LIMITS.max_text_inject
+        assert "[transcript truncated:" in bounded
+        assert "full text at" in bounded
+        assert bounded.count("voice-memo-transcript.txt") == 1
+        # The sidecar exists and holds the whole transcript.
+        path_line = [ln for ln in bounded.splitlines() if "full text at" in ln][0]
+        sidecar = path_line.split("full text at", 1)[1].strip("] ")
+        from pathlib import Path
+
+        assert Path(sidecar).read_text(encoding="utf-8") == joined
+
+    def test_a_short_memo_transcript_passes_through_unchanged(self):
+        """ATT-4: under the cap, no sidecar, no note, byte-identical text."""
+        from kiro_crew.slack import events as ev
+
+        raw = "short memo text"
+        assert ev._bound_transcript_inline(raw) == raw
+
     @pytest.mark.asyncio
     async def test_voice_memo_gets_the_voice_in_voice_out_notice(self, monkeypatch):
         _voice_on(monkeypatch, auto_reply_to_voice=True, provider="polly")
