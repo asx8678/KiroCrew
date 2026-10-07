@@ -82,6 +82,56 @@ async def test_deadline_passed_mid_turn_fires_after_overdue_beat(svc):
 
 
 @pytest.mark.asyncio
+async def test_an_owed_wake_re_arms_at_the_short_beat_not_the_full_interval(svc):
+    """LOOP-16: a wake refused because the conductor's slot was BUSY is owed
+    (``followup_ticks``); the turn-complete re-arm must deliver it on the FIRST
+    tick after the turn ends, not one full patrol interval later."""
+    from kiro_crew.monitoring.models import MONITOR_STATE_VERSION
+
+    def _monitor(followup: int):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            version=MONITOR_STATE_VERSION, followup_ticks=followup, next_probe_at=0.0
+        )
+
+    await svc.start()
+    delays = _capture_arm_delays(svc)
+    loop = await svc.add(slot_key="chat-1-123", message="go", idle_secs=3600, watch="work-ledger")
+    # The delivered fire zeroed the deadline, so a deadline arm would start a
+    # FULL 3600 s countdown; the refused wake left one tick owed.
+    loop.next_due_ts = 0.0
+    loop.monitor = _monitor(1)
+    svc.notify_turn_complete("chat-1-123")
+    assert delays[-1] == float(_OVERDUE_REARM_SECS)
+    svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_no_wake_owed_still_re_arms_the_full_interval(svc):
+    """LOOP-16 control: with nothing owed, the turn-complete re-arm starts the
+    next full cycle from the cleared deadline, exactly as before."""
+    from kiro_crew.monitoring.models import MONITOR_STATE_VERSION
+
+    def _monitor(followup: int):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            version=MONITOR_STATE_VERSION, followup_ticks=followup, next_probe_at=0.0
+        )
+
+    await svc.start()
+    delays = _capture_arm_delays(svc)
+    loop = await svc.add(slot_key="chat-1-123", message="go", idle_secs=3600, watch="work-ledger")
+    loop.next_due_ts = 0.0
+    loop.monitor = _monitor(0)
+    svc.notify_turn_complete("chat-1-123")
+    resumed = delays[-1]
+    assert resumed is not None and 3590 <= resumed <= 3600
+    svc.stop()
+
+
+@pytest.mark.asyncio
 async def test_delivered_fire_clears_deadline_then_turn_end_starts_fresh(svc, monkeypatch):
     """The loop's own cycles keep the historical semantics: full interval from turn end."""
     fired: list[NudgeLoop] = []

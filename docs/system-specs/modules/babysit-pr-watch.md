@@ -206,7 +206,14 @@ and `test_delivered_fire_clears_deadline_then_turn_end_starts_fresh` pin both
 sides of the contract. Channel-bound loops re-arm after their unattended turn
 in `AutoNudgeService._run_fire_cycle` (`autonudge_service/firing.py`) because they do not
 use the dashboard
-turn-lifecycle hooks.
+turn-lifecycle hooks. One exception shortens the fresh interval: a wake that
+was REFUSED because the conductor's slot was busy is owed
+(`followup_ticks`), and the turn-complete re-arm brings the next tick within
+the short overdue beat (`_OVERDUE_REARM_SECS`, 10 s) so the owed wake lands
+on the first tick after the turn ends — the kernel already deduped the
+observation, so only that bypass tick can deliver it;
+`test_autonudge_deadline.py::test_an_owed_wake_re_arms_at_the_short_beat_not_the_full_interval`
+pins it.
 
 The schemas in `validation.MONITOR_START_SCHEMA` and
 `validation.MONITOR_UPDATE_SCHEMA` bound the message, interval, cycle cap, and
