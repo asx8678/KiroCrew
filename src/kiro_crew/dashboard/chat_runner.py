@@ -11984,9 +11984,13 @@ async def _run_chat(
                 _turn_thought = True
             elif event.kind == EVENT_TOOL_CALL:
                 _turn_tool_calls += 1
-                _repeat_loop.note_call(
+                _advisory = _repeat_loop.note_call(
                     event.tool_call_id, event.tool_name or "", event.tool_input, event.title
                 )
+                if _advisory:
+                    # TOOL-20: the one-time long-turn advisory, delivered on
+                    # the same in-band seam as the loop notice.
+                    await _deliver_repeat_loop_notice(client, slot, _redact_tool_field(_advisory))
                 if (
                     event.is_shell
                     and event.tool_call_id
@@ -12237,9 +12241,15 @@ async def _run_chat(
                 if not event.tool_call_id:
                     continue
                 if event.tool_input:
-                    _repeat_loop.note_call(
+                    _advisory = _repeat_loop.note_call(
                         event.tool_call_id, event.tool_name or "", event.tool_input, event.title
                     )
+                    if _advisory:
+                        # TOOL-20: the one-time long-turn advisory, delivered on
+                        # the same in-band seam as the loop notice.
+                        await _deliver_repeat_loop_notice(
+                            client, slot, _redact_tool_field(_advisory)
+                        )
                 _dir_refresh = _pending_dir_for_digest.get(event.tool_call_id, "")
                 if not _dir_refresh:
                     # claude-agent-acp's initial tool_call carries a generic title
