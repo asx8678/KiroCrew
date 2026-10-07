@@ -1163,7 +1163,7 @@ async def _run_refine(
         EVENT_TEXT_CHUNK,
     )
 
-    session_key = f"taskrunner:refine:{int(_time.time() * 1000)}"
+    session_key = f"taskrunner:refine:{uuid.uuid4().hex[:8]}"
     _last_push = 0.0
     state._refine_session_key = session_key
     state._refine_answer_future = None  # type: ignore[attr-defined]

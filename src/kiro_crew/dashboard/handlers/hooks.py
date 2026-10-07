@@ -954,7 +954,9 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
             {"error": "sessionKey must be a string", "code": "session_key_not_a_string"}, status=400
         )
     if not session_key:
-        session_key = f"hook:default:{int(time.time())}"
+        import uuid
+
+        session_key = f"hook:default:{uuid.uuid4().hex[:8]}"
     if not session_key.startswith(_HOOK_SESSION_PREFIX):
         return web.json_response(
             {
