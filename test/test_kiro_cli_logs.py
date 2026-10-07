@@ -250,6 +250,40 @@ def test_response_budget_stays_under_the_transport_ceiling():
     assert diagnostics._MAX_LOG_RESPONSE_CHARS < validation.MAX_RESPONSE_LEN
     # And with room for the framing the reader adds on top of the log text.
     assert diagnostics._MAX_LOG_RESPONSE_CHARS + 2000 <= validation.MAX_RESPONSE_LEN
+    # The DEFAULT view's budget sits under the ceiling the same way.
+    assert diagnostics._DEFAULT_LOG_RESPONSE_CHARS < diagnostics._MAX_LOG_RESPONSE_CHARS
+
+
+def test_the_default_view_is_a_bounded_20k_read(tmp_path, monkeypatch):
+    """TOOL-11: a call that names no tail answers in ~20k chars, newest lines
+    merged across sources; an explicit tail keeps the 80,000-char ceiling."""
+    import kiro_crew.diagnostics as diag
+
+    sources = []
+    for i in range(3):
+        p = tmp_path / f"mcp{i}.log"
+        p.write_text(
+            "\n".join(
+                f"2026-09-06T16:00:{n // 60:02d}.{n % 60:02d} line {n} " + "y" * 400
+                for n in range(2_000)
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        sources.append(p)
+    monkeypatch.setattr(diag, "_kiro_cli_extra_logs", lambda: sources)
+
+    out = diag.read_kiro_cli_logs()
+    assert len(out) <= diagnostics._DEFAULT_LOG_RESPONSE_CHARS
+    # The newest line of each source survived, one section per source.
+    for i in range(3):
+        assert f"=== mcp{i}.log" in out
+        assert "line 1999" in out
+    assert "default view" in out
+
+    wide = diag.read_kiro_cli_logs(tail=2_000)
+    assert len(wide) <= diagnostics._MAX_LOG_RESPONSE_CHARS
+    assert "default view" not in wide
 
 
 def test_response_over_budget_keeps_the_newest_lines(tmp_path, monkeypatch):

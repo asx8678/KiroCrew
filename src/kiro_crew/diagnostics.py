@@ -345,6 +345,15 @@ _MAX_LOG_READ_BYTES = 64 * 1024
 #: (``mcp_tools/skills.py`` bounds its own fields against the same ceiling for
 #: the same reason, so this is an existing contract, not a new one.)
 _MAX_LOG_RESPONSE_CHARS = 80_000
+
+#: Default-response budget (TOOL-11): a call that names no ``tail`` answers in
+#: ~20k chars, not the full ceiling — the old default returned 65-80k chars per
+#: call (~16-20k tokens), because 200 lines PER SOURCE with protocol-length
+#: lines filled the whole 80k cap. Explicit ``tail`` requests keep the ceiling.
+_DEFAULT_LOG_RESPONSE_CHARS = 20_000
+
+#: Total newest lines the default view aims for, merged across all sources.
+_DEFAULT_LOG_TAIL_LINES_TOTAL = 50
 #: Prepended when the response budget forced older output out. Deliberately
 #: says which end went, since the transport's own marker does not.
 _RESPONSE_TRIM_NOTE = (
@@ -696,7 +705,7 @@ def read_kiro_cli_logs(
     lands on a line boundary, so no credential is separated from the header token
     that redacts it.
     """
-    tail = _DEFAULT_LOG_TAIL if tail is None else tail
+    tail_given = tail is not None
     sections: list[str] = []
     total_redactions = 0
 
@@ -705,13 +714,21 @@ def read_kiro_cli_logs(
     # which `_scrub` (a credential pass) does not narrow.
     sources: list[tuple[str, Path]] = [(p.name, p) for p in _kiro_cli_extra_logs()]
 
+    if not tail_given:
+        # The default view answers "what just happened" in ONE bounded read:
+        # ~50 newest lines MERGED across sources (divided between them) under a
+        # 20,000-char response budget. A caller who asks for more gets the full
+        # per-source tail and the 80,000-char ceiling.
+        tail = max(1, _DEFAULT_LOG_TAIL_LINES_TOTAL // max(len(sources), 1))
+    response_budget = _MAX_LOG_RESPONSE_CHARS if tail_given else _DEFAULT_LOG_RESPONSE_CHARS
+
     # Read the caps from the module at CALL time so a test can monkeypatch them.
     # Divide the response budget among the sources instead of giving each the
     # full per-source cap: `_read_log_tail` keeps the NEWEST bytes of whatever
     # window it is given, so dividing up front means every source contributes its
     # own newest lines and the assembled total already fits. Applying the full
     # cap to each and trimming afterwards would throw away one source entirely.
-    max_bytes = min(_MAX_LOG_READ_BYTES, _MAX_LOG_RESPONSE_CHARS // max(len(sources), 1))
+    max_bytes = min(_MAX_LOG_READ_BYTES, response_budget // max(len(sources), 1))
 
     for label, path in sources:
         try:
@@ -765,21 +782,28 @@ def read_kiro_cli_logs(
         )
     header = (
         f"kiro-cli logs (tail={tail}"
+        + ("/source" if len(sources) > 1 else "")
         + (f", since={since}" if since else "")
-        + f", {total_redactions} secret(s) redacted, capped at {max_bytes // 1024} KiB/source)\n"
+        + f", {total_redactions} secret(s) redacted, capped at {max_bytes // 1024} KiB/source"
+        + (
+            "; default view - ask for more with tail=N (up to 2000, 80,000-char ceiling)"
+            if not tail_given
+            else ""
+        )
+        + ")\n"
     )
     out = header + "\n".join(sections)
-    if len(out) <= _MAX_LOG_RESPONSE_CHARS:
+    if len(out) <= response_budget:
         return out
     # Belt and braces over the pre-read division above, which bounds BYTES while
     # the transport's ceiling counts CHARACTERS: `_scrub` can grow the text (a
     # short token replaced by `[REDACTED]`), and the section framing adds to it.
     # Keep the header and the NEWEST characters; the header must survive because
     # it is what states the tail/since/redaction count the rest is read against.
-    budget = _MAX_LOG_RESPONSE_CHARS - len(header) - len(_RESPONSE_TRIM_NOTE)
+    budget = response_budget - len(header) - len(_RESPONSE_TRIM_NOTE)
     if budget <= 0:
         # Degenerate only if the ceiling is set below the framing itself.
-        return (header + _RESPONSE_TRIM_NOTE)[:_MAX_LOG_RESPONSE_CHARS]
+        return (header + _RESPONSE_TRIM_NOTE)[:response_budget]
     kept = out[-budget:]
     # Start on a line boundary, purely so the first surviving line is readable:
     # unlike the cut in `_read_log_tail`, this one cannot expose a credential,
