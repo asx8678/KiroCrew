@@ -379,9 +379,39 @@ def get_chat_session(name: str, args: dict[str, Any]) -> str:
 
     title = meta.get("title") or key
     lines = [f"\U0001f4dc Conversation: **{title}**  ·  `{key}`", ""]
-    for m in messages:
-        role = str(m.get("role", "?")).title()
-        lines.append(f"**{role}:** {m.get('content', '')}")
+    # Per-message and total caps, matching the replay path's budgets (user
+    # 8k, assistant 4k, other 2k, head+tail with a marker): without these the
+    # only bound was the transport's 100k head-only cut, which dropped the
+    # MOST RECENT messages of a long transcript instead of the oldest.
+    _TOTAL_BUDGET = 40_000
+    _ROLE_CAPS = {"user": 8_000, "assistant": 4_000}
+    _DEFAULT_CAP = 2_000
+
+    def _cap(text: str, cap: int) -> str:
+        if len(text) <= cap:
+            return text
+        half = cap // 2
+        return f"{text[:half]}\n…[message truncated, {len(text)} chars total]\n{text[-half:]}"
+
+    budget = _TOTAL_BUDGET
+    kept: list[dict] = []
+    for m in reversed(messages):
+        content = str(m.get("content", ""))
+        role = str(m.get("role", "?"))
+        capped = _cap(content, _ROLE_CAPS.get(role, _DEFAULT_CAP))
+        cost = len(capped) + len(role) + 6  # role prefix + blank separator
+        if budget - cost < 0 and kept:
+            break  # newest messages are the ones kept
+        budget -= cost
+        kept.append({"role": role, "content": capped})
+    kept.reverse()
+    if len(kept) < len(messages):
+        lines.append(
+            f"_Showing {len(kept)} of {len(messages)} messages (newest kept). Ask with a smaller `max_messages` for older ones._"
+        )
+        lines.append("")
+    for m in kept:
+        lines.append(f"**{m['role']}:** {m['content']}")
         lines.append("")
 
     output = mcp_core._redact_history_output("\n".join(lines))
