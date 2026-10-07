@@ -169,7 +169,8 @@ def session_memory_parts(
     A private V2 member reads only its own prepared vectors -- never the global
     store in their place -- and the prompt names learned memory as unavailable when
     they are not prepared. Every other session reads its workspace's V1 store:
-    complete preferences (cut only at the model-safe ceiling, with an in-prompt
+    complete preferences up to the startup allowance the ``pref.*`` semantic
+    rows get (cut only at the model-safe ceiling above it, with an in-prompt
     notice naming the file), the protected activity index, the optional
     ``[Memory activity]`` background block and the ``[Memory tools]`` pointer.
     Returns ``(memory, member_vectors, activity_ranked)`` for the lessons block
@@ -231,28 +232,43 @@ def session_memory_parts(
                 prefs_startup_cap=caps.prefs_startup,
             )
             if memory_ctx:
-                # Preferences are read complete below the model-safe ceiling.
-                # The ceiling itself is the one bound they cannot cross: a
-                # preferences file the agent grew past it would otherwise
-                # overflow the window with no notice in the prompt.
+                # Preferences are injected up to the same startup allowance
+                # the pref.* semantic rows get (caps.prefs_startup, from
+                # _PREFS_STARTUP_CAP) and the model-safe ceiling above it.
+                # The two bounds exist for different reasons: the startup
+                # allowance keeps an agent-grown file from spending the
+                # whole protected set on persona text every session, and
+                # the ceiling is the one bound nothing can cross. Past
+                # either bound the head is kept, cut at a line boundary,
+                # with a notice naming the file to read for the rest.
                 protected_so_far = len(essentials) + sum(
                     len(parts[index]) for index in protected_parts
                 )
-                room = caps.protected_context - protected_so_far
+                ceiling_room = caps.protected_context - protected_so_far
+                room = min(caps.prefs_startup, ceiling_room)
                 if len(memory_ctx) > room:
                     omitted_chars = len(memory_ctx) - max(0, room)
+                    bound = (
+                        "startup allowance"
+                        if ceiling_room > caps.prefs_startup
+                        else "model-safe protected-content ceiling"
+                    )
                     notice = (
                         f"\n[Context budget: omitted {omitted_chars} chars of "
-                        "preferences above the model-safe protected-content ceiling; "
+                        f"preferences above the {bound}; "
                         f"read {memory._preferences_file} for the complete file.]\n"
                     )
                     logger.warning(
-                        "Preferences exceed model-safe ceiling: chars=%d room=%d; "
-                        "keeping the head",
+                        "Preferences exceed startup bound: chars=%d room=%d; " "keeping the head",
                         len(memory_ctx),
                         room,
                     )
-                    memory_ctx = memory_ctx[: max(0, room - len(notice))] + notice
+                    cut = max(0, room - len(notice))
+                    if cut > 0:
+                        newline = memory_ctx.rfind("\n", 0, cut)
+                        if newline > 0:
+                            cut = newline
+                    memory_ctx = memory_ctx[:cut] + notice
                 append_required(memory_ctx)
             activity = memory.activity_index()
             if activity:

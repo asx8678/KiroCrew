@@ -90,8 +90,15 @@ time-to-first-token: `build_session_context` stamps `_mark(...)` per group
 `include_activity=False` for the protected half, then
 `MemoryStore.get_activity_context` for the background half:
 
-- **Preferences** — injected **complete**, not capped, while the protected set
-  stays under the model-safe ceiling.
+- **Preferences** — injected up to the same startup allowance the `pref.*`
+  semantic rows get (`_PREFS_STARTUP_CAP` in `context_assembly/budget.py`,
+  window-scaled), and below it **complete**: past the allowance the head is
+  kept, cut at a line boundary, and the prompt carries a
+  `[Context budget: omitted N chars of preferences above the startup
+  allowance; read <file> for the complete file.]` notice naming the file. The
+  same head-plus-notice shape applies past the model-safe ceiling. The file
+  itself keeps every byte; `MemoryStore.write_preferences` warns once per
+  process when a write crosses the allowance.
 - **Semantic memory** — the eligible `pref.*` records
   (`get_preferences_context`) are protected but bounded by the startup allowance
   `_PREFS_STARTUP_CAP` in `context_assembly/budget.py`: over it, rows are ranked by

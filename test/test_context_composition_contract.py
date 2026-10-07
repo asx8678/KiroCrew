@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import hashlib
 import importlib
 import importlib.util
@@ -524,7 +525,8 @@ def _session_context_member_mode(rig: _Rig) -> str:
 
 
 def _background_overflow(rig: _Rig) -> str:
-    """Protected preferences fill the allowance, so background is omitted by name."""
+    """Preferences past the startup allowance are capped (head + notice), so the
+    background blocks the old uncapped preferences crowded out are admitted."""
     rig.seed_memory()
     rig.memory._preferences_file.write_text(
         "# Preferences\n" + "Keep this standing preference.\n" * 1_000,
@@ -662,12 +664,14 @@ _SCENARIOS = {
 #: recorded before the assembly moved into owners.
 _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
     "background_overflow": (
-        "2c4855e1f2a3372fb61f2d9abac311aeb1e524374c11dddea87a6e50d396f7e5",
+        "677e0b75a1aaa77fef9a3efa0499852de97dee0e2bb43be22461f86693230e09",
         [
-            ("unclassified", 173),
+            ("unclassified", 64),
             ("agent_identity", 25),
             ("surface", 197),
-            ("memory", 31487),
+            ("workspace_identity", 371),
+            ("docs_pointer", 235),
+            ("memory", 13033),
             ("memory_tools", 425),
             ("lessons", 179),
         ],
@@ -1424,7 +1428,19 @@ def test_a_live_window_report_wins_over_the_model_id() -> None:
     assert ctx.window_for_provider_client(object()) is None
 
 
-def test_preferences_past_the_ceiling_keep_their_head_and_name_the_file(rig: _Rig) -> None:
+def test_preferences_past_the_ceiling_keep_their_head_and_name_the_file(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The startup allowance (12,700 chars) binds before the ceiling for any
+    # preferences file, so raise it here to pin the model-safe ceiling
+    # backstop: it still guards the block when other protected content has
+    # eaten the protected set down below the allowance.
+    real_caps = ctx._resolve_caps(200_000)
+    monkeypatch.setattr(
+        ctx,
+        "_resolve_caps",
+        lambda window: dataclasses.replace(real_caps, prefs_startup=600_000),
+    )
     rig.memory.init()
     body = "# Preferences\n" + "Keep this preference.\n" * 6_000
     rig.memory._preferences_file.write_text(body, encoding="utf-8", newline="\n")
@@ -1438,6 +1454,39 @@ def test_preferences_past_the_ceiling_keep_their_head_and_name_the_file(rig: _Ri
     assert notice.group(2) == str(rig.memory._preferences_file)
     assert int(notice.group(1)) > 0
     assert "Keep this preference.\n" * 100 in text
+
+
+def test_preferences_past_the_startup_allowance_keep_their_head_and_name_the_file(
+    rig: _Rig,
+) -> None:
+    # The markdown block gets the same startup allowance the pref.* semantic
+    # rows get (12,700 chars, window-independent): past it the head is kept,
+    # cut at a line boundary, with a notice naming the file. Below it nothing
+    # changes — the byte-identical scenarios pin that half.
+    rig.memory.init()
+    body = "# Preferences\n" + "Keep this preference.\n" * 1_500
+    rig.memory._preferences_file.write_text(body, encoding="utf-8", newline="\n")
+    text = rig.builder.build_session_context("dashboard:prefs", model_window=200_000)
+    notice = re.search(
+        r"\[Context budget: omitted (\d+) chars of preferences above the startup "
+        r"allowance; read (.+?) for the complete file\.\]",
+        text,
+    )
+    assert notice is not None
+    assert notice.group(2) == str(rig.memory._preferences_file)
+    omitted = int(notice.group(1))
+    assert omitted > 0
+    # The injected block (header + kept head + notice) respects the allowance.
+    block = text[text.index("## User Preferences") : notice.end()]
+    allowance = 12_700
+    assert len(block) <= allowance + 200  # header + notice slack
+    # The head is kept, cut at a line boundary, and the file's first line survives.
+    assert text.count("Keep this preference.\n") > 100
+    kept_head = text[: text.index("[Context budget: omitted")]
+    assert "# Preferences\n" in kept_head
+    assert not kept_head.rstrip("\n").endswith("Keep this pref")
+    # The file itself is untouched: the full body is still on disk.
+    assert rig.memory._preferences_file.read_text(encoding="utf-8") == body
 
 
 # ── Hostile text ──────────────────────────────────────────────────────────────
