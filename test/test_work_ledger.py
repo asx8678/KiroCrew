@@ -854,8 +854,60 @@ def test_work_brief_shows_the_item_and_not_the_conductors_goal():
 # ── caps refuse, and a refusal changes no bytes ───────────────────────────
 
 
+def test_the_goal_budget_is_durable_state_the_store_enforces():
+    """LOOP-18: the 20-item per-goal cap the prompt always stated is now a
+    budget on the conductor header the STORE refuses past — so a compaction
+    cannot make the conductor lose count — and a 'goal' action raises it."""
+    wl.ensure_conductor(CONDUCTOR, goal="g")
+    for index in range(wl.WORK_ITEM_BUDGET_DEFAULT):
+        wl.apply_conductor_action(CONDUCTOR, "create", title=f"t{index}", acceptance={})
+    before = sorted(p.name for p in wl.items_dir(CONDUCTOR).iterdir())
+    with pytest.raises(wl.WorkLedgerError) as caught:
+        wl.apply_conductor_action(CONDUCTOR, "create", title="one too many", acceptance={})
+    assert caught.value.code == wl.CODE_ITEM_BUDGET_EXCEEDED
+    assert (
+        sorted(p.name for p in wl.items_dir(CONDUCTOR).iterdir()) == before
+    ), "a refused create must write nothing"
+
+    # The user approves a larger Round-0 plan: the goal action raises the budget,
+    # and the same create now lands.
+    wl.apply_conductor_action(CONDUCTOR, "goal", item_budget=wl.WORK_ITEM_BUDGET_DEFAULT + 5)
+    raised = wl.apply_conductor_action(
+        CONDUCTOR, "create", title="the one that was refused", acceptance={}
+    )
+    assert raised["item"] is not None
+    # The budget is durable on the header.
+    assert wl.read_conductor(CONDUCTOR).item_budget == wl.WORK_ITEM_BUDGET_DEFAULT + 5
+
+
+def test_the_structural_caps_still_refuse_behind_the_goal_budget():
+    """LOOP-18: the budget refusal precedes but does not replace the 32-open /
+    256-stored structural caps — a raised budget still ends at them."""
+    wl.ensure_conductor(CONDUCTOR, goal="g")
+    wl.apply_conductor_action(CONDUCTOR, "goal", item_budget=wl.MAX_STORED_ITEMS_PER_CONDUCTOR)
+    for index in range(wl.MAX_ITEMS_PER_CONDUCTOR):
+        wl.apply_conductor_action(CONDUCTOR, "create", title=f"t{index}", acceptance={})
+    with pytest.raises(wl.WorkLedgerError) as caught:
+        wl.apply_conductor_action(CONDUCTOR, "create", title="over open", acceptance={})
+    assert caught.value.code == wl.CODE_ITEM_CAP_EXCEEDED
+
+
+def test_a_legacy_board_without_the_field_reads_the_default_budget():
+    """LOOP-18: zero on a record means the field predates the enforcement, so
+    the default the prompt promised applies — never an unbounded zero."""
+    wl.ensure_conductor(CONDUCTOR, goal="g")
+    record = wl.read_conductor(CONDUCTOR)
+    record.item_budget = 0  # a header from before the field
+    assert wl.effective_item_budget(record) == wl.WORK_ITEM_BUDGET_DEFAULT
+    wl.apply_conductor_action(CONDUCTOR, "goal", item_budget=2)
+    assert wl.effective_item_budget(wl.read_conductor(CONDUCTOR)) == 2
+
+
 def test_the_item_cap_refuses_the_thirty_third_item():
     wl.ensure_conductor(CONDUCTOR, goal="g")
+    # LOOP-18: the default 20-item goal budget would refuse first; raise it so
+    # this test reaches the OPEN-cap it exists to pin.
+    wl.apply_conductor_action(CONDUCTOR, "goal", item_budget=wl.MAX_STORED_ITEMS_PER_CONDUCTOR)
     for index in range(wl.MAX_ITEMS_PER_CONDUCTOR):
         wl.apply_conductor_action(CONDUCTOR, "create", title=f"t{index}", acceptance={})
     before = sorted(p.name for p in wl.items_dir(CONDUCTOR).iterdir())
@@ -874,6 +926,9 @@ def test_closed_items_do_not_count_toward_the_item_cap(terminal_state: str):
     with nothing live behind the refusal.
     """
     wl.ensure_conductor(CONDUCTOR, goal="g")
+    # LOOP-18: raise the per-goal budget so this structural test reaches the
+    # cap it exists to pin rather than the default 20-item goal budget.
+    wl.apply_conductor_action(CONDUCTOR, "goal", item_budget=wl.MAX_STORED_ITEMS_PER_CONDUCTOR)
     ids = [
         wl.apply_conductor_action(CONDUCTOR, "create", title=f"t{index}", acceptance={})[
             "item"
@@ -898,6 +953,9 @@ def test_closed_items_do_not_count_toward_the_item_cap(terminal_state: str):
 def test_closed_items_stay_on_disk_listed_and_readable_past_the_cap():
     """Freeing a seat changes nothing about the closed item's own record."""
     wl.ensure_conductor(CONDUCTOR, goal="g")
+    # LOOP-18: raise the per-goal budget so this structural test reaches the
+    # cap it exists to pin rather than the default 20-item goal budget.
+    wl.apply_conductor_action(CONDUCTOR, "goal", item_budget=wl.MAX_STORED_ITEMS_PER_CONDUCTOR)
     ids = [
         wl.apply_conductor_action(CONDUCTOR, "create", title=f"t{index}", acceptance={})[
             "item"
@@ -1990,6 +2048,9 @@ def test_two_concurrent_writers_leave_a_parseable_item_and_a_clean_event_log():
 
 def test_the_item_cap_holds_under_concurrent_creates():
     wl.ensure_conductor(CONDUCTOR, goal="g")
+    # LOOP-18: raise the per-goal budget so this structural test reaches the
+    # cap it exists to pin rather than the default 20-item goal budget.
+    wl.apply_conductor_action(CONDUCTOR, "goal", item_budget=wl.MAX_STORED_ITEMS_PER_CONDUCTOR)
     refused: list[str] = []
 
     def create() -> None:

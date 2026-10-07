@@ -52,6 +52,7 @@ WORK_STORED_ITEM_LIMIT: int = 256
 #: the committed item is what the fold applies to the rebuilt one; the two read
 #: this one table so they cannot drift apart. A worker's fields are fixed.
 WORK_CONDUCTOR_FIELDS: dict[str, tuple[str, ...]] = {
+    "goal": ("goal", "round", "item_budget"),
     "create": ("title", "acceptance", "round"),
     "bind": ("worker_session_key",),
     "decide": ("decision", "round"),
