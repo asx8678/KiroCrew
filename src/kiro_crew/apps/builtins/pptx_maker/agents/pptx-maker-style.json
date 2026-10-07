@@ -1,6 +1,7 @@
 {
   "name": "pptx-maker-style",
   "description": "Style creator. Builds a reusable presentation style guide (an HTML document) through conversation.",
+  "includeMcpJson": false,
   "mcpServers": {
     "sdpm": {
       "command": "{UV_BIN}",

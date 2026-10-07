@@ -1,6 +1,7 @@
 {
   "name": "pptx-maker-vibe",
   "description": "Fast presentation agent. Turns source material (a URL, pasted text, a short brief) into slides with minimal questions, then delegates composition to pptx-maker-composer.",
+  "includeMcpJson": false,
   "mcpServers": {
     "sdpm": {
       "command": "{UV_BIN}",
