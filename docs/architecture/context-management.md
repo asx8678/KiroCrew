@@ -350,8 +350,11 @@ compact block (`goal`, `phase`, `next`, the last three `tried`, artifacts, bound
 by `_SNAPSHOT_MAX_CHARS`) and `dashboard/handlers/autonudge.py` prepends it to a
 **monitor /
 auto-nudge cycle message**, so each cycle starts from durable state rather than
-transcript memory. It is empty when the session has no ledger or its phase is
-terminal. See [Session Ledger](../../src/kiro_crew/docs/session-ledger.md), [Monitor Loops](../../src/kiro_crew/docs/monitor-loops.md).
+transcript memory. An artifact value that looks like an image path is prefixed
+with a glued `file:` — the attachment grammar cannot match that form, so a
+snapshot naming a picture re-attaches it zero times instead of on every cycle,
+while the path stays readable. It is empty when the session has no ledger or its
+phase is terminal. See [Session Ledger](../../src/kiro_crew/docs/session-ledger.md), [Monitor Loops](../../src/kiro_crew/docs/monitor-loops.md).
 
 ## 3. Sub-agent sessions (`spawn_run`)
 

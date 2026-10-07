@@ -337,6 +337,55 @@ def test_snapshot_includes_artifact_only_ledger():
     assert "feat/x" in snap
 
 
+def test_snapshot_artifact_image_path_never_re_attaches_as_an_image(tmp_path):
+    """build_prompt_blocks scans the whole outgoing cycle message and inlines
+    every readable image path, so a snapshot naming a picture re-attached the
+    same PNG on EVERY monitor/auto-nudge cycle. The glued ``file:`` prefix is a
+    form the attachment grammar cannot match, while the path stays readable —
+    and a user-typed message with the same path still attaches once."""
+    import struct
+    import zlib
+
+    from kiro_crew.acp.prompt_blocks import build_prompt_blocks
+
+    png = tmp_path / "chart.png"
+    # An 8x8 valid PNG (IHDR + IDAT + IEND).
+    ihdr = struct.pack(">IIBBBBB", 8, 8, 8, 2, 0, 0, 0)
+
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    scanlines = b"".join(b"\x00" + b"\x40\x80\xc0" * 8 for _ in range(8))
+    png.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", zlib.compress(scanlines))
+        + _chunk(b"IEND", b"")
+    )
+
+    key = "chat-11-223"
+    _unit(slot=key)
+    _record(key, artifacts={"chart": str(png)})
+    snap = sl.render_snapshot(key)
+    assert f"file:{png}" in snap, snap
+
+    # A nudge cycle message: the snapshot plus a plain body.
+    cycle = f"{snap}\n\nContinue the task."
+    blocks = build_prompt_blocks(cycle, allow_image=True)
+    assert [b["type"] for b in blocks] == ["text"], blocks
+    assert "file:" in blocks[0]["text"]
+
+    # The SAME path typed by the user still attaches exactly once.
+    user = f"Here is the chart: {png}"
+    user_blocks = build_prompt_blocks(user, allow_image=True)
+    assert [b["type"] for b in user_blocks] == ["text", "image"], user_blocks
+
+
 def test_snapshot_contains_state_and_is_capped():
     key = "chat-12-222"
     _unit(slot=key)
