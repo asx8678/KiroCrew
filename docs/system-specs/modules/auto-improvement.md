@@ -30,6 +30,15 @@ All routes live under `/api/apps/auto-improvement/` and are registered by
 in-process on the gateway's own aiohttp app. Every handler is wrapped in
 `_require_enabled` (403 when the app is disabled).
 
+Disabling the app also stops its WORK (LOOP-26): the disable teardown's
+`on_shutdown` hook stops the run supervisor AND the whole PR-watcher registry
+(the same stop the gateway's own on_cleanup performs), and — defence in depth —
+each watcher's nudge loop re-checks `is_app_enabled` before every agent pass,
+so a watcher whose thread was mid-pass when the operator disabled the app
+ends after at most that pass, as STOPPED with `app disabled`, instead of
+spending its remaining nudges (up to 4 watchers x 6 passes) against a
+disabled app.
+
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET | `/health` | liveness; echoes the app name |

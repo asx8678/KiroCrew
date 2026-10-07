@@ -1004,9 +1004,22 @@ class PRWatcherRegistry:
         runner: Any,
     ) -> None:
         """At most ``max_nudges`` passes of: read the PR, act on it, wait."""
+        from kiro_crew.apps.manager import is_app_enabled
+
+        from . import store
+
         for attempt in range(1, st.max_nudges + 1):
             if stop_ev.is_set():
                 self._set(st, status=STATUS_STOPPED, note="stopped")
+                return
+            # LOOP-26: defence in depth under the shutdown stop — a watcher
+            # whose thread was mid-pass when the operator disabled the app
+            # ends after at most that pass instead of running its remaining
+            # nudges (up to 4 watchers x 6 passes) against a disabled app.
+            # Off the loop already: this runs on the watcher's worker thread.
+            if not is_app_enabled(store.APP_NAME):
+                self._set(st, status=STATUS_STOPPED, note="app disabled")
+                self._log(st, "verdict", "STOPPED — app disabled mid-watch")
                 return
             self._set(
                 st,

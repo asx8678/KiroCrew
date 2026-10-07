@@ -137,9 +137,23 @@ async def on_startup(ctx: Any) -> None:
 
 
 async def on_shutdown(ctx: Any) -> None:
+    """The app's disable/shutdown hook: stop the run supervisor AND the PR watchers.
+
+    The supervisor half predates LOOP-26; the watchers did not stop here, so
+    up to MAX_ACTIVE_WATCHERS (4) of them kept running agent passes (6 each,
+    1800 s apart) after the operator disabled the app — their only other
+    stop was the aiohttp on_cleanup at full gateway shutdown. Both stops run
+    on worker threads through the same owned-task helper, matching the
+    routes.py teardown shape.
+    """
+    from .pr_watchers import get_registry
     from .runner import get_supervisor
 
-    await _await_owned(asyncio.create_task(asyncio.to_thread(get_supervisor().stop)))
+    async def _stop_all() -> None:
+        await asyncio.to_thread(get_supervisor().stop)
+        await asyncio.to_thread(get_registry().stop_all)
+
+    await _await_owned(asyncio.create_task(_stop_all()))
 
 
 def build_runner(*, stop_check, on_activity):
