@@ -6242,7 +6242,10 @@ class GatewayOrchestrator:
                 # of a cycle runs on this one session, so the record of skill
                 # bodies it already holds is kept under the heartbeat key: a
                 # skill two tasks match reaches the session once. The prompt is
-                # still built without a session key.
+                # still built without a session key. CTX-5: interactive=False —
+                # a heartbeat turn runs unattended, so the [OPTIONS:] paragraph
+                # and the dashboard-card guidance must not reach it (measured
+                # ~430 B of [OPTIONS:] per cycle for nothing).
                 full_message, _ = await run_in_embed_pool(
                     self.ctx_builder.build_message,
                     injected,
@@ -6250,6 +6253,7 @@ class GatewayOrchestrator:
                     memory_store=_memory_store,
                     needs_reinjection=_needs_reinjection,
                     skill_bodies_session=session_key,
+                    interactive=False,
                 )
 
                 # A heartbeat turn runs unattended. Bound it with a hard deadline

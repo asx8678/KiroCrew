@@ -1270,6 +1270,26 @@ _BUILDER_MEMBERS: dict[str, tuple[str, str]] = {
         "method",
         "(self, session_key: 'str | None', agent: 'str | None', candidates: 'list[tuple[str, str]]') -> 'None'",
     ),
+    "_rail_digest_key": (
+        "method",
+        "(self, session_key: 'str | None', agent: 'str | None') -> 'str | None'",
+    ),
+    "_settle_rail_digest_commit": (
+        "method",
+        "(self, session_key: 'str | None') -> 'None'",
+    ),
+    "_settle_rail_digest_rollback": (
+        "method",
+        "(self, session_key: 'str | None') -> 'None'",
+    ),
+    "rail_block_fresh": (
+        "method",
+        "(self, session_key: 'str | None', agent: 'str | None', block: 'str', digest: 'str') -> 'bool'",
+    ),
+    "reset_rail_blocks": (
+        "method",
+        "(self, session_key: 'str | None', agent: 'str | None') -> 'None'",
+    ),
     "_live_shown_lessons": ("method", "(self, session_key: 'str') -> '_ShownLessons'"),
     "_load_agent_prompt": (
         "static",

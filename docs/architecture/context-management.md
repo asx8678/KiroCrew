@@ -211,11 +211,26 @@ it adds:
 
 | Block | Source | When |
 |---|---|---|
-| `[RUNTIME]` refresh | trusted `runtime_source` | every follow-up; a channel turn also re-asserts the diff-block mandate |
+
+**Per-turn dedup (CTX-5).** The `[PROJECT]`, `[RUNTIME]` and guidance blocks
+keep a per-(session, agent) digest in `ContextBuilder`
+(`rail_block_fresh`): an unchanged block on a follow-up turn arrives as a
+one-line pointer instead of its full text (measured ~1.9 KB re-sent
+byte-identical per dashboard turn). A changed block, a fresh session, a
+re-injection or an agent switch re-sends it whole (the record resets on those
+turns, before any block asks); the record settles at the turn seam with the
+skill-body record (`commit_skill_bodies` / `rollback_skill_bodies`), so a turn
+that never lands re-sends. A build without a session key (the heartbeat,
+CLI, tests) keeps no record and always sends whole — and the heartbeat passes
+`interactive=False`, so it carries no `[OPTIONS:]` paragraph at all.
+
+| Block | Source | When |
+|---|---|---|
+| `[RUNTIME]` refresh | trusted `runtime_source` | when the runtime CHANGED since the session last saw it (a per-session digest, reset on a new session, re-injection and an agent switch); an unchanged turn gets a one-line `[RUNTIME] unchanged` pointer, and a channel turn's diff-block mandate rides the full block |
 | Channel history | `channel_history.context_for` | group-channel turns, except a thread turn that carries `[SLACK THREAD REPLIES]`; a thread turn sends only buffered messages the session has not been shown yet (a per-(session, thread) watermark, reset on a new session and after compaction, committed at the turn seam like the skill-body record), never the current incoming message, with absolute `HH:MM` stamps |
 | `[SLACK THREAD CONTEXT]` | thread parent / metadata | Slack threads |
 | `[SLACK THREAD REPLIES]` | `slack/thread_replies.py`, fenced as untrusted | a Slack thread turn with replies it has not seen |
-| `[PROJECT]` | the slot's project dir | every turn, `project` group |
+| `[PROJECT]` | the slot's project dir | when the project CHANGED (or the first turn / a window rebuild); an unchanged follow-up gets a one-line `[PROJECT] unchanged` pointer — `project` group |
 | `[BOARD]` | slot board tags, sanitized ids | slot carries tags |
 | `[RESOURCES]` | `resource_status.probe` | host memory tight/critical, or the agent slice within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max`, or a macOS kernel memory-pressure level of WARN or worse |
 | `[FOLDER]` | sidebar ancestry | once per session, and after a move |
