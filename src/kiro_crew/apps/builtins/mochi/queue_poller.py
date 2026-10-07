@@ -82,6 +82,16 @@ MAX_PLAN_FAILS = 5
 PLAN_BACKOFF_BASE_MS = 60_000
 _PLAN_BACKOFF_CAP_MS = 16 * 60_000
 
+# UI-5: a REFUSED freestyle-agent spawn is retried with exponential backoff
+# (this base doubling to the same cap the plan retry uses) instead of on the
+# very next 1 s poll — one due task whose spawn raises cost 60 attempts/min,
+# 7 due tasks 420/min. Watch checks already keep a 5-min lock and plans use
+# their own backoff; only freestyle lacked one. The poller is process-local,
+# so the retry bookkeeping can be an in-memory map keyed by task id, cleared
+# when the task completes or the queue forgets it.
+_FREESTYLE_RETRY_BASE_MS = 30_000
+_FREESTYLE_RETRY_CAP_MS = _PLAN_BACKOFF_CAP_MS
+
 # Storm breaker: hard rate-limit on watch spawns regardless of lock state.
 WATCH_STORM_WINDOW_MS = 10 * 60_000
 MAX_WATCH_SPAWNS_PER_WINDOW = 5
@@ -230,6 +240,11 @@ class QueuePoller:
         self._watch_spawn_at = 0
         self._plan_fail_count = 0
         self._plan_next_retry_at = 0
+        # UI-5: per-task freestyle spawn backoff — task id -> (fail_count,
+        # retry_at_ms). In-memory on purpose: the queue file is the app's
+        # contract with its agents, and a host-side retry cadence is not
+        # their business.
+        self._freestyle_retry: dict[Any, tuple[int, int]] = {}
         self._watch_spawn_count = 0
         self._watch_window_start = 0
         self._first_launch_grace = False
@@ -560,6 +575,11 @@ class QueuePoller:
         for task in due_tasks:
             if task.get("type") not in AGENT_TYPES:
                 continue
+            # UI-5: a task whose last spawn was refused is not due until its
+            # retry_at passes; completed/absent tasks drop out of the map.
+            _retry = self._freestyle_retry.get(task.get("id"))
+            if _retry is not None and now_ms < _retry[1]:
+                continue
             try:
                 await self._spawn_agent_task_serial(task)
             except Exception:  # noqa: BLE001
@@ -660,6 +680,21 @@ class QueuePoller:
             on_end = getattr(self._callbacks, "on_agent_spawn_end", None)
             if on_end is not None:
                 on_end()
+            # UI-5: back off exponentially — the next 1 s poll must not retry a
+            # refused spawn (30 s doubling to the 16-min cap, the plan retry's
+            # constants); a task that later completes drops its entry.
+            _count = (self._freestyle_retry.get(task_id, (0, 0))[0]) + 1
+            _backoff_ms = min(
+                _FREESTYLE_RETRY_BASE_MS * (2 ** (_count - 1)),
+                _FREESTYLE_RETRY_CAP_MS,
+            )
+            self._freestyle_retry[task_id] = (_count, self._clock() + _backoff_ms)
+            logger.warning(
+                "[QueuePoller] freestyle spawn %s refused (attempt %d); next retry in %ds",
+                task_id,
+                _count,
+                round(_backoff_ms / 1000),
+            )
             return
 
         self._current_spawn_id = spawn_id or None
