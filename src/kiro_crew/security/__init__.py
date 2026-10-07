@@ -439,6 +439,11 @@ _CRED_CLASS: frozenset[str] = frozenset(
 # fixed-format credential so a split token is always rejoined before emission;
 # bounds latency/memory for a pathologically long unbroken run (only affects a
 # single >512-char secret with no delimiter, which no supported provider issues).
+# The floor ESCALATES for a credential-shaped tail: a trailing credential-class
+# run longer than the floor is a bare secret or key-anchored value the batch
+# passes judge only WHOLE, so it is held to the JWT ceiling below and fails
+# closed past that rather than bisected into anchor-less fragments too short
+# for any batch pass to judge (which streamed raw).
 _STREAM_HOLDBACK_MAX = 512
 
 # PEM header hold-back: matches an in-progress "BEGIN [type] PRIVATE KEY"
@@ -450,6 +455,33 @@ _PEM_HOLD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A COMPLETE PEM header anywhere in the buffer (the hold above only matches one
+# still in progress at the commit tail): the material that follows is a PEM
+# body, and in a JSON-quoted value its line breaks arrive as the two characters
+# ``\`` ``n`` -- not in ``_CRED_CLASS``, so without this the held run would end
+# at every line boundary and body lines would commit in fragments too short for
+# any batch pass to judge.  Keyed off the header, the natural-cut walk in
+# ``feed`` steps over the escape, keeping the whole PEM one run.  The spelling
+# is ``redaction.py``'s own (the pass-1 branch and the record rule share it), so
+# the stream and the batch cannot drift.
+_PEM_HEADER_COMPLETE_RE = re.compile(redaction._PRIVATE_KEY_HEADER)
+
+# An in-progress END marker at the commit-window tail, mirroring the BEGIN hold
+# above: a commit that severs ``-----END ... PRIVATE KEY-----`` leaves the
+# private-key pass no complete marker to span, and the body it protected
+# commits raw.
+_PEM_END_HOLD_RE = re.compile(
+    r"END[\s](?:RSA[\s]?|DSA[\s]?|EC[\s]?|OPENSSH[\s]?)?(?:PRIVATE)?[\s]?$",
+    re.IGNORECASE,
+)
+
+# The commit-window tail when the stopped-at space sits inside a PEM marker
+# phrase, complete or still arriving (``-----END `` / ``-----BEGIN PRIVATE ``):
+# stepping over such a space keeps the marker inside the held run, so a commit
+# can never sever ``-----END ... KEY-----`` and leave the private-key pass no
+# complete marker to span -- the shape that committed the PEM body raw.
+_PEM_MARKER_INTERIOR_RE = re.compile(r"-----(?:BEGIN|END)[A-Z ]*$")
+
 # JWTs (esp. RS256/ES256 with embedded claims) routinely exceed the 512-char DoS
 # floor, so a terminal JWT longer than _STREAM_HOLDBACK_MAX would be bisected by
 # the default cap and emitted half-redacted. When the withheld tail *looks like*
@@ -458,8 +490,9 @@ _PEM_HOLD_RE = re.compile(
 _STREAM_HOLDBACK_JWT_MAX = 4096
 
 # A sticky discard consumes only bytes that the ARMING anchor defines as value
-# bytes. These two classes are the existing classes from the partial JWT and
-# Bearer anchors below, named so the anchors and discard cannot drift apart.
+# bytes. These classes are the existing classes from the partial JWT and Bearer
+# anchors below and redaction.py's own run classes, named so the anchors and
+# discard cannot drift apart.
 _JWT_SEGMENT_VALUE_CLASS = r"[A-Za-z0-9_-]"
 _BEARER_VALUE_CLASS = r"[A-Za-z0-9._~+/=-]"
 _STREAM_DISCARD_RUN_RES = {
@@ -470,6 +503,11 @@ _STREAM_DISCARD_RUN_RES = {
     "token-param": re.compile(rf"{redaction._TOKEN_PARAM_VALUE_CLASS}*"),
     "jwt": re.compile(rf"(?:{_JWT_SEGMENT_VALUE_CLASS}|\.)*"),
     "bearer": re.compile(rf"{_BEARER_VALUE_CLASS}*"),
+    # An over-ceiling credential-class run with no other anchor: its
+    # continuation is bare-secret run material (the batch entropy pass's own
+    # judgment unit) plus the JSON-escaped line break a PEM body carries, both
+    # read off redaction.py like the classes above.
+    "held-run": re.compile(rf"(?:{redaction._BARE_SECRET_VALUE_CLASS}|\\n)*"),
 }
 # Bytes of terminator-less continuation dropped silently between two tags. It is
 # NOT an exit: at the bound the discard re-emits the tag, zeroes the counter and
@@ -602,8 +640,43 @@ class StreamRedactor:
         # Invariant: every candidate can only move the cut backward. Bytes before
         # the minimum do not bisect any known in-progress credential anchor.
         natural_cut = len(self._buf)
-        while natural_cut > 0 and self._buf[natural_cut - 1] in _CRED_CLASS:
-            natural_cut -= 1
+        # A complete PEM header means the run that follows is a PEM body whose
+        # JSON-escaped line breaks (``\`` ``n``) would otherwise end the held
+        # run at every line boundary; step over the escape so the body stays
+        # one run (see ``_PEM_HEADER_COMPLETE_RE``).
+        pem_live = _PEM_HEADER_COMPLETE_RE.search(self._buf) is not None
+        while natural_cut > 0:
+            prev = self._buf[natural_cut - 1]
+            if prev in _CRED_CLASS:
+                natural_cut -= 1
+                continue
+            if pem_live and prev == "\\":
+                tail = self._buf[natural_cut : natural_cut + 1]
+                if tail == "n":
+                    # A JSON-escaped line break inside the held value.
+                    natural_cut = max(0, natural_cut - 2)
+                    continue
+                if not tail:
+                    # The escape's second character has not arrived yet; hold
+                    # the backslash too, or the commit right after it would
+                    # carry the PEM header away, drop it from the buffer and
+                    # disarm this hold mid-body.
+                    natural_cut -= 1
+                    continue
+            if (
+                pem_live
+                and prev == " "
+                and _PEM_MARKER_INTERIOR_RE.search(
+                    self._buf[max(0, natural_cut - 50) : natural_cut]
+                )
+            ):
+                # A space inside a PEM marker phrase, complete or still
+                # arriving: step over it so the phrase stays inside the held
+                # run and the over-cap escalation below keeps treating the
+                # whole PEM as one credential-shaped tail.
+                natural_cut -= 1
+                continue
+            break
         partial_jwt = _partial_jwt_tail(self._buf)
         safety_cuts = [natural_cut]
 
@@ -628,9 +701,12 @@ class StreamRedactor:
         # PEM header hold-back (ported from the upstream project): the
         # multi-word phrase "BEGIN RSA PRIVATE KEY" splits on whitespace. If the
         # tail of the commit window contains an in-progress PEM header prefix,
-        # refuse to commit at this boundary.
-        if natural_cut > 0 and _PEM_HOLD_RE.search(
-            self._buf[max(0, natural_cut - 50) : natural_cut]
+        # or an in-progress END marker (the same phrase shape, which would
+        # otherwise let a commit sever the marker the private-key pass needs to
+        # span the body), refuse to commit at this boundary.
+        if natural_cut > 0 and (
+            _PEM_HOLD_RE.search(self._buf[max(0, natural_cut - 50) : natural_cut])
+            or _PEM_END_HOLD_RE.search(self._buf[max(0, natural_cut - 50) : natural_cut])
         ):
             safety_cuts.append(0)
 
@@ -661,11 +737,21 @@ class StreamRedactor:
         if complete_token_crossing is not None:
             i = min(i, complete_token_crossing.start())
 
+        # A trailing credential-class run longer than the holdback floor is a
+        # potential bare secret or key-anchored value the batch passes judge
+        # only WHOLE: the entropy pass needs the complete run, and no stream
+        # anchor names every key spelling a value can ride behind (``password=``,
+        # a JSON key, a header-style ``api_key:``).  Held to the ceiling it
+        # rejoins whole and redacts with the batch; past the ceiling it fails
+        # closed like Bearer/JWT instead of committing anchor-less fragments
+        # too short for any batch pass to judge (which streamed raw).
+        long_cred_run = len(self._buf) - natural_cut > _STREAM_HOLDBACK_MAX
         strong_anchored = (
             partial_jwt is not None
             or bearer_anchor is not None
             or complete_token_crossing is not None
             or strong_token_anchor
+            or long_cred_run
         )
 
         # A partial canonical tag is already-redacted material. It lowers only
@@ -694,6 +780,7 @@ class StreamRedactor:
                     partial_jwt is not None
                     or bearer_anchor is not None
                     or strong_token_anchor
+                    or long_cred_run
                     or (
                         complete_token_crossing is not None
                         and complete_token_crossing.end(1) == len(self._buf)
@@ -705,8 +792,9 @@ class StreamRedactor:
                     # Every arming term above maps to exactly one kind, carrier
                     # first: a STRONG token anchor or a complete crossing ending
                     # the buffer -> "token-param"; a Bearer anchor -> "bearer";
-                    # a partial JWT -> "jwt". No other term can arm, so the
-                    # final `else` holds a true invariant.
+                    # a partial JWT -> "jwt"; an over-ceiling credential-class
+                    # run with no other anchor -> "held-run". No other term can
+                    # arm, so the final `else` holds a true invariant.
                     # Prefer an enclosing carrier over a token shape inside its
                     # value: its value class defines where that credential ends.
                     token_param_reaches_end = strong_token_anchor or (
@@ -717,9 +805,15 @@ class StreamRedactor:
                         self._discard_kind = "token-param"
                     elif bearer_anchor is not None:
                         self._discard_kind = "bearer"
-                    else:
-                        assert partial_jwt is not None
+                    elif partial_jwt is not None:
                         self._discard_kind = "jwt"
+                    else:
+                        # The only remaining arming term is the over-ceiling
+                        # unanchored run, whose continuation is bare-secret run
+                        # material plus the JSON-escaped line break a PEM body
+                        # carries.
+                        assert long_cred_run
+                        self._discard_kind = "held-run"
                 self._discarded = 0
                 # A complete value may cross the safety cut yet end before a
                 # benign suffix in the same buffer. Drop only through the value;
