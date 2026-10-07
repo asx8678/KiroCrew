@@ -136,6 +136,35 @@ class TestSteerPolicyNotice:
         assert notices and "User denied tool execution" in notices[0]
 
     @pytest.mark.asyncio
+    async def test_the_second_denial_in_a_turn_uses_the_short_repeat_form(self):
+        """TOOL-17: the first notice is byte-identical; a later denial in the
+        same turn carries the ~400-char invariant wording ONCE, and the repeat
+        names the block and points at the guidance already steered."""
+        from kiro_crew.deny_notice import build_refusal_steer_notice, build_repeat_refusal_notice
+
+        client = _SteerClient()
+        notices: list[str] = []
+        assert await _steer_policy_notice(client, "bash", "denied by policy", notices) is True
+        first = notices[0]
+        assert first  # populated below alongside the second call
+        assert await _steer_policy_notice(client, "curl", "denied again", notices) is True
+        second = notices[1]
+        assert second.startswith("[Kiro Crew host notice] Blocked again by host policy")
+        assert "curl: denied again" in second
+        assert len(second) < len(first)
+        # The first notice keeps the full invariant wording.
+        assert "User denied tool execution" in first
+        # A FRESH turn's first denial is full-form again.
+        fresh: list[str] = []
+        assert await _steer_policy_notice(client, "bash", "denied", fresh) is True
+        assert "User denied tool execution" in fresh[0]
+        # The builder round-trips the repeat shape standalone.
+        assert build_repeat_refusal_notice("t", "r").startswith(
+            "[Kiro Crew host notice] Blocked again"
+        )
+        assert build_refusal_steer_notice("t", "r")
+
+    @pytest.mark.asyncio
     async def test_backend_without_steer_writes_nothing(self):
         client = _SteerClient(supports_steer=False)
         notices: list[str] = []
