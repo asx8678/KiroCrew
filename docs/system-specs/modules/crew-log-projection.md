@@ -1060,7 +1060,14 @@ dashboard state exists, so the crew log names no dashboard symbol. The conductor
 pull-forward (`conductor_wake`, registered at `AutoNudgeService.start`) is the second
 subscriber: on a `work` fold's event it diffs each item's `last_report_at` against the
 board it last saw and pulls the conductor's armed work-ledger loop forward for the items
-that moved -- the event's `key` is the conductor's board, so it reads no binding.
+that moved -- the event's `key` is the conductor's board, so it reads no binding. A push
+arms the tick at a 30 s SETTLE window rather than immediately, so reports from
+different workers that land inside the window share ONE wake turn (each later push
+re-arms the same pending tick out to its own settle stamp, and the tick that runs
+reads the last write); a lone report still wakes the conductor inside the window. The
+pull-forward is budgeted twice: `ITEM_PULLS_PER_HOUR` (12) per item, and
+`LOOP_PULLS_PER_HOUR` (24) per conductor ACROSS items, so a wide crew cannot buy
+N x 12 wake turns an hour on one conductor.
 Further consumers -- a summary fold over a session's events, the automatic-card sentence
 trigger, channel notifications -- are expected to subscribe the same way and are not
 built here.

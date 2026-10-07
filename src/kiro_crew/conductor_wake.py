@@ -505,8 +505,23 @@ def reset_for_tests() -> None:
 #: an item over its cap is heard at the patrol cadence instead of at once.
 ITEM_PULLS_PER_HOUR = 12
 
+#: Per-LOOP pull-forward budget per hour, ACROSS items: without it, N bound
+#: items each spending their own :data:`ITEM_PULLS_PER_HOUR` would buy N x 12
+#: pull-forward ticks on ONE conductor an hour. Generous over the per-item cap
+#: (several hot items may legitimately share a conductor), but finite.
+LOOP_PULLS_PER_HOUR = 24
+
 #: The window :data:`ITEM_PULLS_PER_HOUR` counts over, in seconds.
 _ITEM_WINDOW_SECS = 3600.0
+
+#: How long a worker-report push WAITS before arming the conductor's tick
+#: (LOOP-15): reports from different workers that land inside this window share
+#: ONE wake turn -- the first push arms at now + settle, and each later push
+#: re-arms the same pending tick, pushing it out to its own write's settle
+#: stamp, so a burst coalesces and the LAST write is the one the tick reads.
+#: 30s: long enough for a crew's near-simultaneous reports to batch, short
+#: enough that a lone report still wakes the conductor well inside a minute.
+_REPORT_SETTLE_SECS = 30.0
 
 
 def _admit(svc: Any, loop_id: str, item_id: str, now: float) -> bool:
@@ -548,6 +563,23 @@ def _admit(svc: Any, loop_id: str, item_id: str, now: float) -> bool:
                 item_id,
                 ITEM_PULLS_PER_HOUR,
                 loop_id,
+            )
+        return False
+    # Per-LOOP budget, across every item: the per-item cap alone lets N bound
+    # items buy N x ITEM_PULLS_PER_HOUR pull-forwards on one conductor an hour,
+    # which for a wide crew is the same unbounded wake spend the per-item cap
+    # exists to stop. Bounded the same way, recorded once per refusal.
+    _loop_recent = [
+        t for stamps in per_loop.values() for t in stamps if now - t < _ITEM_WINDOW_SECS
+    ]
+    if len(_loop_recent) >= LOOP_PULLS_PER_HOUR:
+        if pair not in capped:
+            capped.add(pair)
+            logger.info(
+                "conductor wake: loop %s reached %d pull-forwards within an hour "
+                "across its items -- further writes wait for the scheduled tick",
+                loop_id,
+                LOOP_PULLS_PER_HOUR,
             )
         return False
     recent.append(now)
@@ -668,15 +700,24 @@ async def _fire(svc: Any, conductor_slot_key: str, item_id: str = "") -> str:
         # worth remembering. The cycle in flight read the ledger BEFORE this write landed,
         # and the re-arm at its tail would otherwise aim at the loop's own deadline -- so
         # on the hours-long cadence this design is meant to enable, the report would wait
-        # hours. With the flag, that tail arms at delay zero instead. The refusal still
-        # comes back here and is still logged and dropped.
+        # hours. With the flag, that tail arms at the settle delay instead. The refusal
+        # still comes back here and is still logged and dropped.
         #
         # Passed UNGUARDED. An earlier revision wrapped this in ``except TypeError`` for
         # "a service build that predates the flag"; no such build exists, because the
         # package defines one ``fire_now`` and it ships with this caller in the same
         # commit -- so the branch could only ever be entered by a test stub, while
         # silently retrying a genuine ``TypeError`` raised INSIDE ``fire_now``.
-        _loop, reason, status = await svc.fire_now(loop_id, defer_if_firing=True)
+        #
+        # ``delay_secs`` (LOOP-15): a worker-report push arms the tick at now +
+        # _REPORT_SETTLE_SECS rather than immediately, so reports from different
+        # workers that land within the window share ONE wake turn: each later
+        # push re-arms the same pending tick out to its own settle stamp, and
+        # the tick that finally runs reads the LAST write. A lone report still
+        # wakes the conductor inside the window.
+        _loop, reason, status = await svc.fire_now(
+            loop_id, defer_if_firing=True, delay_secs=_REPORT_SETTLE_SECS
+        )
     except Exception:  # pragma: no cover - a push must never reach its trigger
         logger.debug("conductor wake: fire_now raised for loop %s", loop_id, exc_info=False)
         return ""
