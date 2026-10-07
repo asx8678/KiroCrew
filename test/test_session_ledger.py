@@ -624,6 +624,40 @@ async def test_route_record_and_get_roundtrip(_open_route):
 
 
 @pytest.mark.asyncio
+async def test_get_serves_each_event_once_and_only_the_tail(_open_route):
+    """TOOL-12: the response's `state` carries no `events` (the record's own
+    list served each event twice next to the 20-event tail), and the separate
+    `events` key is the bounded tail."""
+    routes = _open_route
+    key = sl.ledger_key("chat-r-2")
+    _unit(slot=key)
+    for i in range(sl._MAX_EVENTS + 30):
+        _record(key, event=f"n{i}", event_kind="note")
+    resp = await routes.api_session_ledger_get(_mk_request("GET", "/api/session-ledger"))
+    data = json.loads(resp.text)
+    assert "events" not in data["state"]
+    assert len(data["events"]) == sl._MAX_EVENT_TAIL
+
+
+def test_mcp_read_renders_compact_json(monkeypatch):
+    """TOOL-12: indent=2 cost ~68% of the read's tokens; the tool renders
+    compact JSON with no newline indentation."""
+    from kiro_crew import mcp_core
+    from kiro_crew.mcp_tools import ledger as tools
+
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "chat-c-1")
+    monkeypatch.setattr(
+        mcp_core,
+        "_get",
+        MagicMock(return_value={"state": {"goal": "g"}, "events": [{"kind": "note"}]}),
+    )
+    out = tools.session_ledger_read("x", {})
+    assert "\n " not in out
+    parsed = json.loads(out)
+    assert parsed["state"]["goal"] == "g"
+
+
+@pytest.mark.asyncio
 async def test_route_phase_without_event_is_400(_open_route):
     routes = _open_route
     _unit(slot=sl.ledger_key("chat-r-1"))

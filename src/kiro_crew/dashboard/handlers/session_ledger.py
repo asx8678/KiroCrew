@@ -96,8 +96,14 @@ async def api_session_ledger_get(request: web.Request) -> web.Response:
         key,
         _session_unit(state, request.headers.get("X-Session-Key", "")),
     )
-    events = state_record.get("events", [])[-session_ledger._MAX_EVENT_TAIL :]
-    return web.json_response({"state": state_record, "events": events})
+    # TOOL-12: the state record carries its own full `events` list (up to
+    # _MAX_EVENTS); serving it whole next to the separate 20-event tail sent
+    # each event twice — 120 event objects, ~10k tokens per read at steady
+    # state, for the 20 events the contract documents. The response's `state`
+    # therefore carries everything EXCEPT events, and `events` is the tail.
+    state_without_events = dict(state_record)
+    events = state_without_events.pop("events", [])[-session_ledger._MAX_EVENT_TAIL :]
+    return web.json_response({"state": state_without_events, "events": events})
 
 
 async def api_session_ledger_record(request: web.Request) -> web.Response:
