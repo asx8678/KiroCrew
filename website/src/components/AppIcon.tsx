@@ -187,6 +187,12 @@ export default function AppIcon({
         if (text.trim().startsWith('<svg')) {
           svgCache.set(url, text)
           if (!cancelled) setMarkup(text)
+        } else {
+          // A 2xx body that is not an SVG (an XML prolog, a leading comment,
+          // an HTML page) must reach the same terminal state as a failed
+          // fetch: without this, markup stays null and the component renders
+          // the empty placeholder span forever instead of falling back.
+          if (!cancelled) setImgFailed(true)
         }
       })
       .catch(() => { if (!cancelled) setImgFailed(true) })
