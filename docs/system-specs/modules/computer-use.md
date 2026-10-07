@@ -357,6 +357,15 @@ check is kept as the last line of defence rather than deleted as redundant.
 `SKILL.md`'s tool table states the same thing, since an optional-looking argument
 there would have the model discover the refusal by hitting it.
 
+The chokepoint is pinned structurally, repo-wide
+(`test_computer_use_dispatch_pin.py`): no module outside `computer_use/` may
+import the service, a platform driver or the FFI, `get_shared_service()` may
+be called only by `tools.py` and the CLI, and the dashboard handler's one
+action entry must call `dispatch_tool`. A new action route therefore cannot
+ship without passing the chokepoint. `backend` is importable outside only for
+its read-only probe names (`get_shared_backend`, `platform_id_for_current_os`)
+and the fake's subclass.
+
 Every tool has a `MCP_COMPUTER_SCHEMAS` entry in `validation.py`. That is
 mandatory, not tidiness: an unregistered tool's arguments pass RAW through
 `_validate_args`, and a `ValidationError` raised inside a handler escapes the
