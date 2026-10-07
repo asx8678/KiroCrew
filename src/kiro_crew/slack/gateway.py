@@ -12628,10 +12628,27 @@ class GatewayOrchestrator:
             tree_moved = False
             update_ownership.clear_restart_refusal()
             logger.info("Auto-update: rebuild complete, preparing safe restart")
-            # Re-read version from rebuilt package for the operator-facing log;
-            # restart ownership itself is centralized below.
-            importlib.reload(kiro_crew)
-            new_ver = kiro_crew.__version__
+            # Re-read version from the rebuilt package WITHOUT reloading
+            # kiro_crew: importlib.reload re-executes __init__.py, which
+            # rebinds shutdown_event to a fresh _LazyShutdownEvent — the
+            # signal handler and every pre-reload importer keep the OLD
+            # object, so a signal sets only the old event and /readyz (which
+            # reads the attribute) keeps answering on the NEW one during a
+            # deferred restart. Reading the version from the file on disk
+            # gives the same answer with no module re-execution.
+            import importlib.metadata
+
+            try:
+                new_ver = importlib.metadata.version("kiro-crew")
+            except importlib.metadata.PackageNotFoundError:
+                # Source checkout without an installed dist-info: read the
+                # stamped version straight from the package file.
+                version_file = Path(kiro_crew.__file__).parent / "_version.py"
+                new_ver = (
+                    version_file.read_text(encoding="utf-8").strip().split('"')[1]
+                    if version_file.exists()
+                    else kiro_crew.__version__
+                )
             print(f"👻 New version {new_ver} available — auto-updating and restarting…")
             # Hand the gap to the restart: this step's ownership ends here and
             # the restart's begins as the await starts, with no yield between.
