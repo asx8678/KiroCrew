@@ -99,6 +99,23 @@ def _kick_local_decision_model(state: DashboardState) -> None:
     task.add_done_callback(state._background_tasks.discard)
 
 
+def _kick_cleanup_loop(state: DashboardState) -> None:
+    """Start the session cleanup loop at gateway boot, not at the first session.
+
+    The loop's sandbox-artifact pass reclaims the runtime-tmpfs mount sources
+    whose exhaustion makes spawning an agent impossible, and before this it
+    started only when a NEW session registered: an idle or headless gateway
+    (no chat, no subagent, no cron run after boot) never swept while its
+    background runtime and MCP respawns kept staging entries, and a host whose
+    tmpfs was ALREADY exhausted could not create the session that would have
+    started the janitor -- a self-locking failure the boot pass exists to
+    break. ``start_cleanup`` is idempotent, so a session registering later
+    finds the loop already running and still gets its one-loop guarantee.
+    """
+    if state.sessions is not None:
+        state.sessions._ensure_cleanup_task()
+
+
 def _kick_session_search_index(state: DashboardState) -> None:
     """Keep the session search candidate index caught up, in its OWN process.
 
