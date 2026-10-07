@@ -6,6 +6,7 @@ owns its memory, catalog, prompt and configuration; all data stays under tmp_pat
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import datetime
 from pathlib import Path
@@ -97,10 +98,15 @@ class TestDefaultMemory:
 
     def test_preferences_are_complete_even_above_background_budget(self, rig):
         builder, memory, _, _, _ = rig
-        preference = "Always preserve this rule.\n" * (ctx._CONTEXT_BUDGET_BASE // 20)
+        # Under the startup allowance (CTX-3): complete, no notice, and never
+        # sliced to make room for background blocks — the protected contract
+        # this test pins. (Past the allowance the head is kept with a notice,
+        # pinned in test_context_composition_contract.)
+        preference = "Always preserve this rule.\n" * 400
         memory.write_preferences(preference + "FINAL EXPLICIT RULE")
         text = builder.build_session_context()
         assert preference + "FINAL EXPLICIT RULE" in text
+        assert "[Context budget: omitted" not in text
         assert "lessons truncated" not in text
 
     def test_temporary_context_never_reads_memory_or_lessons(self, rig, monkeypatch):
@@ -154,8 +160,17 @@ class TestProtectedContextCeiling:
         assert expected_lessons in text
         assert "model-safe protected-content ceiling" not in text
 
-    def test_preferences_alone_above_the_ceiling_are_bounded_with_a_notice(self, rig):
+    def test_preferences_alone_above_the_ceiling_are_bounded_with_a_notice(self, rig, monkeypatch):
         builder, memory, _, _, _ = rig
+        # The startup allowance (12,700) binds before the ceiling for any real
+        # file, so raise it here to pin the model-safe ceiling backstop (the
+        # same pin the composition contract keeps for its own ceiling test).
+        real_caps = ctx._resolve_caps(200_000)
+        monkeypatch.setattr(
+            ctx,
+            "_resolve_caps",
+            lambda window: dataclasses.replace(real_caps, prefs_startup=600_000),
+        )
         caps = ctx._resolve_caps(200_000)
         line = "OVERSIZED PREFERENCE LINE.\n"
         preference = line * (caps.protected_context // len(line) + 200)

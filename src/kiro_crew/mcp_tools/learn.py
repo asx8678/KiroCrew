@@ -297,6 +297,11 @@ def learn_add(name: str, args: dict[str, Any]) -> str:
     applies = args.get("applies", "")
     if applies:
         payload["applies"] = applies
+    # Provenance (SEC-11, decision (b)): this is the AGENT's own write, and the
+    # injected block frames agent-recorded lessons as advisory rather than as
+    # user-taught rules. The dashboard and CLI send no source and stay
+    # user_explicit.
+    payload["source"] = "agent"
     d = mcp_core._post("/api/lessons", payload)
     err_val = d.get("error")
     if err_val:

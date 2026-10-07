@@ -1403,6 +1403,13 @@ LEARN_ADD_SCHEMA = ToolSchema(
         FieldSpec("rule", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("category", str, allowed=ALLOWED_LESSON_CATEGORIES, default="knowledge"),
         FieldSpec("negative", str, max_len=MAX_SHORT_STRING),
+        # Provenance of the write (SEC-11, decision (b)): "agent" marks the
+        # learn_add MCP tool's own write, so the injected lessons block can
+        # frame it as advisory. The dashboard and CLI send no source and the
+        # route defaults them to user_explicit. A caller cannot CLAIM a human
+        # source it does not have: the allowlist admits only these two, and
+        # "agent" is the only value the tool path sets.
+        FieldSpec("source", str, allowed=frozenset({"user_explicit", "agent"}), max_len=16),
         # Path fragment naming the repository a correction belongs to; absent means
         # it applies everywhere. The pattern is the gate's own (imported, not
         # restated), so a value the gate could never satisfy -- a dot segment,
