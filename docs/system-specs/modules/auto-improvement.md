@@ -39,6 +39,15 @@ ends after at most that pass, as STOPPED with `app disabled`, instead of
 spending its remaining nudges (up to 4 watchers x 6 passes) against a
 disabled app.
 
+The disable race is closed too (LOOP-27): a stop that lands while a run's
+START is mid-build — the seconds-long `_build_driver` window that releases the
+lock — no longer returns 'no active run' and lets the launch proceed.
+`start()` reserves itself before the build, `stop()` treats the reservation
+like a live thread (STATUS_STOPPING, 'a starting run will not launch'), and
+the launch block refuses when a stop was requested, reporting 'stopped before
+launch'. A run started just before disable therefore never spends after the
+app is off, and a start whose build fails clears its own reservation.
+
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET | `/health` | liveness; echoes the app name |
