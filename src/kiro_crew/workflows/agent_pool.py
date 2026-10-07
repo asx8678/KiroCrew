@@ -36,6 +36,7 @@ import logging
 from typing import Any, Callable, Optional
 
 from kiro_crew.acp.worker_pool import WorkerPool
+from kiro_crew.effort import is_valid_effort
 from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect
 from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.security import redact
@@ -115,12 +116,14 @@ class _WorkflowSessionWorker:
         extra_env: Optional[dict[str, str]] = None,
         memory_scope: Any = None,
         context_builder: Any = None,
+        effort: str = "",
     ) -> None:
         self._sessions = sessions
         self._key = key
         self._agent = agent
         self._model = model
         self._cwd = cwd
+        self._effort = effort
         self._extra_env = extra_env
         self._memory_scope = memory_scope
         self._context_builder = context_builder
@@ -138,6 +141,7 @@ class _WorkflowSessionWorker:
             agent=self._agent,
             model=self._model,
             cwd=self._cwd,
+            reasoning_effort_override=self._effort,
             extra_env=self._extra_env,
         )
         self._provider = provider
@@ -301,8 +305,21 @@ def build_pooled_agent_fn(
     """
     worker_ids = itertools.count()
 
+    def _validated_step_effort(value: object) -> str:
+        """WF-5: validate ctx.agent(effort=...) — invalid warns and falls back
+        to the factory's effort (the call still runs; only the pin drops)."""
+        effort = str(value or "").strip()
+        if effort and not is_valid_effort(effort):
+            logger.warning(
+                "workflow step effort=%r invalid (run=%s); using the default effort",
+                effort,
+                run_id,
+            )
+            return ""
+        return effort
+
     def _make_pool(
-        agent: Optional[str], model: Optional[str], work_dir: Optional[str]
+        agent: Optional[str], model: Optional[str], work_dir: Optional[str], effort: Optional[str]
     ) -> WorkerPool:
         def _factory() -> _WorkflowSessionWorker:
             wid = next(worker_ids)
@@ -315,6 +332,7 @@ def build_pooled_agent_fn(
                 extra_env=extra_env,
                 memory_scope=memory_scope,
                 context_builder=context_builder,
+                effort=effort or "",
             )
 
         return WorkerPool(
@@ -327,17 +345,21 @@ def build_pooled_agent_fn(
     # Default sub-pool (no per-call override) + a registry of identity-keyed
     # sub-pools created on demand. ``pool`` (the default) is returned to the
     # caller for shutdown; it delegates to every sub-pool via _AggregatePool.
-    default_pool = _make_pool(default_agent, default_model, cwd)
-    subpools: dict[tuple[Optional[str], Optional[str], Optional[str]], WorkerPool] = {}
+    default_pool = _make_pool(default_agent, default_model, cwd, "")
+    subpools: dict[
+        tuple[Optional[str], Optional[str], Optional[str], Optional[str]], WorkerPool
+    ] = {}
 
     def _pool_for(
-        agent: Optional[str], model: Optional[str], work_dir: Optional[str]
+        agent: Optional[str], model: Optional[str], work_dir: Optional[str], effort: Optional[str]
     ) -> Optional[WorkerPool]:
         # ``agent=None`` on the call means "use the run default" — identical to
         # build_agent_fn's ``opts.get("agent") or default_agent``. Resolve first
         # so a call that explicitly asks for the default reuses the default pool.
-        key = (agent or default_agent, model or default_model, work_dir or cwd)
-        if key == (default_agent, default_model, cwd):
+        # WF-5: effort joins the identity key — a warm worker built at one
+        # effort must not serve a call that asked for another.
+        key = (agent or default_agent, model or default_model, work_dir or cwd, effort or "")
+        if key == (default_agent, default_model, cwd, ""):
             return default_pool
         sp = subpools.get(key)
         if sp is not None:
@@ -365,12 +387,14 @@ def build_pooled_agent_fn(
             if named is not None:
                 key = memory_scope.worker_key(f"named:{named}")
             await memory_scope.prepare(context_builder, key)
+        _effort = _validated_step_effort(opts.get("effort"), run_id)
         provider, is_new, _resumed = await sessions.get_or_create(
             key,
             agent=opts.get("agent") or default_agent,
             model=opts.get("model") or default_model,
             cwd=opts.get("cwd") or cwd,
             extra_env=extra_env,
+            reasoning_effort_override=_effort,
         )
         try:
             # Same identity publication as the pooled worker (see
@@ -427,13 +451,14 @@ def build_pooled_agent_fn(
             cwd=opts.get("cwd"),
             app=app,
         )
+        _step_effort = _validated_step_effort(opts.get("effort"))
         if step_cwd != opts.get("cwd"):
             # Launch in the RESOLVED directory and key the warm sub-pool on it, so
             # a worker is never built for an unresolved spelling of a path.
             opts = {**opts, "cwd": step_cwd}
         if opts.get("session") is not None:
             return await _run_unpooled(prompt, opts)
-        target = _pool_for(opts.get("agent"), opts.get("model"), opts.get("cwd"))
+        target = _pool_for(opts.get("agent"), opts.get("model"), opts.get("cwd"), _step_effort)
         if target is None:
             return await _run_unpooled(prompt, opts)
         return await target.send(prompt)
