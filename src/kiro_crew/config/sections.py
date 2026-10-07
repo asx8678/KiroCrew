@@ -1645,6 +1645,19 @@ class AgentConfig:
             "completed before the cutoff is preserved on the run record.",
         ),
     )
+    workflow_completion_turn: str = field(
+        default="chat",
+        metadata=_meta(
+            "Workflow Completion Turn",
+            "What happens when a workflow bound to a chat slot finishes: 'chat' "
+            "(default) injects the result and then automatically runs ONE "
+            "parent-agent turn on that slot to answer the request that "
+            "prompted the workflow; 'off' injects the result only, spending no "
+            "model turn — for slot-bound workflows whose own result already is "
+            "the deliverable. Read per workflow completion.",
+            enum=["chat", "off"],
+        ),
+    )
     subagent_mem_buffer_pct: int = field(
         default=20,
         metadata=_meta(
