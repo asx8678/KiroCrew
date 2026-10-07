@@ -77,7 +77,7 @@ class _Svc:
     def get_by_slot(self, slot_key: str) -> "_Loop | None":
         return self._loop if self._loop is not None and slot_key == CONDUCTOR else None
 
-    async def fire_now(self, loop_id, *, defer_if_firing=False):
+    async def fire_now(self, loop_id, *, defer_if_firing=False, delay_secs=0.0):
         if self._refuse:
             if defer_if_firing:
                 self.deferred.append(loop_id)
@@ -1327,6 +1327,9 @@ def test_a_close_after_a_done_wake_buys_no_second_turn(tmp_path, monkeypatch):
     buys exactly one turn.
     """
     closed: set[str] = set()
+    # This drive awaits the pushed tick, so it pins the no-second-turn rule
+    # rather than the settle window: zero it so the tick runs immediately.
+    monkeypatch.setattr(conductor_wake, "_REPORT_SETTLE_SECS", 0.0)
     done_item = _bind(WORKER)
     other_item = _bind(WORKER_B)
 
@@ -1360,6 +1363,9 @@ def test_a_close_after_a_done_wake_buys_no_second_turn(tmp_path, monkeypatch):
 
 def _storm_during_a_turn(tmp_path, monkeypatch, *, news: bool) -> "list[int]":
     """Ten pushes from two workers land while the woken turn is in flight."""
+    # This drive awaits the pushed tick, so it pins the coalescing mechanics
+    # rather than the settle window: zero it so the tick runs immediately.
+    monkeypatch.setattr(conductor_wake, "_REPORT_SETTLE_SECS", 0.0)
     first = _bind(WORKER)
     second = _bind(WORKER_B)
 
@@ -1448,7 +1454,7 @@ def test_an_item_pulls_its_conductor_forward_at_most_twelve_times_an_hour(
     assert cap == 12
     assert fired[0] and fired[:cap] == [fired[0]] * cap, "the first twelve pull forward"
     assert fired[cap] == "", "the thirteenth does not"
-    assert arms == [0.0] * cap
+    assert arms == [conductor_wake._REPORT_SETTLE_SECS] * cap
     assert active is True, "the loop and its scheduled tick stay armed"
     assert _item(item_id).summary == str(cap), "the thirteenth report still landed"
     tripped = [r for r in caplog.records if "pull-forwards of loop" in r.getMessage()]

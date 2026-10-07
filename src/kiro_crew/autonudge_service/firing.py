@@ -725,7 +725,11 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
 
 
 async def fire_now(
-    self: AutoNudgeService, loop_id: str, *, defer_if_firing: bool = False
+    self: AutoNudgeService,
+    loop_id: str,
+    *,
+    defer_if_firing: bool = False,
+    delay_secs: float = 0.0,
 ) -> tuple["NudgeLoop | None", str, int]:
     """Bring one loop's next cycle forward to now, out of band from its countdown.
 
@@ -827,7 +831,7 @@ async def fire_now(
             # out the conductor's whole patrol cadence.
             self._pulled_forward.add(loop_id)
         return None, "loop is already firing", 409
-    self._arm_timer(loop, delay=0.0)
+    self._arm_timer(loop, delay=max(0.0, float(delay_secs)))
     if defer_if_firing:
         # A worker's push, not a person's press: the tick it armed is marked so the gate
         # observes rather than spending the post-wake follow-up, and so a quiet answer
@@ -835,9 +839,11 @@ async def fire_now(
         # write, turn end and close; the operator's button keeps its INFO line below.
         self._pushed_ticks.add(loop_id)
         logger.debug(
-            "AutoNudge: loop %s pulled forward by a worker's write -- cycle %d armed to run now",
+            "AutoNudge: loop %s pulled forward by a worker's write -- cycle %d armed "
+            "to run in %.0fs",
             loop.id,
             loop.cycle_count + 1,
+            max(0.0, float(delay_secs)),
         )
         return loop, "", 200
     logger.info(
