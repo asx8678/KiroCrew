@@ -380,19 +380,24 @@ async def maybe_route_linked_thread(
     )
     if not _linked_slot.running:
         from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
 
-        _chat_task = asyncio.create_task(
+        # A chat-shaped turn (a Slack-sent message driving the full _run_chat
+        # path), so it is bounded by the configured turn ceiling
+        # (agent.chat_turn_timeout_secs) — the transport's 4 h prompt floor is
+        # a backstop for NON-chat callers, not this path's ceiling.
+        _chat_task = spawn_guarded_turn(
+            _dashboard_state,  # type: ignore[arg-type]
+            _linked_slot,
             _run_chat(
                 _dashboard_state,  # type: ignore[arg-type]
                 _linked_slot,
                 text,
                 _directive_user_origin=True,
                 _directive_channel_origin=True,
-            )
+            ),
         )
         _linked_slot.task = _chat_task
-        _dashboard_state._background_tasks.add(_chat_task)  # type: ignore[attr-defined]
-        _chat_task.add_done_callback(_dashboard_state._background_tasks.discard)  # type: ignore[attr-defined]
     else:
         # circular import: session_control pulls in dashboard modules at module level.
         from kiro_crew.dashboard.session_control import containment_meta
