@@ -5173,6 +5173,7 @@ def _work_start() -> dict[str, Any]:
         "goal": "",
         "round": 0,
         "goal_version": 0,
+        "item_budget": 0,
         "depth": 0,
         "parent_item": None,
         "created_at": "",
@@ -5407,6 +5408,12 @@ def _work_apply_header(state: dict[str, Any], data: Mapping[str, Any]) -> None:
         state["round"] = _as_int(data.get("round"))
     if "goal_version" in data and data.get("action") == "goal":
         state["goal_version"] = max(state["goal_version"], _as_int(data.get("goal_version")))
+    # LOOP-18: the enforced per-goal item budget is board-level durable state —
+    # only a conductor goal entry may set it (a baseline never speaks over a
+    # budget the record set, same rule as the goal text), and it is version-protected
+    # the same way so a stale entry cannot regress a raise.
+    if "item_budget" in data and data.get("action") == "goal":
+        state["item_budget"] = max(state["item_budget"], _as_int(data.get("item_budget")))
     if "depth" in data and not state["depth"]:
         state["depth"] = _as_int(data.get("depth"))
     if isinstance(data.get("parent_item"), str) and state["parent_item"] is None:
@@ -5562,6 +5569,7 @@ def _work_render(state: dict[str, Any]) -> WorkBoardView:
             "goal": state["goal"],
             "round": state["round"],
             "goal_version": state["goal_version"],
+            "item_budget": state["item_budget"],
             "depth": state["depth"],
             "parent_item": state["parent_item"],
             "created_at": state["created_at"],

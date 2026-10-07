@@ -4377,10 +4377,12 @@ loop is running and drive that one round with `wait`.
 dispatch the next round in the same turn. Do not wait for the user: the one
 Round-0 go-ahead covers every round.
 
-**Rounds are not gated, but spend is bounded.** Count from the ledger. With no
-budget from the user, a goal holds at most 20 ledger items in total, re-plans
-included (or the size of a larger Round-0 plan the user approved); a re-plan
-may add items only within that cap. When two rounds in a
+**Rounds are not gated, but spend is bounded.** The store enforces the item
+cap (LOOP-18): with no budget from the user, a goal holds at most 20 ledger
+items in total, re-plans included (or the size of a larger Round-0 plan the
+user approved), and a create past it is refused with `item_budget_exceeded` —
+read the used-of-budget pair straight from `work_ledger_read`, never from
+memory. On that refusal, or when two rounds in a
 row land with no item accepted, do not re-plan again. Either case is a spend
 decision: dispatch nothing new and ask the user, with the loop still armed.
 

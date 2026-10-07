@@ -1223,7 +1223,12 @@ async def api_work_ledger_get(request: web.Request) -> web.Response:
             f"read, so it is no longer one to return it to: {why}.",
         )
     _audit(key, "work_ledger_read", "ok", resources=f"{len(rows)} item(s)")
-    payload: dict[str, Any] = {"conductor": record.to_dict(), "items": rows}
+    conductor_payload = record.to_dict()
+    # LOOP-18: surface the enforced per-goal budget beside its count, so a
+    # patrol read sees "items used N of B" without deriving it from two fields
+    # (and a board whose budget predates the field reads the default, not 0).
+    conductor_payload["item_budget_effective"] = work_ledger.effective_item_budget(record)
+    payload: dict[str, Any] = {"conductor": conductor_payload, "items": rows}
     if compact:
         payload["compact"] = True
     else:
@@ -1595,6 +1600,9 @@ async def api_work_ledger_record(request: web.Request) -> web.Response:
                 item_id=getattr(item, "item_id", None),
                 generation=getattr(header, "generation", None) or None,
                 goal=getattr(header, "goal", None) if action == "goal" else None,
+                item_budget=(
+                    (getattr(header, "item_budget", None) or None) if action == "goal" else None
+                ),
                 round=(
                     getattr(holder, "round", None) if action == "goal" or "round" in sets else None
                 ),
@@ -1940,6 +1948,7 @@ def _write(key: str, action: str, cleaned: dict[str, Any]) -> dict[str, Any]:
         state=cleaned.get("state"),
         goal=cleaned.get("goal"),
         round_number=cleaned.get("round"),
+        item_budget=cleaned.get("item_budget"),
         fails=cleaned.get("fails"),
     )
 

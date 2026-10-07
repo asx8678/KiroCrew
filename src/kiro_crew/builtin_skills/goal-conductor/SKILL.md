@@ -422,16 +422,22 @@ original plan did not have. Re-planning mid-round is not: let the round finish.
 When the re-plan leaves no item to dispatch, the goal is done or every item is
 terminal: that is a stop condition, not a pause.
 
-**Rounds are not gated, but spend is bounded.** Two checks replace the old
-per-round pause. Count both from `work_ledger_read`, not from memory:
+**Rounds are not gated, but spend is bounded.** The item cap is no longer
+yours to count: it is durable state on the conductor header, and the STORE
+enforces it (LOOP-18). `work_ledger_read` compact shows `item_budget` and
+`created_total` beside each other, so `items used: N of B` reads straight off
+the board and a compaction cannot make you lose count.
 
 - **Item cap.** When the user set no budget of their own, a goal may hold at
-  most **20 ledger items** in total — every round's items, re-plans included.
-  A re-plan may add items only while the total stays within the cap. An item
-  past it is a spend decision: dispatch nothing new, keep patrolling what is in
-  flight, and ask the user with `ask_question` whether to raise the cap. A
-  budget the user set replaces the default, and a Round-0 plan the user
-  approved with more than 20 items sets the cap to that plan's size.
+  most **20 ledger items** in total — every round's items, re-plans included;
+  the store refuses a create past it with `item_budget_exceeded` and nothing is
+  written. On that refusal do not retry the create: dispatch nothing new, keep
+  patrolling what is in flight, and ask the user with `ask_question` whether to
+  raise the budget. A budget the user set replaces the default (set it with
+  `work_ledger_record action=goal item_budget=<n>` when the user approves), and
+  a Round-0 plan the user approved with more than 20 items sets the budget to
+  that plan's size the same way. Structural caps still stand behind the budget:
+  32 open items at once and 256 stored over the board's life.
 - **No progress.** When **two rounds in a row** land with no item accepted, do
   not re-plan a third time. Ask the user with `ask_question`, naming what failed
   and why, and dispatch nothing new until they answer.

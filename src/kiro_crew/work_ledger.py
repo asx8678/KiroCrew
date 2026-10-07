@@ -172,6 +172,24 @@ CONDUCTOR_ACTIONS: frozenset[str] = frozenset(
 #: Closed items are bounded with the open ones by
 #: :data:`MAX_STORED_ITEMS_PER_CONDUCTOR` below.
 MAX_ITEMS_PER_CONDUCTOR = 32
+
+#: LOOP-18: the default per-goal item budget — the number the conductor prompt
+#: always stated (agent.py, goal-conductor SKILL.md) — now durable state the
+#: store enforces. A 'goal' action can raise it when the user approves a larger
+#: Round-0 plan; zero on a record means the default applies (read through
+#: :func:`effective_item_budget`).
+WORK_ITEM_BUDGET_DEFAULT = 20
+
+
+def effective_item_budget(record: ConductorRecord) -> int:
+    """The board's enforced item budget: its own, or the default (LOOP-18).
+
+    Zero on a record means the field predates the enforcement, so the default
+    the prompt always promised applies rather than an unbounded zero.
+    """
+    return record.item_budget or WORK_ITEM_BUDGET_DEFAULT
+
+
 #: How many items one conductor's board may CREATE over its life, open and closed
 #: together -- the bound on stored history, where the cap above bounds live fan-out.
 #: Equal to the crew log fold's per-board item ceiling
@@ -227,6 +245,10 @@ CODE_ALREADY_BOUND = "already_bound"
 CODE_ITEM_CLOSED = "item_closed"
 CODE_ITEM_CAP_EXCEEDED = "item_cap_exceeded"
 CODE_ITEM_STORE_FULL = "item_store_full"
+#: LOOP-18: a create past the per-goal item budget — the durable, store-enforced
+#: form of the 20-item cap the conductor prompt always stated. The conductor
+#: turns this into an ask_question for a larger budget.
+CODE_ITEM_BUDGET_EXCEEDED = "item_budget_exceeded"
 CODE_CREW_LOG_INCOMPLETE = "crew_log_incomplete"
 CODE_CACHE_DIRTY = "cache_dirty"
 CODE_DEPTH_EXCEEDED = "depth_exceeded"
@@ -295,6 +317,15 @@ class ConductorRecord:
     #: sets it to the count the log holds. Zero on records from before it; the
     #: first create on such a board seeds it from the records on the board.
     created_total: int = 0
+    #: LOOP-18: the per-goal item budget the STORE enforces — durable state,
+    #: written by the 'goal' action (default 20, the number the conductor prompt
+    #: always said), so a compaction cannot make the conductor lose count: a
+    #: create past it is refused with CODE_ITEM_BUDGET_EXCEEDED. Measured against
+    #: :attr:`created_total` (every create this board admitted), so closed items
+    #: spend the budget too — they are work the goal produced. Zero on records
+    #: from before the field; the default then applies on read
+    #: (:func:`effective_item_budget`).
+    item_budget: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -309,6 +340,7 @@ class ConductorRecord:
             "goal_version": self.goal_version,
             "recorded_at": self.recorded_at,
             "created_total": self.created_total,
+            "item_budget": self.item_budget,
         }
 
     @classmethod
@@ -333,6 +365,7 @@ class ConductorRecord:
             goal_version=_as_int(raw.get("goal_version"), 0),
             recorded_at=_as_str(raw.get("recorded_at")),
             created_total=max(0, _as_int(raw.get("created_total"), 0)),
+            item_budget=max(0, _as_int(raw.get("item_budget"), 0)),
         )
 
 
@@ -1725,6 +1758,7 @@ def apply_conductor_action(
     state: Any = None,
     goal: Any = None,
     round_number: Any = None,
+    item_budget: Any = None,
     fails: Any = None,
 ) -> dict[str, Any]:
     """Write the fields the CONDUCTOR owns, and append the one event that explains it.
@@ -1761,7 +1795,7 @@ def apply_conductor_action(
 
     if action == "goal":
         return {
-            "conductor": _write_goal(slot_key, record, goal, round_number),
+            "conductor": _write_goal(slot_key, record, goal, round_number, item_budget=item_budget),
             "item": None,
             "event": None,
         }
@@ -1821,7 +1855,7 @@ def _header_under_lock(slot_key: str, verb: str) -> ConductorRecord:
 
 
 def _write_goal(
-    slot_key: str, record: ConductorRecord, goal: Any, round_number: Any
+    slot_key: str, record: ConductorRecord, goal: Any, round_number: Any, item_budget: Any = None
 ) -> ConductorRecord:
     """Partial update of the conductor header, merged UNDER the lock.
 
@@ -1834,6 +1868,7 @@ def _write_goal(
     """
     checked_goal = None if goal is None else _require_text(goal, MAX_GOAL_CHARS, "goal")
     checked_round = None if round_number is None else _require_count(round_number, "round")
+    checked_budget = None if item_budget is None else _require_count(item_budget, "item_budget")
     with _existing_conductor_lock(slot_key):
         # The header is re-read under the lock and REQUIRED to be present and
         # readable, like ``_create_item``: a ``goal`` that waited behind a purge
@@ -1845,6 +1880,10 @@ def _write_goal(
             current.goal = checked_goal
         if checked_round is not None:
             current.round = checked_round
+        if checked_budget is not None:
+            # LOOP-18: the budget is durable state on the header, so it survives
+            # compaction and the STORE enforces it on every later create.
+            current.item_budget = checked_budget
         current.goal_version += 1
         _write_record(conductor_dir(slot_key) / _CONDUCTOR_FILE, current.to_dict())
         return current
@@ -1927,6 +1966,19 @@ def _create_item(
             # below; a refusal here leaves it unwritten and the next create seeds
             # it again, to the same value.
             live.created_total = len(_stored_item_ids(slot_key))
+        # LOOP-18: the per-goal budget first — durable state the STORE enforces,
+        # so a compaction cannot make the conductor lose count. Measured against
+        # the lifetime create total (closed items are work the goal produced),
+        # and refused BEFORE the structural 32/256 caps so the conductor can ask
+        # for a larger budget rather than read a structural refusal.
+        if live.created_total >= effective_item_budget(live):
+            raise WorkLedgerError(
+                f"conductor has used {live.created_total} of its "
+                f"{effective_item_budget(live)}-item goal budget; ask the owner for "
+                "a larger budget with ask_question before creating more items",
+                code=CODE_ITEM_BUDGET_EXCEEDED,
+                field="items",
+            )
         # The stored total first: a board that has admitted every create it may
         # ever admit is refused whatever its open count, so closed history cannot
         # carry the board past the fold's ceiling.

@@ -4341,6 +4341,10 @@ WORK_LEDGER_RECORD_SCHEMA = ToolSchema(
         FieldSpec("state", str, allowed=_WORK_ITEM_STATES),
         FieldSpec("goal", str, max_len=2000),
         FieldSpec("round", int, min_val=0, max_val=1_000_000),
+        # LOOP-18: the per-goal item budget, durable on the conductor header —
+        # bounded by the structural stored cap, which is the most a raise can
+        # ever mean.
+        FieldSpec("item_budget", int, min_val=0, max_val=256),
         FieldSpec("fails", int, min_val=0, max_val=1_000_000),
     ],
 )
