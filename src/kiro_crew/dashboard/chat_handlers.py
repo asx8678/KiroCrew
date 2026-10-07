@@ -1331,9 +1331,11 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     # An app on a session it does not own has no opt-out (`steer` is None there).
     _sub_key = effective_session_key(slot)
     _held = subagents_hold_user_messages(state, _sub_key)
-    # Messages parked while a child was live stay parked once it is flagged
-    # stalled (nothing starts a drain then). A send behind them joins the queue
-    # and drains it, so it is answered after them rather than ahead of them.
+    # Messages parked while a child was live are drained the moment flagging
+    # the last live child stalled lifts the hold (the gateway's stall consumer
+    # starts exactly one drain then — see chat_runner's
+    # drain_released_after_stall). A send that races that drain joins the queue
+    # and is answered after them rather than ahead of them.
     _behind_parked = bool(
         not _held
         and slot._queue

@@ -6646,6 +6646,26 @@ def subagents_hold_user_messages(state: DashboardState, session_key: str) -> boo
     return any(not (isinstance(a, dict) and a.get("stalled")) for a in agents)
 
 
+async def drain_released_after_stall(state: DashboardState, slot: _ChatSlot) -> bool:
+    """Drain a slot's parked queue once the sub-agent hold has lifted (EVT-11).
+
+    Called from the gateway's ``subagent_stalled`` consumer: flagging the last
+    live child stalled makes :func:`subagents_hold_user_messages` false, but
+    nothing used to start a drain, so messages parked while the child ran sat
+    until the user's NEXT send joined the queue behind them. The guards are
+    the natural idempotence: an idle slot (``task`` is None), a non-empty
+    queue, and the hold actually lifted — a still-live sibling keeps the hold
+    true and the messages parked, and a drain already running makes the slot
+    busy. Memory preparation is guarded inside :func:`_start_next_queued_turn`,
+    which re-parks the queue until it completes.
+    """
+    if getattr(slot, "task", None) is not None or not slot._queue:
+        return False
+    if subagents_hold_user_messages(state, effective_session_key(slot)):
+        return False
+    return await _start_next_queued_turn(state, slot)
+
+
 async def _start_next_queued_turn(
     state: DashboardState,
     slot: _ChatSlot,
