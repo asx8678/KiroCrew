@@ -1431,6 +1431,17 @@ class GatewayManager:
             self._process = None
             if self._stopping:
                 return
+            # Reap the pooled backends the dead daemon recorded, so third-
+            # party servers that do not exit on stdin EOF are not orphaned:
+            # the zombie-probe branch above reaches this through
+            # _terminate_process's SIGKILL path, but a daemon that died on
+            # its own (crash, OOM-kill, external SIGKILL) skips that entirely
+            # — without this reap, the respawn overwrites the sidecar and the
+            # old pgids leak as init-reparented session leaders.
+            try:
+                await self._reap_orphaned_backends()
+            except Exception:
+                logger.debug("mcp-gateway: orphaned-backend reap failed", exc_info=True)
             logger.warning(
                 "mcp-gateway: %s — respawning in %.1fs", exit_reason, backoff,
             )
