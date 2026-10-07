@@ -3255,6 +3255,7 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         # Same band workflows/service.py clamp_run_timeout enforces, so a
         # hand-edited file and the live-bound setter agree.
         workflow_run_timeout_secs=section.read("workflow_run_timeout_secs", _safe_int, 60, 21600),
+        cron_catchup_window_secs=section.read("cron_catchup_window_secs", _safe_int, 0, 86400),
         workflow_completion_turn=(
             "off"
             if section.get("workflow_completion_turn") == "off"

@@ -1658,6 +1658,20 @@ class AgentConfig:
             enum=["chat", "off"],
         ),
     )
+    cron_catchup_window_secs: int = field(
+        default=21600,
+        metadata=_meta(
+            "Cron Catch-Up Window (secs)",
+            "How long after its scheduled minute a cron-expression job still "
+            "fires once on wake, for a boundary the host slept through or the "
+            "gateway was down for. 0 disables catch-up (the historical "
+            "behaviour: a missed minute is skipped entirely). Default 21600 "
+            "(6h); clamped to 0..86400. A catch-up fires at most once per "
+            "missed boundary, never on a skip-dated day, and 'every'/'at' jobs "
+            "are unaffected (they already catch up by construction). Read on "
+            "the cron timer sweep, refreshed at most once a minute.",
+        ),
+    )
     subagent_mem_buffer_pct: int = field(
         default=20,
         metadata=_meta(

@@ -3612,10 +3612,13 @@ class CronService:
         try:
             snapshot = await asyncio.to_thread(self._tick_scan_locked)
             now = time.time()
+            catchup_window = self._cron_catchup_window_secs()
             due = [
                 j
                 for j in snapshot
-                if j.enabled and j.id not in self._claims and self._is_due(j, now)
+                if j.enabled
+                and j.id not in self._claims
+                and self._is_due(j, now, catchup_window_secs=catchup_window)
             ]
 
             # An empty due-scan can only end the tick when no deferral episode is
@@ -3625,17 +3628,19 @@ class CronService:
                 return
 
             # Posture-gated admission: while host memory is CRITICAL, defer this
-            # tick's ``every``/``at`` firings instead of admitting more work onto
-            # a host that cannot absorb it. The verdict is computed off-loop
+            # tick's ``every``/``at`` firings instead of admitting more work onto a
+            # host that cannot absorb it. The verdict is computed off-loop
             # (config + procfs reads must not stall the event loop). Deferral is
             # deliberately STATELESS and only applies to schedule kinds that stay
             # due on their own (``last_run_ts`` untouched, so a deferred job fires
-            # on the first admitted tick). A cron-expression job is only due while
-            # its expression matches the current minute, so it cannot be deferred
-            # statelessly: an in-memory catch-up marker loses the occurrence on
-            # gateway restart, and dropping it silently loses the occurrence
-            # outright — so cron-expression jobs run normally even under critical
-            # posture (persisted deferral markers are a possible follow-up).
+            # on the first admitted tick). A cron-expression job defers through
+            # the CATCH-UP window instead: ``is_due`` fires a boundary the host
+            # slept through or this gate deferred, once, as long as it is inside
+            # ``agent.cron_catchup_window_secs`` (6h default; 0 = off) and the
+            # job's persisted ``last_run_ts`` is older than the boundary — so a
+            # restart cannot lose the occurrence, and a skipped boundary is
+            # bounded by the operator's own window. Persisted deferral markers
+            # remain a possible follow-up for windows longer than the ceiling.
             # Manual runs (run_job / cron_trigger) never pass through this scan
             # and are not deferred. Fails open on unknown posture. The INFO log
             # fires once per deferral episode and re-fires every 15 minutes so a
@@ -3665,7 +3670,7 @@ class CronService:
                 if j.id in live_by_id
                 and j.id not in self._claims
                 and j.id not in self._pending_removals
-                and self._is_due(live_by_id[j.id], now)
+                and self._is_due(live_by_id[j.id], now, catchup_window_secs=catchup_window)
             ]
 
             if not decision.admitted:
@@ -3961,6 +3966,34 @@ class CronService:
     _compute_jitter = staticmethod(compute_jitter)
     #: Whether a job is due at an epoch (:func:`~kiro_crew.cron_service.schedule.is_due`).
     _is_due = staticmethod(is_due)
+    #: ``_cron_catchup_window_secs`` cache: (read-at, seconds). Class-level
+    #: default so an instance built without ``__init__`` still reads the
+    #: documented default on its first sweep; refreshed at most once a minute.
+    _catchup_cache: "tuple[float, int]" = (0.0, 21600)
+
+    def _cron_catchup_window_secs(self) -> int:
+        """The catch-up window from ``agent.cron_catchup_window_secs``, cached.
+
+        :func:`is_due` runs per job per timer sweep, so the config read is
+        cached for a minute rather than re-parsed per call — a hot-apply lands
+        on the next refresh. 0 (the historical off switch) needs no cache
+        invalidation to be exact.
+        """
+        import time as _time
+
+        now = _time.time()
+        cached = self._catchup_cache
+        if cached[0] and now - cached[0] < 60.0:
+            return cached[1]
+        val = 21600  # the documented default; an unreadable config keeps it
+        try:
+            val = int(KiroCrewConfig.load().agent.cron_catchup_window_secs)
+        except Exception:
+            logger.debug("cron catch-up window unreadable; using default", exc_info=True)
+        if not 0 <= val <= 86400:
+            val = 21600
+        self._catchup_cache = (now, val)
+        return val
 
     async def _execute_with_timeout(self, job: CronJob, claim: _RunClaim | None = None) -> None:
         """Execute a job with a timeout guard.
