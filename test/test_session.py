@@ -6748,10 +6748,13 @@ class TestIneffectiveCompactionCooldown:
     # ── (b) effective but still above the trigger threshold is NOT ineffective ──
 
     @pytest.mark.asyncio
-    async def test_inplace_effective_above_threshold_not_damped(self, cfg):
+    async def test_inplace_effective_above_threshold_counts_toward_the_episode(self, cfg):
         """A good compaction of a very long turn can land above
-        ``autocompact_pct`` while still having freed real headroom. The
-        ineffective test is the measured drop, not the absolute level."""
+        ``autocompact_pct`` while still having freed real headroom — but a
+        reading that stays above threshold-margin is the measured repeat loop
+        (the same reading re-triggers every cooldown window), so it counts
+        toward the episode and arms the backing-off cooldown instead of
+        clearing it. The episode ends only on a landing below the margin."""
         mgr = SessionManager(cfg, provider_factory=self._inplace_factory(pct_after=92.0))
         await mgr.get_or_create("dashboard:chat-1")
         mgr.release("dashboard:chat-1")
@@ -6759,7 +6762,9 @@ class TestIneffectiveCompactionCooldown:
 
         await mgr._compact_session("dashboard:chat-1", 99.0)
 
-        assert "dashboard:chat-1" not in mgr._compact_cooldown_until
+        # Freed 7 points but landed above threshold-margin (70-10): counted.
+        assert mgr._compact_episode_count["dashboard:chat-1"] == 1
+        assert "dashboard:chat-1" in mgr._compact_cooldown_until
         await mgr.close_all()
 
     # ── (c) ineffective compaction arms the cooldown and suppresses the next trigger ──
@@ -6843,6 +6848,92 @@ class TestIneffectiveCompactionCooldown:
         # The forced reset clears the cooldown too — the fresh session starts
         # with no inherited damping.
         assert "dashboard:chat-1" not in mgr._compact_cooldown_until
+        await mgr.close_all()
+
+    # ── episode accounting: repeated compactions that never land are capped ──
+
+    @pytest.mark.asyncio
+    async def test_repeated_no_landing_compactions_exhaust_the_episode(self, cfg):
+        """A compacted floor above threshold-margin re-triggered every cooldown
+        window indefinitely (measured: 11 compactions in 20 turns), each pass a
+        summarization of the same oversized window. Two consecutive no-landing
+        compactions exhaust the episode: the gate declines with
+        'episode_exhausted', the callback fires ONCE, and no further /compact is
+        dispatched."""
+        outcomes: list[str | None] = []
+
+        async def cb(key, pct, *, success, outcome=None):
+            outcomes.append(outcome)
+
+        mgr = SessionManager(cfg, provider_factory=self._inplace_factory(pct_after=80.0))
+        mgr.set_compact_callback(cb)
+        provider, _, _ = await mgr.get_or_create("dashboard:chat-1")
+        mgr.release("dashboard:chat-1")
+        try:
+            result = ""
+            for _ in range(6):
+                # Deterministic in place of the clock: expire the cooldown the
+                # same way time passing would.
+                mgr._compact_cooldown_until.pop("dashboard:chat-1", None)
+                result = await mgr.compact_if_needed("dashboard:chat-1")
+                for _ in range(3):
+                    await asyncio.sleep(0)
+            assert result == "episode_exhausted"
+            # Two compactions ran; the episode declined the rest.
+            assert provider.stream_command.call_count <= 3
+            assert outcomes.count("episode_exhausted") == 1
+        finally:
+            await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_landing_ends_the_episode(self, cfg):
+        """A landing below threshold - warn margin is compaction doing its job:
+        the episode and its fired marker clear alongside the cooldown."""
+        mgr = SessionManager(cfg, provider_factory=self._inplace_factory(pct_after=40.0))
+        await mgr.get_or_create("dashboard:chat-1")
+        mgr.release("dashboard:chat-1")
+        mgr._compact_episode_count["dashboard:chat-1"] = 5
+        mgr._compact_episode_fired.add("dashboard:chat-1")
+
+        await mgr._compact_session("dashboard:chat-1", 95.0)
+
+        assert "dashboard:chat-1" not in mgr._compact_episode_count
+        assert "dashboard:chat-1" not in mgr._compact_episode_fired
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_each_no_landing_level_doubles_the_cooldown(self, cfg):
+        """The failure cooldown backs off exponentially per episode level,
+        capped at 15 min, instead of the flat 60 s that retried every window."""
+        mgr = SessionManager(cfg, provider_factory=self._inplace_factory(pct_after=80.0))
+        await mgr.get_or_create("dashboard:chat-1")
+        mgr.release("dashboard:chat-1")
+
+        # freed 15 points but the floor stays above threshold-margin: counted.
+        await mgr._compact_session("dashboard:chat-1", 95.0)
+        first = mgr._compact_cooldown_until["dashboard:chat-1"] - time.monotonic()
+        assert 55 <= first <= 65
+        assert mgr._compact_episode_count["dashboard:chat-1"] == 1
+
+        mgr._compact_cooldown_until.pop("dashboard:chat-1")
+        await mgr._compact_session("dashboard:chat-1", 95.0)
+        second = mgr._compact_cooldown_until["dashboard:chat-1"] - time.monotonic()
+        assert 115 <= second <= 125
+        assert mgr._compact_episode_count["dashboard:chat-1"] == 2
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_remove_clears_episode_state(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        mgr._compact_episode_count["k1"] = 2
+        mgr._compact_episode_fired.add("k1")
+
+        await mgr.remove("k1")
+
+        assert "k1" not in mgr._compact_episode_count
+        assert "k1" not in mgr._compact_episode_fired
         await mgr.close_all()
 
 
