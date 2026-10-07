@@ -434,6 +434,33 @@ def _next_cron_boundary_ts(job: CronJob, now: float) -> float | None:
     return nxt
 
 
+def _prev_cron_boundary_ts(job: CronJob, now: float) -> float | None:
+    """The most recent cron boundary at or before ``now``, as a UTC epoch.
+
+    The catch-up half of :func:`is_due`: a host that sleeps (or a gateway that
+    is down) through a boundary wakes PAST the matching minute, so
+    ``cron_expr_matches`` is False and the occurrence is silently skipped.
+    This answers which boundary was missed, so :func:`is_due` can fire it
+    once. Same error posture as :func:`_next_cron_boundary_ts`: ``None`` for
+    a non-cron or invalid expression (already warned once there), never a
+    raise on the timer path.
+    """
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    sched = job.schedule
+    if sched.kind != "cron" or sched.cron_expr is None:
+        return None
+    try:
+        tz = _job_tz(job)
+        base = seams.datetime.fromtimestamp(now, tz=tz)
+        prev = croniter(sched.cron_expr, base).get_prev(float)
+    except Exception:
+        return None
+    if isinstance(prev, float) and not math.isfinite(prev):
+        return None
+    return prev
+
+
 def _compute_next_run_ts_raw(job: CronJob, now: float | None = None) -> float | None:
     """Unchecked next-fire-time computation; see :func:`compute_next_run_ts`."""
     from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
@@ -532,8 +559,19 @@ def compute_jitter(job: CronJob) -> float:
     return 0.0
 
 
-def is_due(job: CronJob, now: float) -> bool:
-    """Whether ``job`` is due at ``now``: its schedule has arrived and ``now`` is not a skip date."""
+def is_due(job: CronJob, now: float, *, catchup_window_secs: int = 0) -> bool:
+    """Whether ``job`` is due at ``now``: its schedule has arrived and ``now`` is not a skip date.
+
+    ``catchup_window_secs`` (0 = off, the historical behaviour) arms the
+    CATCH-UP half for cron-expression jobs only: a boundary the host slept
+    through or the gateway was down for fires ONCE on wake, when the most
+    recent boundary is later than the job's last run and inside the window.
+    The ``last_run_ts`` comparison makes a catch-up un-double-fireable, and
+    ``skip_dates`` is evaluated against the MISSED boundary's date, not
+    today's — a skip-dated day is never caught up. An ``every``/``at`` job
+    already catches up by construction (due whenever ``now >= last_run +
+    interval`` / ``at_ts``), so the window is ignored there.
+    """
     from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
 
     if job.schedule.kind == "every" and job.schedule.every_secs:
@@ -547,10 +585,29 @@ def is_due(job: CronJob, now: float) -> bool:
         tz = _job_tz(job)
         dt = seams.datetime.fromtimestamp(now, tz=tz)
         if not seams.cron_expr_matches(job.schedule.cron_expr, dt):
-            return False
-        # Don't re-fire within the same UTC minute (immune to DST ambiguity)
-        if job.last_run_ts and int(job.last_run_ts) // 60 == int(now) // 60:
-            return False
+            # ── Catch-up: the current minute does not match, but a recent one
+            # might have been missed. Fire it once on wake when the boundary
+            # is inside the window and the job has not run at/after it.
+            if catchup_window_secs <= 0:
+                return False
+            prev = _prev_cron_boundary_ts(job, now)
+            if prev is None:
+                return False
+            if (job.last_run_ts or 0.0) >= prev:
+                return False  # already fired at/after that boundary
+            if now - prev > catchup_window_secs:
+                return False  # too old: today's behaviour, skip the occurrence
+            # skip_dates applies to the MISSED boundary's local date, so a
+            # skip-dated day is never caught up (evaluated against the
+            # boundary, not against today's date).
+            if job.skip_dates:
+                bnd_date = seams.datetime.fromtimestamp(prev, tz).strftime("%Y-%m-%d")
+                if bnd_date in job.skip_dates:
+                    return False
+        else:
+            # Don't re-fire within the same UTC minute (immune to DST ambiguity)
+            if job.last_run_ts and int(job.last_run_ts) // 60 == int(now) // 60:
+                return False
     else:
         return False
     # Skip dates check (evaluated in job's local timezone, applies to all schedule types)
