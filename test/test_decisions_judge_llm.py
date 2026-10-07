@@ -465,6 +465,100 @@ class TestRunnerSeam:
             asyncio.run(runner("prompt"))
         assert asked == [None]
 
+    def test_a_transient_failure_is_not_retried_inside_the_gate_budget(self) -> None:
+        """LOOP-9: the gate's own wait_for already turns a failure into its
+        FALLBACK decision, so a transient error inside the 8 s budget must not
+        burn hidden same-model retries — exactly one prompt is sent."""
+        from kiro_crew.acp.client import AcpError
+
+        calls = {"n": 0}
+
+        class _Provider:
+            async def stream(self, prompt: str):
+                calls["n"] += 1
+                raise AcpError("LLM dispatch failure: connection reset by peer")
+                yield  # pragma: no cover
+
+        class _Sessions:
+            async def get_or_create(self, key: str, agent: str = "", model: object = None):
+                return _Provider(), True, False
+
+            def release(self, key: str) -> None:
+                return None
+
+            async def destroy(self, key: str) -> None:
+                return None
+
+        runner = impl_llm.build_session_runner(_Sessions(), model="")
+        with pytest.raises(AcpError):
+            asyncio.run(runner("prompt"))
+        assert calls["n"] == 1, "a transient failure must not be retried here"
+
+    def test_a_successful_ask_records_exactly_one_usage_row(self, monkeypatch) -> None:
+        """LOOP-9: the judge's spend was invisible — stream_and_collect persists
+        nothing and this runner is not run_bg_oneliner. A billed ask now records
+        one usage row with surface bg:judge."""
+        from types import SimpleNamespace
+
+        recorded: list[dict] = []
+
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        class _Provider:
+            served_model = "claude-haiku-4.5"
+
+            async def stream(self, prompt: str):
+                yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="ok")
+                yield LLMEvent(kind=EVENT_COMPLETE)
+
+        class _Sessions:
+            async def get_or_create(self, key: str, agent: str = "", model: object = None):
+                return _Provider(), True, False
+
+            def release(self, key: str) -> None:
+                return None
+
+            async def destroy(self, key: str) -> None:
+                return None
+
+        usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+            credits=1,
+        )
+        monkeypatch.setattr(
+            "kiro_crew.llm_helpers.provider_last_turn_usage",
+            lambda provider, since=None: usage,
+        )
+        monkeypatch.setattr(
+            "kiro_crew.llm_helpers.usage_has_billing",
+            lambda u: True,
+        )
+
+        async def _fake_persist(session_key, model, u, label, *, surface, elapsed_ms, model_source):
+            recorded.append(
+                {
+                    "session_key": session_key,
+                    "model": model,
+                    "surface": surface,
+                }
+            )
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.usage.persist_token_record_async",
+            _fake_persist,
+        )
+
+        runner = impl_llm.build_session_runner(_Sessions(), model="")
+        text = asyncio.run(runner("prompt"))
+        assert text == "ok"
+        assert len(recorded) == 1, "exactly one usage row per ask"
+        assert recorded[0]["surface"] == "bg:judge"
+        assert recorded[0]["model"] == "claude-haiku-4.5"
+        assert recorded[0]["session_key"].startswith("judge:")
+
     def test_the_response_ceiling_refuses_mid_stream(self, monkeypatch) -> None:
         """The ceiling bounds what is RETAINED, so it fires while chunks arrive.
 
