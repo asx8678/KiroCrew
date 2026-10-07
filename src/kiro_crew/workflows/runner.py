@@ -78,6 +78,13 @@ except ImportError:  # pragma: no cover - security is app-layer optional
 # Wall-clock ceiling per run (matches ``_RUN_TIMEOUT_SECS`` in the spec).
 DEFAULT_RUN_TIMEOUT_SECS = 3600
 
+# WF-2: run-wide default for the bound on a step's output handed back to the
+# script. A step's text (or schema JSON) can be arbitrarily large, and a script
+# that passes it verbatim into later prompts pays for it again on every step;
+# only the error string (500) and the event summary (120) were bounded before.
+# None disables the bound entirely.
+DEFAULT_MAX_OUTPUT_CHARS = 20_000
+
 # Bounds on a caller-supplied per-run ceiling. The ceiling is the runaway
 # backstop, so a caller may LENGTHEN it for a genuinely long investigation but can
 # never disable it — and can't set one so short the run cannot even author itself.
@@ -323,6 +330,7 @@ class _RunContext:
         replay_results: Optional[dict] = None,
         replay_before: int = 0,
         on_agent_result: Optional[AgentResultFn] = None,
+        max_output_chars: Optional[int] = None,
     ) -> None:
         self.args = args
         self.now = now
@@ -333,6 +341,11 @@ class _RunContext:
         # (e.g. ``ctx.nudge`` → AutoNudge) know which session to act on. Empty
         # when the run was not launched from a nudge-able session.
         self._session_key = session_key
+        # WF-2: run-wide bound on what a step's output may hand the SCRIPT. The
+        # record (agent_results, for resume replay) keeps the WHOLE value; only
+        # the value the script receives is bounded, so a step cannot paste a
+        # 200k-char result verbatim into every later prompt.
+        self._max_output_chars = max_output_chars
 
         # Ports native to Kiro Crew — injected per run; None when the host did
         # not grant/wire them (the frozen contract allows None, like AppContext).
@@ -516,6 +529,20 @@ class _RunContext:
                 "error": error,
             },
         )
+        # WF-2: bound the value the SCRIPT receives. The record above
+        # (agent_results, for resume replay) keeps the whole value, so a resume
+        # replays the full result and bounds it again here. Head+tail with a
+        # marker naming the cut, so the script (and the model behind the next
+        # prompt) knows the text was truncated. Schema values are left whole —
+        # the script indexes their fields, and a cut dict is worse than a big
+        # one. None disables the bound.
+        if ok and self._max_output_chars and isinstance(result, str):
+            cap = int(self._max_output_chars)
+            if len(result) > cap:
+                marker = f"\n[… {len(result) - cap} chars truncated …]\n"
+                keep = max(0, cap - len(marker))
+                half = keep // 2
+                result = result[:half] + marker + result[len(result) - (keep - half) :]
         return result
 
     # --- scheduling (delegate to the dsl combinators with the run's cap) ---
@@ -625,11 +652,13 @@ class WorkflowRunner:
         on_complete: Optional[Callable[[], Awaitable[None]]] = None,
         pre_terminal: Optional[Callable[[], Awaitable[None]]] = None,
         execution_guard: Optional[Callable[[], Awaitable[None]]] = None,
+        max_output_chars: Optional[int] = DEFAULT_MAX_OUTPUT_CHARS,
     ) -> None:
         self._agent_fn = agent_fn
         self._timeout_secs = timeout_secs
         self._max_agents = max_agents_per_run
         self._concurrency = concurrency
+        self._max_output_chars = max_output_chars
         # B10 audit sink (default = real SEL) + native ports (default = none wired).
         self._audit = _guarded_audit(audit or _default_audit)
         self._ports = ports or {}
@@ -900,6 +929,7 @@ class WorkflowRunner:
             replay_results=replay_results,
             replay_before=replay_before,
             on_agent_result=on_agent_result,
+            max_output_chars=self._max_output_chars,
         )
         ctx._execution_guard = self._execution_guard
         ctx._events = events  # share the sink so phase/log/agent events land in order
