@@ -44,6 +44,16 @@ logger = logging.getLogger(__name__)
 
 _MANAGED_SETTING = "kirocrew.skillDiscovery.inheritFiles"
 _INHERIT_SETTING = "chat.disableInheritingDefaultResources"
+
+#: Agents whose projected views carry NO inherited steering or AGENTS.md
+#: (SEC-22). ``kirocrew-guest`` is the tool-less agent a NON-operator channel
+#: sender talks to, a trust boundary that mounts nothing; the inherited
+#: resources are operator-authored instruction content, so they stay out of
+#: its view. Crew-side rather than a spec key (the spec format denies unknown
+#: fields, and the guest's config is shipped, never user-authored). Add ONLY
+#: shipped, boundary-defined agents here -- never a user-authored name, which
+#: would let a config file silently un-steer any agent it names.
+_NO_INHERITED_STEERING_AGENTS: frozenset[str] = frozenset({"kirocrew-guest"})
 _INHERIT_SOURCE = "kirocrew.skillDiscovery.inheritSource"
 _PREVIOUS_INHERITANCE = "kirocrew.skillDiscovery.previousInheritance"
 _SEARCH_TOOL = "@kirocrew-core/skill_search"
@@ -3021,7 +3031,22 @@ def prepare_native_skill_projection(
                     }
 
                 if inherited:
-                    for view in specs.values():
+                    for view_name, view in specs.items():
+                        # The guest exemption (SEC-22): ``kirocrew-guest`` is the
+                        # tool-less agent a NON-operator channel sender talks
+                        # to -- a trust boundary that mounts nothing -- so the
+                        # operator's global steering (the absolute
+                        # ``~/.kiro/steering`` glob, workspace ``.kiro/steering``
+                        # and ``AGENTS.md``) never lands in its context: steering
+                        # is operator-authored instruction content, and an
+                        # admitted non-operator can ask about what sits in the
+                        # view. A Crew-side set rather than a spec field: the
+                        # spec format denies unknown fields, and the guest's
+                        # config is shipped, never user-authored. Other agents
+                        # (``kirocrew`` itself, user custom agents) keep the
+                        # inheritance the operator configured.
+                        if view_name in _NO_INHERITED_STEERING_AGENTS:
+                            continue
                         for resource in (
                             f"file://{kiro_home().as_posix()}/steering/**/*.md",
                             "file://.kiro/steering/**/*.md",
