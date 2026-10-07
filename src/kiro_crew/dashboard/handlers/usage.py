@@ -1412,6 +1412,38 @@ def _coerce_int(value: Any) -> int:
         return 0
 
 
+def _catalog_rate_multiplier(model: str) -> float | None:
+    """The kiro catalog's credit rate multiplier for *model*, or None.
+
+    USE-9: credits on each row are already the billed (multiplied) amount, so
+    the gap is attribution — a row could not say which multiplier produced
+    its credits. Read from the cached ``--list-models`` catalog (the same rows
+    the model picker serves); an unknown id, a cold cache and a non-numeric
+    badge all read as None. Lazy import: the usage store is written from
+    turn hooks on the loop, and the catalog handler is not on its import path.
+    """
+    if not model:
+        return None
+    try:
+        from kiro_crew.dashboard.handlers.agents import _catalog_cache
+
+        rows = _catalog_cache.models
+    except Exception:  # noqa: BLE001 — telemetry attribution is best-effort
+        return None
+    if not rows:
+        return None
+    needle = model.strip()
+    for row in rows:
+        if not isinstance(row, dict) or row.get("modelId") != needle:
+            continue
+        for key in ("rateMultiplier", "rate_multiplier"):
+            value = row.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            return float(value)
+    return None
+
+
 def _build_token_record(
     slot_key: str,
     model: str,
@@ -1497,6 +1529,10 @@ def _build_token_record(
         # none). str-coerced so a non-string on a test double / legacy event
         # can't break json.dumps.
         "stop_reason": _stop if isinstance(_stop, str) else "",
+        # Additive (USE-9): the kiro catalog's credit rate multiplier that
+        # produced this row's credits (None when the id is not in the cached
+        # catalog — unknown model, cold cache). Old shards lack the key.
+        "rate_multiplier": _catalog_rate_multiplier(model),
     }
 
 
