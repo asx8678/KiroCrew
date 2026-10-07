@@ -984,3 +984,40 @@ class TestAProjectAlwaysSkillCannotFailTheSession:
             )
         assert "SCOPED BODY" not in "".join(required)
         assert not [r for r in caplog.records if "were not injected" in r.getMessage()]
+
+
+def test_the_repo_specific_dev_skills_carry_repo_scope(tmp_path: Path) -> None:
+    """SKL-2: the Kiro Crew repo-development skills are mechanically contained.
+
+    Their prose "Kiro Crew repo only" scope guards were never obeyed
+    mechanically, and with triggers on they injected hundreds of KB into
+    unrelated projects' sessions. The ``repo_scope`` frontmatter makes the
+    loader suppress them outside this repository — for injection, search and
+    catalog alike — while ``babysit`` (a general skill) stays unscoped."""
+    import os
+    import tempfile
+
+    from kiro_crew.skills import SkillsLoader
+
+    os.environ.setdefault("KIRO_HOME", tempfile.mkdtemp(prefix="kc-skl2-"))
+    loader = SkillsLoader(skills_path=tmp_path / "s", install_builtins=True)
+    scoped = {
+        "kirocrew-dev/kirocrew-prepare-pr",
+        "kirocrew-dev/writing-tests",
+        "kirocrew-dev/kirocrew-worktree-dev",
+        "kirocrew-dev/dashboard-template",
+    }
+    seen: dict[str, str] = {}
+    for name, skill_file, _within in loader._iter_visible(None):
+        if name not in scoped and name != "kirocrew-dev/babysit":
+            continue
+        meta = loader._readable_frontmatter(skill_file, within=_within)
+        assert meta is not None, name
+        seen[name] = meta.get("repo_scope", "").strip()
+    assert seen == {
+        "kirocrew-dev/kirocrew-prepare-pr": "src/kiro_crew",
+        "kirocrew-dev/writing-tests": "src/kiro_crew",
+        "kirocrew-dev/kirocrew-worktree-dev": "src/kiro_crew",
+        "kirocrew-dev/dashboard-template": "src/kiro_crew",
+        "kirocrew-dev/babysit": "",
+    }
