@@ -77,6 +77,7 @@ from kiro_crew.platform.tool_paths import (
     target_paths,
 )
 from kiro_crew.sel import sel
+from kiro_crew.versioning import _is_newer, _version_key
 
 logger = logging.getLogger(__name__)
 
@@ -1820,22 +1821,6 @@ class BootControls:
     fail_closed: bool = True
 
 
-def _version_tuple(value: str) -> Tuple[int, ...]:
-    """Parse a version's numeric core into a comparable tuple.
-
-    The pre-release/build suffix is split off the WHOLE string before splitting
-    on dots, because this project's CI stamps a dot INSIDE the pre-release
-    (``0.2.0-nightly.20260728t184500``, ``0.3.0-insider.2``) — splitting
-    per-component would leave ``nightly.20260728t184500`` as its own component
-    and read every nightly as version ``0``.
-    """
-    core = re.split(r"[-+]", str(value).strip(), maxsplit=1)[0]
-    try:
-        return tuple(int(chunk) for chunk in core.split("."))
-    except ValueError:
-        return ()
-
-
 @dataclass(frozen=True)
 class UpdatePins:
     """Policy-only update pins: WHERE new code comes from, and the MINIMUM version.
@@ -1900,18 +1885,22 @@ class UpdatePins:
     def meets_min_version(self, version: str) -> bool:
         """Is *version* at or above the floor? An empty floor is always met.
 
-        An unparseable floor imposes none (a typo must not brick a fleet); an
-        unparseable *version* is treated as below the floor, which makes the host
-        take the update rather than sit on a build it cannot identify.
+        Versions order by the ONE comparator the update check uses
+        (:func:`kiro_crew.versioning._version_key`), so a prerelease or dev
+        build of ``X.Y.Z`` — any lane's spelling: ``X.Y.Zrc1``,
+        ``X.Y.Z.dev…``, ``X.Y.Z-rc.1``, ``X.Y.Z-nightly.…`` — is BELOW an
+        ``X.Y.Z`` floor and at or above any lower floor. An unparseable floor
+        imposes none (a typo must not brick a fleet); an unparseable *version*
+        is treated as below the floor, which makes the host take the update
+        rather than sit on a build it cannot identify.
         """
-        floor = _version_tuple(self.min_version) if self.min_version else ()
-        if not floor:
+        if not self.min_version:
             return True
-        current = _version_tuple(version)
-        if not current:
+        if _version_key(self.min_version) is None:
+            return True
+        if _version_key(version) is None:
             return False
-        width = max(len(current), len(floor))
-        return current + (0,) * (width - len(current)) >= floor + (0,) * (width - len(floor))
+        return not _is_newer(self.min_version, version)
 
     @staticmethod
     def from_dict(d: Mapping[str, object]) -> "UpdatePins":
@@ -3548,14 +3537,16 @@ def _intersect_update_pins(authority: UpdatePins, subordinate: UpdatePins) -> Up
     if not authority.min_version:
         min_version = subordinate.min_version
     elif subordinate.min_version:
-        upper = _version_tuple(authority.min_version)
-        lower = _version_tuple(subordinate.min_version)
-        if not upper:
+        # Two floors intersect as the higher one, ordered by the ONE shared
+        # comparator; an unparseable floor imposes none
+        # (:meth:`UpdatePins.meets_min_version`), so it yields to a parseable
+        # one.
+        if _version_key(authority.min_version) is None:
             min_version = subordinate.min_version
-        elif lower:
-            width = max(len(upper), len(lower))
-            if lower + (0,) * (width - len(lower)) > upper + (0,) * (width - len(upper)):
-                min_version = subordinate.min_version
+        elif _version_key(subordinate.min_version) is not None and _is_newer(
+            subordinate.min_version, authority.min_version
+        ):
+            min_version = subordinate.min_version
     return replace(authority, source=source, min_version=min_version)
 
 
