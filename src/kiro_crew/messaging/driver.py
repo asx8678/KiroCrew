@@ -516,6 +516,11 @@ class TurnDriver:
         # Terminal stop reason of the last run() — read by the dispatcher's
         # post-turn bookkeeping (e.g. COMPACTION_FAILED -> session reset).
         self.last_stop_reason: str = ""
+        #: CTX-12: a COMPLETED backend compaction was observed mid-turn — the
+        #: dispatcher's settle seam reads this to arm the post-compaction
+        #: re-injection flag every multi-turn loop owes its session. Cleared by
+        #: nothing: one turn's observation is settled once at the turn seam.
+        self.compaction_completed: bool = False
         # Whether run() saw an EVENT_COMPLETE at all. ``last_stop_reason`` is
         # "" both before any completion and for a completion that carries no
         # reason, and the two mean opposite things to the post-compaction
@@ -959,6 +964,13 @@ class TurnDriver:
                     resources=f"request_id={event.request_id} mode={self.approval_mode}",
                 )
             elif kind == EVENT_COMPACTION_STATUS:
+                if event.text == "completed":
+                    # CTX-12: the backend compacted on its own (kiro-cli /compact,
+                    # the claude/codex equivalents). The notice below still renders;
+                    # the FLAG the next turn's contract depends on is armed at the
+                    # turn seam from this field, so every transport sharing this
+                    # driver gets it, not only the dashboard runner and heartbeat.
+                    self.compaction_completed = True
                 await self.renderer.dispatch(
                     OutputEvent(kind=COMPACTION, context_usage_pct=event.context_usage_pct)
                 )
