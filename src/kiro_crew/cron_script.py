@@ -2989,9 +2989,14 @@ def run_command_sandboxed(
     # agent-denied env keys, while deliberately leaving ~/.ssh reachable so a
     # legitimate command cron can still do git/scp/rsync over SSH. "strict" would
     # additionally hide ~/.ssh but break those workflows; the residual .ssh
-    # exposure is covered by the storage-time deny-list (mcp_cron._vet_shell_command,
-    # which blocks any .ssh reference) — the primary control. This sandbox is
-    # defense-in-depth and is bypassed when the OS backend falls back to "none"
+    # exposure is bounded by this sandbox tier. The storage-time deny-list
+    # (mcp_cron._vet_shell_command) is an ACCIDENT RAIL, not the control: it
+    # blocks only literal .ssh spellings, while glob-expansion and
+    # interpreter-built paths (bash -O dotglob / GLOBIGNORE, find -exec, a
+    # python that assembles the path at run time) carry no literal reference
+    # and pass it, so the sandbox, not the text gate, is what fences ~/.ssh
+    # here. This sandbox is
+    # bypassed when the OS backend falls back to "none"
     # (e.g. macOS >= 26 — see _clean_cron_env).
     #
     # wrap_argv is INSIDE the try: on a host with no OS sandbox backend (every
