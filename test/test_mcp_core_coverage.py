@@ -761,6 +761,90 @@ class TestWorkflowDefinitionLibrary:
         assert "/workflow debug-project" in out
 
 
+class TestWorkflowResultSummaryAndPaging:
+    """TOOL-7: the default is a bounded summary (failures BEFORE events, result
+    capped, last 20 events); section=events pages through the whole stream."""
+
+    @staticmethod
+    def _stub(monkeypatch, events, agent_errors=None, result=None, agent_results=None):
+        import kiro_crew.mcp_tools.workflows as wf
+
+        payload = {
+            "run_id": "r9",
+            "status": "failed",
+            "result": result,
+            "error": "",
+            "events": events,
+            "agent_errors": agent_errors or {},
+        }
+        if agent_results is not None:
+            payload["agent_results"] = agent_results
+        monkeypatch.setattr(wf.mcp_core, "_resolve_session_key_strict", lambda: "dashboard:w")
+        monkeypatch.setattr(wf.mcp_core, "_resolve_session_key", lambda: "dashboard:w")
+        monkeypatch.setattr(wf.mcp_core, "_get", lambda *a, **k: payload)
+        return wf
+
+    def test_the_default_summary_is_bounded_and_failures_come_first(self, monkeypatch):
+        wf = self._stub(
+            monkeypatch,
+            events=[{"seq": i, "type": "log", "data": {"m": "x" * 50}} for i in range(5_000)],
+            agent_errors={"a0": "boom"},
+            result="r" * 50_000,
+        )
+        out = wf.workflow_result("workflow_result", {"run_id": "r9"})
+        assert len(out) <= 12_000
+        body = json.loads(out)
+        assert body["agent_errors"] == {"a0": "boom"}
+        assert len(body["events"]) == 20
+        assert body["events_total"] == 5_000
+        # The failure fields precede the events in the serialized output.
+        assert out.index("agent_errors") < out.index('"events"')
+        assert "result truncated" in out
+        assert "\n " not in out  # compact JSON
+
+    def test_section_events_pages_through_the_whole_stream(self, monkeypatch):
+        wf = self._stub(
+            monkeypatch,
+            events=[{"seq": i, "type": "log"} for i in range(5_000)],
+        )
+        first = json.loads(
+            wf.workflow_result(
+                "workflow_result", {"run_id": "r9", "section": "events", "limit": 2_000}
+            )
+        )
+        assert len(first["events"]) == 2_000
+        assert first["has_more"] is True
+        second = json.loads(
+            wf.workflow_result(
+                "workflow_result",
+                {"run_id": "r9", "section": "events", "offset": 2_000, "limit": 2_000},
+            )
+        )
+        assert len(second["events"]) == 2_000
+        third = json.loads(
+            wf.workflow_result(
+                "workflow_result",
+                {"run_id": "r9", "section": "events", "offset": 4_000, "limit": 2_000},
+            )
+        )
+        assert len(third["events"]) == 1_000
+        assert third["has_more"] is False
+
+    def test_section_agent_results_pages_keys(self, monkeypatch):
+        wf = self._stub(
+            monkeypatch,
+            events=[],
+            agent_results={f"a{i}": f"v{i}" for i in range(10)},
+        )
+        page = json.loads(
+            wf.workflow_result(
+                "workflow_result", {"run_id": "r9", "section": "agent_results", "limit": 4}
+            )
+        )
+        assert list(page["agent_results"].keys()) == ["a0", "a1", "a2", "a3"]
+        assert page["has_more"] is True
+
+
 class TestWorkflowReadIdentity:
     @pytest.mark.parametrize("tool", ["workflow_status", "workflow_result", "workflow_list"])
     def test_reads_refuse_inherited_identity_without_http(self, tool):
