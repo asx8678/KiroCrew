@@ -212,7 +212,15 @@ async def test_long_episode_is_a_snippet_in_actual_http_and_mcp_json(
     assert "PRIVATE_TAIL_SENTINEL" not in result
     selected = json.loads(result)
     assert selected["retrieval"]["episodes"] == [
-        {key: value for key, value in row.items() if key != "text"} for row in evidence
+        {
+            "id": row["id"],
+            "retrieval": (
+                {"reason": row["retrieval"]["reason"]}
+                if "reason" in row.get("retrieval", {})
+                else {}
+            ),
+        }
+        for row in evidence
     ]
     assert selected["episodic_context"].count(evidence[0]["text"]) == 1
     assert tier.get_episodic_list()[0]["text"] == source
@@ -333,7 +341,11 @@ async def test_actual_stdio_frame_counts_nested_json_escaping_and_content_wrappe
     assert envelope["id"] == request_id
     assert envelope["result"] == {"content": [{"type": "text", "text": text}]}
     selected = json.loads(envelope["result"]["content"][0]["text"])
-    assert selected["total_chars"] <= 3000
+    assert "total_chars" not in selected
+    assert (
+        sum(len(selected[f"{kind}_context"]) for kind in ("semantic", "episodic", "lessons"))
+        <= 3000
+    )
     assert {row["id"] for row in selected["retrieval"]["facts"]}.issubset(
         {row["id"] for row in payload["retrieval"]["facts"]}
     )
@@ -385,7 +397,12 @@ async def test_final_redaction_cannot_expand_context_past_requested_char_budget(
     monkeypatch.setattr(learn.mcp_core, "_get", lambda *args, **kwargs: payload)
     wire = learn.memory_recall("memory_recall", {"query": "PostgreSQL database"})
     assert "TOKEN" not in wire
-    assert json.loads(wire)["total_chars"] <= 3000
+    selected = json.loads(wire)
+    assert "total_chars" not in selected
+    assert (
+        sum(len(selected[f"{kind}_context"]) for kind in ("semantic", "episodic", "lessons"))
+        <= 3000
+    )
     assert _transport_size(wire, mcp_envelope=True) <= MAX_RECALL_PAYLOAD_BYTES
 
 
