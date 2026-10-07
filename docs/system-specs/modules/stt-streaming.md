@@ -179,7 +179,12 @@ Server to client, JSON. `stt.session.SttEvent.kind` supplies the local provider'
 - `{"type":"final","text":"..."}`: the committed transcript for the utterance. An empty final explicitly retracts the previous partial, including a hypothesis removed by hallucination filtering or redaction. It contributes no text to semantic endpointing. The client clears that live hypothesis so disconnect recovery cannot restore it.
 - `{"type":"endpoint","complete":true}`: the semantic endpointer judged the
   utterance a finished request, so the composer may submit without a keypress.
-  Only when `stt.endpointing` is on.
+  Only when `stt.endpointing` is on. The classifier input is the LAST 40 words
+  of the transcript (`_ENDPOINT_TAIL_WORDS`), not the whole growing dictation,
+  and a narrow local pre-check answers the obvious tails with no model call —
+  a sentence terminator with no dangling connective is COMPLETE, a tail ending
+  in a connective is INCOMPLETE; the model judges everything in between on the
+  inherited pinned background model.
 - `{"type":"error","message":"...","code":"..."}`: a setup failure, a refusal or
   a cap. The English `message` is advisory and the `code` is the contract, because
   the dashboard renders localised text and cannot key off a sentence. Codes the
