@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.handlers.messaging import (
         _SPAWN_STATUS_MAX_GREP_LEN,
         _SPAWN_STATUS_MAX_LINES,
+        _SPAWN_TAIL_MAX_CHARS,
         PERSISTED_SUBAGENT_REPLAY_KEEP,
         PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
         DashboardState,
@@ -54,15 +55,22 @@ def _redact(text: str) -> str:
     return text
 
 
-def _spawn_result_view(text: str, offset: int, limit: int, grep: str) -> tuple[str, dict]:
-    """Apply optional grep (regex line filter) then offset/limit line slicing.
+def _spawn_result_view(
+    text: str, offset: int, limit: int, grep: str, tail: int = 0
+) -> tuple[str, dict]:
+    """Apply optional grep (regex line filter) then offset/limit or tail slicing.
 
     Line-oriented, like reading code: *offset* is a 0-based start line and *limit*
     caps returned lines (0 = to end, hard-capped at ``_SPAWN_STATUS_MAX_LINES``).
     When *grep* is set, lines are filtered by a case-insensitive regex first, then
-    offset/limit apply to the matches. Returns ``(view_text, meta)``; on a bad
-    regex ``meta['grep_error']`` is set and *view_text* is empty. Pure CPU — run
-    via ``asyncio.to_thread`` so a pathological regex never stalls the loop.
+    offset/limit (or tail) apply to the matches. When *tail* > 0 the LAST
+    ``tail`` lines are returned instead — the end of the transcript is where a
+    finished subagent's closing answer is, and the transport's head-only cut
+    would otherwise drop it — kept under ``_SPAWN_TAIL_MAX_CHARS`` by dropping
+    whole lines from the front (the newest line is always returned). Returns
+    ``(view_text, meta)``; on a bad regex ``meta['grep_error']`` is set and
+    *view_text* is empty. Pure CPU — run via ``asyncio.to_thread`` so a
+    pathological regex never stalls the loop.
     """
     lines = text.splitlines()
     total = len(lines)
@@ -75,6 +83,21 @@ def _spawn_result_view(text: str, offset: int, limit: int, grep: str) -> tuple[s
     meta: dict = {"total_lines": total}
     if grep:
         meta["matched_lines"] = len(lines)
+    if tail > 0:
+        span = min(tail, _SPAWN_STATUS_MAX_LINES)
+        start = len(lines)
+        used = 0
+        while start > 0 and (len(lines) - start) < span:
+            cost = len(lines[start - 1]) + (1 if used else 0)
+            if used and used + cost > _SPAWN_TAIL_MAX_CHARS:
+                break
+            used += cost
+            start -= 1
+        meta["offset"] = start
+        meta["returned_lines"] = len(lines) - start
+        meta["has_more"] = start > 0
+        meta["tail_view"] = True
+        return "\n".join(lines[start:]), meta
     start = min(max(0, offset), len(lines))
     span = _SPAWN_STATUS_MAX_LINES if limit <= 0 else min(limit, _SPAWN_STATUS_MAX_LINES)
     end = min(len(lines), start + span)
@@ -100,10 +123,11 @@ async def _apply_result_view(request: web.Request, text: str) -> tuple[str, dict
 
     offset = _q_int("offset")
     limit = _q_int("limit")
+    tail = _q_int("tail")
     grep = (request.query.get("grep") or "").strip()[:_SPAWN_STATUS_MAX_GREP_LEN]
-    if not (grep or offset > 0 or limit > 0):
+    if not (grep or offset > 0 or limit > 0 or tail > 0):
         return text, {}
-    return await asyncio.to_thread(_spawn_result_view, text, offset, limit, grep)
+    return await asyncio.to_thread(_spawn_result_view, text, offset, limit, grep, tail)
 
 
 async def api_spawn_status(request: web.Request) -> web.Response:

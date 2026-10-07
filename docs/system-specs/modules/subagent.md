@@ -3417,16 +3417,19 @@ truncated in-memory `info.result` ("truncated at the same place").
 Parameters:
 - `agent_id` (str, required): subagent ID from the completion event (alnum, max 64 chars)
 - `offset` (int, optional): 0-based start line for a paged read (line-oriented, like reading code)
-- `limit` (int, optional): max lines to return (1–2000). Omit for the full transcript.
+- `limit` (int, optional): max lines to return (1–2000). With no offset/limit/grep the MCP tool requests the transcript TAIL instead (last 200 lines, kept under 12k chars) — the end of the transcript is where a finished run's closing answer is.
 - `grep` (str, optional): case-insensitive regex; return only matching transcript lines (offset/limit then apply to the matches)
+- `tail` (int, optional): return the last N lines instead of an offset window; used by the MCP tool as its no-argument default (`tail=200`). The HTTP route's no-parameter contract is unchanged (full transcript).
 
-When any of `offset`/`limit`/`grep` is set, the `/api/spawn/{id}` response
+When any of `offset`/`limit`/`grep`/`tail` is set, the `/api/spawn/{id}` response
 includes a `result_meta` block (`total_lines`, `matched_lines`, `offset`,
-`returned_lines`, `has_more`) and the tool output is prefixed with a one-line
-continuation header (`showing lines X-Y of N | more available — call again with
-offset=Y`). With no paging params the full-transcript contract is unchanged. The
-line split + regex run via `asyncio.to_thread` so a pathological pattern never
-stalls the event loop.
+`returned_lines`, `has_more`, plus `tail_view` for a tail read) and the tool output
+is prefixed with a one-line continuation header (`showing lines X-Y of N | more
+available — call again with offset=Y`, or for a tail view `earlier lines available
+— call again with offset=0 limit=X`). With no paging params the route's
+full-transcript contract is unchanged; the MCP tool's no-argument default is the
+bounded tail view. The line split + regex run via `asyncio.to_thread` so a
+pathological pattern never stalls the event loop.
 
 When positive terminal credits were recorded, the MCP tool prefixes the full transcript
 with `[usage: <credits> credits · <elapsed>]`; paged responses include the same
