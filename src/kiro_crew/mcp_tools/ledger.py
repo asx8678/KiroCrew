@@ -176,7 +176,10 @@ def session_ledger_read(name: str, args: dict[str, Any]) -> str:
             f"unset it (or remove it from {env_file_display()}) and restart "
             "the gateway (the env var is the only setting; there is no config key)."
         )
-    return json.dumps({"state": state, "events": events}, indent=2)
+    # TOOL-12: compact JSON — indent=2 cost ~68% of the read's tokens and the
+    # ledger is read every patrol cycle. The state arrives without `events`
+    # (the route pops them); `events` is the bounded tail.
+    return json.dumps({"state": state, "events": events}, ensure_ascii=False, separators=(",", ":"))
 
 
 def session_ledger_record(name: str, args: dict[str, Any]) -> str:
