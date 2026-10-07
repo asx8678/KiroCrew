@@ -133,7 +133,7 @@ Resolution rules:
 | `src/kiro_crew/config/defaults.json` | Shipped base configuration. A development project can override it with `agents/defaults.json`. |
 | `src/kiro_crew/config/prompt.md` | Shipped system prompt. A development project can override it with `agents/prompt.md`. |
 | `~/.kiro/crew/agent.json` | Optional user overrides merged on top of defaults. |
-| `~/.kiro/crew/prompt.md` | Optional user prompt override, which takes priority over the shipped prompt. |
+| `~/.kiro/crew/prompt.md` | Optional user prompt override, which takes priority over the shipped prompt. It is injected whole at every session start and after every compaction, so an override past 100,000 characters (~2.5x the shipped prompt) still works but logs one WARNING naming its measured size — keep it within the budget. |
 | `~/.kiro/agents/kirocrew.json` | Installed generated agent configuration. |
 
 ## Reinstalling Agent Config

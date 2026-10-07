@@ -167,6 +167,38 @@ class TestUtf16OverrideDegradesToShippedPrompt:
         assert "UTF8-OVERRIDE-MARKER" in resolved
         assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
+    def test_oversized_override_is_used_whole_with_one_size_warning(
+        self, home: Path, builder: ContextBuilder, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """CTX-16: an override past the 100K-char budget is NOT truncated — a
+        contract must stay whole — but exactly one WARNING names its measured
+        size per (path, size) per process. A fresh read of the same file logs
+        nothing new, and an ordinary 30K override logs nothing at all."""
+        ctx_mod._prompt_size_warned.clear()
+        override = home / "prompt.md"
+        override.write_text("x" * 150_000, encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger=ctx_mod.logger.name):
+            first = _resolve(builder)
+        assert len(first) == 150_000  # used whole, never truncated
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+        assert "150000" in warnings[0].getMessage()
+        assert str(override) in warnings[0].getMessage()
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=ctx_mod.logger.name):
+            second = _resolve(builder)
+        assert second == first
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        caplog.clear()
+        ctx_mod._prompt_size_warned.clear()
+        override.write_text("y" * 30_000, encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger=ctx_mod.logger.name):
+            small = _resolve(builder)
+        assert len(small) == 30_000
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
     def test_claude_code_branch_reads_through_the_same_reader(
         self, home: Path, builder: ContextBuilder, caplog: pytest.LogCaptureFixture
     ) -> None:
