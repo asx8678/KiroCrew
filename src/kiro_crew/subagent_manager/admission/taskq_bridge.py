@@ -1190,7 +1190,13 @@ class _TaskqBridgeMixin(ManagerComponent):
         return store.advance(agent_id, state, generation=generation)
 
     def taskq_fail(self, agent_id: str, reason: str) -> None:
-        """Terminal ``failed`` for a persisted row refused before it registered."""
+        """Terminal ``failed`` for a persisted row refused before it registering.
+
+        Best-effort (posted when a loop is running): for the durable variant
+        callers that can await use :meth:`taskq_fail_async`, which retries a
+        locked store once and returns whether the row reached terminal
+        FAILED before the refusal was announced.
+        """
         from kiro_crew import taskq as _taskq
 
         store = self.taskq_store()
@@ -1199,6 +1205,42 @@ class _TaskqBridgeMixin(ManagerComponent):
         self._post_store_write(
             store, f"fail {agent_id}", store.finish, agent_id, _taskq.FAILED, error=reason
         )
+
+    async def taskq_fail_async(self, agent_id: str, reason: str) -> bool:
+        """Durable terminal ``failed``: retries a locked store, returns commit.
+
+        Unlike the posted :meth:`taskq_fail`, this runs the ``finish`` on a
+        worker thread and AWAITS it, so the caller can announce the refusal
+        only after the row is durably terminal — a row left queued or admitted
+        by a store that could not commit would be re-dispatched by the pump or
+        the boot reconciler after the caller was told it was refused. Retries
+        once on :class:`~kiro_crew.taskq.TaskStoreUnavailable` (a locked or
+        momentarily unwritable database); a second failure returns ``False``
+        with a WARNING naming the row, so the operator sees a refusal whose
+        store verdict did not land.
+        """
+        from kiro_crew import taskq as _taskq
+
+        store = self.taskq_store()
+        if store is None:
+            return True  # no store: nothing that could be re-dispatched
+
+        def _finish() -> bool:
+            return store.finish(agent_id, _taskq.FAILED, error=reason)
+
+        for attempt in (1, 2):
+            try:
+                return await _asyncio.to_thread(_finish)
+            except _taskq.TaskStoreUnavailable:
+                if attempt == 2:
+                    _glue_logger.warning(
+                        "taskq: fail %s did not commit after retry; the row may "
+                        "be re-dispatched by the pump or boot reconcile",
+                        agent_id,
+                        exc_info=True,
+                    )
+                    return False
+        return False
 
     def taskq_settle(self, info: SubagentInfo, *, row_settled: bool = False) -> None:
         """Write the run's terminal state from its record; fenced by generation.
