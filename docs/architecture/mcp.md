@@ -770,6 +770,23 @@ from the gateway environment (the operator's shell and the crew `.env`), which
 no agent can write. A sidecar publication failure drops every rebind from that
 pass, so gatewayd refuses the changed expansion and the next boot retries. A
 changed command, argument or declared env text is still refused.
+
+The launch line is only half of what an approval covers: `tool-digests.json`
+in the same `mcp-launch-approvals/` directory pins what the server's TOOLS
+SAY. One sha256 digest per tool over the canonical JSON of its `name`,
+`description` and `inputSchema` is recorded from the first complete listing
+the gateway sees after the operator enables the server, and every later
+complete listing is compared against that baseline. A changed description or
+inputSchema is surfaced with an SEL event and a warning — served, not
+withheld, because blocking a working server on a benign update is an owner
+decision — and the baseline adopts the change so one drift reports once;
+added tools are recorded, dropped tools leave the baseline, and a paginated
+or partial listing (which cannot stand for the tool set) skips the
+comparison. The drift vectors this closes: `notifications/tools/list_changed`
+re-lists and package-floating launches (`npx pkg@latest`) whose argv hash
+never changes while the code does. Servers kiro-cli talks to directly are
+outside this pin — Crew has no observation point on them.
+
 Both halves of the fingerprint fold exactly three gateway-computed spellings
 (`hashing.install_aliases`), each in the ONE slot the gateway's own writer
 (`apps/bridges.py`) emits it in: `sys.executable` (what the rewriter substitutes

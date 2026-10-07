@@ -42,6 +42,14 @@ encoding opens with a byte no UTF-8 token can contain, so no spelled-out argv or
 env value collides with it. An approval of such a launch recorded before the
 encoding existed is refused once as `changed_needs_reapproval` and re-approved
 by the operator; the store never admits the pre-encoding digest.
+The sibling `tool-digests.json` leaf pins the server's TOOL DEFINITIONS the
+same way the approvals pin its launch: one digest per tool over its name,
+description and inputSchema, recorded from the first complete listing after
+the operator enables the server and compared on every later complete listing,
+with drift surfaced as an SEL event (served, not withheld — blocking is an
+owner decision) and re-recorded so one change reports once. Non-stubbed
+servers are out of scope: kiro-cli talks to them directly and Crew has no
+observation point.
 The residual: `${VAR}` values come from the gateway environment, so an
 unsealed source of it (such as a writable shell rc file) changes an approved
 launch's values silently instead of surfacing as a refusal.
