@@ -3517,6 +3517,38 @@ def reproject_for_ceiling_change() -> None:
     _projected_ceiling_generation = generation
 
 
+def _seed_main_agent_model_tracking(config: dict, *, clean: bool, fresh_install: bool) -> None:
+    """Seed default-model tracking for the main agent at rebuild time.
+
+    A clean regen always resumes tracking the shipped default; a first-time
+    install seeds tracking only when the sidecar has no prior (possibly frozen)
+    choice to preserve.
+
+    MOD-7 added the grandfathered arm: a sidecar that never recorded the main
+    agent (an install upgraded from before the sidecar existed) whose spec
+    model EQUALS the current config agent.model got that pin from this
+    rebuild's own propagation — nobody chose it in the template editor,
+    because an editor pick freezes the sidecar entry to False rather than
+    leaving it absent. Adopting it into tracking is what lets a later switch
+    back to 'auto' clear the pin instead of resolving to it. Never flips an
+    existing entry, True or False: a frozen pick is an explicit user choice
+    (model-selection.md: never silently swap a user's pick).
+    """
+    main_name = config.get("name") or _MAIN_AGENT_NAME
+    if fresh_install and (clean or agent_state.get_model_managed(main_name) is None):
+        agent_state.set_model_managed(main_name, True)
+        return
+    if clean or agent_state.get_model_managed(main_name) is not None:
+        return
+    from kiro_crew.config.loader import coerce_config_field, normalize_agent_model
+
+    _mc_model = normalize_agent_model(
+        coerce_config_field(_load_json(_mc_config_path()) or {}, "agent", dict, {}).get("model")
+    )
+    if _mc_model and normalize_agent_model(config.get("model")) == _mc_model:
+        agent_state.set_model_managed(main_name, True)
+
+
 def rebuild_agent_config(
     *,
     clean: bool = False,
@@ -3614,12 +3646,9 @@ def rebuild_agent_config(
         config = build_agent_config(gated_off=gated_off)
         fresh_install = True
 
-    # Seed default-model tracking for a fresh/clean build. A clean regen always
-    # resumes tracking the shipped default; a first-time install seeds tracking
-    # only when the sidecar has no prior (possibly frozen) choice to preserve.
-    main_name = config.get("name") or _MAIN_AGENT_NAME
-    if fresh_install and (clean or agent_state.get_model_managed(main_name) is None):
-        agent_state.set_model_managed(main_name, True)
+    # Seed default-model tracking for a fresh/clean build, and adopt the
+    # propagated pin on a grandfathered install (see the helper).
+    _seed_main_agent_model_tracking(config, clean=clean, fresh_install=fresh_install)
 
     # Merge shared MCP servers from ~/.kiro/settings/mcp.json (Kiro user-level
     # config) FIRST.  KiroCrew is kiro-first (ACP/kiro-cli only), so Kiro

@@ -29,7 +29,7 @@ from pathlib import Path
 import pytest
 
 from kiro_crew import agent_state
-from kiro_crew.agent import _refresh_dynamic_fields
+from kiro_crew.agent import _refresh_dynamic_fields, _seed_main_agent_model_tracking
 from kiro_crew.config import config_path
 from kiro_crew.config.loader import DEFAULT_MODEL, KiroCrewConfig, resolve_effective_model
 
@@ -167,6 +167,56 @@ class TestOwnershipBoundary:
         _set_global("auto")
 
         assert _refresh(_PINNED)["model"] == _PINNED
+
+
+class TestGrandfatheredInstallsAdoptTracking:
+    """MOD-7: a sidecar-less main agent whose spec pin came FROM propagation is
+    adopted into tracking at the next rebuild, so a later switch back to 'auto'
+    clears it; a frozen pick (model_managed=False) never flips."""
+
+    def test_a_propagated_pin_is_adopted(self, shipped) -> None:
+        shipped(None)
+        assert agent_state.get_model_managed(_AGENT) is None
+        _set_global(_PINNED)
+        config = _refresh(_PINNED)  # the propagation wrote this pin
+
+        _seed_main_agent_model_tracking(config, clean=False, fresh_install=False)
+
+        assert agent_state.get_model_managed(_AGENT) is True
+
+    def test_a_pin_the_propagation_did_not_write_is_left_alone(self, shipped) -> None:
+        """A spec pin that differs from the global was hand-set or stale —
+        ownership stays unknown rather than being guessed."""
+        shipped(None)
+        _set_global("some-other-model")
+        config = {"name": _AGENT, "model": _PINNED, "tools": []}
+
+        _seed_main_agent_model_tracking(config, clean=False, fresh_install=False)
+
+        assert agent_state.get_model_managed(_AGENT) is None
+
+    def test_a_frozen_pick_never_flips(self, shipped) -> None:
+        shipped(None)
+        agent_state.set_model_managed(_AGENT, False)
+        _set_global(_PINNED)
+        config = _refresh(_PINNED)
+
+        _seed_main_agent_model_tracking(config, clean=False, fresh_install=False)
+
+        assert agent_state.get_model_managed(_AGENT) is False
+
+    def test_after_adoption_the_auto_switch_clears_the_pin(self, shipped) -> None:
+        """The end-to-end shape MOD-7 asks for: adopt on the rebuild while the
+        global still names the pin, then the switch back to 'auto' clears it."""
+        shipped("auto")
+        _set_global(_PINNED)
+        config = _refresh(_PINNED)
+        _seed_main_agent_model_tracking(config, clean=False, fresh_install=False)
+        assert agent_state.get_model_managed(_AGENT) is True
+
+        _set_global("auto")
+        assert _refresh(_PINNED)["model"] == "auto"
+        assert resolve_effective_model(KiroCrewConfig.load()) == ""
 
 
 class TestResolverOracle:
