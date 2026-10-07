@@ -541,6 +541,7 @@
         "idle_between_cycles_2": "Inactivité entre les cycles",
         "if_set_the_agent_verifies_against_this_each_cycl": "Si défini, l'agent s'y réfère à chaque cycle et termine lorsque la condition est remplie.",
         "loading": "Chargement...",
+        "live_updates_paused": "Mises à jour en direct en pause — interrogation toutes les quelques secondes",
         "max_cycles": "Cycles max :",
         "max_cycles_2": "Cycles max",
         "min": "min",

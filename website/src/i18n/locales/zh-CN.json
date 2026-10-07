@@ -533,6 +533,7 @@
         "idle_between_cycles_2": "轮次间空闲",
         "if_set_the_agent_verifies_against_this_each_cycl": "设置后，代理每轮都会据此校验，达成即完成。",
         "loading": "正在加载…",
+        "live_updates_paused": "实时更新已暂停——每隔几秒轮询一次",
         "max_cycles": "最大轮次：",
         "max_cycles_2": "最大轮次",
         "min": "分钟",

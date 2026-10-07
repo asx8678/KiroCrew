@@ -613,14 +613,42 @@ function CampaignDetail({ id, onBack, onFork, onOpen }: { id: string; onBack: ()
   })
 
   // SSE: instant updates; on connection error, fall back to polling above.
+  // REL-8: the fallback is not forever — the stream is retried with capped
+  // backoff (1 s doubling, 30 s max), polling stops the moment it reconnects,
+  // and an i18n'd 'live updates paused' indicator shows while polling.
   useEffect(() => {
     setSseFailed(false)  // reset on id change so each campaign starts clean
-    const es = new EventSource(`/api/apps/auto-research/campaigns/${id}/stream`)
-    es.onmessage = () => {
-      qc.invalidateQueries({ queryKey: ['research-campaign', id] })
+    let attempt = 0
+    let cancelled = false
+    let timer: number | null = null
+    let current: EventSource | null = null
+
+    const open = () => {
+      const es = new EventSource(`/api/apps/auto-research/campaigns/${id}/stream`)
+      current = es
+      es.onmessage = () => {
+        qc.invalidateQueries({ queryKey: ['research-campaign', id] })
+      }
+      es.onopen = () => {
+        attempt = 0
+        setSseFailed(false)
+      }
+      es.onerror = () => {
+        setSseFailed(true)
+        es.close()
+        const delay = Math.min(1000 * 2 ** attempt, 30000)
+        attempt += 1
+        timer = window.setTimeout(() => {
+          if (!cancelled) open()
+        }, delay)
+      }
     }
-    es.onerror = () => { setSseFailed(true); es.close() }
-    return () => { es.close() }
+    open()
+    return () => {
+      cancelled = true
+      if (timer != null) clearTimeout(timer)
+      current?.close()
+    }
   }, [id, qc])
   const [showNudge, setShowNudge] = useState(false)
   const [nudgeText, setNudgeText] = useState('')
@@ -647,6 +675,11 @@ function CampaignDetail({ id, onBack, onFork, onOpen }: { id: string; onBack: ()
       <button className="text-sm text-accent" onClick={onBack}>{i18nT('apps.autoResearch.researchLabPage.back')}</button>
       <h2 className="text-lg font-semibold">{campaign.name}</h2>
       <span className="text-xs px-2 py-0.5 rounded bg-bg-elevated">{campaign.status}</span>
+      {sseFailed && (
+        <span className="text-sm text-muted" data-testid="live-updates-paused">
+          {i18nT('apps.autoResearch.researchLabPage.live_updates_paused')}
+        </span>
+      )}
       <button className="text-xs px-2 py-1 rounded bg-bg-elevated text-danger ml-auto" onClick={() => { deleteMut.reset(); setConfirmDelete(true) }}><Trash2 size={12} className="inline" /> {i18nT('apps.autoResearch.researchLabPage.delete')}</button>
     </div>
     <Modal

@@ -194,6 +194,7 @@
         "idle_between_cycles_2": "Idle between cycles",
         "if_set_the_agent_verifies_against_this_each_cycl": "If set, the agent verifies against this each cycle and completes when met.",
         "loading": "Loading...",
+        "live_updates_paused": "Live updates paused — polling every few seconds",
         "max_cycles": "Max cycles:",
         "max_cycles_2": "Max cycles",
         "min": "min",
