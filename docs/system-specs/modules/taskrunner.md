@@ -845,7 +845,12 @@ finalizer removes the worktree.
 
 ## Cycle Detection
 
-`task_executor.execute_task()` tracks consecutive identical errors:
+`task_executor.execute_task()` tracks consecutive identical errors. Identical
+is compared by `repeat_loop.error_fingerprint` (WF-6) — volatile tokens
+(durations, ports, pids, addresses, timestamps, hex ids) masked to fixed
+placeholders, keyed on the FAILED/ERROR/Assertion lines — so two runs of the
+same failing step that differ only by their noise count as the SAME error;
+`task.error` itself keeps its full text for display:
 
 - 2nd identical error → ⚠️ warning notification
 - 3rd identical error → step FAILED with "Loop detected" message

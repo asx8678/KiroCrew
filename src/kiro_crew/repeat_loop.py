@@ -15,9 +15,53 @@ per turn without importing the dashboard.
 from __future__ import annotations
 
 import hashlib
+import re
 
 #: Identical results of one identical call, in one turn, before the notice.
 REPEAT_LOOP_THRESHOLD = 3
+
+#: WF-6: volatile tokens a repeated failure carries without being a different
+#: failure. Masked to a fixed token before comparison, so consecutive runs of
+#: the SAME failing test/command (different durations, ports, pids, addresses,
+#: timestamps, hex ids) fingerprint identically and the loop notice and
+#: fail-fast fire on real loops instead of being defeated by byte drift.
+_VOLATILE_RES: "tuple[tuple[str, str], ...]" = (
+    # Order matters: the specific shapes run BEFORE the generic number mask,
+    # or the number mask eats the timestamp's digits first.
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?\b"), "<ts>"),
+    (re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|s|sec|seconds)\b"), "<dur>"),
+    (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d{2,5}\b"), "<ip:port>"),
+    (re.compile(r"\b[0-9a-fA-F]{8,64}\b"), "<hex>"),
+    (re.compile(r"(?<!\w)\d{2,5}(?=[ .,;]|$)"), "<n>"),
+)
+
+
+def error_fingerprint(text: str) -> str:
+    """The stable comparison key for a failed step's error text.
+
+    Masks volatile tokens (durations, ports, pids, addresses, timestamps, hex
+    ids) to fixed placeholders, KEYED on the FAILED/ERROR/Assertion lines —
+    the lines that say WHY it failed — so two failures that differ only by the
+    noise of a new run compare equal, while genuinely different failures do
+    not. ``task.error`` keeps its full text for display; only the loop
+    detector compares fingerprints (WF-6).
+    """
+    kept: list[str] = []
+    for line in text.splitlines():
+        if not (
+            "FAILED" in line
+            or "ERROR" in line
+            or "AssertionError" in line
+            or "Traceback" in line
+            or "error" in line.lower()
+        ):
+            continue
+        masked = line
+        for pattern, token in _VOLATILE_RES:
+            masked = pattern.sub(token, masked)
+        kept.append(masked.strip())
+    return "\n".join(kept)
+
 
 #: Bound on the call ids and signatures one tracker holds; a turn past it stops
 #: tracking new ones rather than growing without limit.
