@@ -163,6 +163,55 @@ async def test_incomplete_verdict_emits_nothing(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_each_call_carries_only_the_bounded_tail(monkeypatch) -> None:
+    """MOD-6: 50 finals of 10 words each — every classifier prompt carries at
+    most _ENDPOINT_TAIL_WORDS words, not the whole growing dictation."""
+    prompts: list[str] = []
+
+    async def _record(*a: object, **k: object) -> str:
+        prompts.append(str(a[1]))
+        return "INCOMPLETE"
+
+    monkeypatch.setattr("kiro_crew.dashboard.stt_stream.run_bg_oneliner", _record)
+    ws = _fake_ws()
+    ep = stt_stream._Endpointer(ws, object(), debounce=0.0, timeout=1.0)
+    for i in range(50):
+        ep.note_final(f"word{i} " + "w" * 9 + " tail")
+        await _drain(ep)
+    assert prompts
+    for prompt in prompts:
+        tail_part = prompt.split("Transcript:")[-1]
+        assert len(tail_part.split()) <= stt_stream._ENDPOINT_TAIL_WORDS + 4
+
+
+@pytest.mark.asyncio
+async def test_an_obviously_dangling_tail_skips_the_model_call(monkeypatch) -> None:
+    """MOD-6: a final ending in a dangling connective is INCOMPLETE with no
+    model call; a sentence terminator is COMPLETE with no call."""
+    bg = AsyncMock(return_value="COMPLETE")
+    monkeypatch.setattr("kiro_crew.dashboard.stt_stream.run_bg_oneliner", bg)
+    ws = _fake_ws()
+    ep = stt_stream._Endpointer(ws, object(), debounce=0.0, timeout=1.0)
+    ep.note_final("let us deploy the database and")
+    await _drain(ep)
+    bg.assert_not_awaited()
+    ws.send_json.assert_not_awaited()
+
+    ep2 = stt_stream._Endpointer(ws, object(), debounce=0.0, timeout=1.0)
+    ep2.note_final("deploy the database now.")
+    await _drain(ep2)
+    bg.assert_not_awaited()
+    ws.send_json.assert_awaited_once_with({"type": "endpoint", "complete": True})
+
+
+def test_the_local_verdict_helper_is_narrow() -> None:
+    assert stt_stream._endpoint_local_verdict("ship it now.") == "COMPLETE"
+    assert stt_stream._endpoint_local_verdict("ship it and") == "INCOMPLETE"
+    assert stt_stream._endpoint_local_verdict("ship it, and.") == ""  # ask the model
+    assert stt_stream._endpoint_local_verdict("") == ""
+
+
+@pytest.mark.asyncio
 async def test_newer_final_supersedes_the_debounced_one(monkeypatch) -> None:
     """Two finals in quick succession: the earlier task must abort after its
     debounce (gen bumped), so exactly one classification runs and one frame is

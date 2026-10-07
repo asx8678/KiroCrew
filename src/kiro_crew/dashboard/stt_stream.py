@@ -154,6 +154,82 @@ _CODE_VOCABULARY_REJECTED = "stt_transcribe_vocabulary_rejected"
 # it).
 # Debounced so mid-utterance finals don't each fire a model call, and
 # single-flight so at most one bg call runs at once.
+# MOD-6: the classifier input is the last _ENDPOINT_TAIL_WORDS words of the
+# transcript, not the whole growing join — every stable final re-classified the
+# ENTIRE dictation so far, so input grew ~quadratically with dictation length.
+_ENDPOINT_TAIL_WORDS = 40
+
+#: A cheap local pre-check runs BEFORE the model call: a tail that clearly ends
+#: a sentence (terminator, no dangling connective) is COMPLETE with no call,
+#: and a tail that clearly dangles (ends in a connective word) is INCOMPLETE
+#: with no call. The model still judges everything in between.
+_SENTENCE_TERMINATORS = ".?!;"
+_DANGLING_CONNECTIVES = frozenset(
+    {
+        "and",
+        "or",
+        "but",
+        "because",
+        "so",
+        "then",
+        "if",
+        "when",
+        "while",
+        "the",
+        "a",
+        "an",
+        "to",
+        "of",
+        "in",
+        "on",
+        "for",
+        "with",
+        "at",
+        "by",
+        "also",
+        "plus",
+        "which",
+        "that",
+        "your",
+        "our",
+        "my",
+    }
+)
+
+
+def _endpoint_tail(transcript: str) -> str:
+    """The last _ENDPOINT_TAIL_WORDS words — the whole classifier input (MOD-6).
+
+    The endpointing question is about whether the speaker FINISHED, which the
+    tail answers; the head of a long dictation adds cost (the old whole-join
+    re-sent everything so far on every debounced final) and no signal.
+    """
+    words = transcript.split()
+    return (
+        " ".join(words[-_ENDPOINT_TAIL_WORDS:]) if len(words) > _ENDPOINT_TAIL_WORDS else transcript
+    )
+
+
+def _endpoint_local_verdict(transcript: str) -> str:
+    """COMPLETE / INCOMPLETE / empty string — the obvious tails, no model call.
+
+    The empty string means "not obvious; ask the model". The local check is
+    deliberately narrow: only a sentence terminator with NO trailing connective
+    (so "ship it, and" stays a model question) and only a dangling connective
+    word (so "...deploy and" is clearly mid-sentence).
+    """
+    tail = transcript.strip()
+    if not tail:
+        return ""
+    words = tail.split()
+    last = words[-1].strip(_SENTENCE_TERMINATORS) if words else ""
+    if tail[-1] in _SENTENCE_TERMINATORS and last and last.lower() not in _DANGLING_CONNECTIVES:
+        return "COMPLETE"
+    if last and last.lower() in _DANGLING_CONNECTIVES and tail[-1] not in _SENTENCE_TERMINATORS:
+        return "INCOMPLETE"
+    return ""
+
+
 _ENDPOINT_MODEL = None  # no model: inherit the pinned background spec model
 _ENDPOINT_DEBOUNCE_SECS = 0.35
 _ENDPOINT_TIMEOUT_SECS = 5.0
@@ -381,7 +457,7 @@ class _Endpointer:
         if self._can_submit():
             if self._speech_pending and not text and self._finals:
                 self._gen += 1
-                self._schedule(self._gen, " ".join(self._finals).strip())
+                self._schedule(self._gen, _endpoint_tail(" ".join(self._finals).strip()))
             self._speech_pending = False
         self.note_final(text)
 
@@ -396,7 +472,7 @@ class _Endpointer:
         self._finals.append(text)
         self._gen += 1
         gen = self._gen
-        transcript = " ".join(self._finals).strip()
+        transcript = _endpoint_tail(" ".join(self._finals).strip())
         if not transcript:
             return
         self._schedule(gen, transcript)
@@ -423,15 +499,19 @@ class _Endpointer:
         self._inflight = True
         verdict = ""
         try:
-            verdict = await run_bg_oneliner(
-                self._sessions,
-                _ENDPOINT_PROMPT.format(transcript=transcript),
-                model=self._model,
-                sel_source="stt_endpointing",
-                timeout=self._timeout,
-                # The person is mid-dictation; the verdict drives auto-submit.
-                start_priority=StartPriority.FOREGROUND,
-            )
+            # MOD-6: cheap local pre-check first — the obvious tails never pay
+            # a model call (a person mid-dictation is waiting on this verdict).
+            verdict = _endpoint_local_verdict(transcript)
+            if not verdict:
+                verdict = await run_bg_oneliner(
+                    self._sessions,
+                    _ENDPOINT_PROMPT.format(transcript=transcript),
+                    model=self._model,
+                    sel_source="stt_endpointing",
+                    timeout=self._timeout,
+                    # The person is mid-dictation; the verdict drives auto-submit.
+                    start_priority=StartPriority.FOREGROUND,
+                )
         except Exception:
             logger.debug("stt endpointing classification failed", exc_info=True)
         finally:
