@@ -178,6 +178,40 @@ afterEach(() => { global.fetch = prevFetch })
 describe('ActivityViewer — subagent transcript loading', () => {
   const doneAgent = () => ({ s1: mkAgent('s1', { status: 'done' }) })
 
+  it('polls workflow runs only on the workflows tab while a run is in flight (UI-6)', async () => {
+    vi.useFakeTimers()
+    try {
+      const running = {
+        run_id: 'r1', session_key: SLOT, status: 'running',
+        started_at: '2026-10-07T00:00:00Z', updated_at: '2026-10-07T00:00:00Z',
+      }
+      // Links tab: the panel is open but the Workflows view is not visible,
+      // so not a single poll may fire over ten seconds.
+      stubFetch({ runs: [running] })
+      renderPanel(<ActivityViewer {...baseProps} view="links" />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(api.workflowRuns).not.toHaveBeenCalled()
+
+      // Workflows tab with one running run for this slot: polls on the 2.5 s
+      // cadence while it is in flight.
+      const wf = vi.mocked(api.workflowRuns)
+      wf.mockClear()
+      const { unmount } = renderPanel(<ActivityViewer {...baseProps} view="workflows" />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(7_600) })
+      expect(wf.mock.calls.length).toBeGreaterThanOrEqual(3)
+
+      // The run turns terminal: the cadence stops (at most one in-flight tail
+      // call, then silence).
+      wf.mockResolvedValue({ runs: [{ ...running, status: 'succeeded' }] } as Awaited<ReturnType<typeof api.workflowRuns>>)
+      wf.mockClear()
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(wf.mock.calls.length).toBeLessThanOrEqual(1)
+      unmount()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('loads a finished agent transcript from disk only when asked', async () => {
     const { container } = renderPanel(
       <ActivityViewer {...baseProps} view="subagents" subagents={doneAgent()} />,
