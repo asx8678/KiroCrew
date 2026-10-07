@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import fnmatch
 import hmac
+import ipaddress
 import json
 import logging
 import math
@@ -510,6 +511,17 @@ _TRUNCATED_SCAN_ITEM = "\x00<governance:path-scan-truncated-unverifiable>"
 #: edit, while an ungoverned scope still permits (standalone default preserved).
 _UNANCHORED_TARGET_ITEM = "\x00<governance:edit-target-unanchored-unverifiable>"
 
+#: Same never-permittable construction, for a SPECIAL-scheme URL
+#: (``http``/``https``/``ws``/``wss``/``ftp``) whose host cannot be derived at
+#: all — an empty authority, an unterminated ``[`` bracket, a forbidden host
+#: code point, a host no client would accept.  ``_url_host`` returns it instead
+#: of ``""`` so ``classify_tool_args`` still emits a ``network.egress`` pair:
+#: an allow-mode ceiling denies the unverifiable fetch, while a targeted
+#: deny-mode ceiling keeps the marker semantics documented above (it permits
+#: the marker — such a URL names no host any client would connect to, and the
+#: WHATWG host derivation is what makes deny lists bind).
+_UNCLASSIFIABLE_EGRESS_ITEM = "\x00<governance:egress-host-unclassifiable>"
+
 
 def _tool_arg_paths(raw_params: Mapping[str, object]) -> Tuple[Tuple[str, ...], bool]:
     """Return every distinct, non-empty path carried under a supported alias,
@@ -695,6 +707,27 @@ def classify_tool_args(
 # so the egress gate must not derive a phantom host from it.
 _NETWORK_SCHEMES = frozenset({"http", "https", "ws", "wss", "ftp", "ftps"})
 
+# The WHATWG "special" schemes (minus ``file``): a URL on one of these is derived
+# with the WHATWG special-authority rules — ``\`` folds to ``/`` and any run of
+# slashes after ``scheme:`` is skipped — so every spelling that names a host
+# reaches the gate.  ``ftps`` is not special (WHATWG does not list it), so it
+# keeps the historical ``scheme://``-only reading below.
+_SPECIAL_NETWORK_SCHEMES = frozenset({"http", "https", "ws", "wss", "ftp"})
+
+# WHATWG URL parsing trims leading/trailing C0 control or space, then removes
+# every ASCII tab/newline, before it parses.
+_C0_AND_SPACE = "".join(chr(i) for i in range(0x21))
+_TAB_NL_RE = re.compile(r"[\t\n\r]")
+_URL_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
+
+# The four code points WHATWG domain-to-ASCII reads as label separators.
+_LABEL_SEPARATORS = ".\u3002\uff0e\uff61"
+
+# WHATWG forbidden host code points, checked AFTER percent-decoding: a host
+# carrying one is not a host any client would connect to, so the URL is
+# unclassifiable rather than a name to compare against a list.
+_FORBIDDEN_HOST_CHARS = frozenset("\x00\t\n\r #/:<>?@[\\]^|%")
+
 
 def _looks_like_host(token: str) -> bool:
     """True if *token* looks like a network host (vs. a URI scheme word).
@@ -712,19 +745,120 @@ def _looks_like_host(token: str) -> bool:
     return t == "localhost" or "." in t or any(c.isdigit() for c in t)
 
 
+def _ipv4_number(token: str) -> Optional[int]:
+    """Parse one IPv4 part the WHATWG way: decimal, ``0x`` hex, leading-``0`` octal."""
+    if not token:
+        return None
+    if token[:2].lower() == "0x":
+        digits = token[2:]
+        if digits and all(c in "0123456789abcdefABCDEF" for c in digits):
+            return int(digits, 16)
+        return None
+    if token.startswith("0") and len(token) > 1:
+        return int(token, 8) if all(c in "01234567" for c in token) else None
+    if token.isascii() and token.isdigit():
+        return int(token, 10)
+    return None
+
+
+def _host_ends_in_number(host: str) -> bool:
+    """WHATWG's IPv4 trigger: the last label is numeric, or is exactly ``0x``/``0X``."""
+    parts = host.split(".")
+    if len(parts) > 1 and parts[-1] == "":
+        parts = parts[:-1]
+    if not parts:
+        return False
+    last = parts[-1]
+    return _ipv4_number(last) is not None or last.lower() == "0x"
+
+
+def _parse_ipv4(host: str) -> Optional[str]:
+    """Canonicalise a WHATWG IPv4 host to dotted-quad form, or ``None``.
+
+    ``0x7f.1`` → ``127.0.0.1``, ``2130706433`` → ``127.0.0.1``, ``1.2.3.4`` →
+    ``1.2.3.4``; anything the WHATWG parser refuses (a non-last part over 255,
+    more than four parts, a non-numeric part) is ``None``.
+    """
+    parts = host.split(".")
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    if not parts or len(parts) > 4:
+        return None
+    values: List[int] = []
+    for part in parts:
+        n = _ipv4_number(part)
+        if n is None:
+            return None
+        values.append(n)
+    if any(v > 255 for v in values[:-1]):
+        return None
+    if values[-1] >= 256 ** (5 - len(values)):
+        return None
+    ipv4 = values[-1]
+    for i, v in enumerate(values[:-1]):
+        ipv4 += v * 256 ** (3 - i)
+    return ".".join(str((ipv4 >> shift) & 0xFF) for shift in (24, 16, 8, 0))
+
+
+def _normalize_host(host: str) -> str:
+    """Normalise an extracted host the way the fetching client would.
+
+    The WHATWG host normalisation, applied to the SUBJECT host in this one
+    place (never to an operator's pattern): percent-decode, reject the
+    forbidden host code points, canonicalise an IPv4-numeric host to dotted
+    quad, IDNA-map a domain to its ASCII form (``encodings.idna`` is IDNA2003,
+    close enough for a comparison that only ever deny-binds or fails closed),
+    lowercase, and strip one trailing ``.`` — the FQDN marker, which DNS
+    treats as the same name and which no extracted host keeps.
+
+    Returns ``_UNCLASSIFIABLE_EGRESS_ITEM`` for a host no WHATWG parser would
+    accept, so an allow-mode ceiling denies the unverifiable fetch while a
+    targeted deny-mode ceiling keeps its documented marker semantics.
+    """
+    try:
+        decoded = urllib.parse.unquote(host, errors="strict")
+    except UnicodeDecodeError:
+        return _UNCLASSIFIABLE_EGRESS_ITEM
+    if _FORBIDDEN_HOST_CHARS.intersection(decoded):
+        return _UNCLASSIFIABLE_EGRESS_ITEM
+    if decoded and decoded[-1] in _LABEL_SEPARATORS:
+        decoded = decoded[:-1]
+    if not decoded:
+        return _UNCLASSIFIABLE_EGRESS_ITEM
+    if _host_ends_in_number(decoded):
+        ipv4 = _parse_ipv4(decoded)
+        return ipv4 if ipv4 is not None else _UNCLASSIFIABLE_EGRESS_ITEM
+    try:
+        return decoded.encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        return _UNCLASSIFIABLE_EGRESS_ITEM
+
+
 def _url_host(url: str) -> str:
     """Extract the host from a URL for the ``host`` matcher (no network I/O).
 
-    Returns ``""`` for a URL that carries no network host, so a hostless URL is
-    NOT mis-classified as egress to a phantom host the fetch would never contact.
-    The cases, by shape of the input:
+    The host is derived the way a WHATWG URL parser — the standard the
+    fetching client follows — would, so every spelling that names a host
+    reaches the gate instead of escaping it:
 
-    * ``scheme://authority/…`` — a host only when ``scheme`` is a known NETWORK
-      scheme (``http``/``https``/``ws``/``wss``/``ftp``/``ftps``).  ``file:///…``
-      and any other scheme with an authority return ``""``.
-    * no scheme (``host/path`` or ``//host/path``) — recover the authority via a
-      ``//`` retry.
-    * ``scheme:rest`` with NO ``://`` — EITHER a non-network URI
+    * a SPECIAL scheme (``http``/``https``/``ws``/``wss``/``ftp``) — C0/space
+      trimmed, ASCII tab/newline removed, ``\\`` folded to ``/``, and every
+      ``/`` run after ``scheme:`` skipped, so ``scheme:authority``,
+      ``scheme:/authority`` and ``scheme:///authority`` all carry the same
+      authority.  The authority ends at the first ``/ ? #``, userinfo
+      (everything before the LAST ``@``) and one port are stripped, an IPv6
+      literal ``[::1]:443`` unwraps to its canonical compressed form, and the
+      host is normalised by :func:`_normalize_host`.  ``https://evil.com\\@
+      good.com/`` therefore resolves ``evil.com`` (the backslash fold), not
+      the ``good.com`` a plain rsplit on ``@`` over the whole netloc yields.
+    * ``ftps`` (a network scheme WHATWG does not treat as special) keeps the
+      historical ``scheme://``-only reading.
+    * any other scheme with an authority (``file:///…``, ``gopher://…``)
+      returns ``""`` — those URLs contact no host.
+    * no scheme (``host/path`` or ``//host/path``) — recover the authority
+      via a ``//`` retry, with the ``\\`` fold applied (a protocol-relative
+      URL resolves the way a browser would against an http(s) base).
+    * ``scheme:rest`` with no ``://`` — EITHER a non-network URI
       (``mailto:``/``tel:``/``data:`` → no host) OR the scheme-less ``host:port``
       form that urlparse mis-reads as ``scheme:path`` (``example.com:8080`` →
       scheme ``example.com``, path ``8080``).  We retry as an authority ONLY when
@@ -732,37 +866,81 @@ def _url_host(url: str) -> str:
       a host (``_looks_like_host``).  ``example.com:8080`` / ``localhost:3000`` →
       host; ``tel:80`` / ``mailto:443`` / ``gopher:1234`` → ``""`` (a bare-word
       URI scheme is never a hostname), so they cannot yield a phantom host.
+
+    Returns ``""`` for a URL that carries no network host, so a hostless URL
+    is NOT mis-classified as egress to a phantom host the fetch would never
+    contact.  A SPECIAL-scheme URL whose host cannot be derived at all
+    returns ``_UNCLASSIFIABLE_EGRESS_ITEM`` instead: a never-permittable
+    marker, so an allow-mode ``network.egress`` ceiling denies the
+    unverifiable fetch.  A targeted deny-mode ceiling permits the marker
+    (see ``_TRUNCATED_SCAN_ITEM`` for the marker semantics) — the WHATWG
+    derivation and normalisation are what make deny lists bind, not a new
+    refusal the operator's list did not name.
     """
     from urllib.parse import urlparse
 
+    s = url.strip(_C0_AND_SPACE)
+    s = _TAB_NL_RE.sub("", s)
+    m = _URL_SCHEME_RE.match(s)
+    scheme = m.group(1).lower() if m else ""
+    if m and scheme in _SPECIAL_NETWORK_SCHEMES:
+        # WHATWG special scheme: ``\`` folds to ``/`` and any run of slashes
+        # after ``scheme:`` is ignored, so ``https:evil.com``, ``https:/evil.com``
+        # and ``https:///evil.com`` all yield the authority ``evil.com``.
+        rest = s[m.end() :].replace("\\", "/")
+        authority = re.split(r"[/?#]", rest.lstrip("/"), 1)[0]
+        if not authority:
+            return _UNCLASSIFIABLE_EGRESS_ITEM
+        host = authority.rsplit("@", 1)[-1]
+        if host.startswith("["):  # IPv6 literal [::1]:443
+            if "]" not in host:
+                return _UNCLASSIFIABLE_EGRESS_ITEM
+            inner = host[1 : host.index("]")]
+            try:
+                return ipaddress.IPv6Address(inner).compressed
+            except ValueError:
+                return _UNCLASSIFIABLE_EGRESS_ITEM
+        host = host.rsplit(":", 1)[0] if ":" in host else host
+        if not host:
+            return _UNCLASSIFIABLE_EGRESS_ITEM
+        return _normalize_host(host)
     try:
-        s = url.strip()
         parsed = urlparse(s)
         netloc = parsed.netloc
-        scheme = parsed.scheme.lower()
-        if "://" in s:
-            # Real scheme + authority: only a network scheme contacts a host.
-            netloc = netloc if scheme in _NETWORK_SCHEMES else ""
-        elif not scheme:
-            # Scheme-less ``host/path`` (netloc empty → recover via ``//`` retry)
-            # or protocol-relative ``//host/path`` (netloc already parsed → keep).
-            netloc = netloc or urlparse("//" + s).netloc
-        elif not netloc:
-            # ``scheme:rest`` with no ``://``: the ``host:port`` form ONLY when
-            # ``rest`` is a bare numeric port AND the parsed "scheme" looks like a
-            # hostname.  ``tel:80``/``mailto:443``/``gopher:1234`` have a bare-word
-            # scheme (not a host) so they stay hostless; ``example.com:8080`` /
-            # ``localhost:3000`` have a host-shaped token and resolve.
-            first_seg = parsed.path.split("/", 1)[0]
-            host_port_form = first_seg.isdigit() and _looks_like_host(scheme)
-            netloc = urlparse("//" + s).netloc if host_port_form else ""
+        if m:
+            if "://" in s:
+                # A scheme + authority that is not WHATWG-special (ftps): the
+                # historical reading — only a network scheme contacts a host.
+                netloc = netloc if scheme in _NETWORK_SCHEMES else ""
+            else:
+                # ``scheme:rest`` with no ``://``: the ``host:port`` form ONLY
+                # when ``rest`` is a bare numeric port AND the parsed "scheme"
+                # looks like a hostname.  ``tel:80``/``mailto:443``/
+                # ``gopher:1234`` have a bare-word scheme (not a host) so they
+                # stay hostless; ``example.com:8080`` / ``localhost:3000`` have
+                # a host-shaped token and resolve.
+                first_seg = parsed.path.split("/", 1)[0]
+                host_port_form = first_seg.isdigit() and _looks_like_host(scheme)
+                netloc = urlparse("//" + s).netloc if host_port_form else ""
+        else:
+            # Scheme-less ``host/path`` (recover via ``//`` retry) or
+            # protocol-relative ``//host/path`` (netloc already parsed), with
+            # the ``\`` → ``/`` fold a relative URL resolves under.
+            s2 = s.replace("\\", "/")
+            netloc = urlparse(s2).netloc if s2.startswith("//") else urlparse("//" + s2).netloc
     except Exception:
         return ""
     # Strip userinfo + port: ``user:pass@host:443`` → ``host``.
     host = netloc.rsplit("@", 1)[-1]
     if host.startswith("["):  # IPv6 literal [::1]:443
+        # Verbatim, and never a marker here: this branch also serves the
+        # dead-pattern round-trip, which must keep classifying bracket
+        # patterns exactly as it does today.
         return host[1 : host.index("]")] if "]" in host else host
-    return host.rsplit(":", 1)[0] if ":" in host else host
+    host = host.rsplit(":", 1)[0] if ":" in host else host
+    if not host:
+        return ""
+    return _normalize_host(host)
 
 
 def mcp_title_to_ref(title: str) -> str:
@@ -909,10 +1087,10 @@ class ScopedRuleset:
             effect = "refuses" if mode == MODE_ALLOW else "permits"
             for index, pattern in enumerate(live):
                 # Each reason is a character or shape a host cannot carry, read off the
-                # pattern itself.  Round-tripping ``_url_host`` is no test: it cuts a
-                # bare IPv6 literal at its last colon (``::1`` gives ``:``) and a
-                # netloc at the first ``?`` (``api?.skills.sh`` gives ``api``), so it
-                # condemns live rules.
+                # pattern itself.  Round-tripping ``_url_host`` is no test: it maps a
+                # bare IPv6 literal to the unclassifiable marker (``::1`` does not
+                # round-trip to itself) and cuts a netloc at the first ``?``
+                # (``api?.skills.sh`` gives ``api``), so it condemns live rules.
                 name, _, port = pattern.strip().partition(":")
                 stripped = pattern.strip()
                 # IPv6 only when ``_url_host`` unwraps the bracket to an address:
@@ -930,6 +1108,11 @@ class ScopedRuleset:
                     # Exactly one colon, so a port: an IPv6 literal has two or more.
                     # A glob before it can absorb a colon: ``*:443`` matches ``fe80::443``.
                     why = "a port"
+                elif stripped.endswith("."):
+                    # Extracted hosts strip exactly one trailing ``.`` (the FQDN
+                    # marker) in ``_normalize_host``, so no item ever carries one:
+                    # an entry that still ends in a dot can never match.
+                    why = "a trailing '.'"
                 else:
                     continue
                 # Never interpolate the pattern: an operator pastes whole URLs,
