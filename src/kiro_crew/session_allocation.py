@@ -204,9 +204,23 @@ FOREGROUND_COLD_START_RESERVE = 1
 
 
 def new_cold_start_semaphore() -> PrioritySemaphore:
-    """``SessionManager._start_sem``: the background width plus the person reserve."""
+    """``SessionManager._start_sem``: the background width plus the person reserve.
+
+    The background width is the SAME host-sized reading the SessionStartGate
+    uses (``session_start_sizing``), floored at today's constant of 4 so no
+    host is ever throttled below the pre-change behavior; a large host is
+    not throttled to 4 concurrent starts either. The identity sweep drains
+    this semaphore as its barrier (``PrioritySemaphore.drain``), which is
+    width-independent.
+    """
+    from kiro_crew.session_start_sizing import effective_session_start_concurrency
+
+    width = max(
+        MAX_CONCURRENT_COLD_STARTS,
+        effective_session_start_concurrency("auto"),
+    )
     return PrioritySemaphore(
-        MAX_CONCURRENT_COLD_STARTS + FOREGROUND_COLD_START_RESERVE,
+        width + FOREGROUND_COLD_START_RESERVE,
         foreground_reserve=FOREGROUND_COLD_START_RESERVE,
     )
 
