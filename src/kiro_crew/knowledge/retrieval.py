@@ -13,15 +13,27 @@ from .._sqlite_compat import fts5_cjk_match_groups, is_cjk_char, sqlite3
 from .embedder import embedder_signature
 from .store import KnowledgeStore
 
-# Optional dep, same guard shape as ``vector_memory.py``: numpy is declared in
-# setup.cfg but the pure-Python path below stays the reference implementation.
-try:
-    import numpy as np
+# Optional dep, same guard shape as ``vector_memory.py``: numpy is declared
+# in setup.cfg but the pure-Python path below stays the reference
+# implementation. DEFERRED from module top: every mcp-* server imports this
+# module at startup, and a numpy import costs ~7.5 CPU-s per process on Linux
+# (OpenBLAS per-core thread pool init) — a cost servers that never run vector
+# searches must not pay. The check runs once, on the first actual search.
+_HAS_NUMPY: "bool | None" = None
 
-    _HAS_NUMPY = True
-except ImportError:
-    np = None  # type: ignore[assignment]
-    _HAS_NUMPY = False
+
+def _numpy_available() -> bool:
+    """Whether numpy is importable, checked once per process (cached)."""
+    global _HAS_NUMPY
+    if _HAS_NUMPY is None:
+        try:
+            import numpy  # noqa: F401 — importability is the whole question
+
+            _HAS_NUMPY = True
+        except ImportError:
+            _HAS_NUMPY = False
+    return _HAS_NUMPY
+
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +57,7 @@ def _cjk_subruns(word: str) -> list[str]:
     out: list[str] = []
     for size in range(min(len(word), _CJK_SUBRUN_MAX_LEN), 1, -1):
         for i in range(len(word) - size + 1):
-            piece = word[i:i + size]
+            piece = word[i : i + size]
             if piece != word and all(is_cjk_char(ch) for ch in piece):
                 out.append(piece)
                 if len(out) >= _CJK_SUBRUN_MAX_CANDIDATES:
@@ -57,13 +69,58 @@ def _cjk_subruns(word: str) -> list[str]:
 # Common English stopwords + connective phrasing are dropped before FTS5
 # matching so a query like "VoC related to Budget Planning" does not require the
 # literal tokens "related"/"to" to appear in a matching document.
-_STOPWORDS = frozenset({
-    "a", "an", "and", "are", "as", "at", "about", "be", "been", "by", "do",
-    "does", "did", "for", "from", "how", "in", "into", "is", "it", "its", "of",
-    "on", "or", "related", "that", "the", "their", "them", "then", "there",
-    "these", "this", "those", "to", "was", "were", "what", "when", "where",
-    "which", "who", "why", "will", "with", "i", "we", "you",
-})
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "about",
+        "be",
+        "been",
+        "by",
+        "do",
+        "does",
+        "did",
+        "for",
+        "from",
+        "how",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "related",
+        "that",
+        "the",
+        "their",
+        "them",
+        "then",
+        "there",
+        "these",
+        "this",
+        "those",
+        "to",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "will",
+        "with",
+        "i",
+        "we",
+        "you",
+    }
+)
 
 # Weight applied to the vector leg in RRF fusion so semantically-strong matches
 # dominate when the keyword leg returns weak/literal junk.
@@ -167,13 +224,9 @@ class HybridRetriever:
         Returns at most ``limit`` ranked rows, plus at most ONE extra trailing
         row -- the keyword leg's protected top hit (see below).
         """
-        kw = self._keyword_search(
-            query, limit=limit * 2, source_id=source_id, namespace=namespace
-        )
+        kw = self._keyword_search(query, limit=limit * 2, source_id=source_id, namespace=namespace)
         gr = self._graph_search(query, limit=limit * 2)
-        vec = self._vector_search(
-            query, limit=limit * 2, source_id=source_id, namespace=namespace
-        )
+        vec = self._vector_search(query, limit=limit * 2, source_id=source_id, namespace=namespace)
 
         # Vector leg is weighted higher so semantic matches dominate when the
         # keyword leg is weak. Weights align positionally
@@ -329,12 +382,17 @@ class HybridRetriever:
         except sqlite3.OperationalError:
             return
 
-        folder_sids = [sid for sid in sid_list if sid in meta
-                       and meta[sid]["source_type"] in ("local_folder", "obsidian_vault")]
-        artifact_sids = [sid for sid in sid_list if sid in meta
-                         and meta[sid]["source_type"] == "artifact"]
-        agent_sids = [sid for sid in sid_list if sid in meta
-                      and meta[sid]["source_type"] == "agent"]
+        folder_sids = [
+            sid
+            for sid in sid_list
+            if sid in meta and meta[sid]["source_type"] in ("local_folder", "obsidian_vault")
+        ]
+        artifact_sids = [
+            sid for sid in sid_list if sid in meta and meta[sid]["source_type"] == "artifact"
+        ]
+        agent_sids = [
+            sid for sid in sid_list if sid in meta and meta[sid]["source_type"] == "agent"
+        ]
 
         item_to_file: dict[str, str] = {}
         for sid in folder_sids:
@@ -562,7 +620,7 @@ class HybridRetriever:
             params.append(namespace)
         rows = self.store.db.execute(sql, params).fetchall()
 
-        if _HAS_NUMPY:
+        if _numpy_available():
             scored, mismatched = self._score_rows_numpy(rows, query_vec)
         else:
             scored, mismatched = self._score_rows_python(rows, query_vec)
@@ -646,6 +704,8 @@ class HybridRetriever:
         however large the library is and whatever mix of encodings it holds; the
         blobs themselves are already resident in ``rows``.
         """
+        import numpy as np  # deferred: see the module-top _numpy_available note
+
         q_len = len(query_vec)
         q_bytes = q_len * 4
         q = np.asarray(query_vec, dtype=np.float64)
@@ -744,6 +804,8 @@ def _score_batch(
     into one float64 array; each group is scored in a single :func:`_cosine_rows`
     call and the results land back at the rows' own positions.
     """
+    import numpy as np  # deferred: see the module-top _numpy_available note
+
     sims = np.zeros(len(vectors), dtype=np.float64)
     packed_at = [i for i, v in enumerate(vectors) if isinstance(v, bytes)]
     if packed_at:
@@ -770,6 +832,8 @@ def _cosine_rows(mat: Any, q: Any, q_norm: float) -> Any:
     copy of it. A zero-norm row is 0.0 by contract (never divides by zero), and
     0.0 is below the positive-similarity admission bar, so it never ranks.
     """
+    import numpy as np  # deferred: called only from the numpy path
+
     norms = np.sqrt(np.einsum("ij,ij->i", mat, mat, dtype=np.float64))
     dots = np.einsum("ij,j->i", mat, q, dtype=np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
