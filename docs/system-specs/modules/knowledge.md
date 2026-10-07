@@ -117,7 +117,7 @@ The remaining gap is therefore an **A/B task-lift harness** (Tier 2), plus a flo
 | `knowledge/watcher.py` | `KnowledgeWatcher` — polls registered sources for changes; sig-gated self-heal re-embed (single-flight, off-loop DB access) |
 | `knowledge/llm_pool.py` | `LLMPool` / `Worker` / `AcpWorker` — bounded pool of long-lived, sweep-shielded ACP workers |
 | `knowledge/extractor.py` | `EntityExtractor` — LLM entity/relation extraction over the pool |
-| `knowledge/agent_fetch.py` | `fetch_url_content()` — agent-assisted URL fetch over the pool (tools opt-in via `KIROCREW_KNOWLEDGE_FETCH_TOOLS`) |
+| `knowledge/agent_fetch.py` | `local_fetch_text()` — the governed LOCAL fetch that runs FIRST on every URL sync: the SSRF/private-address guard (alternate IPv4 encodings normalized, applied before and after redirect resolution), redirects pinned to the source URL's own host, a 1 MiB bounded read, and the readers' own html2text conversion, so a reachable page indexes with ZERO model tokens. `None` (refused, non-200, unfetchable, unsupported body) falls back to `fetch_url_content()`, the agent-assisted URL fetch over the pool (tools opt-in via `KIROCREW_KNOWLEDGE_FETCH_TOOLS`) |
 | `knowledge/chunker.py` | `HeadingAwareChunker` — text/markdown/code/slide chunking |
 | `knowledge/embedder.py` | `InProcessEmbedder` — embedding in-process via the shared `EmbeddingBackend` (vendored llama-cpp runtime, no server and no HTTP hop); owns `embed_signature` (per-item vector-space identity) |
 | `knowledge/store.py` | `KnowledgeStore` — SQLite schema, items/entities/graph, FTS5 sync |

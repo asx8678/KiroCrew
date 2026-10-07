@@ -40,7 +40,7 @@ from kiro_crew.dashboard.handlers.files import (
 )
 from kiro_crew.dashboard.origin import is_direct_local_request
 from kiro_crew.executors import run_in_embed_pool
-from kiro_crew.knowledge.agent_fetch import fetch_url_content
+from kiro_crew.knowledge.agent_fetch import fetch_url_content, local_fetch_text
 from kiro_crew.knowledge.agent_source import add_agent_document
 from kiro_crew.knowledge.artifact_ingest import ArtifactKnowledgeSync
 from kiro_crew.knowledge.chunker import HeadingAwareChunker
@@ -90,8 +90,10 @@ _MAX_SOURCE_NAME_LEN = 200
 def _sel_log(tool: str, **kwargs: object) -> None:
     """Emit SEL audit event for knowledge API mutations."""
     sel().log_tool_invocation(
-        session_key="dashboard", agent="knowledge-api",
-        tool_name=f"knowledge.{tool}", outcome=str(kwargs.pop("outcome", "completed")),
+        session_key="dashboard",
+        agent="knowledge-api",
+        tool_name=f"knowledge.{tool}",
+        outcome=str(kwargs.pop("outcome", "completed")),
         resources=str(kwargs) if kwargs else "",
     )
 
@@ -112,6 +114,7 @@ async def _audited_write(fn, *, event: str, fields=None):
     their own sync helper instead (``_create_source_audited``). Returns whatever
     *fn* returned.
     """
+
     def _write_and_audit():
         result = fn()
         _sel_log(event, **(fields or {}))
@@ -120,8 +123,15 @@ async def _audited_write(fn, *, event: str, fields=None):
     return await asyncio.to_thread(_write_and_audit)
 
 
-_BUNDLE_LIST_FIELDS = ("items", "entities", "relations", "sources", "source_locations",
-                       "mentions", *BUNDLE_STATE_KEY_COL)
+_BUNDLE_LIST_FIELDS = (
+    "items",
+    "entities",
+    "relations",
+    "sources",
+    "source_locations",
+    "mentions",
+    *BUNDLE_STATE_KEY_COL,
+)
 # The fields import_bundle's redaction loops pass to _redact(); each has to be
 # a string or null before it reaches _redact() -> redact_exfiltration_urls(),
 # whose regex .finditer() raises an unhandled TypeError on anything else.
@@ -286,10 +296,13 @@ async def list_namespaces(request: web.Request) -> web.Response:
     """GET /api/knowledge/namespaces -- all namespaces with item counts."""
     store = _store(request)
     rows = await asyncio.to_thread(_namespace_rows, store)
-    return web.json_response([{"name": r["namespace"] or "default", "count": r["count"]} for r in rows])
+    return web.json_response(
+        [{"name": r["namespace"] or "default", "count": r["count"]} for r in rows]
+    )
 
 
 # ---------- Source Watcher ----------
+
 
 async def _start_watcher_async(app: web.Application) -> None:
     """Start the source watcher (auto-watches local_file sources)."""
@@ -305,7 +318,9 @@ async def _start_watcher_async(app: web.Application) -> None:
     app["_knowledge_watcher_task"] = task
 
 
-async def _start_artifact_ingest_async(app: web.Application, cfg: KiroCrewConfig | None = None) -> None:
+async def _start_artifact_ingest_async(
+    app: web.Application, cfg: KiroCrewConfig | None = None
+) -> None:
     """Wire artifact -> Knowledge Library sync when auto-ingest is enabled.
 
     Registers an in-process change-listener on the artifact store: every
@@ -433,12 +448,20 @@ def _attach_file_paths(store, items: list[dict]) -> None:
     if not source_ids:
         return
     ph = ",".join("?" * len(source_ids))
-    folder_sids = {r["id"] for r in store.db.execute(
-        f"SELECT id FROM sources WHERE id IN ({ph}) AND source_type IN ('local_folder', 'obsidian_vault')",  # noqa: S608
-        list(source_ids)).fetchall()}
-    artifact_sids = {r["id"] for r in store.db.execute(
-        f"SELECT id FROM sources WHERE id IN ({ph}) AND source_type = 'artifact'",  # noqa: S608
-        list(source_ids)).fetchall()}
+    folder_sids = {
+        r["id"]
+        for r in store.db.execute(
+            f"SELECT id FROM sources WHERE id IN ({ph}) AND source_type IN ('local_folder', 'obsidian_vault')",  # noqa: S608
+            list(source_ids),
+        ).fetchall()
+    }
+    artifact_sids = {
+        r["id"]
+        for r in store.db.execute(
+            f"SELECT id FROM sources WHERE id IN ({ph}) AND source_type = 'artifact'",  # noqa: S608
+            list(source_ids),
+        ).fetchall()
+    }
     if not folder_sids and not artifact_sids:
         return
     # Build item_id -> group-label reverse map.
@@ -446,7 +469,8 @@ def _attach_file_paths(store, items: list[dict]) -> None:
     # Folder/vault sources: group label is the file path.
     for sid in folder_sids:
         for row in store.db.execute(
-                "SELECT file_path, item_ids FROM folder_file_state WHERE source_id = ?", (sid,)):
+            "SELECT file_path, item_ids FROM folder_file_state WHERE source_id = ?", (sid,)
+        ):
             try:
                 ids = json.loads(row["item_ids"]) if row["item_ids"] else []
             except (json.JSONDecodeError, TypeError):
@@ -456,7 +480,8 @@ def _attach_file_paths(store, items: list[dict]) -> None:
     # Aggregate artifact source: group label is the artifact name (fallback slug).
     for sid in artifact_sids:
         for row in store.db.execute(
-                "SELECT slug, name, item_ids FROM artifact_item_state WHERE source_id = ?", (sid,)):
+            "SELECT slug, name, item_ids FROM artifact_item_state WHERE source_id = ?", (sid,)
+        ):
             try:
                 ids = json.loads(row["item_ids"]) if row["item_ids"] else []
             except (json.JSONDecodeError, TypeError):
@@ -524,7 +549,7 @@ def _load_items_by_id(store, item_ids: list[str]) -> dict[str, dict]:
     """
     out: dict[str, dict] = {}
     for start in range(0, len(item_ids), _SQLITE_VARIABLE_CHUNK):
-        chunk = item_ids[start:start + _SQLITE_VARIABLE_CHUNK]
+        chunk = item_ids[start : start + _SQLITE_VARIABLE_CHUNK]
         placeholders = ",".join("?" * len(chunk))
         rows = store.db.execute(
             f"SELECT * FROM items WHERE id IN ({placeholders})",  # noqa: S608
@@ -535,8 +560,9 @@ def _load_items_by_id(store, item_ids: list[str]) -> dict[str, dict]:
     return out
 
 
-def _items_page(store, where_clause: str, params: list,
-                limit: int, offset: int) -> tuple[int, list[dict]]:
+def _items_page(
+    store, where_clause: str, params: list, limit: int, offset: int
+) -> tuple[int, list[dict]]:
     """One page of the item listing, with its total, in one off-loop take.
 
     Sync on purpose: the COUNT is a full scan over ``items``, which grows
@@ -548,11 +574,12 @@ def _items_page(store, where_clause: str, params: list,
     is thread-local, so the thread gets its own connection.
     """
     total = store.db.execute(
-        f"SELECT COUNT(*) FROM items i WHERE {where_clause}",  # noqa: S608
-        params).fetchone()[0]
+        f"SELECT COUNT(*) FROM items i WHERE {where_clause}", params  # noqa: S608
+    ).fetchone()[0]
     rows = store.db.execute(
         f"SELECT i.* FROM items i LEFT JOIN sources s ON i.source_id = s.id WHERE {where_clause} ORDER BY s.updated_at DESC, i.chunk_index ASC LIMIT ? OFFSET ?",  # noqa: S608, E501
-        [*params, limit, offset]).fetchall()
+        [*params, limit, offset],
+    ).fetchall()
     items = [store._serialize_item(r) for r in rows]
     _attach_file_paths(store, items)
     return total, items
@@ -595,9 +622,7 @@ async def list_items(request: web.Request) -> web.Response:
         if source_id:
             all_results = await _search_until_exhausted(retriever, q, limit)
         else:
-            all_results = await run_in_embed_pool(
-                retriever.search, q, limit=limit * 3
-            )
+            all_results = await run_in_embed_pool(retriever.search, q, limit=limit * 3)
         # Batch fetch all candidate items (avoid N+1). A scoped search escalates
         # its candidate pool, so this query and the row serialization can both be
         # large: run them in a worker thread rather than on the event loop.
@@ -623,7 +648,7 @@ async def list_items(request: web.Request) -> web.Response:
             filtered.append(item)
         total = len(filtered)
         offset = (page - 1) * limit
-        items = filtered[offset:offset + limit]
+        items = filtered[offset : offset + limit]
         await asyncio.to_thread(_attach_file_paths, store, items)
         return web.json_response({"items": items, "total": total, "page": page, "limit": limit})
     else:
@@ -642,10 +667,11 @@ async def list_items(request: web.Request) -> web.Response:
         elif source_id:
             where.append("i.source_id = ?")
             params.append(source_id)
-        where_clause = ' AND '.join(where)
+        where_clause = " AND ".join(where)
         offset = (page - 1) * limit
         total, items = await asyncio.to_thread(
-            _items_page, store, where_clause, params, limit, offset)
+            _items_page, store, where_clause, params, limit, offset
+        )
         return web.json_response({"items": items, "total": total, "page": page, "limit": limit})
 
 
@@ -664,7 +690,9 @@ def _item_detail(store, item_id: str) -> dict | None:
     if not item:
         return None
 
-    mentions = store.db.execute("SELECT entity_id, context FROM mentions WHERE item_id = ?", (item_id,)).fetchall()
+    mentions = store.db.execute(
+        "SELECT entity_id, context FROM mentions WHERE item_id = ?", (item_id,)
+    ).fetchall()
     entity_ids = [m["entity_id"] for m in mentions]
     entities = []
     for eid in entity_ids:
@@ -676,19 +704,26 @@ def _item_detail(store, item_id: str) -> dict | None:
     seen_ids = set()
     for eid in entity_ids:
         for row in store.db.execute(
-                "SELECT * FROM entity_relations WHERE source_id = ? OR target_id = ?", (eid, eid)):
+            "SELECT * FROM entity_relations WHERE source_id = ? OR target_id = ?", (eid, eid)
+        ):
             r = dict(row)
             if r["id"] not in seen_ids:
                 seen_ids.add(r["id"])
                 # Resolve entity names for display
-                src = store.db.execute("SELECT name FROM entities WHERE id = ?", (r["source_id"],)).fetchone()
-                tgt = store.db.execute("SELECT name FROM entities WHERE id = ?", (r["target_id"],)).fetchone()
+                src = store.db.execute(
+                    "SELECT name FROM entities WHERE id = ?", (r["source_id"],)
+                ).fetchone()
+                tgt = store.db.execute(
+                    "SELECT name FROM entities WHERE id = ?", (r["target_id"],)
+                ).fetchone()
                 r["source_name"] = src["name"] if src else r["source_id"]
                 r["target_name"] = tgt["name"] if tgt else r["target_id"]
                 relations.append(r)
 
-    locations = [dict(r) for r in store.db.execute(
-        "SELECT * FROM source_locations WHERE item_id = ?", (item_id,))]
+    locations = [
+        dict(r)
+        for r in store.db.execute("SELECT * FROM source_locations WHERE item_id = ?", (item_id,))
+    ]
 
     return {**item, "entities": entities, "relations": relations, "source_locations": locations}
 
@@ -721,7 +756,9 @@ async def update_item(request: web.Request) -> web.Response:
         return web.json_response({"error": "no valid fields"}, status=400)
     await _audited_write(
         partial(store.update_item, item_id, **fields),
-        event="item.update", fields={"item_id": item_id, "fields": list(fields)})
+        event="item.update",
+        fields={"item_id": item_id, "fields": list(fields)},
+    )
     return web.json_response({"ok": True})
 
 
@@ -779,7 +816,8 @@ def _entity_list_rows(store, where_clause: str, params: list) -> list:
     connection.
     """
     return store.db.execute(
-        f"SELECT * FROM entities WHERE {where_clause} ORDER BY name LIMIT ?", params).fetchall()  # noqa: S608
+        f"SELECT * FROM entities WHERE {where_clause} ORDER BY name LIMIT ?", params
+    ).fetchall()  # noqa: S608
 
 
 async def list_entities(request: web.Request) -> web.Response:
@@ -800,8 +838,7 @@ async def list_entities(request: web.Request) -> web.Response:
         where.append("name LIKE ?")
         params.append(f"%{q}%")
     params.append(limit)
-    rows = await asyncio.to_thread(
-        _entity_list_rows, store, ' AND '.join(where), params)
+    rows = await asyncio.to_thread(_entity_list_rows, store, " AND ".join(where), params)
     return web.json_response([dict(r) for r in rows])
 
 
@@ -875,8 +912,12 @@ def _related_items(store, item_id: str, limit: int) -> list[dict]:
     ``store.db`` is thread-local, so the thread gets its own connection.
     """
     # Find entities mentioned in this item
-    entity_ids = [r["entity_id"] for r in store.db.execute(
-        "SELECT entity_id FROM mentions WHERE item_id = ?", (item_id,)).fetchall()]
+    entity_ids = [
+        r["entity_id"]
+        for r in store.db.execute(
+            "SELECT entity_id FROM mentions WHERE item_id = ?", (item_id,)
+        ).fetchall()
+    ]
     if not entity_ids:
         return []
 
@@ -887,7 +928,7 @@ def _related_items(store, item_id: str, limit: int) -> list[dict]:
         f"FROM items i JOIN mentions m ON i.id = m.item_id "
         f"WHERE m.entity_id IN ({placeholders}) AND i.id != ? AND i.status = 'active' "
         f"GROUP BY i.id ORDER BY shared_entities DESC LIMIT ?",
-        [*entity_ids, item_id, limit]
+        [*entity_ids, item_id, limit],
     ).fetchall()
     return [{**store._serialize_item(r), "shared_entities": r["shared_entities"]} for r in rows]
 
@@ -961,7 +1002,9 @@ async def get_full_graph(request: web.Request) -> web.Response:
             return web.json_response({"nodes": [], "edges": []})
         # Rank allowed entities by degree, take top N
         nodes_by_degree = sorted(
-            allowed_entities, key=lambda n: graph.degree(n) if graph.has_node(n) else 0, reverse=True
+            allowed_entities,
+            key=lambda n: graph.degree(n) if graph.has_node(n) else 0,
+            reverse=True,
         )[:limit]
     else:
         nodes_by_degree = sorted(graph.nodes, key=lambda n: graph.degree(n), reverse=True)[:limit]
@@ -969,10 +1012,16 @@ async def get_full_graph(request: web.Request) -> web.Response:
     if not nodes_by_degree:
         return web.json_response({"nodes": [], "edges": []})
     node_set = set(nodes_by_degree)
-    nodes = [{"id": n, "name": graph.nodes[n].get("name"), "type": graph.nodes[n].get("entity_type")}
-             for n in node_set if graph.has_node(n)]
-    edges = [{"source": u, "target": v, "type": d.get("relation_type"), "weight": d.get("weight")}
-             for u, v, d in graph.edges(data=True) if u in node_set and v in node_set]
+    nodes = [
+        {"id": n, "name": graph.nodes[n].get("name"), "type": graph.nodes[n].get("entity_type")}
+        for n in node_set
+        if graph.has_node(n)
+    ]
+    edges = [
+        {"source": u, "target": v, "type": d.get("relation_type"), "weight": d.get("weight")}
+        for u, v, d in graph.edges(data=True)
+        if u in node_set and v in node_set
+    ]
     return web.json_response({"nodes": nodes, "edges": edges})
 
 
@@ -1030,8 +1079,7 @@ async def source_counts(request: web.Request) -> web.Response:
     # than run inline: blocking the event loop here would stall chat and
     # heartbeat processing on a large knowledge base.
     # The UNION repeats the filter clause, so the placeholders are bound twice.
-    rows = await asyncio.to_thread(
-        lambda: store.db.execute(sql, params + params).fetchall())
+    rows = await asyncio.to_thread(lambda: store.db.execute(sql, params + params).fetchall())
     counts = {r["sid"]: r["cnt"] for r in rows}
     # NOT sum(counts.values()): a document held by two sources appears in both
     # per-source counts, so summing them would exceed the number of documents and
@@ -1039,7 +1087,8 @@ async def source_counts(request: web.Request) -> web.Response:
     total_row = await asyncio.to_thread(
         lambda: store.db.execute(
             f"SELECT COUNT(*) FROM items WHERE {' AND '.join(where)}", params  # noqa: S608
-        ).fetchone())
+        ).fetchone()
+    )
     return web.json_response({"counts": counts, "total": total_row[0]})
 
 
@@ -1085,7 +1134,8 @@ def _finalize_sync_status_write(
     marks = ", ".join("?" for _ in from_statuses)
     cur = store.db.execute(
         f"UPDATE sources SET sync_status = ? WHERE id = ? AND sync_status IN ({marks})",
-        (status, source_id, *from_statuses))
+        (status, source_id, *from_statuses),
+    )
     store.db.commit()
     return cur.rowcount > 0
 
@@ -1107,10 +1157,10 @@ async def _finalize_sync_status(
     try:
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.to_thread(
-                _finalize_sync_status_write, store, source_id, status, from_statuses)
+                _finalize_sync_status_write, store, source_id, status, from_statuses
+            )
     except Exception:
-        logger.exception(
-            "Could not finalize sync_status=%r for source %s", status, source_id)
+        logger.exception("Could not finalize sync_status=%r for source %s", status, source_id)
 
 
 async def _write_status_cancel_safe(store, source_id: str, status: str) -> None:  # type: ignore[no-untyped-def]
@@ -1147,9 +1197,9 @@ def _claim_sync(store, source_id: str) -> bool:
     clears it.
     """
     cur = store.db.execute(
-        "UPDATE sources SET sync_status = 'syncing' "
-        "WHERE id = ? AND sync_status <> 'syncing'",
-        (source_id,))
+        "UPDATE sources SET sync_status = 'syncing' " "WHERE id = ? AND sync_status <> 'syncing'",
+        (source_id,),
+    )
     store.db.commit()
     return cur.rowcount > 0
 
@@ -1188,7 +1238,8 @@ def _set_file_state(store, source_id: str, file_path: str, status: str) -> None:
     store.db.execute(
         "UPDATE folder_file_state SET status = ?, error_message = NULL "
         "WHERE source_id = ? AND file_path = ?",
-        (status, source_id, file_path))
+        (status, source_id, file_path),
+    )
     store.db.commit()
 
 
@@ -1202,12 +1253,14 @@ def _source_rows(store, uri_filter: str | None) -> list:
     thread-local, so the thread gets its own connection.
     """
     if uri_filter:
-        resolved_filter = str(Path(uri_filter).resolve()) if uri_filter.startswith('/') else uri_filter
+        resolved_filter = (
+            str(Path(uri_filter).resolve()) if uri_filter.startswith("/") else uri_filter
+        )
         return store.db.execute(
             "SELECT s.*, COALESCE(c.cnt, 0) AS item_count "
             "FROM sources s LEFT JOIN (SELECT source_id, COUNT(*) AS cnt FROM items GROUP BY source_id) c "
             "ON s.id = c.source_id WHERE s.uri = ? ORDER BY s.updated_at DESC",
-            (resolved_filter,)
+            (resolved_filter,),
         ).fetchall()
     return store.db.execute(
         "SELECT s.*, COALESCE(c.cnt, 0) AS item_count "
@@ -1280,13 +1333,17 @@ def _run_folder_dialog() -> str | None:
     if osascript is None:
         return None
     cmd = [
-        osascript, "-e",
-        'POSIX path of (choose folder with prompt '
+        osascript,
+        "-e",
+        "POSIX path of (choose folder with prompt "
         '"Select a folder to add to your knowledge base")',
     ]
     try:
         proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            cmd, capture_output=True, text=True, timeout=_FOLDER_DIALOG_TIMEOUT,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_FOLDER_DIALOG_TIMEOUT,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
@@ -1332,9 +1389,7 @@ async def add_source(request: web.Request) -> web.Response:
     uri = body.get("uri", "")
     properties = body.get("properties", {})
     if not isinstance(properties, dict):
-        return web.json_response(
-            {"error": "properties must be an object"}, status=400
-        )
+        return web.json_response({"error": "properties must be an object"}, status=400)
     namespace = body.get("namespace", "")
 
     # Validate namespace if provided at top level or in properties
@@ -1342,9 +1397,7 @@ async def add_source(request: web.Request) -> web.Response:
         namespace = properties.get("namespace", "")
     if namespace:
         if not isinstance(namespace, str):
-            return web.json_response(
-                {"error": "namespace must be a string"}, status=400
-            )
+            return web.json_response({"error": "namespace must be a string"}, status=400)
         namespace = namespace.strip()[:64]
 
     if not source_type:
@@ -1361,12 +1414,7 @@ async def add_source(request: web.Request) -> web.Response:
     # prefix — Path("\\/?\\C:\\...") normalizes to the same extended path as
     # \\?\ — so match on "first two chars are any slash", not literal "\\" /
     # "//" alone.
-    if (
-        isinstance(uri, str)
-        and len(uri) >= 2
-        and uri[0] in ("\\", "/")
-        and uri[1] in ("\\", "/")
-    ):
+    if isinstance(uri, str) and len(uri) >= 2 and uri[0] in ("\\", "/") and uri[1] in ("\\", "/"):
         _sel_log("source.add_denied", reason="unsupported_prefix", uri=uri)
         return web.json_response(
             {
@@ -1393,7 +1441,9 @@ async def add_source(request: web.Request) -> web.Response:
         resolved_uri = str(Path(uri).resolve())
         if is_sensitive_path(resolved_uri):
             _sel_log("source.add_denied", reason="sensitive_path", uri=uri)
-            return web.json_response({"error": "Path is restricted for security reasons"}, status=403)
+            return web.json_response(
+                {"error": "Path is restricted for security reasons"}, status=403
+            )
 
     # Validate URI format for sources without a dedicated connector
     if source_type == "local_file":
@@ -1434,15 +1484,18 @@ async def add_source(request: web.Request) -> web.Response:
     existing = await asyncio.to_thread(store.get_source_by_uri, uri)
     if existing:
         return web.json_response(
-            {"error": "source already exists", "id": existing["id"],
-             "code": "source_exists"}, status=409)
+            {"error": "source already exists", "id": existing["id"], "code": "source_exists"},
+            status=409,
+        )
 
     # Folder sources: discovery walk + pending_confirmation (no auto-scan)
     if source_type in ("local_folder", "obsidian_vault"):
         folder_path = Path(uri).resolve()
         if is_sensitive_path(str(folder_path)):
             _sel_log("source.add_denied", reason="sensitive_path", uri=uri)
-            return web.json_response({"error": "Path is restricted for security reasons"}, status=403)
+            return web.json_response(
+                {"error": "Path is restricted for security reasons"}, status=403
+            )
         if not folder_path.is_dir():
             return web.json_response({"error": f"Directory not found: {uri}"}, status=400)
 
@@ -1459,12 +1512,14 @@ async def add_source(request: web.Request) -> web.Response:
             # The same filters the sweep applies, or the count describes a
             # different file set from the one that gets ingested.
             discovered = await asyncio.to_thread(
-                watcher._folder_watcher._walk, str(folder_path),
-                **walk_filters(properties, source_type))
+                watcher._folder_watcher._walk,
+                str(folder_path),
+                **walk_filters(properties, source_type),
+            )
             file_count = len(discovered)
             cost = await asyncio.to_thread(
-                estimate_scan_cost, discovered,
-                max_files=max_files_prop(properties))
+                estimate_scan_cost, discovered, max_files=max_files_prop(properties)
+            )
 
         # Store with pending_confirmation status
         if isinstance(properties, dict):
@@ -1473,12 +1528,17 @@ async def add_source(request: web.Request) -> web.Response:
             if namespace and "namespace" not in properties:
                 properties["namespace"] = namespace
         sid, created = await asyncio.to_thread(
-            _create_source_audited, store, source_type, name=name or uri, uri=uri,
-            properties=properties)
+            _create_source_audited,
+            store,
+            source_type,
+            name=name or uri,
+            uri=uri,
+            properties=properties,
+        )
         if not created:
             return web.json_response(
-                {"error": "source already exists", "id": sid,
-                 "code": "source_exists"}, status=409)
+                {"error": "source already exists", "id": sid, "code": "source_exists"}, status=409
+            )
         return web.json_response(
             {
                 "id": sid,
@@ -1497,12 +1557,12 @@ async def add_source(request: web.Request) -> web.Response:
         )
 
     sid, created = await asyncio.to_thread(
-        _create_source_audited, store, source_type, name=name or uri, uri=uri,
-        properties=properties)
+        _create_source_audited, store, source_type, name=name or uri, uri=uri, properties=properties
+    )
     if not created:
         return web.json_response(
-            {"error": "source already exists", "id": sid,
-             "code": "source_exists"}, status=409)
+            {"error": "source already exists", "id": sid, "code": "source_exists"}, status=409
+        )
 
     # Trigger immediate ingestion for local_file sources. The task claims
     # 'syncing' itself, so nothing is written here that a disconnect could
@@ -1562,7 +1622,8 @@ async def _ingest_local_file_task(  # type: ignore[no-untyped-def]
             # retry it. Caught rather than left to propagate: these tasks carry
             # `add_done_callback(set.discard)`, which never retrieves an exception.
             logger.exception(
-                "Could not claim sync for source %s; leaving its status untouched", source_id)
+                "Could not claim sync for source %s; leaving its status untouched", source_id
+            )
             return
     finally:
         if claim_settled is not None:
@@ -1675,29 +1736,39 @@ async def _sync_source_body(request: web.Request) -> web.Response:
         if not file_uri:
             return web.json_response({"error": "no file path to sync"}, status=400)
         if source["sync_status"] == "syncing":
-            return web.json_response({"error": "sync already in progress", "source_id": source_id}, status=409)
+            return web.json_response(
+                {"error": "sync already in progress", "source_id": source_id}, status=409
+            )
         pipeline = _pipeline(request)
         if not pipeline:
             return web.json_response({"error": "pipeline not configured"}, status=503)
         # The task claims the row; this read is only the fast 409 for the common
         # case, so a lost claim ends the task rather than double-starting a sync.
         await _hand_off_under_gate(
-            request, pipeline,
+            request,
+            pipeline,
             lambda settled: _ingest_local_file_task(
-                pipeline, store, file_uri, source_id, claim_settled=settled),
+                pipeline, store, file_uri, source_id, claim_settled=settled
+            ),
         )
         _sel_log("source.sync.local_file", source_id=source_id)
         return web.json_response({"synced": False, "status": "syncing", "source_id": source_id})
 
     # Agent-assisted sync: fetch in background, no chat session needed
     uri = source["uri"] or ""
-    props = json.loads(source["properties"] or "{}") if isinstance(source["properties"], str) else (source["properties"] or {})
+    props = (
+        json.loads(source["properties"] or "{}")
+        if isinstance(source["properties"], str)
+        else (source["properties"] or {})
+    )
     url = uri or props.get("url", "")
     if not url:
         return web.json_response({"error": "no URL to fetch"}, status=400)
 
     if source["sync_status"] == "syncing":
-        return web.json_response({"error": "sync already in progress", "source_id": source_id}, status=409)
+        return web.json_response(
+            {"error": "sync already in progress", "source_id": source_id}, status=409
+        )
 
     pipeline = _pipeline(request)
     if not pipeline:
@@ -1715,17 +1786,25 @@ async def _sync_source_body(request: web.Request) -> web.Response:
             status=503,
         )
     await _hand_off_under_gate(
-        request, pipeline,
+        request,
+        pipeline,
         lambda settled: _background_agent_sync(
-            source_id, url, source["name"], store, pipeline, pool, claim_settled=settled),
+            source_id, url, source["name"], store, pipeline, pool, claim_settled=settled
+        ),
     )
     _sel_log("source.sync.agent", source_id=source_id, url=url)
     return web.json_response({"synced": False, "status": "syncing", "source_id": source_id})
 
 
 async def _background_agent_sync(  # type: ignore[no-untyped-def]
-    source_id: str, url: str, name: str, store, pipeline, pool: LLMPool,
-    *, claim_settled: asyncio.Event | None = None,
+    source_id: str,
+    url: str,
+    name: str,
+    store,
+    pipeline,
+    pool: LLMPool,
+    *,
+    claim_settled: asyncio.Event | None = None,
 ) -> None:
     """Background task: fetch content via agent, then ingest.
 
@@ -1756,7 +1835,8 @@ async def _background_agent_sync(  # type: ignore[no-untyped-def]
             # retry it. Caught rather than left to propagate: these tasks carry
             # `add_done_callback(set.discard)`, which never retrieves an exception.
             logger.exception(
-                "Could not claim sync for source %s; leaving its status untouched", source_id)
+                "Could not claim sync for source %s; leaving its status untouched", source_id
+            )
             return
     finally:
         if claim_settled is not None:
@@ -1764,7 +1844,21 @@ async def _background_agent_sync(  # type: ignore[no-untyped-def]
     if not claimed:
         return
     try:
-        content = await fetch_url_content(url, pool)
+        # LOCAL FIRST: a reachable page costs no model tokens at all, where the
+        # pool path paid for the whole document as model OUTPUT on every sync.
+        # The local fetch is governed (SSRF/private-address guard, redirects
+        # pinned to the source's own host, bounded read) and converts HTML with
+        # the readers' own conversion, so the text indexes identically. ``None``
+        # (refused, non-200, unfetchable, unsupported body) falls back to the
+        # URL-fetch pool -- the sync never silently skips.
+        content = await asyncio.to_thread(local_fetch_text, url)
+        if content is None:
+            logger.info(
+                "Knowledge sync: local fetch unavailable for %s; falling back "
+                "to the agent URL-fetch pool",
+                url,
+            )
+            content = await fetch_url_content(url, pool)
         redacted = _redact(content)
         content = redacted if redacted is not None else content
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".md", prefix="agent_sync_")
@@ -1813,7 +1907,9 @@ async def delete_source(request: web.Request) -> web.Response:
         # call for that long -- never on the event loop.
         await _audited_write(
             partial(store.delete_source_cascade, source_id),
-            event="source.delete", fields={"source_id": source_id})
+            event="source.delete",
+            fields={"source_id": source_id},
+        )
     except Exception:
         logger.exception("delete_source failed: source_id=%s", source_id)
         return web.json_response({"error": "internal server error"}, status=500)
@@ -1844,10 +1940,13 @@ async def rename_source(request: web.Request) -> web.Response:
         return web.json_response({"error": "name cannot be empty"}, status=400)
     if len(name) > _MAX_SOURCE_NAME_LEN:
         return web.json_response(
-            {"error": f"name must be {_MAX_SOURCE_NAME_LEN} characters or fewer"}, status=400)
+            {"error": f"name must be {_MAX_SOURCE_NAME_LEN} characters or fewer"}, status=400
+        )
     await _audited_write(
         partial(store.update_source, source_id, name=name),
-        event="source.rename", fields={"source_id": source_id})
+        event="source.rename",
+        fields={"source_id": source_id},
+    )
     return web.json_response({"ok": True, "name": name})
 
 
@@ -1888,7 +1987,8 @@ def _adopt_source(store, source_id: str, *, event: str):
         source_id,
         set_keys={AUTO_REGISTRATION_RETIRED_PROP: True},
         remove_keys=("scan_paused",),
-        sync_status="active")
+        sync_status="active",
+    )
     if props is None:
         # Deleted between the read above and the write. Same answer as a row
         # that was never there: the caller 404s.
@@ -1909,8 +2009,12 @@ def _pause_source_row(store, source_id: str) -> bool:
     what stops the sweep from walking and delete-reconciling the whole folder;
     the deeper scan_paused gate in folder_watcher stops the ingestion itself.
     """
-    if store.merge_source_properties(
-            source_id, set_keys={"scan_paused": True}, sync_status="paused") is None:
+    if (
+        store.merge_source_properties(
+            source_id, set_keys={"scan_paused": True}, sync_status="paused"
+        )
+        is None
+    ):
         return False
     _sel_log("source.pause", source_id=source_id)
     return True
@@ -1938,7 +2042,13 @@ def _track_scan_task(app: web.Application, task: asyncio.Task) -> None:  # type:
     tasks = _task_registry(app, "_scan_tasks")
     tasks.add(task)
     task.add_done_callback(tasks.discard)
-    task.add_done_callback(lambda t: logger.exception("scan_source failed", exc_info=t.exception()) if not t.cancelled() and t.exception() else None)
+    task.add_done_callback(
+        lambda t: (
+            logger.exception("scan_source failed", exc_info=t.exception())
+            if not t.cancelled() and t.exception()
+            else None
+        )
+    )
 
 
 async def confirm_source(request: web.Request) -> web.Response:
@@ -1949,7 +2059,8 @@ async def confirm_source(request: web.Request) -> web.Response:
     store = _store(request)
     source_id = request.match_info["id"]
     outcome, row, props = await asyncio.to_thread(
-        _adopt_source, store, source_id, event="source.confirm")
+        _adopt_source, store, source_id, event="source.confirm"
+    )
     if outcome == "missing":
         return web.json_response({"error": "not found"}, status=404)
     if outcome == "denied":
@@ -1957,13 +2068,19 @@ async def confirm_source(request: web.Request) -> web.Response:
     # Trigger scan
     watcher = request.app.get("knowledge_watcher")
     if watcher:
-        source = {"id": source_id, "uri": row["uri"], "source_type": row["source_type"], "properties": json.dumps(props)}
+        source = {
+            "id": source_id,
+            "uri": row["uri"],
+            "source_type": row["source_type"],
+            "properties": json.dumps(props),
+        }
         # Paced like the watcher's own sweeps. This is the burst that costs the
         # most -- nothing is ingested yet, so every discovered file is new -- so
         # skipping the budget here would spend the whole folder before the first
         # sweep ever ran.
-        task = asyncio.create_task(watcher._folder_watcher.scan_source(
-            source, chunk_budget=folder_chunk_budget(props)))
+        task = asyncio.create_task(
+            watcher._folder_watcher.scan_source(source, chunk_budget=folder_chunk_budget(props))
+        )
         _track_scan_task(request.app, task)
     return web.json_response({"status": "scanning"})
 
@@ -1988,7 +2105,8 @@ async def resume_source(request: web.Request) -> web.Response:
     store = _store(request)
     source_id = request.match_info["id"]
     outcome, row, props = await asyncio.to_thread(
-        _adopt_source, store, source_id, event="source.resume")
+        _adopt_source, store, source_id, event="source.resume"
+    )
     if outcome == "missing":
         return web.json_response({"error": "not found"}, status=404)
     if outcome == "denied":
@@ -1996,9 +2114,15 @@ async def resume_source(request: web.Request) -> web.Response:
     # Trigger scan to pick up remaining files
     watcher = request.app.get("knowledge_watcher")
     if watcher:
-        source = {"id": source_id, "uri": row["uri"], "source_type": row["source_type"], "properties": json.dumps(props)}
-        task = asyncio.create_task(watcher._folder_watcher.scan_source(
-            source, chunk_budget=folder_chunk_budget(props)))
+        source = {
+            "id": source_id,
+            "uri": row["uri"],
+            "source_type": row["source_type"],
+            "properties": json.dumps(props),
+        }
+        task = asyncio.create_task(
+            watcher._folder_watcher.scan_source(source, chunk_budget=folder_chunk_budget(props))
+        )
         _track_scan_task(request.app, task)
     return web.json_response({"status": "scanning"})
 
@@ -2014,7 +2138,8 @@ def _folder_file_rows(store, source_id: str) -> list:
     return store.db.execute(
         "SELECT file_path, status, error_message, mtime, content_hash, item_ids, last_seen "
         "FROM folder_file_state WHERE source_id = ? ORDER BY last_seen DESC",
-        (source_id,)).fetchall()
+        (source_id,),
+    ).fetchall()
 
 
 async def list_source_files(request: web.Request) -> web.Response:
@@ -2022,16 +2147,24 @@ async def list_source_files(request: web.Request) -> web.Response:
     store = _store(request)
     source_id = request.match_info["id"]
     rows = await asyncio.to_thread(_folder_file_rows, store, source_id)
-    files = [{"file_path": r["file_path"], "status": r["status"] or "pending",
-              "error_message": _redact(r["error_message"]) if r["error_message"] else None,
-              "mtime": r["mtime"],
-              "item_count": len(json.loads(r["item_ids"] or "[]"))} for r in rows]
+    files = [
+        {
+            "file_path": r["file_path"],
+            "status": r["status"] or "pending",
+            "error_message": _redact(r["error_message"]) if r["error_message"] else None,
+            "mtime": r["mtime"],
+            "item_count": len(json.loads(r["item_ids"] or "[]")),
+        }
+        for r in rows
+    ]
     # Also count totals
     total = len(files)
     done = sum(1 for f in files if f["status"] == "done")
     failed = sum(1 for f in files if f["status"] == "failed")
     skipped = sum(1 for f in files if f["status"] == "skipped")
-    return web.json_response({"files": files, "total": total, "done": done, "failed": failed, "skipped": skipped})
+    return web.json_response(
+        {"files": files, "total": total, "done": done, "failed": failed, "skipped": skipped}
+    )
 
 
 async def retry_file(request: web.Request) -> web.Response:
@@ -2053,7 +2186,9 @@ async def retry_file(request: web.Request) -> web.Response:
         return web.json_response({"error": "path is restricted"}, status=403)
     await _audited_write(
         partial(_set_file_state, store, source_id, file_path, "pending"),
-        event="source.file.retry", fields={"source_id": source_id})
+        event="source.file.retry",
+        fields={"source_id": source_id},
+    )
     return web.json_response({"status": "pending"})
 
 
@@ -2076,7 +2211,9 @@ async def skip_file(request: web.Request) -> web.Response:
         return web.json_response({"error": "path is restricted"}, status=403)
     await _audited_write(
         partial(_set_file_state, store, source_id, file_path, "skipped"),
-        event="source.file.skip", fields={"source_id": source_id})
+        event="source.file.skip",
+        fields={"source_id": source_id},
+    )
     return web.json_response({"status": "skipped"})
 
 
@@ -2113,8 +2250,9 @@ async def ingest_text(request: web.Request) -> web.Response:
         try:
             tmp.write(text.encode())
             tmp.close()
-            job_id = await pipeline.ingest_file(tmp.name, original_name=name,
-                                                namespace=namespace, source_id=source_id)
+            job_id = await pipeline.ingest_file(
+                tmp.name, original_name=name, namespace=namespace, source_id=source_id
+            )
             # Update source status. INVARIANT: the 'synced' write and the
             # source.ingest_text audit ride in ONE worker take (_audited_write),
             # with no await between them -- that is what makes the audit
@@ -2122,15 +2260,17 @@ async def ingest_text(request: web.Request) -> web.Response:
             # off-loop on its own.
             await _audited_write(
                 partial(_set_sync_status, store, source_id, "synced"),
-                event="source.ingest_text", fields={"source_id": source_id, "name": name})
+                event="source.ingest_text",
+                fields={"source_id": source_id, "name": name},
+            )
             return web.json_response({"ok": True, "job_id": job_id})
         except ImportChunkBudgetError as exc:
             # The cross-file import budget deferred this ingest. Surface the reasoned
             # refusal (429, not a generic 500) so the caller learns it is a transient
             # budget deferral it can retry, not a server fault. Nothing was written.
             return web.json_response(
-                {"error": str(exc), "code": "import_budget_exceeded"},
-                status=429)
+                {"error": str(exc), "code": "import_budget_exceeded"}, status=429
+            )
         except BaseException as exc:
             # ``except BaseException`` so a cancel is seen and re-raised (task
             # semantics), but this handler writes NO terminal status: it holds
@@ -2162,12 +2302,14 @@ async def get_config(request: web.Request) -> web.Response:
     # keep ``supported_formats`` as the clean extension list and surface the
     # no-extension capability via an explicit boolean instead of stripping the
     # information away entirely.
-    return web.json_response({
-        "enabled": pipeline is not None,
-        "supported_formats": sorted(FileReader.SUPPORTED - {''}),
-        "accepts_no_extension": '' in FileReader.SUPPORTED,
-        "folder_picker": _folder_picker_available(request),
-    })
+    return web.json_response(
+        {
+            "enabled": pipeline is not None,
+            "supported_formats": sorted(FileReader.SUPPORTED - {""}),
+            "accepts_no_extension": "" in FileReader.SUPPORTED,
+            "folder_picker": _folder_picker_available(request),
+        }
+    )
 
 
 # ---------- Stats ----------
@@ -2186,7 +2328,8 @@ def _stats_counts(store, with_embedded: bool) -> tuple[dict, int]:
     if not with_embedded:
         return stats, 0
     embedded = store.db.execute(
-        "SELECT COUNT(*) FROM items WHERE embedding IS NOT NULL").fetchone()[0]
+        "SELECT COUNT(*) FROM items WHERE embedding IS NOT NULL"
+    ).fetchone()[0]
     return stats, embedded
 
 
@@ -2194,8 +2337,7 @@ async def get_stats(request: web.Request) -> web.Response:
     """GET /api/knowledge/stats."""
     store = _store(request)
     embedder = request.app.get("knowledge_embedder")
-    stats, embedded_count = await asyncio.to_thread(
-        _stats_counts, store, embedder is not None)
+    stats, embedded_count = await asyncio.to_thread(_stats_counts, store, embedder is not None)
     if embedder:
         available = await embedder.is_available_async()
         stats["embeddings"] = {
@@ -2323,7 +2465,8 @@ async def ingest_file(request: web.Request) -> web.Response:
                 staged.unlink(missing_ok=True)
                 _sel_log("ingest", filename=filename, outcome="rejected", reason=reason)
                 return web.json_response(
-                    {"error": f"{ext} archive rejected ({reason})"}, status=400)
+                    {"error": f"{ext} archive rejected ({reason})"}, status=400
+                )
 
         # Admission BEFORE acceptance. This route answers 'processing' and ingests
         # in the background, and the staged temp file is the only server-side copy
@@ -2338,7 +2481,8 @@ async def ingest_file(request: web.Request) -> web.Response:
             staged.unlink(missing_ok=True)
             _sel_log("ingest", filename=filename, outcome="deferred")
             return web.json_response(
-                {"error": str(exc), "code": "import_budget_exceeded"}, status=429)
+                {"error": str(exc), "code": "import_budget_exceeded"}, status=429
+            )
 
         # Create source record immediately so it appears in the UI
         store = _store(request)
@@ -2378,7 +2522,8 @@ async def ingest_file(request: web.Request) -> web.Response:
                     # status itself on both its paths (ingestion.py:1128 / 1144), so a
                     # skipped stamp costs a UI hint and heals on its own.
                     stamp = asyncio.ensure_future(
-                        asyncio.to_thread(_set_sync_status, store, src_id, "syncing"))
+                        asyncio.to_thread(_set_sync_status, store, src_id, "syncing")
+                    )
                     try:
                         await asyncio.shield(stamp)
                     except asyncio.CancelledError:
@@ -2396,10 +2541,12 @@ async def ingest_file(request: web.Request) -> web.Response:
                         # client-supplied and can carry a secret, and the row is what
                         # a reader needs to correlate a status write that did not land.
                         logger.exception(
-                            "Could not stamp 'syncing' for source %s; ingesting anyway",
-                            src_id)
+                            "Could not stamp 'syncing' for source %s; ingesting anyway", src_id
+                        )
                     await pipeline.ingest_file(
-                        tmp_path, original_name=filename, namespace=namespace,
+                        tmp_path,
+                        original_name=filename,
+                        namespace=namespace,
                         source_id=src_id,
                         # Admission was settled above, so this call must not enter the
                         # budget again -- including when the reservation returned None
@@ -2439,7 +2586,8 @@ async def ingest_file(request: web.Request) -> web.Response:
                 pipeline.release_import_budget(budget_token)
                 if is_cancel:
                     await _finalize_sync_status(
-                        store, src_id, "error", from_statuses=("syncing", "pending"))
+                        store, src_id, "error", from_statuses=("syncing", "pending")
+                    )
                     raise
                 # Unconditional, NOT the CAS: this path's 'syncing' stamp is
                 # best-effort, so a failed stamp co-occurring with a failed
@@ -2460,8 +2608,12 @@ async def ingest_file(request: web.Request) -> web.Response:
             # the orphan sweep until its ingest ends, and a disconnect cannot
             # commit a 'syncing' the scheduled work then never clears.
             source_id, created = await asyncio.to_thread(
-                _add_source_unique, store,
-                name=filename, source_type='local_file', uri=uri, properties={},
+                _add_source_unique,
+                store,
+                name=filename,
+                source_type="local_file",
+                uri=uri,
+                properties={},
             )
             if not created:
                 # Marking a re-used row owed an ingest keeps the id the client
@@ -2478,10 +2630,12 @@ async def ingest_file(request: web.Request) -> web.Response:
                 except Exception:
                     logger.exception(
                         "Could not stamp 'syncing' for re-used source %s; ingesting anyway",
-                        source_id)
+                        source_id,
+                    )
             staged_path = str(staged)
             await _hand_off_under_gate(
-                request, pipeline,
+                request,
+                pipeline,
                 lambda gate_taken: _bg_ingest(staged_path, source_id, gate_taken),
             )
 
@@ -2502,8 +2656,10 @@ async def get_job(request: web.Request) -> web.Response:
     """GET /api/knowledge/jobs/{id}."""
     store = _store(request)
     row = await asyncio.to_thread(
-        lambda: store.db.execute("SELECT * FROM ingestion_jobs WHERE id = ?",
-                                 (request.match_info["id"],)).fetchone())
+        lambda: store.db.execute(
+            "SELECT * FROM ingestion_jobs WHERE id = ?", (request.match_info["id"],)
+        ).fetchone()
+    )
     if not row:
         return web.json_response({"error": "not found"}, status=404)
     return web.json_response(dict(row))
@@ -2520,7 +2676,9 @@ async def export_item(request: web.Request) -> web.Response:
     if not bundle:
         return web.json_response({"error": "not found"}, status=404)
     _sel_log("export_item", item_id=item_id)
-    return web.json_response(bundle, headers={"Content-Disposition": "attachment; filename=item.knowledge"})
+    return web.json_response(
+        bundle, headers={"Content-Disposition": "attachment; filename=item.knowledge"}
+    )
 
 
 async def export_all(request: web.Request) -> web.Response:
@@ -2529,9 +2687,11 @@ async def export_all(request: web.Request) -> web.Response:
     _sel_log("export_all", namespace=namespace)
     store = _store(request)
     bundle = await asyncio.to_thread(store.export_all, namespace=namespace)
-    safe_ns = re.sub(r'[^\w.-]', '_', namespace) if namespace else None
+    safe_ns = re.sub(r"[^\w.-]", "_", namespace) if namespace else None
     filename = f"{safe_ns}.knowledge" if safe_ns else "knowledge.knowledge"
-    return web.json_response(bundle, headers={"Content-Disposition": f"attachment; filename={filename}"})
+    return web.json_response(
+        bundle, headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 
 async def import_bundle(request: web.Request) -> web.Response:
@@ -2601,8 +2761,13 @@ async def import_bundle(request: web.Request) -> web.Response:
             {"error": f"malformed bundle: {exc}", "code": "malformed_knowledge_bundle"},
             status=400,
         )
-    except (KeyError, OverflowError, sqlite3.IntegrityError,
-            sqlite3.ProgrammingError, sqlite3.DataError) as exc:
+    except (
+        KeyError,
+        OverflowError,
+        sqlite3.IntegrityError,
+        sqlite3.ProgrammingError,
+        sqlite3.DataError,
+    ) as exc:
         # Only failures that genuinely mean a bad bundle earn a 400:
         # IntegrityError (constraint/FK violations), ProgrammingError and
         # DataError (bad values reaching the SQL layer), KeyError (missing
@@ -2659,9 +2824,9 @@ def _embedding_counts(store) -> tuple[int, int]:
     dispatches this to a worker thread; ``store.db`` is thread-local, so the
     thread gets its own connection.
     """
-    total = store.db.execute(
-        "SELECT COUNT(*) as c FROM items WHERE status = 'active'"
-    ).fetchone()["c"]
+    total = store.db.execute("SELECT COUNT(*) as c FROM items WHERE status = 'active'").fetchone()[
+        "c"
+    ]
     embedded = store.db.execute(
         "SELECT COUNT(*) as c FROM items WHERE status = 'active' AND embedding IS NOT NULL"
     ).fetchone()["c"]
@@ -2675,17 +2840,20 @@ async def get_embedding_status(request: web.Request) -> web.Response:
     total, embedded = await asyncio.to_thread(_embedding_counts, store)
     # Polled every 30s by the frontend — loop-safe probe.
     available = await embedder.is_available_async() if embedder else False
-    return web.json_response({
-        "enabled": embedder is not None,
-        "available": available,
-        "model": embedder.model if embedder else None,
-        "total_items": total,
-        "embedded_items": embedded,
-    })
+    return web.json_response(
+        {
+            "enabled": embedder is not None,
+            "available": available,
+            "model": embedder.model if embedder else None,
+            "total_items": total,
+            "embedded_items": embedded,
+        }
+    )
 
 
-def _finalize_job(store, job_id: str, status: str, *,
-                  processed: int | None = None, error: str | None = None) -> bool:
+def _finalize_job(
+    store, job_id: str, status: str, *, processed: int | None = None, error: str | None = None
+) -> bool:
     """Stamp a terminal state on an ingestion job row, in one off-loop take.
 
     True when this call is the one that moved the row. Only a row still
@@ -2703,19 +2871,27 @@ def _finalize_job(store, job_id: str, status: str, *,
         cur = store.db.execute(
             "UPDATE ingestion_jobs SET status = ?, items_processed = ?, updated_at = ? "
             "WHERE id = ? AND status = 'processing'",
-            (status, processed, datetime.now().isoformat(), job_id))
+            (status, processed, datetime.now().isoformat(), job_id),
+        )
     else:
         cur = store.db.execute(
             "UPDATE ingestion_jobs SET status = ?, error = ?, updated_at = ? "
             "WHERE id = ? AND status = 'processing'",
-            (status, error, datetime.now().isoformat(), job_id))
+            (status, error, datetime.now().isoformat(), job_id),
+        )
     store.db.commit()
     return cur.rowcount > 0
 
 
-def _finalize_job_audited(store, job_id: str, status: str, *, fields: dict,
-                          processed: int | None = None,
-                          error: str | None = None) -> bool:
+def _finalize_job_audited(
+    store,
+    job_id: str,
+    status: str,
+    *,
+    fields: dict,
+    processed: int | None = None,
+    error: str | None = None,
+) -> bool:
     """Finalize a rebuild job and audit the outcome, in ONE off-loop take.
 
     The audit rides inside the take for the reason ``_audited_write`` documents,
@@ -2764,7 +2940,8 @@ def _write_embedding(store, item_id: str, vector: bytes, sig: str) -> None:
     """
     store.db.execute(
         "UPDATE items SET embedding = ?, embedding_sig = ?, embedded_at = ? WHERE id = ?",
-        (vector, sig, datetime.now().isoformat(), item_id))
+        (vector, sig, datetime.now().isoformat(), item_id),
+    )
     store.db.commit()
 
 
@@ -2775,8 +2952,9 @@ def _unembedded_count(store) -> int:
     ).fetchone()["c"]
 
 
-async def _rebuild_embeddings_job(app: web.Application, store, embedder, job_id: str,
-                                  force: bool = False) -> None:
+async def _rebuild_embeddings_job(
+    app: web.Application, store, embedder, job_id: str, force: bool = False
+) -> None:
     """Background wrapper: run the sig-gated rebuild and finalize the job row.
 
     The re-embed loop itself lives in ``knowledge.ingestion.rebuild_embeddings`` so
@@ -2794,16 +2972,21 @@ async def _rebuild_embeddings_job(app: web.Application, store, embedder, job_id:
         # watching its progress bar — the load is expected, so it runs at the
         # interactive scheduling class with no idling. The watcher self-heal
         # path stays on the paced default.
-        processed = await rebuild_embeddings(store, embedder, job_id=job_id, force=force,
-                                             pace=False)
+        processed = await rebuild_embeddings(
+            store, embedder, job_id=job_id, force=force, pace=False
+        )
         # Audit from inside the worker, gated on the CAS: a cancel delivered
         # while this await is in flight would otherwise skip the completed line
         # (it is the coroutine that dies, not the thread), and a cancel that
         # already stamped the row must not collect a completed line either.
         await asyncio.to_thread(
-            _finalize_job_audited, store, job_id, "completed", processed=processed,
-            fields={"count": processed, "rebuild": True, "force": force,
-                    "outcome": "completed"})
+            _finalize_job_audited,
+            store,
+            job_id,
+            "completed",
+            processed=processed,
+            fields={"count": processed, "rebuild": True, "force": force, "outcome": "completed"},
+        )
     except BaseException as exc:
         # CancelledError is a BaseException in 3.8+; finalize the row so a
         # shutdown cancellation does not leave it 'processing'.
@@ -2821,8 +3004,13 @@ async def _rebuild_embeddings_job(app: web.Application, store, embedder, job_id:
         # Suppressing the re-cancel keeps `exc` current for the bare `raise`.
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.to_thread(
-                _finalize_job_audited, store, job_id, status, error=str(exc),
-                fields={"rebuild": True, "force": force, "outcome": status})
+                _finalize_job_audited,
+                store,
+                job_id,
+                status,
+                error=str(exc),
+                fields={"rebuild": True, "force": force, "outcome": status},
+            )
         if is_cancel:
             raise
 
@@ -2865,7 +3053,8 @@ async def batch_embed_items(request: web.Request) -> web.Response:
                 {"job_id": active["id"] if active else None, "status": "processing"}
             )
         task = asyncio.create_task(
-            _rebuild_embeddings_job(request.app, store, embedder, job_id, force=force))
+            _rebuild_embeddings_job(request.app, store, embedder, job_id, force=force)
+        )
         app_tasks = _task_registry(request.app, "_bg_tasks")
         app_tasks.add(task)
         task.add_done_callback(app_tasks.discard)
@@ -2881,8 +3070,7 @@ async def batch_embed_items(request: web.Request) -> web.Response:
             None, embedder.embed_for_item, row["title"], row["summary"], row["content"]
         )
         if vec:
-            await asyncio.to_thread(
-                _write_embedding, store, row["id"], floats_to_bytes(vec), sig)
+            await asyncio.to_thread(_write_embedding, store, row["id"], floats_to_bytes(vec), sig)
             embedded += 1
 
     remaining = await asyncio.to_thread(_unembedded_count, store)
@@ -2987,18 +3175,20 @@ async def search_for_context(request: web.Request) -> web.Response:
         if remaining_budget <= 0:
             break
         if tokens > remaining_budget:
-            content = content[:remaining_budget * 4]
+            content = content[: remaining_budget * 4]
             tokens = remaining_budget
         cards.append(_build_context_card(r, content, tokens))
         total_tokens += tokens
 
     _sel_log("search_for_context", query=_redact(q), results=len(cards))
-    return web.json_response({
-        "query": _redact(q),
-        "results": cards,
-        "total_tokens": total_tokens,
-        "max_tokens": max_tokens,
-    })
+    return web.json_response(
+        {
+            "query": _redact(q),
+            "results": cards,
+            "total_tokens": total_tokens,
+            "max_tokens": max_tokens,
+        }
+    )
 
 
 async def add_agent_document_route(request: web.Request) -> web.Response:
@@ -3014,14 +3204,18 @@ async def add_agent_document_route(request: web.Request) -> web.Response:
     cfg = KiroCrewConfig.load()
     if not cfg.knowledge.auto_add_documents:
         return web.json_response(
-            {"error": "Adding documents to the knowledge library is turned off "
-                      "(knowledge.auto_add_documents).",
-             "code": "auto_add_documents_disabled"}, status=403)
+            {
+                "error": "Adding documents to the knowledge library is turned off "
+                "(knowledge.auto_add_documents).",
+                "code": "auto_add_documents_disabled",
+            },
+            status=403,
+        )
     pipeline = _pipeline(request)
     if not pipeline:
         return web.json_response(
-            {"error": "pipeline not configured",
-             "code": "pipeline_unavailable"}, status=503)
+            {"error": "pipeline not configured", "code": "pipeline_unavailable"}, status=503
+        )
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
@@ -3035,9 +3229,13 @@ async def add_agent_document_route(request: web.Request) -> web.Response:
     )
     if result.get("status") == "error":
         return web.json_response(
-            {"error": result["error"], "code": "document_rejected"}, status=400)
-    _sel_log("agent_document.add", title=_redact(result.get("title", "")) or "",
-             status=result.get("status", ""))
+            {"error": result["error"], "code": "document_rejected"}, status=400
+        )
+    _sel_log(
+        "agent_document.add",
+        title=_redact(result.get("title", "")) or "",
+        status=result.get("status", ""),
+    )
     return web.json_response(result)
 
 
@@ -3118,8 +3316,7 @@ def setup_knowledge_routes(app: web.Application) -> None:
             )
         )
         app["knowledge_pipeline"] = pipeline
-        app["knowledge_sync"] = SyncScheduler(store=store, pipeline=pipeline,
-                                              connectors=connectors)
+        app["knowledge_sync"] = SyncScheduler(store=store, pipeline=pipeline, connectors=connectors)
         # Start source watcher (auto-watches local_file sources)
         app.on_startup.append(_start_watcher_async)
         # Start artifact ingest watcher (no-op unless auto-ingest is enabled)
