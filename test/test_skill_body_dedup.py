@@ -509,16 +509,25 @@ class TestSessionsAreIndependent:
         assert BODY_SENTINEL in _send(builder, session_key="chat-b")
 
 
-class TestConfinedSkillNeverDemoted:
-    """A confined project skill has no pointer form, so it always re-injects."""
+class TestConfinedSkillDemotesToANameOnlyPointer:
+    """SKL-6: a confined project skill's repeat match sends a NAME-ONLY pointer.
 
-    def test_confined_skill_body_repeats_every_turn(self, tmp_path: Path) -> None:
+    It has no trigger_hint form (a live path would leave the confined reader),
+    but it no longer re-pastes its whole body on every matching turn either:
+    the second match in one provider window carries a name-only line, and a
+    needs_reinjection turn re-sends the body.
+    """
+
+    def test_confined_body_sends_once_then_a_name_only_pointer(self, tmp_path: Path) -> None:
         loader = MagicMock()
         loader.get_triggered_skills.return_value = ["proj-skill"]
         loader.split_triggered.return_value = (["proj-skill"], [])
-        # Confinement is what forbids the pointer path; mark it confined.
+        # Confinement forbids the trigger_hint pointer path; mark it confined.
         loader.confined_triggered.return_value = {"proj-skill"}
-        loader.load_skill.return_value = "confined body ONE"
+        loader.load_skill = MagicMock(
+            return_value="confined body ONE",
+            side_effect=lambda name, project_dir=None, **k: "confined body ONE",
+        )
         loader.strip_frontmatter.return_value = "confined body ONE"
         loader.trigger_hint.return_value = ""
         builder = ContextBuilder(memory=MemoryStore(workspace=tmp_path / "ws"), skills=loader)
@@ -526,11 +535,13 @@ class TestConfinedSkillNeverDemoted:
         first, _ = builder.build_message("trigger", is_new_session=False, session_key=SESSION)
         second, _ = builder.build_message("trigger", is_new_session=False, session_key=SESSION)
 
-        # Demoting it would drop it entirely (no body, no pointer); instead it
-        # re-injects both times.
         assert "confined body ONE" in first
-        assert "confined body ONE" in second
+        # Second match: the name-only pointer, NOT the whole body again.
+        assert "confined body ONE" not in second
         assert "[Skill: proj-skill]" in second
+        assert "already in this conversation" in second
+        # A rebuilt window re-sends the body (the reset is pinned in
+        # test_skill_trigger_budget.py with a real loader).
 
 
 class TestRecordIsBounded:

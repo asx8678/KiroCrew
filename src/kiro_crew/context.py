@@ -242,7 +242,7 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel
 from kiro_crew.session_surface import has_dashboard_surface
-from kiro_crew.skills import PROJECT_SKILL_BODY_CAP, SkillsLoader
+from kiro_crew.skills import PROJECT_SKILL_BODY_CAP, SKILL_READ_CAPACITY, SkillsLoader
 
 if TYPE_CHECKING:
     from kiro_crew.agent_sdk import ContextPromptProvider
@@ -3783,8 +3783,19 @@ class ContextBuilder:
                 # (skill_key, stripped_body, body_sha256) for each enforced
                 # skill whose body loaded — collected first so the per-session
                 # dedup decision runs once, as a single guarded transaction,
-                # rather than per skill inside the emit loop.
+                # rather than per skill inside the emit loop. SKL-6: every
+                # body read is capped at SKILL_READ_CAPACITY (99,000 B — the
+                # same bound the $key and exact-read paths use; the old call
+                # passed no cap and a matched GLOBAL body was injected whole,
+                # measured 153,062 B), and the turn's bodies share ONE
+                # SKILL_READ_CAPACITY budget: a body past it arrives as its
+                # pointer line instead. Names decided here NEVER reach the
+                # dedup record — only bodies that will actually be delivered
+                # are recorded as sent.
                 loadable: list[tuple[str, str, str]] = []
+                over_budget: list[str] = []
+                too_big: list[str] = []
+                spent = 0
                 for name in enforced:
                     # project_dir, not project-blind: get_triggered_skills and
                     # split_triggered above are both project-aware, so a trusted
@@ -3792,35 +3803,39 @@ class ContextBuilder:
                     # returned None, making a matched skill contribute nothing at
                     # all. The project branch reads through the containment-checked
                     # reader, so this is confined like every other project read.
-                    content = self.skills.load_skill(name, project)
-                    if content:
-                        stripped = self.skills.strip_frontmatter(content)
-                        # Key the session record by the body actually about to
-                        # be injected, so an edited skill (new hash) re-injects
-                        # while an unchanged one demotes to its pointer.
-                        digest = hashlib.sha256(stripped.encode("utf-8")).hexdigest()
-                        loadable.append((name, stripped, digest))
+                    reasons: list[str] = []
+                    content = self.skills.load_skill(
+                        name, project, max_bytes=SKILL_READ_CAPACITY, refusal_reasons=reasons
+                    )
+                    if content is None:
+                        if "size_cap" in reasons:
+                            too_big.append(name)
+                        continue
+                    stripped = self.skills.strip_frontmatter(content)
+                    if spent + len(stripped) > SKILL_READ_CAPACITY and loadable:
+                        over_budget.append(name)
+                        continue
+                    # Key the session record by the body actually about to
+                    # be injected, so an edited skill (new hash) re-injects
+                    # while an unchanged one demotes to its pointer.
+                    digest = hashlib.sha256(stripped.encode("utf-8")).hexdigest()
+                    loadable.append((name, stripped, digest))
+                    spent += len(stripped)
                 # One guarded transaction: decide which loadable bodies were
                 # already sent in this session (demote those to a pointer) and
                 # record the rest as sent. `is_new_session`/`needs_reinjection`
                 # are the turns whose provider window cannot hold the prior
                 # bodies, so they reset the record and everything re-injects.
-                # Confined project skills are never demotion candidates: they
-                # have no pointer form (trigger_hint omits them), so demoting
-                # one would drop it from the prompt entirely instead of falling
-                # back to a pointer -- they always re-inject their body.
-                confined = self.skills.confined_triggered(
-                    [name for name, _stripped, _digest in loadable], project
-                )
+                # SKL-6: confined project skills are demotion candidates NOW —
+                # a repeat match sends a NAME-ONLY pointer line (below), which
+                # leaks nothing and preserves the match signal, instead of
+                # re-pasting the full body on every matching turn (measured:
+                # 19,442 B re-sent on each of 3 consecutive matches).
                 demote = self._dedup_triggered_bodies(
                     skill_bodies_session,
                     agent,
                     reset=is_new_session or needs_reinjection,
-                    candidates=[
-                        (name, digest)
-                        for name, _stripped, digest in loadable
-                        if name not in confined
-                    ],
+                    candidates=[(name, digest) for name, _stripped, digest in loadable],
                 )
                 demoted: list[str] = []
                 for name, stripped, _digest in loadable:
@@ -3839,12 +3854,29 @@ class ContextBuilder:
                     # positive, pointer-only, demoted, or undelivered) must not
                     # earn ranking weight in the lazy-load hotness ledger.
                     self.skills._record_use(name)
-                # A demoted body still tells the agent the skill applies: hand
-                # it the same pointer line an `inject_on_trigger: false` skill
-                # gets, preserving match order (enforced before opted-out).
-                hint = self.skills.trigger_hint(demoted + pointer_only, project)
+                # A demoted, oversized or over-budget body still tells the
+                # agent the skill applies: hand it the same pointer line an
+                # `inject_on_trigger: false` skill gets, preserving match order
+                # (enforced before opted-out). Confined project skills are
+                # omitted by trigger_hint on purpose, so a confined demotion
+                # gets a NAME-ONLY line instead — the match signal survives
+                # and nothing behind the confinement boundary is named beyond
+                # the skill's own key (SKL-6).
+                confined = set(self.skills.confined_triggered(enforced, project))
+                pointered = demoted + over_budget + too_big + pointer_only
+                hint = self.skills.trigger_hint(
+                    [name for name in pointered if name not in confined], project
+                )
                 if hint:
                     parts.append(_neutralize_structural_markers(hint))
+                for name in pointered:
+                    if name in confined:
+                        safe = _neutralize_structural_markers(name)
+                        parts.append(
+                            f"[Skill: {safe}] Its body is already in this "
+                            "conversation or did not fit this turn's skill budget; "
+                            "re-read it with the skill tool if you need it.\n\n"
+                        )
                 # Correct the delivery audit. The matcher's single `skill_trigger`
                 # row records the FRONTMATTER-level split (bodies vs opted-out
                 # pointers) it computes at match time -- but that runs before this
@@ -3854,11 +3886,11 @@ class ContextBuilder:
                 # procedure in the prompt?" is not told a demoted body was sent.
                 # Only when a demotion diverged from the matcher's claim -- the
                 # common no-demotion turn keeps its one row and pays nothing here.
-                if demoted:
+                if demoted or over_budget or too_big:
                     delivered_bodies = [
                         name for name, _stripped, _digest in loadable if name not in demote
                     ]
-                    pointers = demoted + pointer_only
+                    pointers = demoted + over_budget + too_big + pointer_only
                     cap = self._SKILL_DELIVERY_AUDIT_NAMES
                     name_len = self._SKILL_DELIVERY_AUDIT_NAME_LEN
 
