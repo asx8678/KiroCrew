@@ -3791,9 +3791,17 @@ for native view and inherited steering behavior.
 **Dollar-load transcript snapshot:** the dashboard chat runner records each
 successful `$skillname` selection as one `system` row with
 `meta.kind=skill_load`. `meta.skills` keeps the ordered `{name, body}` list that
-entered that turn. `resolve_dollar_skills` has already removed frontmatter, and
-the runner applies credential and outbound-URL redaction before it writes either
-the model block or the snapshot. The snapshot therefore remains accurate if a
+entered that turn (`body` is empty for a pointer-deferred skill). One turn's
+`$`-expansion carries at most one full body's worth of bytes
+(`SKILL_READ_CAPACITY`, 99,000): bodies past that budget arrive as pointer lines
+the agent can read on demand, and the chip names which tokens were deferred.
+A body the session already holds — an earlier `$` turn's delivery or a trigger
+match — also arrives as its pointer, through the same per-session record
+`build_message`'s trigger path uses (`dollar_skills_already_held` /
+`record_dollar_skill_bodies`); the reset rules (fresh window, re-injection,
+agent switch) are `build_message`'s. `resolve_dollar_skills` has already
+removed frontmatter, and the runner applies credential and outbound-URL
+redaction before it writes either the model block or the snapshot. The snapshot therefore remains accurate if a
 skill changes or disappears later and adds no second filesystem read. Existing
 dollar-skill count and file-read caps bound the row. The dashboard renders the
 row through the same disclosure shell as a compaction summary, collapsed by

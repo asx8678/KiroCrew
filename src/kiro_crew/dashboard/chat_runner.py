@@ -582,6 +582,7 @@ from kiro_crew.session_agent_selection import (  # noqa: F401
     session_agent_selection_kind,
 )
 from kiro_crew.session_capabilities import CapabilityStartupError
+from kiro_crew.skills import SKILL_READ_CAPACITY
 from kiro_crew.slack.handler import post_linked_approval, resolve_linked_approval
 from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.start_priority import StartPriority, person_priority
@@ -4692,18 +4693,60 @@ def _expand_dollar_skills(
     blocks: list[str] = []
     names: list[str] = []
     snapshots: list[dict[str, str]] = []
-    for _token, name, body in resolved:
+    deferred: list[str] = []
+    delivered: list[tuple[str, str]] = []
+    # SKL-7: one turn's $-expansion carries at most ONE full body's worth of
+    # bytes (SKILL_READ_CAPACITY, 99,000). Before the budget, five distinct
+    # tokens appended up to ~495 KB in a single message — measured 163,048 B
+    # for five real skills — with no per-turn total.
+    total = 0
+    # SKL-5: a body this session already saw (an earlier $ turn or a trigger
+    # match) re-sends as its POINTER, through the same per-session record
+    # build_message's trigger path uses. A session re-sending $babysit every
+    # turn paid the 21,543 B body each time for nothing the window did not
+    # already hold.
+    candidates = [
+        (name, hashlib.sha256(body.encode("utf-8", "replace")).hexdigest())
+        for _token, name, body in resolved
+    ]
+    builder = getattr(state, "context_builder", None)
+    held: set[str] = set()
+    if builder is not None:
+        held = builder.dollar_skills_already_held(session_key, slot.agent or None, candidates)
+    for (_token, name, body), (_c_name, digest) in zip(resolved, candidates):
         body, _ = redact_credentials(body)
         body, _ = redact_exfiltration_urls(body)
+        pointer = (
+            f"[Skill: {name}] Not re-sent — this conversation already holds it "
+            "(or this turn's skill budget is full). Read it with the skill tool "
+            "if you need it again."
+        )
+        if name in held or (total + len(body) > SKILL_READ_CAPACITY and delivered):
+            blocks.append(pointer)
+            names.append(name)
+            deferred.append(name)
+            snapshots.append({"name": name, "body": ""})
+            continue
         blocks.append(f"[Skill: {name}]\n\n{body}")
         names.append(name)
+        total += len(body)
+        delivered.append((name, digest))
         snapshots.append({"name": name, "body": body})
+    if builder is not None and delivered:
+        # Record only what was DELIVERED: a pointer-deferred body must not
+        # read as sent. The reset rules (fresh window, re-injection, agent
+        # switch) live with build_message.
+        builder.record_dollar_skill_bodies(session_key, slot.agent or None, delivered)
 
     expanded = message + "\n\n" + "\n\n---\n\n".join(blocks)
 
+    chip = f"📎 Loaded skill(s) via `$`: **{', '.join(names)}**"
+    if deferred:
+        # The user can see which tokens arrived as pointers, not bodies.
+        chip += f" (as pointers: {', '.join(deferred)})"
     slot.append(
         "system",
-        f"📎 Loaded skill(s) via `$`: **{', '.join(names)}**",
+        chip,
         "msg msg-info",
         meta={"kind": "skill_load", "skills": snapshots},
     )

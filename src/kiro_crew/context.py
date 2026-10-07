@@ -2193,6 +2193,53 @@ class ContextBuilder:
                 self._thread_channel_watermarks.pop(oldest, None)
                 self._thread_watermark_undo.pop(oldest, None)
 
+    def dollar_skills_already_held(
+        self,
+        session_key: str | None,
+        agent: str | None,
+        candidates: list[tuple[str, str]],
+    ) -> set[str]:
+        """Read-only half of the ``$skill`` dedup (SKL-5): names already held.
+
+        *candidates* is ``[(skill_key, body_sha256), ...]`` for the bodies a
+        ``$`` expansion resolved. Returns the subset whose digest this session
+        already holds — from an earlier ``$`` turn or a trigger match — WITHOUT
+        recording anything: the caller records only what it actually delivers
+        (a body deferred to a pointer must not read as sent). Mirrors the read
+        half of :meth:`_dedup_triggered_bodies` against the same record, so
+        the two paths can never disagree about what this session saw. The
+        reset rules (fresh window, re-injection, agent switch) live with
+        ``build_message``, which covers this path's callers too.
+        """
+        if not session_key:
+            return set()
+        key = self._cap_memo_key(session_key)
+        agent_key = None if agent is None else self._cap_memo_key(agent)
+        with self._sent_skill_bodies_lock:
+            if self._sent_skill_agents.get(key) != agent_key:
+                return set()
+            sent = self._sent_skill_bodies.get(key) or {}
+            return {
+                skill_key
+                for skill_key, digest in candidates
+                if sent.get(self._cap_memo_key(skill_key)) == digest
+            }
+
+    def record_dollar_skill_bodies(
+        self,
+        session_key: str | None,
+        agent: str | None,
+        candidates: list[tuple[str, str]],
+    ) -> None:
+        """Record the ``$skill`` bodies this expansion DELIVERED (SKL-5).
+
+        Same per-session record the trigger path writes, no reset: a body a
+        ``$`` turn delivered is one the provider window holds, so a later
+        trigger match for the same body demotes to its pointer line instead of
+        re-sending it.
+        """
+        self._dedup_triggered_bodies(session_key, agent, reset=False, candidates=candidates)
+
     def commit_skill_bodies(self, session_key: str | None) -> None:
         """Discard the current turn's rollback state after its turn LANDED.
 
