@@ -20,9 +20,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.context_assembly import budget as _budgets
 from kiro_crew.context_assembly import inclusion as _inclusion
 from kiro_crew.context_assembly import markers as _markers
 from kiro_crew.context_assembly import sections as _sections
+from kiro_crew.context_assembly import store_admission
 
 if TYPE_CHECKING:
     from kiro_crew.context import ContextBuilder
@@ -53,11 +55,16 @@ def post_compaction_parts(
 ) -> list[str]:
     """What a turn re-injects after a confirmed compaction dropped session start.
 
-    The agent contract, the memory activity index, the skills index (same gate and
-    glob restriction as session start), the CURRENT reply-style preferences and the
-    CURRENT folder steering. The member section is re-injected by the caller,
-    through the member lifecycle chokepoint. Also starts the session's shown-lesson
-    record again, since the compaction dropped those blocks too.
+    The agent contract, the critical rules, the memory preferences and the
+    standing-rule lessons (the protected half of the session-start memory
+    family — a compaction drops those blocks too, and their loss is invisible:
+    the model simply drifts off the user's standing corrections), the memory
+    activity index, the skills index (same gate and glob restriction as session
+    start), the CURRENT reply-style preferences and the CURRENT folder
+    steering. The member section is re-injected by the caller, through the
+    member lifecycle chokepoint, so member sessions re-inject none of the
+    memory half here. Also starts the session's shown-lesson record again,
+    since the compaction dropped those blocks too.
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
 
@@ -80,15 +87,99 @@ def post_compaction_parts(
     )
     if _agent_prompt:
         parts.append(f"[AGENT SYSTEM PROMPT]\n{_agent_prompt}\n[END AGENT SYSTEM PROMPT]\n\n")
+    # The critical-rules block is session-start context the compaction
+    # dropped, and it carries the diff mandate — without it a dashboard
+    # session post-compaction silently loses the show-a-diff rule (channel
+    # turns get a per-turn [RUNTIME] refresh that partly re-asserts it;
+    # dashboard turns get nothing). Same gate as session start: an agent
+    # that declared includeCrewContext: false opted out there and here.
+    if ctx._agent_includes_crew_context(agent):
+        _rules = ctx._critical_rules_for(session_key, runtime_source)
+        if _rules:
+            parts.append(_rules)
     # The stored-memory half routes through the same config intersection
     # as the session-start build: this path restores a block that build
     # withheld, so reading the caller scope alone would hand back the
     # activity index the operator's inject_memory setting excluded.
-    if not blocks_reads and _inclusion._group_included(
+    caps = ctx._resolve_caps(model_window)
+    _memory_on = not blocks_reads and _inclusion._group_included(
         ctx._config_scoped_groups(context_groups), _inclusion.CONTEXT_GROUP_MEMORY
-    ):
-        memory = builder.get_memory_for(workspace, memory_store)
-        parts.append(ctx._neutralize_structural_markers(memory.activity_index()))
+    )
+    _memory = builder.get_memory_for(workspace, memory_store) if _memory_on else None
+    if not _essentials:
+        # The protected half of the session-start memory family — the
+        # preferences markdown with its pref.* semantic rows, and the
+        # standing-rule lessons. A compaction drops both, and unlike the
+        # skills index their loss is invisible: the model simply drifts
+        # off the user's standing corrections and preferences. Member
+        # sessions re-receive the essentials envelope from the caller, so
+        # they take none of this (the same split session start applies).
+        if _memory is not None:
+            try:
+                memory_ctx = _memory.get_context(
+                    prefs_cap=caps.prefs,
+                    projects_cap=caps.projects,
+                    history_cap=caps.memory_history,
+                    semantic_cap=caps.semantic,
+                    episodic_cap=min(_budgets._EPISODIC_INJECT_CAP, caps.episodic),
+                    query="",
+                    include_activity=False,
+                    prefs_startup_cap=caps.prefs_startup,
+                )
+            except (UnicodeDecodeError, OSError):
+                # get_context's own read seam skips an unreadable file;
+                # this guards the remaining explicit-reader surface.
+                memory_ctx = ""
+            if len(memory_ctx) > min(caps.prefs_startup, caps.protected_context):
+                # Mirrors the session-start cap (store_admission): keep the
+                # head, cut at a line boundary, name the file to read.
+                room = min(caps.prefs_startup, caps.protected_context)
+                notice = (
+                    f"\n[Context budget: omitted {len(memory_ctx) - room} chars of "
+                    "preferences above the startup allowance; "
+                    f"read {_memory._preferences_file} for the complete file.]\n"
+                )
+                cut = max(0, room - len(notice))
+                if cut > 0:
+                    newline = memory_ctx.rfind("\n", 0, cut)
+                    if newline > 0:
+                        cut = newline
+                memory_ctx = memory_ctx[:cut] + notice
+            if memory_ctx:
+                parts.append(
+                    "[REINJECTED AFTER COMPACTION — user preferences]\n"
+                    + ctx._neutralize_structural_markers(memory_ctx)
+                    + "\n[END REINJECTED]\n\n"
+                )
+        _lessons_blocks = ctx._budgets.ContextParts()
+        try:
+            _renderer, _idx = store_admission.session_lessons_part(
+                builder,
+                _lessons_blocks,
+                memory=_memory,
+                member_vectors=None,
+                activity_ranked=False,
+                effective_groups=ctx._config_scoped_groups(context_groups),
+                workspace=workspace,
+                memory_store=memory_store,
+                project=project,
+                caps=caps,
+                essentials=essentials,
+                query_text="",
+            )
+        except (OSError, ValueError, RuntimeError):
+            _idx = None
+        if _idx is not None and _lessons_blocks.parts[_idx]:
+            # Empty query_text renders the standing-rule tier only; findings
+            # are withheld by the store's own empty-query rule, which is the
+            # documented behaviour for a block that names no topic.
+            parts.append(
+                "[REINJECTED AFTER COMPACTION — learned lessons]\n"
+                + ctx._neutralize_structural_markers(_lessons_blocks.parts[_idx])
+                + "\n[END REINJECTED]\n\n"
+            )
+    if _memory_on:
+        parts.append(ctx._neutralize_structural_markers(_memory.activity_index()))
         parts.append(
             "[Memory tools] Call memory_recall with specific keywords for prior facts and tasks.\n"
         )
@@ -96,7 +187,6 @@ def post_compaction_parts(
     if _inject:
         _cfg = ctx.KiroCrewConfig.load()
         lazy_skills = bool(getattr(_cfg.skills, "lazy_load", False))
-        caps = ctx._resolve_caps(model_window)
         required_skills, skills_ctx = _inclusion.skill_parts(
             builder, globs=_globs, project=project, caps=caps, lazy_skills=lazy_skills
         )

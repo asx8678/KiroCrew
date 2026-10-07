@@ -294,7 +294,12 @@ task facts and relevant episodes) is appended after the protected
 preferences and activity index. The member-essentials builder and the post-compaction re-injection in
 `build_message()` route through the same intersection, because each restores a
 block the session-start build gates: reading the caller scope alone there would
-hand back withheld memory for the rest of the session. The `[CONTEXT SCOPE]`
+hand back withheld memory for the rest of the session. The post-compaction
+re-injection also restores the protected half itself — the preferences block
+(same startup cap as session start) and the standing-rule lessons tier (same
+render, startup budget, findings withheld by the empty-query rule) — so a
+compaction no longer drops the user's standing corrections; member sessions
+still take only the caller's essentials envelope. The `[CONTEXT SCOPE]`
 withheld-groups block stays keyed to the caller-passed value only: "your parent
 withheld" describes per-spawn narrowing, not the operator's standing config
 choice.
