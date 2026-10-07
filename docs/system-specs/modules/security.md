@@ -689,8 +689,8 @@ Hides credential paths from kiro-cli subprocess tree using platform-native isola
 
 | Mode | Config value | Hides | Accessible | Env scrub |
 |------|-------------|-------|------------|-----------|
-| **Standard** | `"auto"` (default) | `.gnupg`, `.gpg`, `.config/gcloud`, `.azure`, `.docker` | `.aws`, `.ssh`, `.kube`, `.config/gh`, `.npmrc`, `.netrc`, `.git-credentials` | `AWS_SECRET*`, `AWS_SESSION*`, `SSH_AUTH_SOCK`, `GNUPGHOME`, `GIT_ASKPASS` (†) |
-| **Strict** | `"strict"` | All of the above + `.aws`, `.ssh`, `.kube`, `.config/gh`, `.npmrc`, `.netrc`, `.git-credentials` | Only `~/.ssh/known_hosts` | Same as standard (†) |
+| **Standard** | `"auto"` (default) | `.gnupg`, `.gpg`, `.config/gcloud`, `.azure`, `.docker` | `.aws`, `.ssh`, `.kube`, `.config/gh`, `.midway`, `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials` | `AWS_SECRET*`, `AWS_SESSION*`, `SSH_AUTH_SOCK`, `GNUPGHOME`, `GIT_ASKPASS` (†) |
+| **Strict** | `"strict"` | All of the above + `.aws`, `.ssh`, `.kube`, `.config/gh`, `.midway`, `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials` | Only `~/.ssh/known_hosts` | Same as standard (†) |
 | **Off** | `"off"` | Nothing | Everything | Nothing |
 
 (†) `SSH_AUTH_SOCK` is kept, not scrubbed, when the operator has granted the ssh-agent forward consent on the keystone (`ssh_auth_sock_consent.json`) — see the opt-in paragraph below.
