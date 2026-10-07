@@ -631,6 +631,18 @@ key before letting go, so a pop by key alone would kill the runtime the spare
 exists to keep. A release whose pin no longer matches pops nothing, returns
 `False`, and leaves the replacement to the post-condition.
 
+**Parents with live children are busy**: an idle-by-semaphore parent that
+still owns RUNNING or QUEUED subagent runs is treated exactly like a locked
+session — flagged `retire_on_identity_change`, its resume sid cleared with the
+other invalidated keys, skipped, and counted against completeness — never
+retired-and-cancelled as a side effect. The predicate is
+`_snapshot_parent_children(key)`, the same live/queued selection the teardown
+would cancel through, so the sweep and the parent-end teardown cannot disagree
+about what counts as running work. A parent the store could not stamp — or one
+stamped to another account — keeps this protection too, which is what keeps an
+empty-fingerprint sweep (unreadable store, sign-out) from re-killing subagents
+on every turn: it re-sweeps, but each pass is a no-op until the children end.
+
 **Per-turn stamp gate** (`flag_identity_stamp_mismatches`, before the
 unchanged early-return in the turn gate): a session whose stamp provably
 differs from the live account is flagged `retire_on_identity_change` and its

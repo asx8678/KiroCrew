@@ -1359,6 +1359,12 @@ selection can name, and it keeps recording (`_teardown_store_sweeps`) until that
 cancel returns. A recycle takes no snapshot, so it opens no fence and its children's
 rows are left to the resumed conversation.
 
+The identity sweep reads this same selection as a busy predicate
+(`retire_kiro_identity_sessions`): a parent whose snapshot is non-empty is
+flagged `retire_on_identity_change` and skipped rather than retired, so an
+account switch never cancels the runs this method names — it defers the
+retirement to the parent's next acquire after they end.
+
 What it MARKS is wider than what it returns, and the two questions are different:
 the return value is what to cancel, the mark is whose delivery to drop. A run that is
 `done` but whose outcome has not reached the parent has nothing to cancel and everything
