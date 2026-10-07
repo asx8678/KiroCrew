@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import re
@@ -14,6 +15,9 @@ from html.parser import HTMLParser
 from typing import Any, cast
 
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.config.paths import config_dir
+from kiro_crew.atomic_write import atomic_write
+from pathlib import Path
 from kiro_crew.constants import crew_log_enabled
 from kiro_crew.context import ui_language_tag
 from kiro_crew.crew_main_contract import (
@@ -858,6 +862,56 @@ class CardLifecycle:
         self._card_workers: dict[str, frozenset[str]] = {}
         _listen_for_log_growth(self)
 
+    # ------------------------------------------------------------------
+    # DURABLE CARD STORE (LOOP-14): a restart re-seeds every restored slot,
+    # and before this store each seed spent a model call rebuilding the card
+    # the previous process had already published -- up to capacity (128)
+    # generations per gateway hour from the shared budget. The store keeps,
+    # per slot history key, the published payload plus a digest of the card
+    # SOURCE the model was shown (redacted evidence rows + folded reads). A
+    # seeded generation whose source hashes equal republishes the stored card
+    # with no model call; any real change regenerates as before.
+    # ------------------------------------------------------------------
+
+    def _card_store_path(self) -> Path:
+        return config_dir() / "dynamic_card_store.json"
+
+    def _load_card_store(self) -> dict:
+        try:
+            raw = json.loads(self._card_store_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _store_card(self, entry: CardEntry, payload: dict, digest: str) -> None:
+        """Persist one published card under its slot history key."""
+        store = self._load_card_store()
+        store[entry.binding] = {
+            "payload": copy.deepcopy(payload),
+            "digest": digest,
+            "published_at": entry.event_at,
+        }
+        # Bound the file to the publisher's own capacity so a long-lived home
+        # does not accumulate one record per session it ever hosted.
+        while len(store) > self.publisher.budget.capacity:
+            store.pop(next(iter(store)))
+        try:
+            atomic_write(
+                self._card_store_path(),
+                json.dumps(store, ensure_ascii=False),
+                mode=0o600,
+            )
+        except OSError:
+            logger.debug("Failed to persist dynamic_card_store.json", exc_info=True)
+
+    def _stored_card(self, entry: CardEntry, digest: str) -> dict | None:
+        """The stored payload for this binding when its source is unchanged."""
+        record = self._load_card_store().get(entry.binding)
+        if not isinstance(record, dict) or record.get("digest") != digest:
+            return None
+        payload = record.get("payload")
+        return payload if isinstance(payload, dict) and payload.get("html") else None
+
     def set_enabled(self, enabled: bool) -> None:
         """Hot apply the owner's cost opt-in without resetting the hourly budget."""
         if self.enabled == enabled:
@@ -1165,10 +1219,34 @@ class CardLifecycle:
         reads = await asyncio.to_thread(_read_card_folds, entry.key)
         facts = dict(build_crew_main(reads))
         previous = entry.payload
+        tools = _tool_record(await asyncio.to_thread(_read_card_tools, entry.key, reads))
+        # LOOP-14: digest of the card SOURCE -- the redacted evidence rows, the
+        # folded reads, the tool record, AND the source stamp (rotation
+        # generation + chained keys). The stamp is what a rewrite moves without
+        # waiting for the rows to differ, so it belongs in the digest: a
+        # rewritten transcript must regenerate even when its newest rows happen
+        # to read the same. Never the "event"/"previous" inputs, which differ
+        # on every call by construction. A restart re-seeds every restored slot;
+        # when this digest equals the one stored beside the last published
+        # card, that card IS what this source produces, so the stored card is
+        # republished with no model call.
+        digest = hashlib.sha256(
+            json.dumps(
+                {"rows": rows, "facts": facts, "tools": tools, "source": source},
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        if previous is None:
+            stored = self._stored_card(entry, digest)
+            if stored is not None and self._valid(entry):
+                entry.generated_source = source
+                entry.published_source = source
+                return stored
         evidence: dict[str, Any] = {
             "event": entry.reason,
             "facts": facts,
-            **_tool_record(await asyncio.to_thread(_read_card_tools, entry.key, reads)),
+            **tools,
             # The model gets back its own layout and its own three sentences, never the
             # folded values bound into that layout: those are under "facts", read-only.
             "previous": (
@@ -1223,6 +1301,7 @@ class CardLifecycle:
         if await asyncio.to_thread(validate_source) != source:
             return None
         entry.generated_source = source
+        self._store_card(entry, payload, digest)
         return payload
 
     # ----------------------------------------------------------------------
