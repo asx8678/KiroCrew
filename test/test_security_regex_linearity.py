@@ -224,8 +224,17 @@ def test_credential_pattern_module_still_compiles_one_alternation() -> None:
 
     body = inspect_source(redaction_mod._credential_redaction_plan)
     assert "_credential_matches(text)" in body
-    assert "_CREDENTIAL_PATTERNS.search(text, pos)" in inspect_source(
-        redaction_mod._credential_matches
-    )
+    # Pass 1 is the merged two-channel scan: the shared alternation minus the
+    # multi-segment JWT branch, walked by ONE finditer (constant time per
+    # branch at a position it does not match), plus the JWT spans from their
+    # own linear channel -- see `_credential_matches`'s docstring. The literal
+    # spelling changed when the JWT branch moved out of the combined regex
+    # (a per-position engine retry there was quadratic); the invariant pinned
+    # here is the same: no locally compiled scan, and a single left-to-right
+    # pass per channel.
+    scan = inspect_source(redaction_mod._credential_matches)
+    assert "_CREDENTIAL_PATTERNS_SANS_JWT.finditer(text)" in scan
+    assert "_multi_segment_jwt_spans(text)" in scan
+    assert "re.compile(" not in scan
     assert "_might_contain_credential(text)" in body
     assert "re.compile(" not in body

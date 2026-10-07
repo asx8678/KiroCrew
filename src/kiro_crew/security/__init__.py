@@ -431,8 +431,9 @@ def redact(text: str) -> str:
 # phrase contains spaces and is the one pattern that can split on a terminator;
 # it is a non-secret header string and the final full-text pass still redacts
 # the persisted/displayed copy.)
-_CRED_CLASS: frozenset[str] = frozenset(
-    string.ascii_letters + string.digits + "_-+/=.:@%~" + '"' + "'" + "?&#"
+_CRED_CLASS: frozenset[str] = (
+    frozenset(string.ascii_letters + string.digits + "_-+/=.:@%~" + '"' + "'" + "?&#")
+    | redaction._FOLD_CHARS
 )
 
 # Upper bound on withheld trailing characters. Larger than the longest

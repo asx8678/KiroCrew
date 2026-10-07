@@ -1602,6 +1602,93 @@ _TOKEN_PARAM_PARTIAL_RE = re.compile(
 )
 
 
+#: Code points folded out of the redaction MATCHING subject: C0/C1
+#: controls other than tab and newline, DEL, and the Unicode format (Cf) range
+#: an invisible splitter hides in -- zero-width space/joiner, soft hyphen,
+#: BOM, the bidi family and the 0x2060 group. A credential or exfil URL split
+#: by any of these still RENDERS whole to a human on the dashboard or in a
+#: channel, and copy-paste carries it whole, so the redactor must match what
+#: the text says visually, not what its bytes say. Dropped from the subject
+#: ONLY: every matched span maps back onto the original, so the whole split
+#: token, separators included, is what gets replaced.
+_FOLD_INVISIBLE_STR = (
+    "\x00-\x08\x0b\x0c\r\x0e-\x1f\x7f-\x9f\u00ad\u200b-\u200f"
+    "\u202a-\u202e\u2060-\u206f\ufeff\ufff9-\ufffb"
+)
+_FOLD_PROBE_RE = re.compile(f"[{_FOLD_INVISIBLE_STR}]")
+
+#: ANSI escape sequences: multi-char invisible units (CSI `ESC [ ... m` and
+#: OSC `ESC ] ... BEL/ST`). A single-char fold leaves the sequence's visible
+#: bytes (`[0m`) inside the subject, splitting the token anyway, so whole
+#: sequences are dropped as units before the per-character fold.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9:;<=>?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+#: The same fold set as real characters, for the stream redactor's run class
+#: (:data:`kiro_crew.security._CRED_CLASS`): an invisible splitter inside a
+#: token is IN-RUN (non-terminating), so the held run is not committed in
+#: fragments around it and the batch fold pass redacts it whole at commit.
+_FOLD_CHARS: frozenset[str] = frozenset(
+    chr(cp)
+    for lo, hi in (
+        (0x00, 0x08),
+        (0x0B, 0x0D),
+        (0x0E, 0x1F),
+        (0x7F, 0x9F),
+        (0x00AD, 0x00AD),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2060, 0x206F),
+        (0xFEFF, 0xFEFF),
+        (0xFFF9, 0xFFFB),
+    )
+    for cp in range(lo, hi + 1)
+)
+
+
+def _fold_view(text: str) -> "tuple[str, list[int] | None]":
+    """The matching subject with invisible splitters dropped, plus the map back.
+
+    Returns ``(subject, index_map)``: ``index_map[i]`` is the ORIGINAL index
+    of ``subject[i]``, or ``None`` when nothing was folded -- the
+    overwhelmingly common case, which then runs the exact pre-fold code path
+    unchanged.
+    """
+    if _FOLD_PROBE_RE.search(text) is None and _ANSI_ESCAPE_RE.search(text) is None:
+        return text, None
+    # ANSI sequences drop as UNITS first (their visible bytes would otherwise
+    # split the token in the subject), then the single-character fold.
+    ansi_spans = [m.span() for m in _ANSI_ESCAPE_RE.finditer(text)]
+    chars: list[str] = []
+    index_map: list[int] = []
+    i = 0
+    ai = 0
+    n = len(text)
+    while i < n:
+        if ai < len(ansi_spans) and ansi_spans[ai][0] == i:
+            i = ansi_spans[ai][1]
+            ai += 1
+            continue
+        ch = text[i]
+        if not _FOLD_PROBE_RE.match(ch):
+            chars.append(ch)
+            index_map.append(i)
+        i += 1
+    if len(index_map) == n:
+        return text, None
+    return "".join(chars), index_map
+
+
+def _remap_span(span: _RedactionSpan, index_map: "list[int]") -> _RedactionSpan:
+    """Map one folded-subject span back onto the ORIGINAL text.
+
+    The span grows to swallow the folded separators inside it, which is the
+    point: the replacement covers the token AND the invisible bytes that
+    split it, so nothing the eye read as one credential survives.
+    """
+    start, end, replacement = span
+    return (index_map[start], index_map[end - 1] + 1, replacement)
+
+
 #: One redaction the batch redactor has decided on, positioned against the
 #: ORIGINAL text: ``(start, end, replacement)``. Every pass produces these and
 #: nothing is written until every pass has spoken.
@@ -1684,11 +1771,17 @@ def _splice(text: str, spans: list[_RedactionSpan]) -> str:
 def redact_credentials(text: str) -> tuple[str, list[str]]:
     """Redact raw credential patterns from text, including base64-encoded.
 
-    Returns (cleaned_text, list_of_warnings).
+    Returns (cleaned_text, list_of_warnings). The passes run on the
+    FOLD-folded subject (:func:`_fold_view`) so a token split by an invisible
+    code point still matches; every span is mapped back onto the original, so
+    the replacement covers the separators too.
     """
-    spans, warnings, _rules = _credential_redaction_plan(text)
+    subject, index_map = _fold_view(text)
+    spans, warnings, _rules = _credential_redaction_plan(subject)
     if not spans:
         return text, warnings
+    if index_map is not None:
+        spans = [_remap_span(s, index_map) for s in spans]
     return _splice(text, spans), warnings
 
 
@@ -1766,11 +1859,16 @@ def redact_credentials_with_records(text: str) -> tuple[str, list[str], list[Cre
 
     The cleaned text and warnings are byte-identical to ``redact_credentials``;
     both share one plan, so the records cannot describe a redaction the text
-    does not contain.
+    does not contain. A record's ``value`` is the ORIGINAL slice (separators
+    included) when the token was split by an invisible code point -- it is
+    what was actually removed, and it never leaves this process.
     """
-    spans, warnings, rules = _credential_redaction_plan(text)
+    subject, index_map = _fold_view(text)
+    spans, warnings, rules = _credential_redaction_plan(subject)
     if not spans:
         return text, warnings, []
+    if index_map is not None:
+        spans = [_remap_span(s, index_map) for s in spans]
     matches: list[CredentialMatch] = []
     ordinal = 0
     cursor = 0
