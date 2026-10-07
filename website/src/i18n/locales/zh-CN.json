@@ -14781,6 +14781,7 @@
         "advanced": "高级",
         "agent_model_pin_overrides_default": "<agent/> 代理上的新聊天使用它自己已置顶的模型 <model/>，而不是此设置。之后你可以在聊天模型选择器中再次置顶一个模型。",
         "agent_template_pin_overrides_default": "<agent/> 代理上的新聊天使用 <model/>，它来自该代理的模板或后端默认值，而不是此设置。该代理自身没有置顶模型，因此这里没有可清除的内容。要选择模型，请打开聊天模型选择器并将一个模型置顶到该代理。",
+        "agent_template_pin_overrides_auto": "新对话使用 <model/>，因为代理模板锁定了它，而不是此设置。清除模板锁定后将重新使用默认值。",
         "discovery": "发现",
         "rail_label": "聊天设置",
         "side_panel": "侧边面板",
