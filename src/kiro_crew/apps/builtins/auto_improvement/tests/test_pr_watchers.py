@@ -103,8 +103,15 @@ def _status(
 
 
 @pytest.fixture()
-def loop() -> Any:
-    """A real event loop on its own thread — the gateway loop the watcher bridges to."""
+def loop(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A real event loop on its own thread — the gateway loop the watcher bridges to.
+
+    Also stands the app in as ENABLED: the nudge loop's per-pass
+    is_app_enabled check (LOOP-26) reads installed.json, which a test host
+    has no reason to carry — the same stand-in test_finding_detail.py uses
+    for the route gate. Tests of the disable semantics un-patch it.
+    """
+    monkeypatch.setattr("kiro_crew.apps.manager.is_app_enabled", lambda _name: True)
     made = asyncio.new_event_loop()
     thread = threading.Thread(target=made.run_forever, daemon=True)
     thread.start()
@@ -630,6 +637,89 @@ class TestGitOutputDecoding:
         proc = pr_watchers._git("-C", str(repo), "diff", "HEAD~1...HEAD", timeout=60)
         assert (proc.stdout or "").strip() != ""
         assert "shot.png" in proc.stdout
+
+
+class TestDisableStopsWatchers:
+    """LOOP-26: disabling the app stops every PR watcher after at most its
+    current pass — the shutdown hook stops them outright, and a watcher whose
+    thread was mid-pass ends on the next pass boundary instead of spending
+    its remaining nudges against a disabled app."""
+
+    def test_a_watcher_mid_pass_ends_stopped_after_the_disable(
+        self, loop: Any, scripted: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scripted.script.append(_status(pr_checks.VERDICT_PROGRESS))
+        entered = threading.Event()
+        released = threading.Event()
+        second = threading.Event()
+
+        class ParkingRunner(StubRunner):
+            def run(self, prompt: str, **kw: Any) -> StubResult:
+                if not released.is_set():
+                    entered.set()
+                    released.wait(timeout=WAIT_S)  # park mid-pass
+                    return StubResult(ok=True, text="pass one done")
+                second.set()
+                return StubResult(ok=True, text="must not run")
+
+        enabled = {"on": True}
+        monkeypatch.setattr(
+            "kiro_crew.apps.manager.is_app_enabled", lambda _name: enabled["on"]
+        )
+        runner = ParkingRunner()
+        reg = _registry(loop, runner)
+        reg.start(
+            fp="fp-disable",
+            pr="https://github.com/owner/repo/pull/7",
+            max_nudges=6,
+            interval_s=0.0,
+        )
+        # Park the first pass, then disable the app MID-PASS and let the pass
+        # finish: the next pass boundary must end the watcher.
+        assert entered.wait(timeout=WAIT_S)
+        enabled["on"] = False
+        released.set()
+        snap = _await_status(reg, "fp-disable", {pr_watchers.STATUS_STOPPED})
+        assert "disabled" in snap["lastNote"]
+        assert not second.is_set(), "no second pass against a disabled app"
+        assert not reg.is_alive("fp-disable")
+        assert reg.active_summary().get("active", 0) == 0
+
+    def test_the_shutdown_hook_stops_the_whole_registry(
+        self, loop: Any, scripted: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """on_shutdown (the app's disable hook) stops the registry, not just
+        the run supervisor."""
+        import importlib
+
+        scripted.script.append(_status(pr_checks.VERDICT_PROGRESS))
+        runner = StubRunner()
+        reg = _registry(loop, runner)
+        reg.start(fp="fp-hook", pr="https://github.com/owner/repo/pull/7", max_nudges=6)
+
+        stopped: dict[str, int] = {}
+
+        class _FakeSupervisor:
+            def stop(self) -> None:
+                stopped["supervisor"] = 1
+
+        import kiro_crew.apps.builtins.auto_improvement.backend.crew as crew_mod
+
+        monkeypatch.setattr(
+            "kiro_crew.apps.builtins.auto_improvement.backend.runner.get_supervisor",
+            lambda: _FakeSupervisor(),
+        )
+        monkeypatch.setattr(
+            pr_watchers, "get_registry", lambda: reg, raising=False
+        )
+        importlib.reload(crew_mod)
+        # The hook the disable teardown invokes.
+        asyncio.run_coroutine_threadsafe(
+            crew_mod.on_shutdown(None), loop
+        ).result(timeout=WAIT_S)
+        assert stopped.get("supervisor") == 1
+        snap = _await_status(reg, "fp-hook", {pr_watchers.STATUS_STOPPED})
+        assert snap["status"] == pr_watchers.STATUS_STOPPED
 
 
 class TestCloneLifecycleAndExport:
