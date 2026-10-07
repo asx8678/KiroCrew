@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from kiro_crew.suggestions import (
     _FALLBACK_SUGGESTIONS,
     SUGGESTION_KINDS,
@@ -11,6 +13,59 @@ from kiro_crew.suggestions import (
     _parse_suggestions,
     _redact_suggestions,
 )
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_context_costs_no_second_model_call(monkeypatch):
+    """LOOP-10: two refreshes past the interval with an UNCHANGED context make
+    one model call — the second bumps generated_at on a matching digest — while
+    a changed context regenerates, and force=1 always does."""
+    from types import SimpleNamespace
+
+    from kiro_crew import suggestions as s
+
+    calls = {"n": 0}
+    contexts = {"i": 0}
+    built = ["x" * 120]
+
+    monkeypatch.setattr(s, "_build_context", lambda state: built[contexts["i"]], raising=False)
+
+    async def fake_generate(context, sessions=None):
+        calls["n"] += 1
+        return s._fallback()
+
+    monkeypatch.setattr(s, "_generate_from_context", fake_generate)
+    import time as _time
+
+    real_time = _time.time
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(s.time, "time", lambda: clock["t"])
+
+    cache = s.SuggestionsCache()
+    cache.generated_at = 0.0  # stale: the interval has passed
+    state = SimpleNamespace(_background_tasks=set())
+
+    await s.refresh_suggestions(state, cache)
+    assert calls["n"] == 1
+    first_digest = cache.context_digest
+    assert first_digest, "a generation records the digest it was built from"
+
+    # 31 minutes pass with no context change: the interval upper bound is met,
+    # but the digest matches, so no second model call — only the stamp moves.
+    clock["t"] = real_time() and 1_000.0 + 31 * 60
+    await s.refresh_suggestions(state, cache)
+    assert calls["n"] == 1
+    assert cache.generated_at == 1_000.0 + 31 * 60
+
+    # The recent-activity input changes: the digest differs, so it regenerates.
+    built[0] = "y" * 120
+    await s.refresh_suggestions(state, cache)
+    assert calls["n"] == 2
+
+    # force always regenerates, digest or not.
+    await s.refresh_suggestions(state, cache, force=True)
+    assert calls["n"] == 3
+    assert real_time() > 0
 
 
 def test_object_items_keep_a_known_kind() -> None:

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
@@ -24,7 +25,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Regenerate suggestions every 30 minutes
+# Regenerate suggestions every 30 minutes — an upper bound, not a schedule
+# (LOOP-10): a refresh whose rebuilt context hashes the same as the one the
+# current suggestions were built from skips the model call and only bumps the
+# stamp, so an unchanged Welcome view stops re-billing the background role.
 _REFRESH_INTERVAL_SECS = 30 * 60
 
 # The fixed vocabulary the dashboard maps to an icon. Anything else the model
@@ -88,6 +92,11 @@ class SuggestionsCache:
 
     suggestions: list[Suggestion] = field(default_factory=_fallback)
     generated_at: float = 0.0
+    #: LOOP-10: sha256 of the context the current suggestions were built from.
+    #: A refresh whose rebuilt context hashes the same skips the model call and
+    #: only bumps generated_at, so an unchanged Welcome view stops re-billing
+    #: the background role every interval.
+    context_digest: str = ""
     # LoopBoundLock, not asyncio.Lock: the cache is stored on the
     # long-lived DashboardState, which outlives any single event loop.
     _lock: LoopBoundLock = field(default_factory=LoopBoundLock, repr=False)
@@ -232,6 +241,15 @@ async def generate_suggestions(state: DashboardState) -> list[Suggestion]:
     # Offload to keep the event loop responsive (same pattern as this PR's other
     # two offload sites in sessions.py).
     context = await asyncio.to_thread(_build_context, state)
+    return await _generate_from_context(context, state.sessions)
+
+
+async def _generate_from_context(context: str, sessions: Any = None) -> list[Suggestion]:
+    """One model call over an already-built context (LOOP-10 split).
+
+    The context build and the model call separated so a refresh can hash the
+    rebuilt context BEFORE deciding to spend the call.
+    """
     if not context or len(context) < 50:
         logger.debug("Insufficient context for suggestions — using fallback")
         return _fallback()
@@ -245,7 +263,7 @@ async def generate_suggestions(state: DashboardState) -> list[Suggestion]:
     # of failing permanently. Best-effort: on any error fall back to the static
     # suggestions rather than surfacing it.
     try:
-        text = await run_bg_oneliner(state.sessions, prompt, sel_source="suggestions", timeout=60)
+        text = await run_bg_oneliner(sessions, prompt, sel_source="suggestions", timeout=60)
     except Exception:
         logger.warning("Suggestions generation failed", exc_info=True)
         return _fallback()
@@ -259,13 +277,27 @@ async def generate_suggestions(state: DashboardState) -> list[Suggestion]:
     return _fallback()
 
 
-async def refresh_suggestions(state: DashboardState, cache: SuggestionsCache) -> None:
-    """Background task: regenerate suggestions."""
+async def refresh_suggestions(
+    state: DashboardState, cache: SuggestionsCache, *, force: bool = False
+) -> None:
+    """Background task: regenerate suggestions when the context changed.
+
+    LOOP-10: the rebuilt context is hashed against the digest the current
+    suggestions were built from — an unchanged context skips the model call and
+    only bumps ``generated_at`` (the interval stays the upper bound), while
+    *force* always regenerates.
+    """
     async with cache._lock:
         try:
-            suggestions = await generate_suggestions(state)
+            context = await asyncio.to_thread(_build_context, state)
+            digest = hashlib.sha256(context.encode("utf-8")).hexdigest()
+            if not force and digest == cache.context_digest:
+                cache.generated_at = time.time()
+                return
+            suggestions = await _generate_from_context(context)
             cache.suggestions = suggestions
             cache.generated_at = time.time()
+            cache.context_digest = digest
         except Exception:
             logger.warning("Suggestions generation failed", exc_info=True)
 
@@ -307,7 +339,7 @@ async def api_suggestions(request: web.Request) -> web.Response:
 
     if force:
         try:
-            await asyncio.wait_for(refresh_suggestions(state, cache), timeout=45)
+            await asyncio.wait_for(refresh_suggestions(state, cache, force=True), timeout=45)
         except (asyncio.TimeoutError, Exception):
             pass
     elif cache.generated_at == 0:
