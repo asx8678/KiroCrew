@@ -5630,6 +5630,75 @@ class TestBackgroundSession:
         await mgr.close_all()
 
 
+class TestBootKickSandboxSweep:
+    """REL-22: the gateway boot hook starts the cleanup loop — and its sandbox
+    sweep — with NO session ever created, so an idle/headless gateway and a
+    host whose tmpfs is already exhausted (which cannot spawn the session that
+    used to be the only trigger) still reclaim dead kirocrew_sb_* entries."""
+
+    @pytest.mark.asyncio
+    async def test_the_boot_kick_sweeps_without_any_session(self, cfg):
+        from types import SimpleNamespace
+
+        from kiro_crew.dashboard.server_runtime import maintenance
+
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        swept = asyncio.Event()
+        count = {"n": 0}
+
+        def _count(*a, **kw):
+            count["n"] += 1
+            swept.set()
+            return 0
+
+        with (
+            patch("kiro_crew.session.cleanup_stale_sandbox_profiles", side_effect=_count),
+            patch("kiro_crew.session._cleanup_orphaned_mcp_servers", return_value=0),
+            patch("kiro_crew.session._collect_active_pids", return_value=({}, True)),
+            patch("kiro_crew.session._periodic_pid_sweep", return_value=([], [])),
+            patch("kiro_crew.session._kill_confirmed_and_writeback", return_value=0),
+            patch("kiro_crew.session.cleanup_orphaned_session_roots", return_value=0),
+            patch("kiro_crew.session.find_orphan_mcp_candidates", return_value=[]),
+            patch("kiro_crew.session.shutdown_event") as mock_event,
+        ):
+            mock_event.is_set = lambda: swept.is_set()
+            mock_event.wait = AsyncMock(side_effect=asyncio.TimeoutError)
+            # The boot hook — NOT get_or_create: no session is ever created.
+            maintenance._kick_cleanup_loop(SimpleNamespace(sessions=mgr))
+            assert mgr._cleanup_boundary().state.cleanup_task is not None
+            await asyncio.wait_for(swept.wait(), timeout=10.0)
+
+        assert count["n"] >= 1
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_later_registration_still_finds_one_loop(self, cfg):
+        """The kick is idempotent: a session registering afterwards must not
+        stack a second cleanup task."""
+        from types import SimpleNamespace
+
+        from kiro_crew.dashboard.server_runtime import maintenance
+
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        with (
+            patch("kiro_crew.session.cleanup_stale_sandbox_profiles", return_value=0),
+            patch("kiro_crew.session._cleanup_orphaned_mcp_servers", return_value=0),
+            patch("kiro_crew.session._collect_active_pids", return_value=({}, True)),
+            patch("kiro_crew.session._periodic_pid_sweep", return_value=([], [])),
+            patch("kiro_crew.session._kill_confirmed_and_writeback", return_value=0),
+            patch("kiro_crew.session.cleanup_orphaned_session_roots", return_value=0),
+            patch("kiro_crew.session.find_orphan_mcp_candidates", return_value=[]),
+            patch("kiro_crew.session.shutdown_event") as mock_event,
+        ):
+            mock_event.is_set = lambda: True  # end immediately
+            mock_event.wait = AsyncMock(side_effect=asyncio.TimeoutError)
+            maintenance._kick_cleanup_loop(SimpleNamespace(sessions=mgr))
+            first = mgr._cleanup_boundary().state.cleanup_task
+            mgr._ensure_cleanup_task()  # the registration point
+            assert mgr._cleanup_boundary().state.cleanup_task is first
+        await mgr.close_all()
+
+
 class TestCleanupLoopResilience:
     """Tests that _cleanup_loop survives _expire_idle exceptions."""
 
