@@ -2041,6 +2041,22 @@ class SessionLifecycleService:
                             invalidated_keys.append(key)
                             skipped = True
                             continue
+                        # Busy by live children, not by the semaphore: a parent
+                        # that ended its turn with ``spawn_run`` children still
+                        # RUNNING or QUEUED is idle by the semaphore test, yet
+                        # retiring it would cancel them mid-prompt ("provider
+                        # shutdown") — the #17360 shape. The same snapshot the
+                        # retire path below would cancel through is the
+                        # predicate, so "busy" means exactly "has children this
+                        # sweep would stop"; the parent is flagged like a
+                        # locked one and retired at its next acquire after the
+                        # children end, and it keeps the sweep incomplete so
+                        # the turn gate re-checks rather than re-kills.
+                        if self._snapshot_parent_children(key):
+                            sess.retire_on_identity_change = True
+                            invalidated_keys.append(key)
+                            skipped = True
+                            continue
                         del owner._sessions[key]
                         owner._advance_session_generation(key)
                         owner._compact_cooldown_until.pop(key, None)
