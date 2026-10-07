@@ -351,6 +351,38 @@ class TestHistoricNamespace:
             return
         assert getattr(h, name) is getattr(module, attr or name)
 
+    def test_parallel_brief_tells_children_to_carry_no_inheritance(self, monkeypatch, tmp_path):
+        """LOOP-13: a parallel cycle's spawn_run tasks carry the sub-question
+        text only — include_memory=false, include_lessons=false,
+        include_project=false — because the sub-question is fully specified and
+        inherited context only spends each child's window on facts it does not
+        need."""
+        from kiro_crew.apps.builtins.auto_research.campaign import publication
+
+        row = {
+            "question": "How do octopuses sleep?",
+            "sub_questions": json.dumps(["Do they dream?", "Where do they rest?"]),
+            "sources": "[]",
+            "scope_constraints": "[]",
+            "max_cycles": 30,
+            "auto_approve": 1,
+            "success_criteria": "",
+            "parallel_workers": 3,
+        }
+        monkeypatch.setattr(publication.storage, "_campaign_dir", lambda cid: tmp_path)
+        publication._write_brief("camp-1", row)
+        brief = (tmp_path / "brief.md").read_text(encoding="utf-8")
+        assert "**Parallel execution:**" in brief
+        assert "3 parallel worker slots" in brief
+        assert "include_memory=false" in brief
+        assert "include_lessons=false" in brief
+        assert "include_project=false" in brief
+
+        row["parallel_workers"] = 1
+        publication._write_brief("camp-1", row)
+        single = (tmp_path / "brief.md").read_text(encoding="utf-8")
+        assert "**Parallel execution:**" not in single
+
     def test_status_values_are_the_persisted_strings(self):
         assert [s.value for s in h.CampaignStatus] == [
             "ready",

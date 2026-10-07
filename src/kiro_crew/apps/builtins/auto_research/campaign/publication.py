@@ -163,6 +163,10 @@ def _write_brief(cid: str, row: Any) -> None:
             "use `spawn_run` with a `tasks` array to investigate up to "
             f"{pw} open sub-questions simultaneously (one task per sub-question). "
             "Each task should be a self-contained research instruction for that sub-question. "
+            "Pass `include_memory=false`, `include_lessons=false` and "
+            "`include_project=false` on each task: the sub-question text is fully "
+            "specified, so inherited memory, lessons and project files only spend "
+            "each child's context on facts it does not need (LOOP-13). "
             "Wait for all completion events, then synthesize results into your cycle finding. "
             f"If fewer than {pw} sub-questions remain open, spawn only as many as needed.",
         ]
