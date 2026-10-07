@@ -94,6 +94,28 @@ def test_a_known_smaller_window_still_scales_the_ceiling_down():
     assert small < ctx._PROTECTED_CONTEXT_FLOOR
 
 
+def test_an_unknown_model_window_is_named_once_per_id(caplog, monkeypatch):
+    """CTX-18: the 1M-reference fallback for an unlisted id is a documented
+    design choice, but it was invisible — now exactly one INFO per id per
+    process names it; '' / 'auto' / known ids log nothing."""
+    import logging
+
+    from kiro_crew.context_assembly import budget as budget_mod
+
+    budget_mod._UNKNOWN_WINDOW_WARNED.clear()
+    with caplog.at_level(logging.INFO, logger="kiro_crew.context"):
+        assert budget_mod.resolve_model_window("some-new-model-x") is None
+        assert budget_mod.resolve_model_window("some-new-model-x") is None  # once per id
+        assert ctx.resolve_model_window("claude-opus-4.5") == 200_000
+        assert ctx.resolve_model_window("") is None
+        assert ctx.resolve_model_window("auto") is None
+
+    named = [r for r in caplog.records if "no known context window" in r.getMessage()]
+    assert len(named) == 1
+    assert "some-new-model-x" in named[0].getMessage()
+    assert named[0].levelno == logging.INFO
+
+
 # ── Fail-safe fallbacks (must never shrink the default deployment) ───────────
 
 

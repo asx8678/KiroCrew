@@ -162,6 +162,15 @@ Thread history has its own reference base, `_HISTORY_REFERENCE_BASE`, and takes
 deadline covers a whole prompt build: `_PROMPT_BUILD_EMBED_TIMEOUT_SECS`, five
 seconds.
 
+An id no tier can place (`resolve_model_window` → `None`) keeps the 1M-reference
+budgets by design — an unresolved window must never silently shrink the default
+deployment — and that fallback is visible (CTX-18): one INFO per id per process
+names the id and says budgets use the 1M reference until the backend reports a
+window. Windows ARE re-resolved after the first turn (`window_for_provider_client`
+prefers the live usage-reported window, and the kiro-list cache learns ids from
+`kiro-cli chat --list-models`), so only a genuinely unlisted id's first-turn build
+uses the reference.
+
 - **Admission is by whole block, never by slicing the joined prompt.** Protected
   blocks (rules, preferences, identity, steering, pinned skill bodies) go first and
   are never truncated below the model-safe ceiling; the rest spend what is left, and

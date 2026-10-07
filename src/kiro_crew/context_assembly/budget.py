@@ -218,6 +218,25 @@ def _resolve_caps_cached(window: int) -> _ResolvedCaps:
     )
 
 
+#: CTX-18: ids already named this process. The unknown-window fallback is
+#: deliberate (it must never silently shrink the default deployment), but it
+#: was invisible — one log line per id makes it visible without spamming every
+#: session start.
+_UNKNOWN_WINDOW_WARNED: set[str] = set()
+
+
+def _warn_unknown_window(model: str) -> None:
+    """Name an unknown-window model once per id per process (CTX-18)."""
+    if model in _UNKNOWN_WINDOW_WARNED:
+        return
+    _UNKNOWN_WINDOW_WARNED.add(model)
+    logger.info(
+        "Model %s has no known context window — budgets use the 1M reference "
+        "until the backend reports one",
+        model,
+    )
+
+
 def resolve_model_window(model: str | None) -> int | None:
     """Map a model string to a context window in tokens for budget scaling.
 
@@ -253,7 +272,15 @@ def resolve_model_window(model: str | None) -> int | None:
     # genuinely-unknown model, so an unrecognized id keeps the full reference
     # budget (via _effective_window(None)) rather than being wrongly shrunk —
     # exactly the guarantee this function existed to provide, now centralized.
-    return ctx.model_registry.model_window(model)
+    window = ctx.model_registry.model_window(model)
+    if window is None:
+        # CTX-18: the fallback is a documented design choice; this only makes
+        # it VISIBLE — one INFO per id per process, never per session start.
+        # '' / 'auto' never reach here (guarded above); a [1m] heuristic id is
+        # not "unknown" either, so only a genuinely unlisted id logs.
+        if ctx.model_registry.window_source(model) == "unknown":
+            _warn_unknown_window(model)
+    return window
 
 
 def window_for_provider_client(client: object) -> int | None:
