@@ -292,6 +292,14 @@ class WatchdogSettings:
     stale_window_secs: float = 600.0
     tool_stall_suspect_secs: float = 5400.0
     tool_stall_hard_cap_secs: float = 7200.0
+    #: Ceiling for WORKING-verdict deferral of an OPAQUE MCP tool (not a
+    #: matched shell child, not the declared-duration wait). The oracle reads
+    #: WORKING for any CPU/IO movement in the runtime's whole descendant tree
+    #: — every MCP server, not just the one serving this call — so a lost
+    #: result frame holds the call open to the turn ceiling without this.
+    #: 0 disables the cap (the pre-change behavior). Default: the hard cap,
+    #: so a lost frame recovers at 2h instead of the 4h turn ceiling.
+    tool_working_opaque_cap_secs: float = 7200.0
     model_silent_probe_secs: float = 1800.0
     remote_flat_probe_secs: float = 0.0
     wellness_sample_secs: float = 3.0
@@ -328,6 +336,7 @@ _TURN_BOUNDED_WINDOWS = (
     "stale_window_secs",
     "tool_stall_suspect_secs",
     "tool_stall_hard_cap_secs",
+    "tool_working_opaque_cap_secs",
     "model_silent_probe_secs",
     "remote_flat_probe_secs",
 )
@@ -4429,12 +4438,39 @@ class AcpSessionHandle:
                             parked_at_own_data = self._parked_total
                             continue
                         if verdict == VERDICT_WORKING:
-                            # Stamped after the consult returns: the probe
-                            # observed the tool at the end of its await, so
-                            # the pre-consult clock would shorten the window.
-                            tool_moved_ts = time.monotonic()
-                            self._log_working_deferral(_tool_idle, evidence, timeout)
-                            continue
+                            # Opaque-MCP WORKING ceiling: the oracle reads WORKING
+                            # whenever ANY CPU/IO movement exists in the runtime's
+                            # whole descendant tree — every MCP server under this
+                            # kiro-cli, not just the one serving this call — so a
+                            # lost result frame holds the call open to the turn
+                            # ceiling without this cap. An opaque tool (not a
+                            # matched shell child, not the declared-duration wait)
+                            # whose elapsed dispatch time exceeds the cap falls
+                            # through to the existing tool-stall recovery.
+                            _tool_state = self._inflight_tool
+                            _opaque_cap = wd.tool_working_opaque_cap_secs
+                            if (
+                                _opaque_cap > 0
+                                and _tool_state is not None
+                                and not _tool_state.is_shell
+                                and _tool_idle > _opaque_cap
+                            ):
+                                verdict = VERDICT_UNKNOWN
+                                evidence = (
+                                    f"opaque mcp working cap exceeded "
+                                    f"({_opaque_cap:.0f}s): {evidence}"
+                                )
+                                # Fall through to the UNKNOWN handling below; the
+                                # opaque cap is at most the hard cap and
+                                # _tool_idle already exceeds it, so
+                                # _full_suspect narrows to fire the recovery.
+                            else:
+                                # Stamped after the consult returns: the probe
+                                # observed the tool at the end of its await, so
+                                # the pre-consult clock would shorten the window.
+                                tool_moved_ts = time.monotonic()
+                                self._log_working_deferral(_tool_idle, evidence, timeout)
+                                continue
                         # UNKNOWN acts at the suspect window. The suspect
                         # default (90 min) is BUILD-scale forbearance — an LLM-shaped
                         # stall (flat subtree whose only live evidence is an
@@ -4457,6 +4493,12 @@ class AcpSessionHandle:
                         # is the existing non-lethal tool-stall recovery.
                         _suspect = wd.tool_stall_suspect_secs
                         _full_suspect = min(_suspect, wd.tool_stall_hard_cap_secs)
+                        # An opaque-MCP WORKING reclassified above: the cap is
+                        # already exceeded, so narrow the effective window to
+                        # it and the existing recovery fires on this iteration
+                        # instead of waiting out the full suspect window.
+                        if "opaque mcp working cap exceeded" in evidence:
+                            _full_suspect = min(_full_suspect, wd.tool_working_opaque_cap_secs)
                         # Idle measure the chosen window is compared against. Only
                         # the remote_flat narrowing swaps it for a stricter one.
                         _window_idle = _tool_idle
@@ -4608,8 +4650,25 @@ class AcpSessionHandle:
                         if self._runtime._last_activity > _stale_runtime_before:
                             continue
                         if verdict == VERDICT_WORKING:
-                            self._log_working_deferral(_stale_idle, evidence, timeout)
-                            continue
+                            # Same opaque-MCP ceiling as the tool-idle branch
+                            # above; the stale-clock path reaches WORKING the
+                            # same way (subtree movement on a stale runtime).
+                            _tool_state = self._inflight_tool
+                            _opaque_cap = wd.tool_working_opaque_cap_secs
+                            if (
+                                _opaque_cap > 0
+                                and _tool_state is not None
+                                and not _tool_state.is_shell
+                                and _stale_idle > _opaque_cap
+                            ):
+                                verdict = VERDICT_UNKNOWN
+                                evidence = (
+                                    f"opaque mcp working cap exceeded "
+                                    f"({_opaque_cap:.0f}s, stale): {evidence}"
+                                )
+                            else:
+                                self._log_working_deferral(_stale_idle, evidence, timeout)
+                                continue
                         _flat_wait = evidence.startswith(EVIDENCE_ESTABLISHED_FLAT)
                         if verdict != VERDICT_DEAD:
                             # UNKNOWN: probe only past the window. An established-

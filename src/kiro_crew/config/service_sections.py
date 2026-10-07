@@ -256,6 +256,24 @@ class WatchdogConfig:
             "callers that pass a larger prompt timeout (review and cron turns).",
         ),
     )
+    tool_working_opaque_cap_secs: float = field(
+        default=7200.0,
+        metadata=_meta(
+            "Opaque MCP WORKING cap (s)",
+            "Ceiling for WORKING-verdict deferral of an opaque MCP tool (not a "
+            "matched shell child, not the declared-duration wait). The liveness "
+            "oracle reads WORKING whenever ANY CPU/IO movement exists in the "
+            "runtime's whole descendant tree — every MCP server under this "
+            "kiro-cli, not just the one serving the call — so a lost result "
+            "frame would otherwise hold the call open until the turn ceiling "
+            "(agent.chat_turn_timeout_secs, default 4h). Past this cap the call "
+            "is routed to the existing non-lethal tool-stall recovery instead. "
+            "0 disables the cap (WORKING tools are never cancelled, the "
+            "pre-change behavior). Default 2h, matching the hard cap, so a lost "
+            "frame recovers at 2h rather than the turn ceiling. Clamped to the "
+            "transport's per-prompt timeout like every other window.",
+        ),
+    )
     tool_stall_hard_cap_secs: float = field(
         default=7200.0,
         metadata=_meta(
