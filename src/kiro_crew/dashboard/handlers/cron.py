@@ -2836,6 +2836,10 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     # which the context builder serves as a standing rule. Both write paths carry
     # it so the JSONL fallback tiers identically to the vector store.
     applies = cleaned.get("applies") or None
+    # Provenance (SEC-11, decision (b)): the learn_add MCP tool tags its own
+    # writes "agent" so the injected block can frame them as advisory; the
+    # dashboard and CLI send no source and stay user_explicit.
+    source = cleaned.get("source") or "user_explicit"
     # Write to vector store if available, else JSONL
     # THE CALLER'S silo, not the global store. This is the agent's only durable
     # memory-write surface, so writing globally let a crew bound to one silo steer
@@ -2879,7 +2883,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             rule,
             category,
             negative,
-            "user_explicit",
+            source,
             rule_emb,
             rule_emb_generation,
             repo_scope,
@@ -2952,6 +2956,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             negative=negative,
             repo_scope=repo_scope,
             applies=applies,
+            source=source,
             ts=datetime.now(timezone.utc).isoformat(),
         )
         store = _lesson_jsonl_store(state, _lesson_silo, scope, cleaned.get("workspace"))

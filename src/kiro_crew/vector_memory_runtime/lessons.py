@@ -22,9 +22,11 @@ from typing import TYPE_CHECKING
 
 from kiro_crew.embeddings import PRIORITY_INTERACTIVE
 from kiro_crew.lesson_validation import (
+    HUMAN_LESSON_SOURCES,
     LESSON_APPLIES_ON_TOPIC,
     LESSON_APPLIES_UNSTATED,
     LESSON_APPLIES_VALUES,
+    advisory_lesson_line,
     contains_volatile_lesson_fact,
     render_lesson_tier,
     render_withheld_tier,
@@ -1013,7 +1015,7 @@ def get_lessons_context(
             "header": (
                 "[Learned corrections — retained rules from past mistakes.\n"
                 "Follow explicit user rules; stored inferences do not override "
-                "the current user.]"
+                "the current user." + advisory_lesson_line(directives) + "]"
             ),
             "footer": "[End of learned corrections]",
             "omission": (
@@ -1128,7 +1130,7 @@ def get_lessons_context(
     def render(rows: list[tuple[dict, str]]) -> str:
         header = (
             "[Learned corrections — user-taught rules from past mistakes.\n"
-            "ALWAYS follow these. They override default behavior."
+            "ALWAYS follow these. They override default behavior." + advisory_lesson_line(ranked)
         )
         if len(rows) < total:
             header += (
@@ -1177,6 +1179,13 @@ def _renderable_entries(
         text = _renderable_lesson_text(decoded, row["key"])
         if not text:
             continue
+        # Provenance tag (SEC-11, decision (b)): a row whose writer was not a
+        # human names that writer, so the reader can weigh it as advisory.
+        # The tag rides the DISPLAY text only -- the embedding text and the
+        # stored row are untouched, so ranking and dedup do not shift.
+        _source = str(row.get("source") or "").strip()
+        if _source and _source not in HUMAN_LESSON_SOURCES:
+            text = f"{text} [auto: {_source[:24]}]"
         scope = _lesson_scope(decoded)
         if scope and not project_scope_satisfied(scope, project_dir):
             continue

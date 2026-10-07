@@ -17,9 +17,11 @@ from pathlib import Path
 
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.lesson_validation import (
+    HUMAN_LESSON_SOURCES,
     LESSON_APPLIES_ALWAYS,
     LESSON_APPLIES_ON_TOPIC,
     LESSON_APPLIES_VALUES,
+    advisory_lesson_line,
     any_request_overlap,
     contains_volatile_lesson_fact,
     order_by_request_relevance,
@@ -135,6 +137,11 @@ class Lesson:
     # from ``category``, ``ts`` or wording -- see
     # ``kiro_crew.lesson_validation.normalize_lesson_applies``.
     applies: str | None = None
+    # Provenance of the write (SEC-11, decision (b)): "agent" marks the
+    # learn_add MCP tool's own write, "consolidation"/"taskrunner" mark
+    # automatic extraction, and ``None`` is every legacy row. The injected
+    # block tags non-human sources and frames them as advisory.
+    source: str | None = None
 
 
 # ── Storage ──
@@ -153,6 +160,10 @@ def _serializable(lesson: Lesson) -> dict:
     row = asdict(lesson)
     if row.get("applies") is None:
         row.pop("applies", None)
+    # Same additive contract as ``applies``: a legacy row stays byte-identical
+    # on the next save, and only a row that names its writer carries the key.
+    if row.get("source") is None:
+        row.pop("source", None)
     return row
 
 
@@ -600,6 +611,11 @@ class LessonStore:
                             and data["applies"].strip().lower() in LESSON_APPLIES_VALUES
                             else None
                         ),
+                        source=(
+                            data["source"].strip()
+                            if isinstance(data.get("source"), str) and data["source"].strip()
+                            else None
+                        ),
                     )
                 )
             except (json.JSONDecodeError, KeyError):
@@ -679,13 +695,13 @@ class LessonStore:
                 unclassified.append(lesson)
 
         def entries(rows: list[Lesson]) -> list[tuple[object, str]]:
-            return [
-                (
-                    lesson,
-                    f"{lesson.rule} — {lesson.negative}" if lesson.negative else lesson.rule,
-                )
-                for lesson in rows
-            ]
+            out: list[tuple[object, str]] = []
+            for lesson in rows:
+                text = f"{lesson.rule} — {lesson.negative}" if lesson.negative else lesson.rule
+                if lesson.source and lesson.source not in HUMAN_LESSON_SOURCES:
+                    text = f"{text} [auto: {lesson.source[:24]}]"
+                out.append((lesson, text))
+            return out
 
         # Every tier is ordered by relevance to this request before the budget cuts,
         # and ordered PER TIER so authored rules keep their precedence over untagged
@@ -703,9 +719,14 @@ class LessonStore:
         directive_block, _ = render_lesson_tier(
             ranked_directives,
             directive_room,
+            # The advisory line is minted only when a tagged row is present, so
+            # an untagged store keeps its exact byte shape and budget (SEC-11,
+            # decision (b)).
             header=(
                 "[Learned corrections — user-taught rules from past mistakes.\n"
-                "ALWAYS follow these. They override default behavior.]"
+                "ALWAYS follow these. They override default behavior."
+                + advisory_lesson_line(ranked_directives)
+                + "]"
             ),
             footer="[End of learned corrections]",
             omission=(
