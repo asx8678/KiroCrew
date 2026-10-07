@@ -3643,11 +3643,14 @@ ever shared the FILTERED result would fail whichever agent asked second.
 The `kirocrew-dev` family is repository-maintainer guidance, not user-project
 advice: isolated implementation, test authoring, PR delivery and monitoring belong
 to `kirocrew-worktree-dev`, `writing-tests`, `kirocrew-prepare-pr` and `babysit`
-respectively, so each contract stays single-owned. None of them carries
-`repo_scope`: they load in every session like any other skill, and each one that
-is specific to this repository says so in its description ("Kiro Crew repo
-only"), so the model decides from the description whether the task is about this
-repository. The dev-fleet app's `pod-e2e` skill follows the same rule.
+respectively, so each contract stays single-owned. The three repo-specific ones
+(`kirocrew-worktree-dev`, `writing-tests`, `kirocrew-prepare-pr`) and
+`dashboard-template` carry `repo_scope: src/kiro_crew`, so the loader admits
+them — for injection, `skill_search` and the catalog — only when the session's
+active project is this repository; their prose "Kiro Crew repo only" scope
+guards were never obeyed mechanically, and with triggers on they injected
+hundreds of KB into unrelated projects' sessions. `babysit` is a general skill
+and carries no scope. The dev-fleet app's `pod-e2e` skill follows the same rule.
 
 A builtin skill that moves (`_RELOCATED_SKILLS`) has its old copy quarantined by
 the sync, and `agent.migrate_relocated_skill_uris` points every agent spec that

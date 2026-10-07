@@ -1,4 +1,5 @@
 ---
+repo_scope: src/kiro_crew
 name: dashboard-template
 description: "Kiro Crew repo only: load this when a task will author or change a dashboard page. A page never ships alone: the same PR carries its TypedDict contract, its provider, and a parity test that the two agree. Scaffold all four from one field list; read numbers from an existing fold, never type them."
 triggers: dashboard template, dashboard card, data-dashboard-field, template contract, card contract, dashboard html, panel template, new dashboard, scaffold template

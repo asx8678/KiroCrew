@@ -1,4 +1,5 @@
 ---
+repo_scope: src/kiro_crew
 name: kirocrew-worktree-dev
 description: "HARD RULE for developing the Kiro Crew source repo ITSELF (not users' projects): develop, build and verify in a git worktree, never against the live gateway. Covers env setup, main-clone sync, build/dist ordering, flags, previews, cleanup, publish authorization; kirocrew-prepare-pr owns PRs."
 triggers: kirocrew worktree, kirocrew main clone sync, kirocrew build gate, kirocrew dev, kirocrew source, contribute to kirocrew, kirocrew repo

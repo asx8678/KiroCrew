@@ -1,4 +1,5 @@
 ---
+repo_scope: src/kiro_crew
 name: kirocrew-prepare-pr
 description: LOAD THIS FOR EVERY KIRO CREW PR you open or update (Kiro Crew repo only; not other repos or CRs). Runs the whole loop — issue + tier, commit, sync, squash, push, drive CI and AI review to green, fix a red main, arm auto-merge and watch it land (24h). 'push my changes' = prepare-only.
 always: false
