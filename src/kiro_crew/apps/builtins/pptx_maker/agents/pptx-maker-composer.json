@@ -12,10 +12,7 @@
   },
   "prompt": "file://{ENGINE_ROOT}/mcp-local/acp-agent-prompts/composer.md",
   "resources": [
-    "file://{ENGINE_ROOT}/skill/references/workflows/create-new-2-compose.md",
-    "file://{ENGINE_ROOT}/skill/references/workflows/create-new-3-review.md",
-    "file://{ENGINE_ROOT}/skill/references/workflows/slide-json-spec.md",
-    "file://{ENGINE_ROOT}/skill/references/guides/grid.md"
+    "file://{ENGINE_ROOT}/skill/references/slide-json-spec.md"
   ],
   "tools": [
     "@sdpm/analyze_template", "@sdpm/apply_style", "@sdpm/code_to_slide",
