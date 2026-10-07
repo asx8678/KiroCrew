@@ -1360,6 +1360,11 @@ _HOST_VERDICT_CACHE_CAP = 4096
 # is this floor's safe direction.
 _HOST_VERDICT_ALLOW_TTL = 300.0
 _HOST_VERDICT_STAMP: "dict[str, float]" = {}
+# The own-set generation a DENY verdict was computed under: ``-1`` marks a
+# permanent deny (a loopback/unspecified target), a non-negative number the
+# own-set generation at verdict time.  ``_resolved_host_verdict`` revalidates a
+# deny whose generation no longer matches the current own set.
+_HOST_VERDICT_GEN: "dict[str, int]" = {}
 
 
 def _resolve_host_verdict_into_cache(host: str) -> None:
@@ -1374,6 +1379,7 @@ def _resolve_host_verdict_into_cache(host: str) -> None:
     """
     verdict = False
     resolved_ok = True
+    permanent_self = False
     try:
         infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
         own = _own_host_names()
@@ -1386,7 +1392,11 @@ def _resolve_host_verdict_into_cache(host: str) -> None:
             mapped = getattr(ip, "ipv4_mapped", None)
             if mapped is not None:
                 ip = mapped
-            if ip.is_loopback or ip.is_unspecified or str(ip).lower() in own:
+            if ip.is_loopback or ip.is_unspecified:
+                verdict = True
+                permanent_self = True
+                break
+            if str(ip).lower() in own:
                 verdict = True
                 break
     except Exception:
@@ -1397,8 +1407,17 @@ def _resolve_host_verdict_into_cache(host: str) -> None:
                 evicted = next(iter(_HOST_VERDICT_CACHE))
                 _HOST_VERDICT_CACHE.pop(evicted)
                 _HOST_VERDICT_STAMP.pop(evicted, None)
+                _HOST_VERDICT_GEN.pop(evicted, None)
             _HOST_VERDICT_CACHE[host] = verdict
             _HOST_VERDICT_STAMP[host] = time.monotonic()
+            if verdict:
+                # A loopback/unspecified deny is permanent; an own-address deny
+                # is tagged with the own-set generation it was computed under,
+                # so an own-set change revalidates it instead of serving it
+                # for the process life.
+                _HOST_VERDICT_GEN[host] = -1 if permanent_self else _OWN_SET_GENERATION
+            else:
+                _HOST_VERDICT_GEN.pop(host, None)
         _HOST_VERDICT_PENDING.discard(host)
 
 
@@ -1738,11 +1757,28 @@ def _resolved_host_verdict(host: str, *, fail_closed: bool = True) -> bool:
             # round-18: an aged ALLOW is served stale exactly while ONE
             # revalidation worker runs -- rebinding to loopback is caught at
             # the next publish, without a recurring first-contact refusal.
-            if (
+            aged_allow = (
                 not verdict
                 and host not in _HOST_VERDICT_PENDING
                 and time.monotonic() - _HOST_VERDICT_STAMP.get(host, 0.0) > _HOST_VERDICT_ALLOW_TTL
-            ):
+            )
+            # A DENY recorded against an older own-set generation is served
+            # stale exactly the same way: the own address it matched may have
+            # left this machine (VPN detached, lease expired), and without
+            # this the refusal stayed permanent for the process life while
+            # the own set had long since moved on.  A loopback/unspecified
+            # deny (generation -1) never revalidates.  ``_OWN_SET_GENERATION``
+            # is a plain int read: a stale value only defers the
+            # revalidation to the next decision.
+            recorded_gen = _HOST_VERDICT_GEN.get(host)
+            stale_generation_deny = (
+                verdict
+                and recorded_gen is not None
+                and recorded_gen >= 0
+                and recorded_gen != _OWN_SET_GENERATION
+                and host not in _HOST_VERDICT_PENDING
+            )
+            if aged_allow or stale_generation_deny:
                 _HOST_VERDICT_PENDING.add(host)
                 try:
                     threading.Thread(
@@ -1958,6 +1994,25 @@ _OWN_HOST_REFRESH_SECS = 300.0
 # single-flight latch — True while an enrichment worker is alive; gates the
 # spawn in ``_own_host_names`` and is cleared in the worker's finally.
 _OWN_HOST_RESOLVE_IN_FLIGHT = False
+# The LIVE own-address base this refresh pass has established: the seed
+# (hostname + current interfaces) plus this pass's netlink dump and DNS
+# resolutions.  A pass resets it to the seed before its first publication, so
+# members only a PREVIOUS pass established become departures rather than
+# permanent residents of the own set.
+_OWN_HOST_LIVE: "frozenset[str] | None" = None
+# Addresses that left the live own set, held for a short grace so an address
+# that flaps out for one refresh pass (VPN re-attach, DHCP renewal) stays
+# "self" through the flap instead of re-opening a window mid-change.  Dropped
+# once the grace expires -- which is what lets the own set SHRINK again instead
+# of only ever growing for the life of the process.
+_OWN_HOST_DEPARTED: "dict[str, float]" = {}
+_OWN_HOST_DEPARTED_GRACE = 300.0
+# Bumped every time the effective own set (live plus in-grace departures)
+# changes.  A DENY verdict recorded against an older generation is
+# revalidated instead of served permanently (see ``_resolved_host_verdict``),
+# so a host that only matched an address this machine no longer holds is not
+# refused for the rest of a long-lived gateway.
+_OWN_SET_GENERATION = 0
 
 
 def _own_host_seed() -> "frozenset[str]":
@@ -2086,18 +2141,49 @@ def warm_own_host_names() -> None:
     _own_host_names()
 
 
+def _apply_own_set_update(live: "frozenset[str]") -> None:
+    """Install *live* as this pass's own addresses, ledgering departures.
+
+    Called under ``_OWN_HOST_RESOLVE_LOCK`` from every publication site.  A
+    member of the previous set that no live source re-establishes moves to the
+    departed ledger and stays "self" only for the grace window; a member that
+    returns leaves the ledger.  The generation bumps exactly when the
+    effective set (live plus in-grace departures) changes, so verdict
+    revalidation in ``_resolved_host_verdict`` can tell a deny computed
+    against an outdated own set from one that still holds.
+    """
+    global _OWN_HOST_NAMES_CACHE, _OWN_SET_GENERATION, _OWN_HOST_DEPARTED
+    now = time.monotonic()
+    prev = _OWN_HOST_NAMES_CACHE or frozenset()
+    for addr in prev - live:
+        _OWN_HOST_DEPARTED.setdefault(addr, now)
+    for addr in live:
+        _OWN_HOST_DEPARTED.pop(addr, None)
+    _OWN_HOST_DEPARTED = {
+        a: t for a, t in _OWN_HOST_DEPARTED.items() if now - t < _OWN_HOST_DEPARTED_GRACE
+    }
+    effective = live | frozenset(_OWN_HOST_DEPARTED)
+    if effective != prev:
+        _OWN_SET_GENERATION += 1
+    _OWN_HOST_NAMES_CACHE = effective
+
+
 def _publish_netlink_addresses(addrs: "set[str]") -> None:
-    """Merge the netlink table into the own-name cache, THEN open the window.
+    """Rebuild the own-name cache around the netlink table, THEN open the window.
 
     The order is load-bearing: flipping ``_NETLINK_ADDRS_PUBLISHED`` before
     the addresses are in the cache would let a concurrent check see the
     window open while an own secondary IP is still missing from the set,
-    and admit it.
+    and admit it.  The rebuild, not a union: addresses the table no longer
+    lists become departures (grace ledger) instead of staying "self"
+    forever, and DNS-merged addresses from the previous pass ride the same
+    grace until this pass's own resolution re-adds them.
     """
-    global _OWN_HOST_NAMES_CACHE, _NETLINK_ADDRS_PUBLISHED
+    global _NETLINK_ADDRS_PUBLISHED, _OWN_HOST_LIVE
     with _OWN_HOST_RESOLVE_LOCK:
-        base = _OWN_HOST_NAMES_CACHE if _OWN_HOST_NAMES_CACHE is not None else _own_host_seed()
-        _OWN_HOST_NAMES_CACHE = base | frozenset(a for a in addrs if a)
+        base = _OWN_HOST_LIVE if _OWN_HOST_LIVE is not None else _own_host_seed()
+        _OWN_HOST_LIVE = base | frozenset(a for a in addrs if a)
+        _apply_own_set_update(_OWN_HOST_LIVE)
         _NETLINK_ADDRS_PUBLISHED = True
 
 
@@ -2197,16 +2283,26 @@ def _resolve_own_host_names_into_cache() -> None:
     retry can spawn again.
     """
     global _OWN_HOST_NAMES_CACHE, _OWN_HOST_RESOLVE_DONE, _OWN_HOST_RESOLVE_IN_FLIGHT
-    global _OWN_HOST_RESOLVE_STAMP
+    global _OWN_HOST_RESOLVE_STAMP, _OWN_HOST_LIVE
     try:
+        # A refresh pass rebuilds the LIVE base from the seed (the hostname
+        # and the CURRENT interfaces); the netlink dump and the DNS
+        # resolution then add this pass's addresses.  Members only a previous
+        # pass established become departures at the first publication, which
+        # is what lets the own set shrink again.
+        with _OWN_HOST_RESOLVE_LOCK:
+            _OWN_HOST_LIVE = _own_host_seed()
         resolved, complete = _resolve_own_host_names()
         if resolved:
-            # Under the lock: ``_publish_netlink_addresses`` merges into the
-            # same cache mid-pass, and an unlocked read-modify-write here
-            # could drop its addresses after the window already opened.
+            # Under the lock: ``_publish_netlink_addresses`` rebuilds the same
+            # cache mid-pass, and an unlocked read-modify-write here
+            # could drop its addresses after the window already opened.  The
+            # resolved names join the LIVE base, so they survive the next
+            # pass's rebuild while they are still ours by name.
             with _OWN_HOST_RESOLVE_LOCK:
-                existing = _OWN_HOST_NAMES_CACHE or frozenset()
-                _OWN_HOST_NAMES_CACHE = existing | resolved
+                base = _OWN_HOST_LIVE if _OWN_HOST_LIVE is not None else _own_host_seed()
+                _OWN_HOST_LIVE = base | resolved
+                _apply_own_set_update(_OWN_HOST_LIVE)
         if complete:
             _OWN_HOST_RESOLVE_DONE = True
             _OWN_HOST_RESOLVE_STAMP = time.monotonic()
