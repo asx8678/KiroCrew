@@ -77,6 +77,7 @@ from kiro_crew.task_models import (
     TaskStatus,
 )
 from kiro_crew.task_planner import group_parallel_tasks
+from kiro_crew.repeat_loop import error_fingerprint
 
 if TYPE_CHECKING:
     from kiro_crew.name_grant import Refusal as NameRefusal
@@ -1121,13 +1122,13 @@ async def execute_task(
                 await sessions.reset(session_key)
             except Exception:
                 logger.debug("Session reset between retries failed", exc_info=True)
-            if previous_error and task.error == previous_error:
+            if previous_error and error_fingerprint(task.error) == previous_error:
                 consecutive_same_error += 1
                 if await _check_error_loop(task, consecutive_same_error, on_notify, run):
                     return False
             else:
                 consecutive_same_error = 0
-            previous_error = task.error
+            previous_error = error_fingerprint(task.error)
             run.last_task_time = _time.time()
             if attempt < MAX_RETRIES + stop_recoveries:
                 continue
@@ -1191,7 +1192,7 @@ async def execute_task(
             except Exception:
                 logger.debug("Session reset between retries failed", exc_info=True)
 
-            if previous_error and task.error == previous_error:
+            if previous_error and error_fingerprint(task.error) == previous_error:
                 consecutive_same_error += 1
                 should_fail = await _check_error_loop(
                     task,
@@ -1203,7 +1204,7 @@ async def execute_task(
                     return False
             else:
                 consecutive_same_error = 0
-            previous_error = task.error
+            previous_error = error_fingerprint(task.error)
             if attempt < MAX_RETRIES + stop_recoveries:
                 continue
             task.status = TaskStatus.FAILED
@@ -1226,7 +1227,7 @@ async def execute_task(
                 task.error = f"Tests failed:\n{test_output}"
                 logger.warning("Task %d tests failed (attempt %d)", task.index, attempt)
                 # Same retry logic as main task failure above
-                if previous_error and task.error == previous_error:
+                if previous_error and error_fingerprint(task.error) == previous_error:
                     consecutive_same_error += 1
                     should_fail = await _check_error_loop(
                         task, consecutive_same_error, on_notify, run
@@ -1235,7 +1236,7 @@ async def execute_task(
                         return False
                 else:
                     consecutive_same_error = 0
-                previous_error = task.error
+                previous_error = error_fingerprint(task.error)
                 if attempt < MAX_RETRIES + stop_recoveries:
                     continue
                 task.status = TaskStatus.FAILED
