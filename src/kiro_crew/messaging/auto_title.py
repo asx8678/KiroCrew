@@ -104,6 +104,17 @@ TITLE_PROSE_MAX_UNSPACED_CHARS = 40
 #: session_key -> claim kind (``None`` for an in-flight automatic claim).
 _titled: "OrderedDict[str, str | None]" = OrderedDict()
 
+#: LOOP-11: session_key -> attempts already spent on naming it. The channel
+#: titler had no cap, so a conversation whose naming turn keeps answering SKIP
+#: or failing claimed again on every exchange and spent another background turn
+#: each time, indefinitely. At TITLE_MAX_ATTEMPTS the key is marked exhausted
+#: and stops in that process. The dashboard titler stops at 5; the channel
+#: turn is smaller and pays per exchange, so the FIX_PLAN figure 3 is used.
+#: Cleared by reset() and by a successful title.
+TITLE_MAX_ATTEMPTS = 3
+_EXHAUSTED_KIND = "__title_attempts_exhausted__"
+_title_attempts: "OrderedDict[str, int]" = OrderedDict()
+
 #: One inner lock per event loop, resolved against the running loop on every
 #: acquire (see :func:`get_lock`).
 _lock = LoopBoundLock()
@@ -114,6 +125,12 @@ ChannelTitleSetter = Callable[[str], Awaitable[None]]
 
 def mark_titled(session_key: str, kind: str | None = None) -> None:
     """Record *session_key* as titled (or claimed, with ``kind=None``)."""
+    if kind is not None:
+        # A real title landed: the naming conversation is over, so the
+        # attempt count no longer matters. A CLAIM (kind=None, from
+        # try_claim) must NOT clear the count - the claim precedes the
+        # attempt, and clearing here would reset the LOOP-11 cap every time.
+        _title_attempts.pop(session_key, None)
     _titled[session_key] = kind
     _titled.move_to_end(session_key)
     if len(_titled) > TITLE_LRU_MAX:
@@ -130,9 +147,25 @@ def titled_kind(session_key: str) -> str | None:
     return _titled.get(session_key)
 
 
-def release_claim(session_key: str) -> None:
-    """Drop *session_key*'s claim so the next exchange may retry."""
+def release_claim(session_key: str) -> bool:
+    """Drop the claim; the next exchange may retry - to a point.
+
+    LOOP-11: counts the attempt. At TITLE_MAX_ATTEMPTS the key is marked
+    exhausted instead, so the next try_claim answers False. Returns whether a
+    further attempt is still allowed (False = exhausted).
+    """
     _titled.pop(session_key, None)
+    _title_attempts[session_key] = _title_attempts.get(session_key, 0) + 1
+    _title_attempts.move_to_end(session_key)
+    if len(_title_attempts) > TITLE_LRU_MAX:
+        _title_attempts.popitem(last=False)
+    if _title_attempts[session_key] >= TITLE_MAX_ATTEMPTS:
+        _titled[session_key] = _EXHAUSTED_KIND
+        _titled.move_to_end(session_key)
+        if len(_titled) > TITLE_LRU_MAX:
+            _titled.popitem(last=False)
+        return False
+    return True
 
 
 def try_claim(session_key: str) -> bool:
@@ -144,6 +177,10 @@ def try_claim(session_key: str) -> bool:
     and the winner owns the claim until it succeeds or calls
     :func:`release_claim`.
     """
+    if _titled.get(session_key) == _EXHAUSTED_KIND:
+        # LOOP-11: a conversation that burned TITLE_MAX_ATTEMPTS on SKIP or
+        # failures in this process spends no further background turns.
+        return False
     if session_key in _titled:
         return False
     mark_titled(session_key)
@@ -161,6 +198,7 @@ def reset() -> None:
     """
     global _lock
     _titled.clear()
+    _title_attempts.clear()
     _lock = LoopBoundLock()
 
 
