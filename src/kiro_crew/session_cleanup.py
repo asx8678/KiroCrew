@@ -264,6 +264,7 @@ class CleanupDeps:
     rss_mb_from_tree: Callable[[int, dict[int, list[int]]], int]
     get_session_rss_mb: Callable[[int], int]
     is_windows: Callable[[], bool]
+    is_darwin: Callable[[], bool]
     getpid: Callable[[], int]
     monotonic: Callable[[], float]
     stats_factory: Callable[[], StatsPort]
@@ -772,6 +773,16 @@ class SessionCleanup:
             if self._deps.is_windows():
 
                 def measure(pid: int) -> int:
+                    return self._deps.get_session_rss_mb(pid)
+
+            elif self._deps.is_darwin():
+                # REL-18: the /proc child map does not exist on macOS, so the
+                # old else-branch read 0 for every tree and the ceiling never
+                # fired. get_session_rss_mb routes darwin through the ACP
+                # process-tree walk (ps snapshot + phys_footprint), the same
+                # reading the ACP probe uses — still measured per runtime,
+                # not per session, by the rss_by_pid cache below.
+                def measure(pid: int) -> int:  # noqa: F811 — the branch redefines the name
                     return self._deps.get_session_rss_mb(pid)
 
             else:

@@ -373,7 +373,13 @@ if needed — no compaction, since background tasks are stateless:
 - Process-tree RSS at or over `session.watchdog_rss_max_mb` → recycle. When
   that knob is 0 (its default, which turns the chat-session sweep off) the
   ceiling is `BACKGROUND_RSS_FALLBACK_MB` (1536 MiB), so this runtime stays
-  bounded either way.
+  bounded either way. Linux measures via `/proc`, Windows through the
+  lineage-validated helper, and macOS — since REL-18 — through the ACP
+  process-tree walk (a memoized `ps` snapshot for the descendant edges, each
+  pid measured by its `phys_footprint` with `ps` RSS as the fallback); before
+  that fix both ceilings returned 0 on macOS and never fired. Behaviour
+  change for macOS operators: a host with `watchdog_rss_max_mb` set, or a
+  background runtime past 1536 MiB, now starts seeing real recycles.
 - Below thresholds → no-op (session stays warm)
 
 Callers: heartbeat callback, taskrunner lesson extraction.

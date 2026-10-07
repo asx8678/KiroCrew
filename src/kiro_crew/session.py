@@ -1432,6 +1432,7 @@ class SessionManager:
             rss_mb_from_tree=lambda pid, child_map: _rss_mb_from_tree(pid, child_map),
             get_session_rss_mb=lambda pid: get_session_rss_mb(pid),
             is_windows=lambda: platform_compat.IS_WINDOWS,
+            is_darwin=lambda: platform_compat.IS_MACOS,
             getpid=lambda: os.getpid(),
             monotonic=lambda: time.monotonic(),
             stats_factory=lambda: Stats(),

@@ -60,12 +60,29 @@ class TestGetSessionRssMb:
         """
         monkeypatch.setattr(session_pid.platform_compat, "IS_WINDOWS", False)
 
-    def test_macos_returns_zero(self) -> None:
-        """macOS has no ctypes-only per-pid RSS route, so the ceiling stays inert."""
+    def test_darwin_measures_the_tree_rather_than_returning_zero(self) -> None:
+        """REL-18: macOS measures the real process-tree footprint via the ACP
+        probe's walk (ps snapshot for the edges, phys_footprint per pid), so
+        BOTH RSS ceilings — the opt-in session ceiling and the always-on
+        background-runtime 1536 MiB fallback — fire there. Returning 0 kept
+        them inert on every macOS host."""
+        import kiro_crew.acp.runtime_process_tree as rpt
+
         with patch("kiro_crew.session_pid.sys.platform", "darwin"), patch(
             "kiro_crew.session_pid.platform_compat.IS_WINDOWS", False
-        ):
-            assert session_pid.get_session_rss_mb(123) == 0
+        ), patch.object(rpt, "_get_rss_tree_mb", return_value=1983.4) as tree:
+            assert session_pid.get_session_rss_mb(100) == 1983
+            tree.assert_called_once_with(100)
+
+    def test_darwin_treats_an_unreadable_tree_as_zero(self) -> None:
+        """None means "unknown"; the ceiling must not fire on a guess — the
+        same contract the Windows route keeps."""
+        import kiro_crew.acp.runtime_process_tree as rpt
+
+        with patch("kiro_crew.session_pid.sys.platform", "darwin"), patch(
+            "kiro_crew.session_pid.platform_compat.IS_WINDOWS", False
+        ), patch.object(rpt, "_get_rss_tree_mb", return_value=None):
+            assert session_pid.get_session_rss_mb(100) == 0
 
     def test_windows_measures_the_tree_rather_than_returning_zero(self) -> None:
         """Windows has no /proc, but it MUST still measure.
@@ -269,6 +286,12 @@ class TestRssThresholdCheck:
         under-threshold. The Windows dispatch has its own test above.
         """
         monkeypatch.setattr(session.platform_compat, "IS_WINDOWS", False)
+        # REL-18: darwin now has its own measurement branch; these tests pin
+        # the /proc branch's DECISIONS, so pin darwin off too (a macOS host
+        # would otherwise take the real-tree darwin branch and every stubbed
+        # tree would read as under-threshold). The darwin dispatch has its
+        # own test above.
+        monkeypatch.setattr(session.platform_compat, "IS_MACOS", False)
 
     def test_shipped_default_reaches_the_enforcement_point(self) -> None:
         """The ceiling is off by default: a manager built from the shipped
