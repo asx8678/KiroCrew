@@ -437,6 +437,18 @@ class NudgeLoop:
     #: sibling sessions has no honest value for either, so a judge-only loop must be
     #: able to hold a streak without one.
     judge_quiet_streak: int = 0
+    #: Consecutive PARTIAL-reading verdicts whose dropped-target count is
+    #: UNCHANGED. A partial reading fires once (the owner learns the watch
+    #: cannot see everything); repeats with the same unreadable count are not
+    #: news and count against the same floor a quiet streak does, so a
+    #: permanently unreachable target buys at most one delivery per floor
+    #: interval instead of a turn every tick. A CHANGED count or a recovery to
+    #: a complete reading resets the streak and fires.
+    judge_partial_streak: int = 0
+    #: The dropped-target COUNT the partial streak was counted against, as a
+    #: string key, so a DIFFERENT number of unreadable targets reads as fresh
+    #: news rather than as a repeat.
+    judge_partial_dropped: str = ""
     #: A judge verdict decided this loop should FIRE and that delivery is not yet
     #: confirmed. Set with the verdict's durable write and cleared only once the fire
     #: is settled, so the owed turn survives a process that stops in between.

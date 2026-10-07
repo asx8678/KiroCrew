@@ -342,17 +342,93 @@ async def _judge_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> bool 
                 answer = True
     else:
         loop.judge_quiet_streak = 0
-        # Marked BEFORE the write that carries it, so the flag and the advanced
-        # cursors land together or not at all. The cursors are what make this
-        # necessary: they have moved, so a process that stops between here and the
-        # fire leaves the next tick reading nothing new, answering quiet, and the
-        # owed turn gone until the streak floor.
-        loop.judge_wake_pending = True
-        self._record_judge_verdict(
-            loop, verdict, screened_items, row_id, suppressed=False, answered=answered
-        )
-        await self._persist_judge_state(loop)
-        logger.info("AutoNudge: loop %s judge verdict %s", loop.id, verdict.outcome.value)
+        # ── Partial readings: a target the collector could not read makes the
+        # judge answer FALLBACK before it ever looks at the delta, so a watch
+        # whose subject is fine but whose target is unreachable fired EVERY
+        # interval -- a permanent outage buying a turn per tick. The first
+        # partial fires (the owner learns the watch cannot see everything);
+        # repeats with the SAME dropped-target set are not news and count
+        # against the same floor a quiet streak does. A CHANGED dropped set,
+        # or a recovery to a complete reading (dropped empty -- the verdict
+        # came from the evidence itself), resets the count and fires.
+        if dropped:
+            # Keyed by the dropped COUNT: the collector reports how many targets
+            # it could not read, not which ones, so the count is the finest
+            # "unchanged partial reading" signal available at the verdict site.
+            _dropped_key = str(int(dropped))
+            if loop.judge_partial_dropped == _dropped_key:
+                # A repeat of the SAME unreadable targets: counted, not news.
+                loop.judge_partial_streak += 1
+                _pfloor = self._judge_quiet_streak_floor()
+                if loop.judge_partial_streak >= _pfloor:
+                    # Floor reached: deliver anyway, exactly as a quiet streak
+                    # at its floor does, so a persistently unreadable target
+                    # still surfaces on the floor's cadence instead of paging
+                    # every tick or going silent forever.
+                    loop.judge_partial_streak = 0
+                    loop.judge_wake_pending = True
+                    self._record_judge_verdict(
+                        loop, verdict, screened_items, row_id, suppressed=False, answered=answered
+                    )
+                    await self._persist_judge_state(loop)
+                    logger.info(
+                        "AutoNudge: loop %s hit the judge partial-reading floor "
+                        "after %d unchanged partial ticks (dropped: %s)",
+                        loop.id,
+                        _pfloor,
+                        _dropped_key,
+                    )
+                else:
+                    self._record_judge_verdict(
+                        loop, verdict, screened_items, row_id, suppressed=True, answered=answered
+                    )
+                    if not await self._persist_judge_state(loop):
+                        logger.warning(
+                            "AutoNudge: loop %s judged a repeat partial but its "
+                            "state did not persist -- firing",
+                            loop.id,
+                        )
+                        # Same contract as a quiet suppression that did not land:
+                        # nothing on disk claims this tick withheld anything, so
+                        # the claim is withdrawn and the tick fires.
+                        self._withdraw_judge_suppression(loop)
+                    else:
+                        logger.debug(
+                            "AutoNudge: loop %s judge partial repeat #%d (dropped: %s)",
+                            loop.id,
+                            loop.judge_partial_streak,
+                            _dropped_key,
+                        )
+                        answer = True
+            else:
+                # First partial, or the dropped set CHANGED: fresh news, fire once.
+                loop.judge_partial_streak = 1
+                loop.judge_partial_dropped = _dropped_key
+                loop.judge_wake_pending = True
+                self._record_judge_verdict(
+                    loop, verdict, screened_items, row_id, suppressed=False, answered=answered
+                )
+                await self._persist_judge_state(loop)
+                logger.info(
+                    "AutoNudge: loop %s judge partial reading fires (dropped: %s)",
+                    loop.id,
+                    _dropped_key,
+                )
+        else:
+            # Complete reading: the verdict came from the evidence itself.
+            loop.judge_partial_streak = 0
+            loop.judge_partial_dropped = ""
+            # Marked BEFORE the write that carries it, so the flag and the advanced
+            # cursors land together or not at all. The cursors are what make this
+            # necessary: they have moved, so a process that stops between here and the
+            # fire leaves the next tick reading nothing new, answering quiet, and the
+            # owed turn gone until the streak floor.
+            loop.judge_wake_pending = True
+            self._record_judge_verdict(
+                loop, verdict, screened_items, row_id, suppressed=False, answered=answered
+            )
+            await self._persist_judge_state(loop)
+            logger.info("AutoNudge: loop %s judge verdict %s", loop.id, verdict.outcome.value)
     if self._emit_judge_notice is not None:
         try:
             await self._emit_judge_notice(loop, notice_text)
