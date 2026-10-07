@@ -10382,6 +10382,22 @@ class GatewayOrchestrator:
                     **extra,
                     "queued": _tab_queued_depth(info.parent_session_key, slot_name, extra),
                 }
+            if etype == "subagent_stalled":
+                # EVT-11: flagging the last live child stalled lifts the hold that
+                # parked user messages, but nothing started a drain — they sat
+                # until the user's next send. Drain now, once; the helper's own
+                # guards keep a still-live sibling parking the queue and a
+                # running turn refusing a second drain.
+                slot = self.dashboard_state.get_slot(slot_name)
+                if slot is not None:
+                    from kiro_crew.dashboard.chat_runner import drain_released_after_stall
+
+                    try:
+                        await drain_released_after_stall(self.dashboard_state, slot)
+                    except Exception:
+                        logger.warning(
+                            "stall-release drain failed for slot %s", slot_name, exc_info=True
+                        )
             if etype == "subagent_injection_failed":
                 # Show error in UI + queue for LLM context on next turn.
                 slot = self.dashboard_state.get_slot(slot_name)

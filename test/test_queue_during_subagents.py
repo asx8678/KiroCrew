@@ -31,13 +31,78 @@ from kiro_crew.dashboard.state import (
 # ── Unit tests: _dequeue_next_system_message ──
 
 
+class TestStallReleaseDrain:
+    """EVT-11: flagging the last live child stalled lifts the hold — the parked
+    queue drains at once instead of waiting for the user's next send."""
+
+    def _slot(self, *, task=None):
+        slot = MagicMock()
+        slot.task = task
+        slot._queue = [("user", "parked while the child ran", {})]
+        return slot
+
+    def test_a_stall_release_drains_the_parked_queue_once(self, monkeypatch) -> None:
+        from kiro_crew.dashboard import chat_runner as cr
+
+        state = MagicMock()
+        slot = self._slot()
+        drained = {"n": 0}
+
+        async def _fake_start(st, sl, **kw):
+            drained["n"] += 1
+            return True
+
+        monkeypatch.setattr(cr, "_start_next_queued_turn", _fake_start)
+        monkeypatch.setattr(cr, "subagents_hold_user_messages", lambda st, key: False)
+
+        assert asyncio.run(cr.drain_released_after_stall(state, slot)) is True
+        assert drained["n"] == 1
+        # A second stalled event for the same release: the drain started a turn,
+        # so the slot is busy and nothing drains twice.
+        slot.task = object()
+        assert asyncio.run(cr.drain_released_after_stall(state, slot)) is False
+        assert drained["n"] == 1
+
+    def test_a_live_sibling_keeps_the_queue_parked(self, monkeypatch) -> None:
+        from kiro_crew.dashboard import chat_runner as cr
+
+        state = MagicMock()
+        slot = self._slot()
+        drained = {"n": 0}
+
+        async def _fake_start(st, sl, **kw):
+            drained["n"] += 1
+            return True
+
+        monkeypatch.setattr(cr, "_start_next_queued_turn", _fake_start)
+        # The hold is still true: another child is live and not stalled.
+        monkeypatch.setattr(cr, "subagents_hold_user_messages", lambda st, key: True)
+
+        assert asyncio.run(cr.drain_released_after_stall(state, slot)) is False
+        assert drained["n"] == 0
+
+    def test_an_empty_or_busy_slot_drains_nothing(self, monkeypatch) -> None:
+        from kiro_crew.dashboard import chat_runner as cr
+
+        state = MagicMock()
+        empty = self._slot()
+        empty._queue = []
+        busy = self._slot(task=object())
+        monkeypatch.setattr(cr, "subagents_hold_user_messages", lambda st, key: False)
+        assert asyncio.run(cr.drain_released_after_stall(state, empty)) is False
+        assert asyncio.run(cr.drain_released_after_stall(state, busy)) is False
+
+
 class TestDequeueNextSystemMessage:
     """The helper drains system injections while keeping plain user messages queued."""
 
     def test_only_user_messages_holds_all(self):
         """With only user messages queued, nothing drains and the queue is intact."""
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": "keep working"}, {"id": "b", "content": "and this too"}]
+        slot._queue = [
+            {"id": "a", "content": "keep working"},
+            {"id": "b", "content": "and this too"},
+        ]
 
         next_msg, consumed = _dequeue_next_system_message(slot)
 
@@ -59,7 +124,10 @@ class TestDequeueNextSystemMessage:
         """A queued sub-agent completion drains; a leading user message stays queued."""
         sa = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `a1` completed \u2705\nResult"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": "tangential question"}, {"id": "b", "content": sa, "kind": SUBAGENT_COMPLETION_KIND}]
+        slot._queue = [
+            {"id": "a", "content": "tangential question"},
+            {"id": "b", "content": sa, "kind": SUBAGENT_COMPLETION_KIND},
+        ]
 
         next_msg, consumed = _dequeue_next_system_message(slot)
 
@@ -72,7 +140,10 @@ class TestDequeueNextSystemMessage:
         """A queued cron notification drains; user messages stay queued."""
         cron = f"{CRON_NOTIFY_PREFIX}daily]: run report"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": "hi there"}, {"id": "b", "content": cron, "kind": CRON_NOTIFICATION_KIND}]
+        slot._queue = [
+            {"id": "a", "content": "hi there"},
+            {"id": "b", "content": cron, "kind": CRON_NOTIFICATION_KIND},
+        ]
 
         next_msg, consumed = _dequeue_next_system_message(slot)
 
@@ -84,7 +155,10 @@ class TestDequeueNextSystemMessage:
         """A leading sub-agent completion drains directly."""
         sa = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `x` completed \u2705\nDone"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": sa, "kind": SUBAGENT_COMPLETION_KIND}, {"id": "b", "content": "user follow-up"}]
+        slot._queue = [
+            {"id": "a", "content": sa, "kind": SUBAGENT_COMPLETION_KIND},
+            {"id": "b", "content": "user follow-up"},
+        ]
 
         next_msg, consumed = _dequeue_next_system_message(slot)
 
@@ -130,7 +204,9 @@ class TestApiChatSubagentQueueGate:
         slot = state.get_or_create_slot("s1")
 
         async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.post("/api/chat?ws=1", json={"message": "tangential q", "slot": "s1"})
+            resp = await client.post(
+                "/api/chat?ws=1", json={"message": "tangential q", "slot": "s1"}
+            )
             assert resp.status == 200
             data = await resp.json()
 
