@@ -3305,12 +3305,14 @@ class DashboardConfig:
         ),
     )
     tips_model: str = field(
-        default="auto",
+        default="",
         metadata=_meta(
             "Tips Model",
-            'Model ID for tips generation. Defaults to "auto" so it inherits the '
-            "account's governed model; a hardcoded id can be rejected on accounts "
-            "or partitions that do not serve it.",
+            "Model ID for tips generation. Empty (the default) means the background "
+            "role: the one-liner inherits the background session's spec model, so "
+            "an operator's agent.role_models.background pin is honored; an unpinned "
+            "install resolves to auto at the wire. A hardcoded id can be rejected on "
+            "accounts or partitions that do not serve it.",
         ),
     )
     tips_explore_ratio: float = field(

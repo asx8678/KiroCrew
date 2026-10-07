@@ -170,14 +170,12 @@ _TITLE_SOURCE_SCAN_LIMIT = _TITLE_TEXT_LIMIT + _TITLE_MAX_ATTACHMENT_FILES * (
     _TITLE_MAX_ATTACHMENT_PATH_LENGTH + 32
 )
 
-# Titling is a trivial 3-6 word task, but it must NOT pin a cheap model by id: a
-# hardcoded model id is not governance-aware, and on an account/partition that
-# does not serve that model the wire rejects it with ``Invalid model ID``.
-# ``"auto"`` means "inherit
-# the session's governed default" — ``run_bg_oneliner`` skips the per-session
-# set_model override for auto, so titling runs on the backend-resolved entitled
-# model instead of a literal the account may not have.
-_TITLE_MODEL = "auto"
+# Titling is a trivial 3-6 word task, and it passes NO model: the one-liner
+# inherits the background session's spec model, which honors an operator's
+# agent.role_models.background pin. (The old literal "auto" did NOT mean
+# "inherit" — run_bg_oneliner forwards any truthy model to set_model, so it
+# replaced the pin at the wire; a hardcoded model id is not governance-aware
+# and 400s on accounts that do not serve it.)
 
 # Per-word delay for the word-by-word title reveal animation. LLM chunk
 # streaming arrives in a sub-second burst (too fast to perceive), so the reveal
@@ -383,8 +381,7 @@ def _attachment_labels(paths: tuple[str, ...]) -> dict[str, str]:
         while depth < len(segments):
             mine = "/".join(segments[-depth:])
             clash = any(
-                other != norm
-                and "/".join([s for s in other.split("/") if s][-depth:]) == mine
+                other != norm and "/".join([s for s in other.split("/") if s][-depth:]) == mine
                 for other in normalized.values()
             )
             if not clash:
@@ -622,9 +619,7 @@ def _prompt_lines(messages: list[dict[str, Any]]) -> tuple[list[str], bool]:
     return lines, truncated
 
 
-def _build_title_prompt(
-    messages: list[dict[str, Any]], *, ui_language: str = ""
-) -> str | None:
+def _build_title_prompt(messages: list[dict[str, Any]], *, ui_language: str = "") -> str | None:
     """Build a title generation prompt from conversation messages.
 
     ``ui_language`` is a validated BCP-47 tag (see ``_ui_language``); ``""``
@@ -745,9 +740,7 @@ async def _reveal_title(
         await asyncio.sleep(_TITLE_REVEAL_STEP_SECS)
 
 
-def _validate_title_reply(
-    text: str, *, control_words: tuple[str, ...] = ("SKIP", "KEEP")
-) -> str:
+def _validate_title_reply(text: str, *, control_words: tuple[str, ...] = ("SKIP", "KEEP")) -> str:
     """Clean, redact and shape-check an LLM title reply; ``""`` means no title.
 
     Shared by the initial titling and the refresh so the two paths cannot drift:
@@ -806,7 +799,7 @@ async def _generate_title_via_kiro(
     text = await run_bg_oneliner(
         state.sessions,
         prompt,
-        model=_TITLE_MODEL,
+        # No model: inherit the pinned background spec model.
         crew_log_kind="title",
         crew_log_session_key=session_key,
     )
@@ -840,7 +833,7 @@ async def _generate_refreshed_title(
     text = await run_bg_oneliner(
         state.sessions,
         prompt,
-        model=_TITLE_MODEL,
+        # No model: inherit the pinned background spec model.
         crew_log_kind="title",
         crew_log_session_key=session_key,
     )
@@ -1359,8 +1352,7 @@ async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
         # before the spend.
         if not await _persist_title(state, slot):
             logger.warning(
-                "Title refresh: consumed milestone not durable for slot %s; "
-                "skipping generation",
+                "Title refresh: consumed milestone not durable for slot %s; " "skipping generation",
                 slot.key,
             )
             return

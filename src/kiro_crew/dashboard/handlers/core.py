@@ -1745,7 +1745,7 @@ async def api_stt_polish(request: web.Request) -> web.Response:
         corrected = await run_bg_oneliner(
             sessions,
             _POLISH_PROMPT.format(transcript=outbound),
-            model="auto",
+            # No model: inherit the pinned background spec model.
             sel_source="stt_polish",
             timeout=_POLISH_TIMEOUT_SECS,
         )

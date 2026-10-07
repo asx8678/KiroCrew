@@ -1114,12 +1114,14 @@ async def generate_tips(state: DashboardState) -> list[dict]:  # type: ignore[ty
 
     loop2 = asyncio.get_running_loop()
     cfg = await loop2.run_in_executor(None, KiroCrewConfig.load)
-    tips_model = cfg.dashboard.tips_model
+    # Empty means the background ROLE: resolve the operator's pin here (an
+    # unpinned install resolves to "auto", unchanged) so an explicit id and a
+    # pin travel the same path. Resolved per call from the live config.
+    tips_model = cfg.dashboard.tips_model or cfg.agent.resolve_model("background")
     # Delegate acquire / pin-model / drive / reject-tools / destroy — and the
     # reactive model-rejection fallback — to run_bg_oneliner.
-    # tips_model (default "auto") is resolved at the wire chokepoint; a rejected
-    # model is retried once against the advertised list. Any failure or timeout
-    # degrades to the catalog fallback.
+    # A rejected model is retried once against the advertised list. Any failure
+    # or timeout degrades to the catalog fallback.
     try:
         text = await run_bg_oneliner(
             state.sessions, prompt, model=tips_model, sel_source="tips", timeout=90

@@ -68,10 +68,10 @@ def _build_link_summary_prompt(links: list[dict]) -> str:
     return _LINK_SUMMARY_PROMPT.format(items="\n".join(items))
 
 
-# "auto" = inherit the session's governed default (run_bg_oneliner skips the
-# override for auto). A hardcoded model id 400s on accounts/partitions that do
-# not serve it.
-_LINK_SUMMARY_MODEL = "auto"
+# No model is passed: the one-liner inherits the background session's spec
+# model, which honors an operator's agent.role_models.background pin (a
+# hardcoded id is not governance-aware and 400s on accounts/partitions that do
+# not serve it; the old literal "auto" OVERRODE the pin at the wire).
 
 #: Unspaced-script ceiling for the prose guard on a 3-8 word label. The prompt
 #: teaches no character budget (the title's "~4-14 characters" hint is not sent
@@ -109,7 +109,10 @@ async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> l
     # Link labeling is a trivial classification task — run on the cheapest model
     # via the shared background one-liner helper (denials are SEL-logged).
     text = await run_bg_oneliner(
-        state.sessions, prompt, model=_LINK_SUMMARY_MODEL, sel_source="chat_nav"
+        # No model: inherit the pinned background spec model.
+        state.sessions,
+        prompt,
+        sel_source="chat_nav",
     )
 
     # Parse: one label per line. The frontend merges the reply POSITIONALLY
@@ -139,8 +142,10 @@ async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> l
         ln, redacted_cred = redact_credentials(ln)
         if redacted_url or redacted_cred:
             sel().log_tool_invocation(
-                session_key=BACKGROUND_KEY, tool_name="llm_output_redaction",
-                source="chat_nav", outcome="redacted",
+                session_key=BACKGROUND_KEY,
+                tool_name="llm_output_redaction",
+                source="chat_nav",
+                outcome="redacted",
                 metadata={"redacted_url": bool(redacted_url), "redacted_cred": bool(redacted_cred)},
             )
         if looks_like_prose(ln, max_unspaced_chars=_LINK_LABEL_MAX_UNSPACED_CHARS):
@@ -197,8 +202,11 @@ async def api_chat_nav_resolve_links(request: web.Request) -> web.Response:
         logger.warning("Link summary resolution failed: %s", type(exc).__name__, exc_info=True)
         try:
             sel().log_tool_invocation(
-                session_key=BACKGROUND_KEY, tool_name="llm_link_summary",
-                source="chat_nav", outcome="error", error=type(exc).__name__,
+                session_key=BACKGROUND_KEY,
+                tool_name="llm_link_summary",
+                source="chat_nav",
+                outcome="error",
+                error=type(exc).__name__,
             )
         except Exception:
             # Best-effort audit: a SEL emit failure must not defeat fail-soft.
@@ -209,4 +217,4 @@ async def api_chat_nav_resolve_links(request: web.Request) -> web.Response:
     while len(summaries) < len(links):
         summaries.append("")
 
-    return web.json_response({"summaries": summaries[:len(links)]})
+    return web.json_response({"summaries": summaries[: len(links)]})
