@@ -1014,6 +1014,20 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
     normalizeModelKey(pinAgent.model) === resolvedKey
   const memberPinOverrides = agentPinOverrides && memberPinApplied
   const showPinNotice = agentPinOverrides && (!memberPinCarried || memberPinApplied)
+  // MOD-7: with the global back on 'auto', a TEMPLATE pin on the default agent
+  // still decides the resolved model, and the notice above cannot fire —
+  // agentPinOverrides requires a concrete global. The deciding tier is the
+  // template exactly when the roster names the same model the resolver picked.
+  // The existing clear path (PATCH model: '') clears the template's pin too,
+  // because the default agent's spec IS its template; a member pin that won
+  // keeps this notice silent (memberPinApplied), so only the template tier
+  // is named.
+  const templatePinOverridesAuto =
+    normalizeModelKey(shownDefaultModel) === 'auto' &&
+    !!resolvedKey && resolvedKey !== 'auto' &&
+    !memberPinApplied &&
+    !!pinAgent?.model && normalizeModelKey(pinAgent.model) === resolvedKey
+  const showTemplatePinNotice = templatePinOverridesAuto && !!pinAgent
   const clearAgentPinMut = useMutation({
     // '' is the inherit sentinel: the agent falls back to the global default.
     mutationFn: () => api.updateKirocrewAgent(pinAgentName, { model: '' }),
@@ -1302,6 +1316,34 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
                   />
                 </>
               )}
+            </div>
+          )}
+          {showTemplatePinNotice && (
+            <div
+              className="mt-1 mb-3 flex flex-wrap items-center gap-3 text-[13px] text-warn"
+              role="status"
+              data-testid="agent-template-pin-notice"
+            >
+              <span className="min-w-0 flex-1 break-words">
+                <Trans
+                  i18nKey="pages.settings.chatPanel.agent_template_pin_overrides_auto"
+                  components={{ model: <span className="font-mono">{resolvedModel}</span> }}
+                />
+              </span>
+              <Btn
+                type="button"
+                className="shrink-0"
+                onClick={() => clearAgentPinMut.mutate()}
+                disabled={clearAgentPinMut.isPending || pinReadsInFlight || pinReadsFailed || defaultModelMut.isPending}
+              >
+                {i18nT('pages.settings.chatPanel.remove_the_agents_pin')}
+              </Btn>
+              <ErrorNotice
+                variant="inline"
+                className="basis-full"
+                message={clearAgentPinError}
+                testId="agent-template-pin-clear-error"
+              />
             </div>
           )}
           <SettingsMultiSelect

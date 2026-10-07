@@ -15249,6 +15249,7 @@
         "advanced": "Avanzate",
         "agent_model_pin_overrides_default": "Le nuove chat sull'agente <agent/> usano il suo modello fissato <model/>, non questa impostazione. Più tardi puoi fissare di nuovo un modello dal selettore del modello della chat.",
         "agent_template_pin_overrides_default": "Le nuove chat sull'agente <agent/> usano <model/>, che viene dal suo template di agente o dal valore predefinito del backend, non da questa impostazione. Questo agente non fissa un modello da sé, quindi qui non c'è nulla da rimuovere. Per sceglierne uno, apri il selettore del modello della chat e fissa un modello su questo agente.",
+        "agent_template_pin_overrides_auto": "Le nuove chat usano <model/> perché il modello dell'agente lo fissa, non questa impostazione. Cancella il pin del modello per tornare al valore predefinito.",
         "discovery": "Scoperta",
         "rail_label": "Impostazioni chat",
         "side_panel": "Pannello laterale",

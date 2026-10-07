@@ -2128,7 +2128,13 @@ name:
 - Read/written via `kiro_crew/agent_state.py` (atomic, lock-guarded near-leaf
   module: stdlib + `config.paths` + `atomic_write` only).
 - `build_agent_config()` is pure (writes no spec key); `rebuild_agent_config()`
-  seeds managed-state on a fresh/clean install (never clobbering a frozen pick).
+  seeds managed-state on a fresh/clean install (never clobbering a frozen pick),
+  and — MOD-7 — adopts a sidecar-less main agent into tracking on any rebuild
+  whose spec model equals the current `agent.model`: that pin came from this
+  rebuild's own propagation (a template-editor pick freezes the sidecar entry
+  to `False` rather than leaving it absent), so the next switch back to
+  `"auto"` can clear it instead of resolving to it. Existing entries, `True`
+  or `False`, are never flipped.
 - `_refresh_dynamic_fields()` sources managed-state from the sidecar and strips
   any stray `model_managed`/`cc_model` from the spec (steady-state self-heal).
   A **managed** spec's `model` is set on every refresh to the shipped default,
@@ -2139,7 +2145,10 @@ name:
   `"auto"` must take the pin back off or `"auto"` is unreachable from the
   configuration surface. Ownership decides who may clear: `model_managed=false`
   (an explicit user pick) and an **absent** sidecar entry (legacy status, owner
-  unknown) both keep their pin untouched.
+  unknown — apart from the propagated-pin adoption above) both keep their pin
+  untouched. The Settings default-model picker names a surviving template pin
+  (a resolved model that differs from `"auto"` while the roster names the
+  same model) and offers the same clear path (MOD-7).
 - `migrate_agent_specs()` runs at startup (top of `rebuild_agent_config`): lifts
   the keys out of every `~/.kiro/agents/*.json` into the sidecar and removes
   them (idempotent), fixing installs polluted by older builds.

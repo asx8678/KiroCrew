@@ -15249,6 +15249,7 @@
         "advanced": "Avançado",
         "agent_model_pin_overrides_default": "Novos chats no agente <agent/> usam o próprio modelo fixado <model/>, não esta configuração. Depois você pode fixar um modelo de novo no seletor de modelo do chat.",
         "agent_template_pin_overrides_default": "Novos chats no agente <agent/> usam <model/>, que vem do template do agente ou do padrão do backend, não desta configuração. Este agente não fixa um modelo por si só, então não há nada para remover aqui. Para escolher um, abra o seletor de modelo do chat e fixe um modelo neste agente.",
+        "agent_template_pin_overrides_auto": "Novas conversas usam <model/> porque o modelo do agente o fixa, não este ajuste. Limpe o pin do modelo para voltar ao padrão.",
         "discovery": "Descoberta",
         "rail_label": "Configurações do chat",
         "side_panel": "Painel lateral",

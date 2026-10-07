@@ -15249,6 +15249,7 @@
         "advanced": "Avancé",
         "agent_model_pin_overrides_default": "Les nouveaux chats sur l’agent <agent/> utilisent son propre modèle épinglé <model/>, pas ce réglage. Tu pourras réépingler un modèle plus tard depuis le sélecteur de modèle du chat.",
         "agent_template_pin_overrides_default": "Les nouveaux chats sur l’agent <agent/> utilisent <model/>, qui vient de son modèle d’agent ou de la valeur par défaut du backend, pas de ce réglage. Cet agent n’épingle pas de modèle lui-même, il n’y a donc rien à retirer ici. Pour en choisir un, ouvre le sélecteur de modèle du chat et épingle un modèle à cet agent.",
+        "agent_template_pin_overrides_auto": "Les nouvelles conversations utilisent <model/> car le modèle d'agent l'épingle, pas ce réglage. Efface l'épingle du modèle pour revenir au réglage par défaut.",
         "discovery": "Découverte",
         "rail_label": "Paramètres du chat",
         "side_panel": "Panneau latéral",

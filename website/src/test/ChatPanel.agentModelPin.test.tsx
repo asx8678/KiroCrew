@@ -93,6 +93,50 @@ describe('ChatPanel — default agent model pin notice', () => {
     seedResolved('claude-opus-5.5')
   })
 
+  it('names the template pin when the default is auto and the template decides (MOD-7)', async () => {
+    // The global is back on 'auto', the resolver answers a concrete model, and
+    // the roster names the same model: the deciding tier is the agent template,
+    // the pin the Settings surface could not reach before.
+    kirocrewConfigMock.mockImplementation(() =>
+      Promise.resolve({ agent: { model: '', reasoning_effort: '' } }) as never
+    )
+    try {
+      seedAgent('claude-opus-5')
+      seedResolved('claude-opus-5', false)  // the record carries no pin: the template did it
+      wrap()
+      await settled()
+      const notice = await screen.findByTestId('agent-template-pin-notice')
+      expect(notice).toHaveTextContent(
+        'New chats use claude-opus-5 because the agent template pins it, not this setting.'
+      )
+      fireEvent.click(screen.getByRole('button', CLEAR_BUTTON))
+      await waitFor(() =>
+        expect(updateKirocrewAgentMock).toHaveBeenCalledWith('default', { model: '' })
+      )
+    } finally {
+      kirocrewConfigMock.mockImplementation(() =>
+        Promise.resolve({ agent: { model: 'claude-opus-5.5', reasoning_effort: '' } }) as never
+      )
+    }
+  })
+
+  it('shows no template-pin notice when auto resolves to auto (MOD-7)', async () => {
+    kirocrewConfigMock.mockImplementation(() =>
+      Promise.resolve({ agent: { model: '', reasoning_effort: '' } }) as never
+    )
+    try {
+      seedAgent('')
+      seedResolved('', false)
+      wrap()
+      await settled()
+      expect(screen.queryByTestId('agent-template-pin-notice')).toBeNull()
+    } finally {
+      kirocrewConfigMock.mockImplementation(() =>
+        Promise.resolve({ agent: { model: 'claude-opus-5.5', reasoning_effort: '' } }) as never
+      )
+    }
+  })
+
   it('names the agent pin when the resolved model is the agent\'s own pin', async () => {
     seedAgent('claude-opus-5')
     seedResolved('claude-opus-5', true)
