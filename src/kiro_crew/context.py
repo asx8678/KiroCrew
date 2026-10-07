@@ -1906,6 +1906,17 @@ class ContextBuilder:
         # fallback. Bounded like the skill-body record (same eviction shape:
         # a dropped key re-sends the thread, never drops a message).
         self._thread_channel_watermarks: dict[str, dict[str, str]] = {}
+        # session_key_digest -> {block_name: last digest}. CTX-5: the per-turn
+        # rail blocks ([PROJECT], [RUNTIME], the interactive guidance) are
+        # byte-identical on nearly every follow-up turn (~1.9 KB re-sent per
+        # turn on the dashboard); this record lets an unchanged block drop to
+        # a one-line pointer. Same reset rules as the skill-body record (a
+        # fresh session, needs_reinjection, an agent switch — the turns whose
+        # provider window cannot hold the earlier copy), same LRU bound, and
+        # the same turn-seam settle (commit/rollback_skill_bodies clears the
+        # undo entry) so a turn that never lands re-sends.
+        self._rail_block_digests: dict[str, dict[str, str]] = {}
+        self._rail_digest_undo: dict[str, dict[str, str | None]] = {}
         # session_key_digest -> {thread_ts: prior watermark | None}, the single
         # most recent build's undo entry; None means it did not exist before.
         self._thread_watermark_undo: dict[str, dict[str, str | None]] = {}
@@ -2155,6 +2166,10 @@ class ContextBuilder:
                         marks.pop(thread_ts, None)
                     else:
                         marks[thread_ts] = prior
+            # CTX-5: the same settle restores this build's rail-block digests
+            # (a prompt that never landed showed nobody the [PROJECT]/[RUNTIME]/
+            # guidance blocks it recorded as sent).
+            self._settle_rail_digest_rollback(session_key)
 
     def _reset_thread_watermark(self, session_key: str, thread_ts: str) -> None:
         """Drop the thread watermark so the whole thread re-sends (new window)."""
@@ -2240,6 +2255,91 @@ class ContextBuilder:
         """
         self._dedup_triggered_bodies(session_key, agent, reset=False, candidates=candidates)
 
+    def _rail_digest_key(self, session_key: str | None, agent: str | None) -> str | None:
+        """The per-(session, agent) rail-digest record key, or None (no dedup)."""
+        if not session_key:
+            return None
+        # Agent switch ⇒ new record, mirroring _dedup_triggered_bodies.
+        return self._cap_memo_key(session_key) + "|" + self._cap_memo_key(agent or "")
+
+    def reset_rail_blocks(self, session_key: str | None, agent: str | None) -> None:
+        """Drop the rail-block digest record (fresh window / re-injection)."""
+        key = self._rail_digest_key(session_key, agent)
+        if key is None:
+            return
+        with self._sent_skill_bodies_lock:
+            self._rail_block_digests.pop(key, None)
+            self._rail_digest_undo.pop(key, None)
+
+    def rail_block_fresh(
+        self,
+        session_key: str | None,
+        agent: str | None,
+        block: str,
+        digest: str,
+    ) -> bool:
+        """Whether *block* is fresh this session — and record it either way.
+
+        Fresh means the session's window has NOT already shown this exact
+        block (same digest): the first send, a changed block, or the first
+        turn after a reset. A stale block returns False and the caller emits a
+        one-line pointer instead. The digest is RECORDED on a fresh answer
+        (with an undo entry the turn seam settles: commit_skill_bodies drops
+        it, rollback_skill_bodies restores the prior value) and left untouched
+        on a stale one, so a demoted block never widens the record.
+        """
+        key = self._rail_digest_key(session_key, agent)
+        if key is None:
+            return True  # no session key (CLI, tests, heartbeat): always send
+        with self._sent_skill_bodies_lock:
+            record = self._rail_block_digests.setdefault(key, {})
+            if record.get(block) == digest:
+                # Touch for the LRU; do not touch the undo entry.
+                self._rail_block_digests[key] = self._rail_block_digests.pop(key)
+                return False
+            undo = self._rail_digest_undo.setdefault(key, {})
+            if block not in undo:
+                undo[block] = record.get(block)
+            record[block] = digest
+            while len(self._rail_block_digests) > self._SENT_SKILL_BODY_SESSIONS:
+                oldest = next(iter(self._rail_block_digests))
+                self._rail_block_digests.pop(oldest, None)
+                self._rail_digest_undo.pop(oldest, None)
+            return True
+
+    def _settle_rail_digest_rollback(self, session_key: str | None) -> None:
+        """Restore this build's rail-block digest writes (turn never landed).
+
+        LOCK-FREE on purpose: the caller (rollback_skill_bodies) already holds
+        ``_sent_skill_bodies_lock`` — a plain Lock, so re-acquiring here would
+        deadlock the turn's ``finally``.
+        """
+        if not session_key:
+            return
+        base = self._cap_memo_key(session_key)
+        for key in [k for k in list(self._rail_digest_undo) if k.startswith(base + "|")]:
+            undo = self._rail_digest_undo.pop(key, None)
+            if not undo:
+                continue
+            record = self._rail_block_digests.setdefault(key, {})
+            for block, prior in undo.items():
+                if prior is None:
+                    record.pop(block, None)
+                else:
+                    record[block] = prior
+
+    def _settle_rail_digest_commit(self, session_key: str | None) -> None:
+        """Drop this build's rail-digest undo entries (the turn landed).
+
+        LOCK-FREE on purpose: the caller (commit_skill_bodies) already holds
+        ``_sent_skill_bodies_lock``.
+        """
+        if not session_key:
+            return
+        base = self._cap_memo_key(session_key)
+        for key in [k for k in list(self._rail_digest_undo) if k.startswith(base + "|")]:
+            self._rail_digest_undo.pop(key, None)
+
     def commit_skill_bodies(self, session_key: str | None) -> None:
         """Discard the current turn's rollback state after its turn LANDED.
 
@@ -2258,6 +2358,7 @@ class ContextBuilder:
         with self._sent_skill_bodies_lock:
             self._sent_skill_bodies_undo.pop(key, None)
             self._thread_watermark_undo.pop(key, None)
+            self._settle_rail_digest_commit(session_key)
 
     def _substitute_bot_name(self, prompt: str) -> str:
         """Replace {bot_name} placeholder in prompt text.
@@ -3502,11 +3603,27 @@ class ContextBuilder:
                     + "\n[END CONVERSATION HISTORY]\n\n"
                 )
 
+        # CTX-5: reset the rail-block digest record before ANY rail block asks
+        # — a window-rebuild turn re-sends [PROJECT]/[RUNTIME]/guidance whole.
+        # The key is normalized HERE (the assignment further down runs too late)
+        # and the skill-body reset below shares the same flags.
+        if (skill_bodies_session or session_key) and (is_new_session or needs_reinjection):
+            self.reset_rail_blocks(skill_bodies_session or session_key, agent)
         # The stable session key describes conversation identity, not
         # necessarily the interface carrying this turn: refresh the runtime on
-        # every follow-up from trusted dispatcher metadata.
+        # every follow-up from trusted dispatcher metadata — CTX-5 narrows it
+        # to the turns the runtime actually CHANGED (or the first after a
+        # window rebuild); an unchanged [RUNTIME] line drops to a pointer.
         if not is_new_session and runtime_source:
-            parts.extend(_sections.runtime_refresh_blocks(session_key or "", runtime_source))
+            _rt_blocks = _sections.runtime_refresh_blocks(session_key or "", runtime_source)
+            _rt_digest = hashlib.sha256("".join(_rt_blocks).encode("utf-8")).hexdigest()
+            if self.rail_block_fresh(session_key, agent, "runtime", _rt_digest):
+                parts.extend(_rt_blocks)
+            else:
+                parts.append(
+                    "[RUNTIME] unchanged from earlier this session — the same "
+                    "interface carries this message.\n\n"
+                )
 
         # Post-compaction re-injection: the skills index was lost when the
         # session-start context was compacted. Re-inject it so the model can
@@ -3659,6 +3776,7 @@ class ContextBuilder:
 
         parts.extend(
             _turn.rail_parts(
+                self,
                 project=project,
                 context_groups=context_groups,
                 board_tags=board_tags,
@@ -3976,6 +4094,20 @@ class ContextBuilder:
             agent=agent,
             minimal_context=minimal_context,
         )
+        # CTX-5: byte-identical guidance on an unchanged turn drops to a
+        # one-line pointer before the request header — the paragraphs were
+        # measured 1,902 of 1,915 B re-sent per follow-up turn. A turn whose
+        # window was rebuilt (fresh session, re-injection, agent switch)
+        # re-sends the full guidance; the reset lives above, beside the
+        # skill-body reset, so rail_block_fresh answers True there and
+        # RECORDS — the first send must always enter the record.
+        if _interactive_guidance and session_key:
+            _gd_digest = hashlib.sha256("".join(_interactive_guidance).encode("utf-8")).hexdigest()
+            if not self.rail_block_fresh(session_key, agent, "guidance", _gd_digest):
+                _interactive_guidance = [
+                    "\n\n(Reply-format, options and card rules as given earlier in "
+                    "this session apply.)"
+                ]
 
         # Injected blocks are not the only source of prior context. A warm
         # provider session can carry its conversation natively while this turn

@@ -348,6 +348,7 @@ def thread_context_parts(
 
 
 def rail_parts(
+    builder: ContextBuilder,
     *,
     project: str | None,
     context_groups: frozenset[str] | None,
@@ -367,15 +368,28 @@ def rail_parts(
 
     parts: list[str] = []
     # Project context — inject on every message so the LLM always knows
-    # the active project, even when set/changed after session start.
+    # the active project, even when set/changed after session start. CTX-5:
+    # an UNCHANGED project on a follow-up turn drops to a one-line pointer
+    # (the block was measured 373 B re-sent byte-identical every turn); a
+    # changed project, a fresh session or a re-injection re-sends it whole.
     if project and _inclusion._group_included(context_groups, _inclusion.CONTEXT_GROUP_PROJECT):
-        parts.append(
+        _project_block = (
             f"[PROJECT] Active project directory: {project}\n"
             "This is the codebase you are working in for this session. "
             "File search, @-mentions, and code references are scoped to "
             "this directory. Prefer files and patterns from this project "
             "when answering questions.\n\n"
         )
+        import hashlib as _hashlib
+
+        _pj_digest = _hashlib.sha256(_project_block.encode("utf-8")).hexdigest()
+        if builder.rail_block_fresh(session_key, agent, "project", _pj_digest):
+            parts.append(_project_block)
+        elif session_key:
+            parts.append(
+                f"[PROJECT] unchanged: {project} — the same active project "
+                "directory as earlier this session.\n\n"
+            )
 
     # Board state — the session's dashboard board tags, so the agent knows
     # its own workflow lane and which tags it is allowed to change with

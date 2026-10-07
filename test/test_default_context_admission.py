@@ -767,7 +767,8 @@ def test_agent_skill_search_entry_finds_omitted_catalog(rig, monkeypatch):
     monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:synthetic")
     output = tools.skill_search("skill_search", {"query": "notebookquartz"})
     assert "notebookquartz" in output
-    assert "key='notebookquartz'" in output
+    # TOOL-15: the load instruction is stated ONCE in the header, not per row.
+    assert "load any: skill_search(action='read', key=KEY)" in output
     assert "Synthetic procedure" in skills.load_skill("notebookquartz")
 
 
