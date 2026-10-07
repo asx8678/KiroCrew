@@ -75,6 +75,7 @@ from kiro_crew.deny_guidance import remediation_for
 from kiro_crew.deny_notice import (  # noqa: F401 -- re-exported for dashboard importers
     _DENY_CAUSE_TEXT,
     build_refusal_steer_notice,
+    build_repeat_refusal_notice,
     steer_refusal_notice,
 )
 from kiro_crew.history import (

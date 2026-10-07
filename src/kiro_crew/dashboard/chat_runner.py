@@ -404,6 +404,7 @@ from kiro_crew.dashboard.state import (  # noqa: F401
     build_infra_retry_prompt,
     build_refusal_recovery_prompt,
     build_refusal_steer_notice,
+    build_repeat_refusal_notice,
     build_stale_recovery_prompt,
     build_tool_stall_recovery_prompt,
     context_entry_expired,
@@ -1143,12 +1144,20 @@ async def _steer_policy_notice(
     """
     if not getattr(client, "supports_refusal_steer", False):
         return False
-    notice = build_refusal_steer_notice(
-        title,
-        reason,
-        cause=cause,
-        credential_tool_hint=await _credential_tool_hint_for(reason, cause, title),
-    )
+    # TOOL-17: the second and later policy denial in one TURN uses the short
+    # repeat form — the attribution correction and guidance are already in the
+    # turn, and re-sending the ~400-char invariant wording for every denial
+    # measured -36% of tokens for the short form. The FIRST notice in a turn
+    # stays byte-identical.
+    if notices and cause == DENY_CAUSE_POLICY:
+        notice = build_repeat_refusal_notice(title, reason, cause=cause)
+    else:
+        notice = build_refusal_steer_notice(
+            title,
+            reason,
+            cause=cause,
+            credential_tool_hint=await _credential_tool_hint_for(reason, cause, title),
+        )
     if not notice:
         return False
     try:

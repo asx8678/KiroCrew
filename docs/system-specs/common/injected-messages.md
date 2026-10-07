@@ -276,7 +276,11 @@ model-inference boundary — the one right after the rejected tool resolves — 
 the model adapts inside the SAME turn. It is opt-in by positive capability
 (`supports_refusal_steer`, i.e. `ACP_BACKENDS_STEER`), so a harness without mid-turn
 steer is unchanged, and so is codex: its user steer rides `_session/steering`, but its
-approval answer cancels the turn and drops what was injected into it.
+approval answer cancels the turn and drops what was injected into it. The
+FIRST notice in a turn carries the full attribution correction and guidance;
+the second and later policy denials in the SAME turn use a short repeat form
+(`build_repeat_refusal_notice`) that names the block and points at the guidance
+already steered, so the ~400-char invariant wording is paid once per turn.
 
 `should_queue_refusal_recovery` then suppresses the extra turn only when every
 refusal got a notice AND a `steering_consumed` echo accounted for all of them. An

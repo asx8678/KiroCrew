@@ -204,6 +204,29 @@ def build_refusal_steer_notice(
     )
 
 
+def build_repeat_refusal_notice(
+    title: str,
+    reason: str,
+    *,
+    cause: str = DENY_CAUSE_POLICY,
+) -> str:
+    """Short form for the SECOND and later policy denial in one turn (TOOL-17).
+
+    The first notice carries ~400 chars of invariant wording — the attribution
+    correction, the "do not apologise" instruction, the cause guidance and any
+    remediation — and repeating all of it for every later denial in the same
+    turn measured -36% of tokens for the short form. The repeat names the block,
+    keeps the "not the user" attribution, and points at the guidance already in
+    the turn. Policy cause only: the other causes judged nothing about the
+    action, and their one-off wording is what says so.
+    """
+    what = f"{title}: {reason}" if reason else title
+    return (
+        f"[Kiro Crew host notice] Blocked again by host policy (not the user): "
+        f"{what}; same guidance as above — decide and continue in this same turn."
+    )
+
+
 async def steer_refusal_notice(
     provider: Any,
     title: str,
