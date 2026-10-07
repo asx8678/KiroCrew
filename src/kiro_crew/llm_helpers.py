@@ -2321,17 +2321,25 @@ async def background_turn(
                 # shared predicate covers the claude seam's cost and cache
                 # dimensions alongside the kiro credits/token signals.
                 if usage_has_billing(usage):
+                    # USE-8: the row's model is the SERVED model — the same
+                    # figure the crew log gets two fields below — so a kiro
+                    # background session inheriting its default (served_model
+                    # "auto", _model "") files under "auto" instead of an
+                    # empty string the Spend page reads as "unknown".
+                    # model_source stays as the resolver fallback for a richer
+                    # figure, the same pattern run_bg_oneliner uses.
+                    _served_model = str(getattr(client, "served_model", "") or "").strip()
                     _record_background_crew_log(
                         _crew_log_owner,
                         crew_log_kind,
                         usage,
-                        model=str(getattr(client, "served_model", "") or "").strip(),
+                        model=_served_model,
                         provider=_provider_label(client),
                         elapsed_ms=turn_elapsed_ms,
                     )
                     await persist_token_record_async(
                         key,
-                        "",
+                        _served_model,
                         usage,
                         _provider_label(client),
                         surface=f"bg:{task}",
