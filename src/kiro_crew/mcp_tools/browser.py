@@ -291,6 +291,16 @@ def _post_command(
         return None, {}
 
 
+# TOOL-10: the per-op result budget. A snapshot is the tree the model must
+# read to find element refs (the description says to call it first), so it
+# gets a real budget; other ops answer with a short confirmation. Past the
+# budget the head is kept and an explicit note names how much was dropped —
+# the old silent [:2000] cut left the model reading a tree that ended
+# mid-node with no idea anything was missing.
+_SNAPSHOT_RESULT_BUDGET = 20_000
+_DEFAULT_RESULT_BUDGET = 2_000
+
+
 def _result_text(op: str, result: Any) -> str:
     """Concise success text, with untrusted panel content redacted."""
     if op == "screenshot":
@@ -308,7 +318,15 @@ def _result_text(op: str, result: Any) -> str:
     rendered = result if isinstance(result, str) else json.dumps(result, default=str)
     rendered, _ = redact_exfiltration_urls(rendered)
     rendered, _ = redact_credentials(rendered)
-    return f"Browser {op}: {rendered[:2000]}"
+    budget = _SNAPSHOT_RESULT_BUDGET if op == "snapshot" else _DEFAULT_RESULT_BUDGET
+    if len(rendered) <= budget:
+        return f"Browser {op}: {rendered}"
+    omitted = len(rendered) - budget
+    return (
+        f"Browser {op}: {rendered[:budget]}\n"
+        f"[truncated: {omitted} more chars — scope with a ref/selector to "
+        "read the rest of the tree]"
+    )
 
 
 def _use_builtin_browser() -> bool:
