@@ -86,8 +86,6 @@ class TestStaleGenerationDeny:
     """
 
     def _armed(self, monkeypatch: pytest.MonkeyPatch, recorded_gen: int | None) -> bool:
-        import threading
-
         spawned: list[object] = []
 
         class _NoThread:
