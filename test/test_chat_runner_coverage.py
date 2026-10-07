@@ -1758,6 +1758,63 @@ class TestExpandDollarSkills:
         assert "AKIAIOSFODNN7EXAMPLE" not in expanded
         assert slot.messages[-1]["role"] == "system"
 
+    @staticmethod
+    def _builder():
+        import os
+        import tempfile
+
+        from kiro_crew.context import ContextBuilder
+
+        os.environ.setdefault("KIRO_HOME", tempfile.mkdtemp(prefix="kc-skl-"))
+        return ContextBuilder(bot_name="Kiro")
+
+    def test_one_turns_expansion_is_capped_to_one_bodys_worth(self, tmp_path):
+        """SKL-7: bodies past the per-turn budget arrive as pointer lines."""
+        state, slot = _state(tmp_path), _slot()
+        skills = MagicMock()
+        big = "x" * 40_000
+        skills.resolve_dollar_skills.return_value = [(f"$s{i}", f"s{i}", big) for i in range(4)]
+
+        with patch.object(chat_runner, "_get_skills", return_value=skills):
+            expanded, count = chat_runner._expand_dollar_skills(
+                "run $s0 $s1 $s2 $s3", state, slot, "dashboard:x"
+            )
+
+        assert count == 4
+        # Two bodies fit the 99,000-char budget; the rest are pointers.
+        assert expanded.count("[Skill: s0]\n\n") == 1
+        assert expanded.count("[Skill: s1]\n\n") == 1
+        assert expanded.count("Not re-sent") == 2
+        assert "as pointers: s2, s3" in slot.messages[-1]["content"]
+        # Delivered bodies respect the budget.
+        assert big in expanded and expanded.count(big) <= 2
+
+    def test_a_body_the_session_holds_arrives_as_its_pointer(self, tmp_path):
+        """SKL-5: a second `$turn` for the same body sends only a pointer; the
+        reset rules build_message owns re-send it after a compaction."""
+        builder = self._builder()
+        state, slot = _state(tmp_path, context_builder=builder), _slot()
+        skills = MagicMock()
+        body = "Procedure body, unique per skill."
+        skills.resolve_dollar_skills.return_value = [("$p", "deploy", body)]
+
+        with patch.object(chat_runner, "_get_skills", return_value=skills):
+            first, _ = chat_runner._expand_dollar_skills("run $p", state, slot, "dashboard:skl")
+            assert body in first
+            # Second turn, same session: the pointer, not the body.
+            second, _ = chat_runner._expand_dollar_skills("again $p", state, slot, "dashboard:skl")
+            assert body not in second
+            assert "Not re-sent" in second
+            # A different session key re-sends (per-session record).
+            third, _ = chat_runner._expand_dollar_skills("again $p", state, slot, "dashboard:other")
+            assert body in third
+            # The compaction reset (build_message's seam) re-sends too.
+            builder._dedup_triggered_bodies("dashboard:skl", None, reset=True, candidates=[])
+            fourth, _ = chat_runner._expand_dollar_skills(
+                "after compaction $p", state, slot, "dashboard:skl"
+            )
+            assert body in fourth
+
 
 # ── requeue suppression / pending reset ───────────────────────────────────
 
