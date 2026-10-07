@@ -154,7 +154,50 @@ class TestPermit:
         assert seen == [adm.OUTCOME_FAILURE, adm.OUTCOME_NEUTRAL]
 
 
-class TestFifo:
+class TestPriorityOrdering:
+    """REL-36: interactive spawns are granted ahead of queued background
+    spawns, and background waiters age to interactive so neither class
+    starves."""
+
+    @pytest.mark.asyncio
+    async def test_interactive_is_granted_before_a_queued_background_waiter(self) -> None:
+        gate = adm.SpawnGate(1)
+        held = await gate.acquire(label="held")
+
+        bg_task = asyncio.ensure_future(gate.acquire(label="bg", priority="background"))
+        await asyncio.sleep(0.01)
+        int_task = asyncio.ensure_future(gate.acquire(label="int", priority="interactive"))
+        await asyncio.sleep(0.01)
+
+        held.release()
+        # ONE slot: the INTERACTIVE waiter takes it first.
+        inter = await asyncio.wait_for(int_task, timeout=2)
+        assert inter.label == "int"
+        # The background waiter is still queued (no slot free).
+        assert not bg_task.done()
+        # Release the interactive permit; the background one is granted now.
+        inter.release()
+        bg = await asyncio.wait_for(bg_task, timeout=2)
+        assert bg.label == "bg"
+        bg.release()
+
+    @pytest.mark.asyncio
+    async def test_fifo_within_one_priority_class(self) -> None:
+        gate = adm.SpawnGate(1)
+        held = await gate.acquire(label="held")
+        first_bg = asyncio.ensure_future(gate.acquire(label="bg-1", priority="background"))
+        await asyncio.sleep(0.01)
+        second_bg = asyncio.ensure_future(gate.acquire(label="bg-2", priority="background"))
+        await asyncio.sleep(0.01)
+        held.release()
+        a = await asyncio.wait_for(first_bg, timeout=2)
+        assert a.label == "bg-1"
+        assert not second_bg.done()
+        a.release()
+        b = await asyncio.wait_for(second_bg, timeout=2)
+        assert b.label == "bg-2"
+        b.release()
+
     @pytest.mark.asyncio
     async def test_waiters_are_admitted_in_arrival_order(self) -> None:
         gate = adm.SpawnGate(1)
@@ -168,7 +211,9 @@ class TestFifo:
 
         tasks = [asyncio.create_task(wait(f"w{i}")) for i in range(3)]
         await _settle()
-        assert gate.queued == 3 and gate.in_flight == 1
+        # Default priority is background, so these wait in the background
+        # queue; `queued` counts BOTH queues since the priority split (REL-36).
+        assert gate.total_queued == 3 and gate.in_flight == 1
         first.release()
         await _settle()
         assert order == ["w0"]
@@ -178,7 +223,7 @@ class TestFifo:
         await _settle()
         (await tasks[2]).release()
         assert order == ["w0", "w1", "w2"]
-        assert gate.in_flight == 0 and gate.queued == 0
+        assert gate.in_flight == 0 and gate.total_queued == 0
 
     @pytest.mark.asyncio
     async def test_a_newcomer_never_jumps_the_queue(self) -> None:
