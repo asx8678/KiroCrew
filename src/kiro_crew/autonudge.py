@@ -813,6 +813,13 @@ class AutoNudgeService:
         # confirmed. Transient on purpose: it is a claim about a turn in flight,
         # so a restart must forget it rather than charge a turn that never ran.
         self._pending_monitor_wake: set[str] = set()
+        # LOOP-17: the gated WAKE brief parked beside its claim — the kernel's
+        # verdict.body ('[work-ledger wake] item=<id> status=<status>' plus the
+        # footer), which the plain fire path used to discard. Memory only, never
+        # persisted: irq's wake_brief is structural by design
+        # (ledger_wake.py:455-468), and the body is rebuilt by the next probe
+        # tick anyway. Consumed and re-owed with the claim in _run_fire_cycle.
+        self._pending_monitor_wake_body: dict[str, str] = {}
         #: A quiet-streak floor tick that has decided to deliver but not yet
         #: delivered. Same shape and same reason as the wake claim above: the charge
         #: belongs at the single point delivery is confirmed, never at the decision.

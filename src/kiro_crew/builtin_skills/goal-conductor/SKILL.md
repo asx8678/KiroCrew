@@ -301,7 +301,10 @@ Each cycle:
    it stays small however many items the board holds. The full read (no
    `compact`) adds every field, the newest events and a ready-to-pipe
    `accept_batch`; take it, or `item_id=<id>` for one item, only when a `done`
-   item needs its bar (step 3). A full read too large for the tool-result limit
+   item needs its bar (step 3). **A wake turn that names one item** (a
+   `[work-ledger wake] item=<id> status=<status>` line in the turn text, LOOP-17)
+   may read that item alone — `work_ledger_read item_id=<id> compact=true` —
+   instead of the whole board: the wake already says which item moved. A full read too large for the tool-result limit
    comes back trimmed with `truncated: true` and says what it left out. An item is never `stale` on the strength of silence alone: its worker
    also has to be not running, and its last word has to have left the next move
    with the worker, so a `done` item waiting on you is not flagged.

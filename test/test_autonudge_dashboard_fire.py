@@ -103,6 +103,107 @@ async def _run_chat_through_monitor_boundary(*_args, **kwargs) -> None:
 
 class TestDashboardNudgeSlotResolution:
     @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_a_gated_wakes_brief_is_appended_to_the_delivered_turn(self) -> None:
+        """LOOP-17: a gated WAKE turn names which items moved and how — the
+        kernel's parked brief rides after the standing message, so a
+        single-item wake can be handled with a targeted read instead of a
+        full board read."""
+        orch = _orchestrator()
+        slot = _slot()
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        brief = "[work-ledger wake] item=X status=question\nthis text names what changed"
+        orch.autonudge_svc.peek_monitor_wake_body = MagicMock(return_value=brief)
+        run_chat = AsyncMock()
+        spawned: list[asyncio.Task] = []
+
+        def _spawn(_state, _slot, coro):
+            task = asyncio.create_task(coro)
+            spawned.append(task)
+            return task
+
+        with (
+            patch.object(gw, "spawn_guarded_turn", _spawn),
+            patch("kiro_crew.dashboard.chat._run_chat", new=run_chat),
+        ):
+            assert await orch._fire_dashboard_nudge(_loop()) is True
+            await asyncio.gather(*spawned)
+        delivered = run_chat.call_args.args[2] if run_chat.call_args.args else ""
+        assert "check the PR" in delivered, "the standing message must still lead"
+        assert delivered.count("[work-ledger wake] item=X status=question") == 1
+        assert "this text names what changed" in delivered
+
+    @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_a_plain_nudge_without_a_brief_carries_no_wake_line(self) -> None:
+        """LOOP-17: liveness and floor turns carry no brief — only a gated WAKE
+        parks one, so the ordinary cadence turn is the standing message alone."""
+        orch = _orchestrator()
+        slot = _slot()
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        orch.autonudge_svc.peek_monitor_wake_body = MagicMock(return_value="")
+        run_chat = AsyncMock()
+        spawned: list[asyncio.Task] = []
+
+        def _spawn(_state, _slot, coro):
+            task = asyncio.create_task(coro)
+            spawned.append(task)
+            return task
+
+        with (
+            patch.object(gw, "spawn_guarded_turn", _spawn),
+            patch("kiro_crew.dashboard.chat._run_chat", new=run_chat),
+        ):
+            assert await orch._fire_dashboard_nudge(_loop()) is True
+            await asyncio.gather(*spawned)
+        delivered = run_chat.call_args.args[2] if run_chat.call_args.args else ""
+        assert "[work-ledger wake]" not in delivered
+        assert "check the PR" in delivered
+
+    @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_a_refused_fire_keeps_the_brief_for_the_retry(self, tmp_path) -> None:
+        """LOOP-17: a refused (BUSY) fire re-owes the parked brief with its
+        claim, so the next attempt still names the item."""
+        from kiro_crew import autonudge as an
+        from kiro_crew.autonudge_service import firing
+
+        svc = an.AutoNudgeService(base_dir=tmp_path)
+        await svc.start()
+        loop = _loop()
+        loop.monitor = MonitorState(
+            kind="github_pull_request",
+            target="owner/repo#123",
+            objective="review_ready",
+            created_ts=1_000.0,
+            last_wake_fingerprint="failure-a",
+            wake_in_flight=True,
+        )
+        svc._loops[loop.id] = loop
+        svc._pending_monitor_wake.add(loop.id)
+        svc._pending_monitor_wake_body[loop.id] = "[work-ledger wake] item=X status=question"
+
+        async def _refused(_loop):
+            return False
+
+        svc._on_fire = _refused
+        await firing._run_fire_cycle(svc, loop)
+        assert loop.id in svc._pending_monitor_wake, "the claim must be re-owed"
+        assert svc._pending_monitor_wake_body.get(loop.id) == (
+            "[work-ledger wake] item=X status=question"
+        ), "the brief must be re-owed with the claim"
+
+        async def _delivered(_loop):
+            return True
+
+        svc._on_fire = _delivered
+        await firing._run_fire_cycle(svc, loop)
+        assert loop.id not in svc._pending_monitor_wake
+        assert not svc._pending_monitor_wake_body.get(loop.id), "consumed on delivery"
+        svc.stop()
+
+    @pytest.mark.asyncio
     async def test_cold_slot_is_rehydrated_and_the_turn_runs(self) -> None:
         """The headline fix: a loop must survive a closed browser tab / restart."""
         orch = _orchestrator()

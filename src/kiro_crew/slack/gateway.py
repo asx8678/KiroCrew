@@ -7215,6 +7215,21 @@ class GatewayOrchestrator:
             _fired_generation = loop.config_generation
             msg = await compose_nudge_body(_fired_message, _fired_sentinel, loop.slot_key)
             tagged = f"{nudge_cycle_header(loop)}\n{msg}"
+            # LOOP-17: a gated loop's WAKE claim carried the kernel's brief —
+            # which item moved and how — and this path used to discard it, so
+            # the conductor's first act on every wake was a full board read.
+            # PEEK, never take: the brief is consumed where the claim is
+            # consumed (firing's settlement) and re-owed on a refused fire, so
+            # a busy slot cannot lose it.
+            _wake_body = ""
+            if self.autonudge_svc is not None:
+                _peeked = self.autonudge_svc.peek_monitor_wake_body(loop.id)
+                # isinstance, not truthiness: a test double's bare MagicMock
+                # returns a Mock and must not append garbage to the prompt.
+                if isinstance(_peeked, str):
+                    _wake_body = _peeked
+            if _wake_body:
+                tagged = f"{tagged}\n{_wake_body}"
         else:
             tagged = wake_message
             # Capture the generation on THIS arm too. A monitor wake runs the
