@@ -129,6 +129,12 @@ _DERIVED_SESSION_SHAPES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("subagent", (_hex(8),)),
     ("cron", (_hex(8), _hex(8))),
     (_MEMORY_CONSOLIDATION_PREFIX, (_MEMORY_STORE_NAME, _hex(32))),
+    # One-run internal LLM calls: each keys a fresh session whose work
+    # directory exists for that call alone, so it is disposable exactly like
+    # a subagent's or a cron run's.
+    ("judge", (_hex(32),)),
+    ("taskrunner", ("refine", _hex(8))),
+    ("hook", ("default", _hex(8))),
 )
 
 
