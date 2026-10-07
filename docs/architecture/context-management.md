@@ -691,6 +691,39 @@ member writes one, and `[CURRENT ASSIGNMENT]` renders
 The stated purpose of the private-file direction is per-member private memory plus
 per-member permission control; both exist today, in the forms above.
 
+## What Crew budgets vs what the harness owns
+
+This is the boundary the numbers above sit inside. Crew's budgets bound only
+what Crew injects; the harness (kiro-cli, claude, codex) owns the rest of the
+model's input, and neither side can see the other's total.
+
+**Crew budgets** (what `_ResolvedCaps`, `build_message` and the replay paths
+bound): the session-start contract blocks (`[AGENT SYSTEM PROMPT]`,
+`[CRITICAL RULES]`, identity, member section, preferences, projects, skills
+index, pinned bodies); the per-turn blocks (memory activity, steering,
+trigger-matched skills, drained app context, formatted MCP results Crew emits
+into the transcript); the bounded session replay (history fallback and
+compressed history, window-scaled); the reinjected blocks after compaction.
+These are the only bytes Crew can shrink, cap or omit, and every cap in the
+table above bounds one of them.
+
+**The harness owns** (invisible to Crew's budgets, unbudgetable from here): the
+native history replay the ACP session carries (after the first turn Crew injects
+no transcript — the session holds it natively); every tool schema the mounted
+servers declare; every tool result the backend retains in its own context;
+the image bytes a conversation carries in native history; the harness's own
+compaction decisions and their window. On the kiro-cli path this is the
+dominant share of the real model input, and `budget.py`'s base is deliberately
+NOT a bound on the provider's full input or a token estimate of it — it is a
+character allowance for the blocks Crew assembles.
+
+**Crew's levers**: what it injects (each block is a cap away from zero), which
+spec and which tools it mounts (the spec's tool list and MCP server set), the
+size of MCP results Crew formats (the per-message truncation cap), the session
+lifecycle (when to compact, when to reset), and the cadence of reinjection.
+What Crew cannot lever: the harness's native window, its history retention, or
+its compaction threshold.
+
 ## Where to look
 
 | Question | Files |
