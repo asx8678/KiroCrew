@@ -71,6 +71,12 @@ _SKILL_DETECTION_WINDOW = 200
 # Seeded sessions (restored from disk after a restart) examined per idle sweep:
 # a large backlog drains a few per heartbeat instead of all at once.
 _SEEDED_PER_SWEEP = 3
+
+#: LOOP-12: the fewest prompt rows an IDLE consolidation pass needs before it
+#: is worth a whole LLM turn. A shorter tail waits — for more rows, or for the
+#: session-end flush, which still consolidates any tail — instead of billing
+#: the fixed consolidation prompt for one new row after an idle window.
+_IDLE_MIN_PROMPT_ROWS = 4
 # Oldest transcript the restart seed backfills: older stranded work is left to a
 # manual ``kirocrew consolidate``, so one boot cannot bill a long-idle backlog.
 _SEED_MAX_AGE_SECS = 7 * 86400
@@ -1159,9 +1165,16 @@ class HistoryConsolidator:
                 self._last_activity[key] = self._last_activity.pop(key)
             # A seed's transcript may be cold and large, so it is never read here on the
             # loop: ``_consolidate`` snapshots it off the loop and enforces the backoff.
-            total, unconsolidated = (0, 1) if seeded else self._log.consolidation_counts(key)
+            # LOOP-12: a tail of fewer than _IDLE_MIN_PROMPT_ROWS prompt rows is
+            # not worth a whole LLM pass — it waits for more rows or for the
+            # session-end flush, which still consolidates any tail.
+            total, unconsolidated, tail_prompt_rows = (
+                (0, 1, _IDLE_MIN_PROMPT_ROWS)
+                if seeded
+                else self._log.consolidation_idle_counts(key)
+            )
             if (
-                unconsolidated < 1
+                tail_prompt_rows < _IDLE_MIN_PROMPT_ROWS
                 or now - self._history_consolidated.get(key, 0) < self._history_idle_secs
                 or self._busy(key)
                 # Durable backoff, checked last so it only costs a metadata read
@@ -1175,7 +1188,7 @@ class HistoryConsolidator:
                 continue
             self._running.add(key)
             captured_now = now
-            t = asyncio.create_task(self._consolidate(key, include_history=True))
+            t = asyncio.create_task(self._consolidate(key, include_history=True, idle_pass=True))
             self._tasks.add(t)
 
             def _on_idle_done(
@@ -1330,7 +1343,7 @@ class HistoryConsolidator:
         return True
 
     async def _consolidate(
-        self, key: str, include_history: bool = True
+        self, key: str, include_history: bool = True, *, idle_pass: bool = False
     ) -> _ConsolidationRefusedSentinel | None:
         """Run LLM consolidation for a session.
 
@@ -1421,6 +1434,24 @@ class HistoryConsolidator:
                 if key in self._seeded_keys:  # a finished seed stops being re-read
                     self._seeded_keys.discard(key)
                     self._last_activity.pop(key, None)
+                return None
+            # LOOP-12: an idle sweep that raced more rows in since its cheap count
+            # still refuses a tail too short to learn from — WITHOUT marking, so
+            # the rows wait for the next window or for the session-end flush,
+            # which consolidates any tail unconditionally. Seeded sessions are
+            # exempt: their transcript was cold and their eligibility was forced
+            # at the count, and their refusal keeps its own bookkeeping below.
+            if (
+                idle_pass
+                and key not in self._seeded_keys
+                and len(_prompt_rows(unconsolidated)) < _IDLE_MIN_PROMPT_ROWS
+            ):
+                self._logger.info(
+                    "idle consolidation skipped for %s: only %d prompt row(s) since the "
+                    "last pass; waiting for more rows or the session-end flush",
+                    key,
+                    len(_prompt_rows(unconsolidated)),
+                )
                 return None
             # Display-only rows (``notice``) are text drawn for the person
             # reading the transcript, not conversation: the Slack thread-parent

@@ -1022,7 +1022,7 @@ class TestFailureAfterTheBilledCall:
         skip conditions are false again 60s later — a fresh billed turn per tick,
         forever. The durable counter is the only thing that stops it.
         """
-        log = _seed_log(tmp_path)
+        log = _seed_log(tmp_path, count=4)  # LOOP-12: the idle sweep needs 4 rows
         c = _make_consolidator(log)
         c._last_activity[KEY] = time.time() - 10
 
@@ -1039,7 +1039,7 @@ class TestFailureAfterTheBilledCall:
         assert retry_at > time.time()
         # The span is still unconsolidated, and the throttle was never set —
         # backoff is the sole remaining gate.
-        assert log.unconsolidated_count(KEY) == 3
+        assert log.unconsolidated_count(KEY) == 4
         assert KEY not in c._history_consolidated
 
         c._tasks.clear()

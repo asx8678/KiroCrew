@@ -13,6 +13,7 @@ alike. These tests pin the split, the separator accounting, the oversized-messag
 case, and that no offset ever advances past what a model actually read.
 """
 
+import asyncio
 import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -295,6 +296,54 @@ class TestTheBudgetIsNotABehaviourChangeForOrdinarySessions:
         c._tasks.clear()
         c.check_idle_sessions()
         assert not c._tasks
+
+
+class TestTheIdleSweepNeedsAMinimumSpan:
+    """LOOP-12: one new prompt row after an idle window is not a whole LLM pass.
+
+    The sweep refuses a tail of fewer than ``_IDLE_MIN_PROMPT_ROWS`` prompt rows
+    and leaves it for more rows or the session-end flush, which still
+    consolidates any tail."""
+
+    @pytest.mark.asyncio
+    async def test_an_idle_session_with_one_new_row_starts_nothing(self, tmp_path) -> None:
+        log = _log_with(tmp_path, [f"m{i}" for i in range(6)])
+        c = _make_consolidator(log)
+        with history_mod.allow_on_loop_persist():
+            log.mark_consolidated(KEY, 5)  # 5 consolidated, 1 new prompt row
+        c._last_activity[KEY] = time.time() - 10_000  # far past the idle window
+
+        c.check_idle_sessions()
+        assert not c._tasks, "a one-row tail must not bill a consolidation pass"
+
+    @pytest.mark.asyncio
+    async def test_an_idle_session_with_four_rows_starts_exactly_one(self, tmp_path) -> None:
+        log = _log_with(tmp_path, [f"m{i}" for i in range(9)])
+        c = _make_consolidator(log)
+        with history_mod.allow_on_loop_persist():
+            log.mark_consolidated(KEY, 5)  # 4 new prompt rows
+        c._last_activity[KEY] = time.time() - 10_000
+
+        with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "e"})):
+            c.check_idle_sessions()
+            await asyncio.gather(*list(c._tasks), return_exceptions=True)
+
+        assert log.unconsolidated_count(KEY) == 0
+
+    @pytest.mark.asyncio
+    async def test_the_session_end_flush_still_consolidates_a_one_row_tail(self, tmp_path) -> None:
+        log = _log_with(tmp_path, [f"m{i}" for i in range(6)])
+        c = _make_consolidator(log)
+        with history_mod.allow_on_loop_persist():
+            log.mark_consolidated(KEY, 5)
+
+        with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "e"})):
+            c.consolidate_session(KEY)
+            await asyncio.gather(*list(c._tasks), return_exceptions=True)
+
+        assert (
+            log.unconsolidated_count(KEY) == 0
+        ), "the session-end flush must keep consolidating any tail"
 
 
 class TestABoundedAttemptIsNotReleasedByGrowth:
