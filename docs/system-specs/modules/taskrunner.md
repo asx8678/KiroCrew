@@ -859,6 +859,15 @@ same failing step that differ only by their noise count as the SAME error;
 
 Applies to both exception errors and test failure outputs.
 
+The chat runner's own repeat-loop tracker (same module) notices when a live
+turn repeats an identical tool call and steers the advice into the running
+turn in-band — on harnesses with a refusal-steer capability
+(`supports_refusal_steer`), selected by that positive capability and never by
+harness identity. When the capability is absent or the steer fails or times
+out, the notice is parked on the slot and delivered exactly once on the next
+prompt that session sends (TOOL-21) — the notice is never lost, and a
+Crew-side cancel after further repeats stays a maintainer decision.
+
 ## Step Prompt Context
 
 `task_executor.build_task_prompt()` assembles context for each step (async):
