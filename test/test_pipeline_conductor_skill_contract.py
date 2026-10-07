@@ -104,6 +104,48 @@ def _skill_section(heading: str) -> str:
 
 
 class TestAgentPromptNamesEveryScript:
+    def test_the_prescribed_patrol_bounds_pass_the_budget_check(self):
+        """LOOP-20: the bounds SKILL.md prescribes must pass goal-conductor's
+        patrol_budget.py check, so the runtime budget — not the cycle count —
+        ends a pipeline patrol and a live fleet is never orphaned by the cap
+        before its 72 h runtime."""
+        text = _read(SKILL_MD)
+        m = re.search(
+            r"interval near (\d+) seconds, an\s+explicit `max_cycles=(\d+)`, and an explicit "
+            r"`max_runtime_secs=(\d+)`",
+            text,
+        )
+        assert m, "SKILL.md no longer prescribes explicit patrol bounds"
+        interval, cycles, runtime = (int(m.group(i)) for i in (1, 2, 3))
+        script = (
+            REPO_ROOT
+            / "src"
+            / "kiro_crew"
+            / "builtin_skills"
+            / "goal-conductor"
+            / "scripts"
+            / "patrol_budget.py"
+        )
+        out = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "check",
+                "--interval-secs",
+                str(interval),
+                "--max-cycles",
+                str(cycles),
+                "--max-runtime-secs",
+                str(runtime),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert out.returncode == 0, (
+            f"SKILL.md bounds ({interval}s x {cycles} vs {runtime}s) fail the budget "
+            f"check: {out.stdout.strip()}"
+        )
+
     def test_prompt_names_the_script_this_change_adds(self):
         """Only ``claim_preflight.py`` is pinned here. The other two are already
         pinned in the installer test's own name list, and re-asserting them would

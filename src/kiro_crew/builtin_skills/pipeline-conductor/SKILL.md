@@ -266,17 +266,19 @@ never relabel it success in the friction report.
    artifact you have to remember to create is one that gets created at the end of
    the run, which is the one moment its contents no longer exist (see "What you
    write down, and when").
-4. Arm the patrol with `monitor_start` using an interval near 90 seconds, an
-   explicit `max_cycles=960`, and an explicit `max_runtime_secs=259200`. **Patrol
+4. Arm the patrol with `monitor_start` using an interval near 300 seconds, an
+   explicit `max_cycles=960`, and an explicit `max_runtime_secs=259200` — bounds
+   that pass `goal-conductor`'s `patrol_budget.py check` (LOOP-20): 300 x 960
+   covers the 72 h runtime, so the runtime budget, not the cycle count, ends the
+   patrol and a live fleet is never orphaned by the cap. **Patrol
    with `monitor_start`, never `wait`.** If live work needs a larger or renewed
    bound, raise it with `monitor_update` before it expires; `monitor_start` is
    create-only. Call `autonudge_stop` yourself when the exit condition fires —
-   coasting into the cycle cap is a failure, not a finish. That ~90s interval is
+   coasting into the cycle cap is a failure, not a finish. That ~300s interval is
    also what sizes your panel's stale window: `BOARD_STALE_AFTER_SECONDS` in
-   `kiro_crew.dashboard.handlers.agent_panel` is about ten of these intervals, so a
-   board reads stale only after the log has been quiet across many cycles rather
-   than after one quiet cycle. Change the cadence here and that constant needs the
-   same look.
+   `kiro_crew.dashboard.handlers.agent_panel` is 900 s — about three of these
+   intervals — so a board reads stale only after the log has been quiet across
+   several cycles rather than after one quiet cycle.
 
 Standing patrol instruction template (keep it CURRENT — steering edits go here
 via `monitor_update`, see "Live steering"):
