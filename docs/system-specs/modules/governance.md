@@ -254,7 +254,17 @@ pins ride in the policy file for it:
   overriding the user's `auto_update=false` (user config sits under the
   enterprise ceiling). It never refuses to *boot*: bricking a fleet on a policy
   typo would remove the surface an admin needs to fix it. An unparseable floor
-  imposes none, for the same reason. What "takes the update" means depends on
+  imposes none, for the same reason. Versions order by the ONE comparator the
+  update check uses (`kiro_crew.versioning`, PEP 440 plus the desktop lane's
+  hyphenated stamps read as prereleases): a prerelease or dev build of `X.Y.Z`
+  — any lane's spelling, `0.3.0rc1`, `0.3.0.dev…`, `0.3.0-rc.1`,
+  `0.3.0-nightly.…` — is BELOW an `X.Y.Z` floor and at or above any lower one,
+  and a build the comparator cannot parse is below the floor. One consequence
+  is decided explicitly: `STABLE_PROMOTE_BYTES` keeps the candidate's `rcN`
+  stamp on the promoted stable bytes, so a fleet that promoted bytes and then
+  pins `min_version` at the bare `X.Y.Z` sees every host report below-floor
+  and take or flag the update per its install type; pin the floor at a version
+  the bytes actually report, or below it. What "takes the update" means depends on
   the install (`slack/gateway.py` `_check_for_updates` and
   `_check_for_updates_via_provider`):
   - **A policy provider** (`check_command` below) applies whenever the check
