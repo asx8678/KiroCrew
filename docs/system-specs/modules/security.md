@@ -862,6 +862,18 @@ which layer to look at, loudly.
 
 ### XPIA Hardening (`security/` + `hooks.py`)
 
+**What redaction does not cover.** `redact()` is a best-effort, shape-based
+output filter — a defense-in-depth layer — and an agent that deliberately
+re-encodes material defeats it by construction: a secret hex-encoded,
+rot13'd, split into short chunks or space-separated passes through
+unredacted (base64-encoded credentials ARE caught by the decode pass). No
+encoded-shape heuristics are added; each encoding closed narrows an unbounded
+set by one, at a false-positive cost — the same spelling-chase the shell gate
+rejects. The controls for an agent that can already read a secret are the
+sandbox tier (which decides which credential stores a spawned shell can open),
+the environment scrub, and the exfiltration gate; redaction never promises to
+catch a re-encoded copy of what those layers let the agent read.
+
 The hook-layer half of this section is reached at `hooks.py`, which stays the import
 path and the patch surface; the rules it threads live in the modules of
 `kiro_crew.hook_runtime` (`safe_reads`, `descriptor_identity`, `pinned_writes`,
