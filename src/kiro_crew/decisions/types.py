@@ -30,11 +30,18 @@ def is_model_id(value: object) -> bool:
 
 @dataclass
 class Choice:
-    """Pick one member of the declared option domain."""
+    """Pick one member of the declared option domain.
+
+    ``option_rubric`` is the optional one-sentence meaning of each option, sent
+    as the provider's per-option ``criteria`` (LOOP-28): the option names
+    travel alone otherwise, and the judge cannot know what choosing one is
+    claiming. Keys outside ``options`` are ignored by the wire mapping.
+    """
 
     id: str
     prompt: str
     options: list[str] = field(default_factory=list)
+    option_rubric: dict[str, str] | None = None
 
 
 #: The fewest and most levels one ``Score`` may declare. The provider refuses
@@ -84,6 +91,13 @@ def question_texts(question: object) -> list[str]:
     texts = [str(getattr(question, "prompt", "") or "")]
     if isinstance(question, Choice):
         texts.extend(str(option) for option in question.options)
+        # LOOP-28: the rubric leaves the machine in the same request, so it
+        # must pass the scrub like every other question text.
+        texts.extend(
+            str(text)
+            for option, text in sorted((question.option_rubric or {}).items())
+            if text and option in question.options
+        )
     elif isinstance(question, Noul):
         texts.extend(str(t) for t in (question.true_means, question.false_means) if t)
     elif isinstance(question, Score):

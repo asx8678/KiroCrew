@@ -139,6 +139,19 @@ OUTCOME_OPTIONS = (
     OUTCOME_BROKEN,
 )
 
+#: One sentence per outcome option (LOOP-28): the judge sees what choosing each
+#: one claims, instead of guessing from the name. The owner's wake/quiet
+#: criteria stay in the instruction text (the needs_owner rubric below); this
+#: map is the OUTCOME question's per-option meaning.
+OUTCOME_RUBRIC = {
+    OUTCOME_NOTHING_NEW: "No new events, rows, or artifacts since the last look.",
+    OUTCOME_PROGRESS_ONLY: "Work moved ahead, but nothing needs the owner now.",
+    OUTCOME_NEEDS_ACTION: "A step is blocked that the owning session can unblock.",
+    OUTCOME_NEEDS_HUMAN: "Only a human decision, approval, or answer will move it.",
+    OUTCOME_FINISHED: "The watched work reached its done state.",
+    OUTCOME_BROKEN: "The watched work failed or is no longer followable.",
+}
+
 #: The two outcomes that say the watched work is over. They WAKE the session and
 #: leave the loop armed: a judge reading prose must not be able to end a watch,
 #: because one hostile or mistaken comment in a watched transcript would then buy
@@ -289,6 +302,7 @@ def build_questions(wake_when: str = "", quiet_when: str = "") -> list[Question]
             Q_OUTCOME,
             "What state is the watched work in?",
             options=list(OUTCOME_OPTIONS),
+            option_rubric=dict(OUTCOME_RUBRIC),
         ),
         Choice(
             Q_URGENCY,
