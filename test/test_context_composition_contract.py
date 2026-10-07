@@ -359,6 +359,23 @@ def _follow_up_reinjection(rig: _Rig) -> str:
     return _turn(rig, "next", False, session_key="dashboard:c", needs_reinjection=True)
 
 
+def test_reinjection_restores_the_protected_memory_half(rig: _Rig) -> None:
+    # A confirmed compaction dropped the session-start blocks; the re-injection
+    # must restore the critical rules, the preferences block and the standing
+    # lessons — without the flag a follow-up turn carries none of them.
+    rig.seed_memory()
+    rig.cfg.dashboard.verbosity = "concise"
+    text = _turn(rig, "next", False, session_key="dashboard:c", needs_reinjection=True)
+    assert "[CRITICAL RULES" in text
+    assert "## User Preferences" in text
+    assert "[Learned corrections" in text
+    assert "Never force-push a shared branch" in text
+    plain = _turn(rig, "next", False, session_key="dashboard:c2")
+    assert "[CRITICAL RULES" not in plain
+    assert "## User Preferences" not in plain
+    assert "[Learned corrections" not in plain
+
+
 def _slack_thread_parent(rig: _Rig) -> str:
     return _turn(
         rig,
@@ -721,14 +738,15 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
         ],
     ),
     "follow_up_reinjection": (
-        "8db385cb24791077937939ce44ce9cbc507854d9550d6023993e4fb41293d647",
+        "386f9d3b6fd0b1b266c09cfb1f56d6ede9cf6610cfc10a94db3dbf3c89b58aff",
         [
             ("agent_instructions", 1479),
-            ("memory", 183),
+            ("unclassified", 120),
+            ("memory", 538),
+            ("recovery", 163),
+            ("lessons", 181),
             ("memory_tools", 84),
-            ("recovery", 114),
             ("skill_index", 439),
-            ("unclassified", 18),
             ("response_preferences", 402),
             ("reply_format_rules", 1325),
             ("request_header", 46),

@@ -312,19 +312,33 @@ answer through `messaging.dispatch.ChannelTurns`; `test/test_reinjection_gate.py
 pins that per module. `build_message` then
 re-adds, once:
 
-1. the memory activity index and the `[Memory tools]` line;
-2. `[REINJECTED AFTER COMPACTION — skills index for discovery]` — the same loader
+1. `[CRITICAL RULES]` — the same runtime-selected block and the same
+   `includeCrewContext` gate as session start, so the diff mandate survives a
+   compaction on the dashboard too (channel turns already get the per-turn
+   `[RUNTIME]` refresh);
+2. `[REINJECTED AFTER COMPACTION — user preferences]` — the preferences
+   markdown with its `pref.*` semantic rows, the same startup cap session start
+   applies, under the memory-group gate;
+3. `[REINJECTED AFTER COMPACTION — learned lessons]` — the standing-rule tier
+   through the same session-start render, with the startup budget; findings are
+   withheld by the store's empty-query rule (the block names no topic);
+4. the memory activity index and the `[Memory tools]` line;
+5. `[REINJECTED AFTER COMPACTION — skills index for discovery]` — the same loader
    call and the same agent gate as session start, via `_skills_injection_plan`;
-3. `[REINJECTED AFTER COMPACTION — response preferences]`, re-read from current
+6. `[REINJECTED AFTER COMPACTION — response preferences]`, re-read from current
    config so a level changed mid-session lands;
-4. the member section, re-read from disk — so the member gets its *current*
+7. the member section, re-read from disk — so the member gets its *current*
    briefing and permanent rules back, not the pre-compaction copy;
-5. `[AGENT SYSTEM PROMPT]` — the managed spec prompt is a stub pointing at this
+8. `[AGENT SYSTEM PROMPT]` — the managed spec prompt is a stub pointing at this
    block, so a compaction that drops it leaves the session with no contract.
    This one is the *session-start* copy: `{{MAX_SUBAGENTS}}` carries the reading
    `_session_cap_figure` took when the session started, because the cap in force
    is derived from live host conditions and a second reading would hand the
    session a contract it never agreed to, differing in a number it never chose.
+
+Member sessions skip items 2 and 3: their essentials envelope is re-injected by
+the caller, through the member lifecycle chokepoint, so the member's own store
+answers and no global memory is substituted.
 
 If that turn does not land (cancelled, refused, errored), `rearm_reinjection` puts
 the flag back, so the context is never lost to a failed turn.
