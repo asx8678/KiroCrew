@@ -1150,6 +1150,12 @@ def test_a_push_during_the_fire_window_re_arms_at_delay_zero_after_the_cycle(tmp
     assert pushed == [""], "the push itself was refused, as the window requires"
 
 
+# LOOP-16's arm-delay contract is pinned in test_autonudge_deadline.py
+# (an owed wake re-arms at the short beat; none owed re-arms the full
+# interval). The full mid-turn simulation needs the wired structured-monitor
+# controller, which the deadline-level tests deliberately stand in for.
+
+
 def _restored_service_ticks(
     tmp_path, monkeypatch, *, report_after: str, followup_ticks: int = 0
 ) -> "tuple[str, list[str]]":

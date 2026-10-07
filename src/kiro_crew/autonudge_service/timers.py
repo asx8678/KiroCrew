@@ -606,6 +606,16 @@ def _arm_from_deadline(self: AutoNudgeService, loop: NudgeLoop) -> None:
         delay = float(seams._OVERDUE_REARM_SECS)
     else:
         delay = min(remaining, float(loop.idle_secs))
+    # LOOP-16: a wake refused because the conductor's slot was BUSY is owed
+    # (``followup_ticks``), and it must land on the FIRST tick after the
+    # running turn ends. Without this the deadline arm above — with the
+    # deadline zeroed at the delivered fire — starts a FULL idle_secs
+    # countdown that replaces the refused path's short retry, and the owed
+    # wake waits a whole patrol interval (300-900 s for a goal conductor)
+    # for a subject the kernel already DEDUPED: only the bypass tick can
+    # deliver it, and the worker's report goes unanswered until then.
+    if loop.monitor is not None and getattr(loop.monitor, "followup_ticks", 0) > 0:
+        delay = min(delay, float(seams._OVERDUE_REARM_SECS))
     self._arm_timer(loop, delay=delay)
 
 
