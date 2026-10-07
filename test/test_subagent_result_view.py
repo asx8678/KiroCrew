@@ -4,13 +4,19 @@ Covers:
 - context_management.summarize_result — the summary + result_path body injected
   into the parent when the completion copy dropped content.
 - dashboard.handlers.messaging._spawn_result_view — line-oriented offset/limit/
-  grep slicing used by the spawn_status offset/grep params.
+  grep slicing and the tail view the spawn_status no-argument default requests.
 """
 
 from __future__ import annotations
 
+import asyncio
+from unittest.mock import patch
+
+from aiohttp.test_utils import make_mocked_request
+
 from kiro_crew.context_management import summarize_result
-from kiro_crew.dashboard.handlers.messaging import _spawn_result_view
+from kiro_crew.dashboard.handlers.messaging import _apply_result_view, _spawn_result_view
+from kiro_crew.mcp_tools import spawn as spawn_tools
 
 
 class TestSummarizeResult:
@@ -79,3 +85,101 @@ class TestSpawnResultView:
         assert view == ""
         assert meta["returned_lines"] == 0
         assert meta["has_more"] is False
+
+    # ── Tail view (the spawn_status no-argument default) ──
+
+    def test_tail_returns_last_lines_with_paging_meta(self):
+        view, meta = _spawn_result_view(self._text(100), 0, 0, "", tail=20)
+        assert view.splitlines() == [f"line{i}" for i in range(80, 100)]
+        assert meta["offset"] == 80
+        assert meta["returned_lines"] == 20
+        assert meta["total_lines"] == 100
+        assert meta["has_more"] is True
+        assert meta["tail_view"] is True
+
+    def test_tail_keeps_the_newest_line_under_the_char_budget(self):
+        # Alternating huge/small lines: whole lines drop from the front until
+        # the view fits 12k chars, but the newest line is always returned.
+        text = (
+            "\n".join(("x" * 5_000) if i % 2 == 0 else f"line{i}" for i in range(100))
+            + "\nthe closing answer"
+        )
+        view, meta = _spawn_result_view(text, 0, 0, "", tail=200)
+        assert view.splitlines()[-1] == "the closing answer"
+        assert len(view) <= 12_000
+        assert meta["has_more"] is True
+        assert meta["tail_view"] is True
+
+    def test_tail_short_text_returns_everything(self):
+        view, meta = _spawn_result_view(self._text(5), 0, 0, "", tail=200)
+        assert meta["returned_lines"] == 5
+        assert meta["offset"] == 0
+        assert meta["has_more"] is False
+
+    def test_tail_with_grep_filters_first(self):
+        text = "\n".join("hit" if i % 2 == 0 else "miss" for i in range(10))
+        view, meta = _spawn_result_view(text, 0, 0, "hit", tail=3)
+        assert view.splitlines() == ["hit", "hit", "hit"]
+        assert meta["matched_lines"] == 5
+        assert meta["returned_lines"] == 3
+        assert meta["has_more"] is True
+
+    def test_route_no_params_still_returns_the_full_transcript(self):
+        # The dashboard ActivityViewer, the CLI poll and spawn_sub_agents all read
+        # GET /api/spawn/{id} with no view params and need the full transcript.
+        req = make_mocked_request("GET", "/api/spawn/x")
+        text = "\n".join(f"line{i}" for i in range(500))
+        view, meta = asyncio.run(_apply_result_view(req, text))
+        assert view == text
+        assert meta == {}
+
+    def test_route_tail_param_slices_from_the_end(self):
+        req = make_mocked_request("GET", "/api/spawn/x?tail=20")
+        view, meta = asyncio.run(_apply_result_view(req, self._text(100)))
+        assert view.splitlines() == [f"line{i}" for i in range(80, 100)]
+        assert meta["tail_view"] is True
+
+
+class TestSpawnStatusMcpDefault:
+    """The no-argument spawn_status requests the bounded tail view, and an
+    explicit offset/limit/grep keeps today's exact paging behaviour."""
+
+    @staticmethod
+    def _big_transcript() -> str:
+        # 400 KB: far past the transport's 100k head-only cut.
+        return "\n".join(f"row {i} " + "y" * 400 for i in range(1_000)) + "\nTHE CLOSING ANSWER"
+
+    def test_no_argument_call_requests_the_tail_and_keeps_the_answer(self):
+        text = self._big_transcript()
+        requested: dict[str, str] = {}
+
+        def fake_get(path: str):
+            requested["path"] = path
+            assert "tail=200" in path
+            view, meta = _spawn_result_view(text, 0, 0, "", tail=200)
+            return {"done": True, "result": view, "result_meta": meta}
+
+        with patch.object(spawn_tools.mcp_core, "_get", side_effect=fake_get):
+            out = spawn_tools.spawn_status("spawn_status", {"agent_id": "abc123"})
+        assert "tail=200" in requested["path"]
+        assert "THE CLOSING ANSWER" in out
+        assert "earlier lines available" in out
+        assert "showing lines" in out
+        # The whole tool response (header + bounded tail) stays small.
+        assert len(out) <= 12_000 + 400
+
+    def test_explicit_offset_keeps_the_paging_contract(self):
+        seen: dict[str, str] = {}
+
+        def fake_get(path: str):
+            seen["path"] = path
+            view, meta = _spawn_result_view("a\nb\nc", offset=1, limit=1, grep="")
+            return {"done": True, "result": view, "result_meta": meta}
+
+        with patch.object(spawn_tools.mcp_core, "_get", side_effect=fake_get):
+            out = spawn_tools.spawn_status(
+                "spawn_status", {"agent_id": "abc123", "offset": 1, "limit": 1}
+            )
+        assert "tail=" not in seen["path"]
+        assert "offset=1" in seen["path"] and "limit=1" in seen["path"]
+        assert "more available — call again with offset=" in out

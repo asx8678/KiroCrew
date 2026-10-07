@@ -625,6 +625,10 @@ _COLLECTED_IDS_CAP = 1000
 
 _SPAWN_STATUS_MAX_LINES = 2000  # cap lines returned per spawn_status page
 _SPAWN_STATUS_MAX_GREP_LEN = 500
+# Char budget for a tail view: the spawn_status no-argument default asks for the
+# last ~200 lines, and this keeps the returned view small even when individual
+# lines are long (whole lines are dropped from the front until it fits).
+_SPAWN_TAIL_MAX_CHARS = 12_000
 
 
 #: No unit holds the child, so no crew-log record was owed or written.

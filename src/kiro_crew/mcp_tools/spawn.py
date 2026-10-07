@@ -29,7 +29,6 @@ from kiro_crew import mcp_core
 from kiro_crew import resource_status as host_status
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.constants import DEFAULT_SUBAGENT_MAX_TURNS
-from kiro_crew.context_management import COMPLETION_KEEP_DEFAULT_CHARS
 from kiro_crew.execution_context import read_session_execution
 from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
 from kiro_crew.platform import redact_via_context as redact
@@ -64,6 +63,11 @@ logger = logging.getLogger(__name__)
 # a tool description is always-on context in every session, so this buys
 # self-correction for a few dozen characters, not a full agent listing.
 _MAX_ROSTER_NAMES = 8
+
+# Lines the no-argument spawn_status requests from the tail view: the closing
+# answer is at the END of a finished transcript, and the transport's head-only
+# 100k cut dropped exactly that on large results.
+_SPAWN_STATUS_TAIL_DEFAULT_LINES = 200
 
 # Owner recorded on an audit record when the resolver named no session. An empty
 # owner is ambiguous by construction: a resolver whose every identity source
@@ -525,16 +529,17 @@ def schemas() -> list[dict[str, Any]]:
             "name": "spawn_status",
             "description": (
                 "Retrieve a subagent's live status and partial transcript while it runs, "
-                "or its full retained transcript after completion. The completion event "
-                "gives a summary plus the transcript path — use this tool (or the read/grep "
-                "tools on the path) to read the rest instead of re-running the subagent. "
-                "For large transcripts, page with offset/limit (line-based, like reading "
-                "code) or filter with grep (regex) rather than pulling the whole thing into "
-                "context. While a run is still going the partial transcript is a live view "
-                "that grows (and past the manager's bound is truncated from the front), so "
-                "line offsets can shift between polls and offset/limit paging is best-effort "
-                "until completion. Terminal responses include elapsed time and credit "
-                "usage when recorded."
+                "or its retained transcript after completion. With no arguments the tool "
+                "returns the transcript TAIL (last 200 lines, kept under 12k chars) — "
+                "that is where a finished run's closing answer is. Page with offset/limit "
+                "(line-based, like reading code) to read from the start, or filter with "
+                "grep (regex). The completion event gives a summary plus the transcript "
+                "path — use this tool (or the read/grep tools on the path) to read the "
+                "rest instead of re-running the subagent. While a run is still going the "
+                "partial transcript is a live view that grows (and past the manager's "
+                "bound is truncated from the front), so line offsets can shift between "
+                "polls and offset/limit paging is best-effort until completion. Terminal "
+                "responses include elapsed time and credit usage when recorded."
             ),
             "inputSchema": {
                 "type": "object",
@@ -550,8 +555,9 @@ def schemas() -> list[dict[str, Any]]:
                     "limit": {
                         "type": "integer",
                         "description": (
-                            "Max lines to return (1-2000). Omit for the full transcript; "
-                            "use with offset to page through a large result."
+                            "Max lines to return (1-2000). With no offset/limit/grep the "
+                            "tool returns the transcript tail (last 200 lines) instead; "
+                            "use with offset to page through a large result from the start."
                         ),
                     },
                     "grep": {
@@ -1191,6 +1197,12 @@ def spawn_status(name: str, args: dict[str, Any]) -> str:
         spawn_params["limit"] = str(limit)
     if isinstance(grep, str) and grep.strip():
         spawn_params["grep"] = grep
+    if not spawn_params:
+        # No explicit view: request the tail. The closing answer is at the
+        # END of a finished transcript, and on a large result the transport's
+        # head-only 100k cut dropped exactly that; the tail view also keeps a
+        # no-argument call small. Explicit offset/limit/grep behave as before.
+        spawn_params["tail"] = str(_SPAWN_STATUS_TAIL_DEFAULT_LINES)
     path = f"/api/spawn/{agent_id}"
     if spawn_params:
         path += "?" + urlencode(spawn_params)
@@ -1261,7 +1273,11 @@ def spawn_status(name: str, args: dict[str, Any]) -> str:
         returned = meta.get("returned_lines", 0)
         hdr.append(f"showing lines {start}-{start + returned} of {total}")
         if meta.get("has_more"):
-            hdr.append(f"more available — call again with offset={start + returned}")
+            if meta.get("tail_view"):
+                # Tail view: the continuation is BACKWARD, toward line 0.
+                hdr.append(f"earlier lines available — call again with offset=0 limit={start}")
+            else:
+                hdr.append(f"more available — call again with offset={start + returned}")
         result = f"[{' | '.join(hdr)}]\n{result}"
 
     if running:
@@ -1536,12 +1552,15 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
             completed += 1
             _settled_ids.add(aid)
             result_text = _redact_sa(sa_st.get("result", ""))
-            # Apply the same summarize_result treatment as spawn_run:
-            # when results exceed completion_keep threshold, return a
+            # Apply the same summarize_result treatment as spawn_run: when
+            # results exceed the configured completion_keep_chars threshold
+            # (agent.completion_keep_chars, 0 = never truncate), return a
             # summary + disk path instead of the full transcript. This
             # prevents massive tool_results from filling the model's
-            # context window and causing attention degradation.
-            if len(result_text) > COMPLETION_KEEP_DEFAULT_CHARS:
+            # context window and causing attention degradation. Read per
+            # call from the live config — MCP tools stay stateless.
+            keep_chars = KiroCrewConfig.load().agent.completion_keep_chars
+            if keep_chars > 0 and len(result_text) > keep_chars:
                 try:
                     result_path = str(agent_dir_for_display(aid) / "result.txt")
                 except (ValueError, OSError):
