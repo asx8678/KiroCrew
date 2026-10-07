@@ -533,6 +533,7 @@
         "idle_between_cycles_2": "サイクル間のアイドル時間",
         "if_set_the_agent_verifies_against_this_each_cycl": "設定されている場合、エージェントは各サイクルでこれに対して検証を行い、条件を満たしたら完了します。",
         "loading": "読み込み中…",
+        "live_updates_paused": "ライブ更新は一時停止中 — 数秒ごとにポーリングしています",
         "max_cycles": "最大サイクル：",
         "max_cycles_2": "最大サイクル",
         "min": "分",

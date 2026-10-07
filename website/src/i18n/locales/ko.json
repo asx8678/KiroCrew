@@ -533,6 +533,7 @@
         "idle_between_cycles_2": "사이클 간 대기",
         "if_set_the_agent_verifies_against_this_each_cycl": "설정하면 에이전트가 매 사이클마다 이 기준으로 검증하고 충족되면 완료합니다.",
         "loading": "불러오는 중…",
+        "live_updates_paused": "라이브 업데이트가 일시 중지됨 — 몇 초마다 폴링 중",
         "max_cycles": "최대 사이클:",
         "max_cycles_2": "최대 사이클",
         "min": "분",

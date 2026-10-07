@@ -9,7 +9,7 @@
  *   - Setup wizard: steps, sub-questions, validation pass/fail, submit
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { render, screen, waitFor, fireEvent, within } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, within, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { Provider } from 'react-redux'
@@ -176,6 +176,63 @@ describe('ResearchLabPage', () => {
     await waitFor(() => expect(screen.getByText(/Executive summary here/)).toBeInTheDocument())
     // The full goal/question is shown in the detail view (not just the truncated name).
     expect(screen.getByText('How do other teams handle API rate limiting effectively?')).toBeInTheDocument()
+  })
+
+  it('polls with a paused indicator after an SSE error, then stops when the stream reconnects (REL-8)', async () => {
+    // Controllable EventSource double: capture instances, fire lifecycle sync.
+    class MockES {
+      static instances: MockES[] = []
+      closed = false
+      onopen: (() => void) | null = null
+      onmessage: ((ev: { data: string }) => void) | null = null
+      onerror: (() => void) | null = null
+      constructor() { MockES.instances.push(this) }
+      close() { this.closed = true }
+    }
+    try {
+      vi.mocked(api.researchCampaigns).mockResolvedValue([ACTIVE])
+      vi.mocked(api.researchCampaign).mockResolvedValue(ACTIVE)
+      renderPage()
+      // Real timers for the mount + navigation (waitFor needs them).
+      await waitFor(() => expect(screen.getByText('How do other teams handle API rate limiting effectively?')).toBeInTheDocument())
+      // Stub only now: the detail view is what opens the stream, and the
+      // double never connects, so no error fires until the test says so.
+      vi.stubGlobal('EventSource', MockES as unknown as typeof EventSource)
+      fireEvent.click(screen.getByText('How do other teams handle API rate limiting effectively?'))
+      await waitFor(() => expect(screen.getByText(/Findings \(/)).toBeInTheDocument())
+      expect(MockES.instances).toHaveLength(1)
+      expect(screen.queryByTestId('live-updates-paused')).toBeNull()
+      // NOW freeze the clock: the polling cadence and the stream's backoff
+      // are what fake timers are for.
+      vi.useFakeTimers()
+
+      // The stream drops: polling begins and the indicator shows.
+      const before = vi.mocked(api.researchCampaign).mock.calls.length
+      act(() => { MockES.instances[0].onerror?.() })
+      expect(MockES.instances[0].closed).toBe(true)
+      expect(screen.getByTestId('live-updates-paused')).toBeInTheDocument()
+      expect(screen.getByTestId('live-updates-paused')).toHaveTextContent(
+        'Live updates paused — polling every few seconds'
+      )
+
+      // Polling: the campaign query refetches on the 5 s cadence.
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+      expect(vi.mocked(api.researchCampaign).mock.calls.length).toBeGreaterThan(before)
+
+      // The stream retries: after the first backoff step a new one opens.
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+      expect(MockES.instances).toHaveLength(2)
+
+      // It reconnects: the indicator disappears and the 5 s refetch stops.
+      act(() => { MockES.instances[1].onopen?.() })
+      expect(screen.queryByTestId('live-updates-paused')).toBeNull()
+      const after = vi.mocked(api.researchCampaign).mock.calls.length
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(vi.mocked(api.researchCampaign).mock.calls.length).toBe(after)
+    } finally {
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+    }
   })
 
   it('detail action buttons call researchAction; nudge sends text', async () => {

@@ -541,6 +541,7 @@
         "idle_between_cycles_2": "Inattività tra i cicli",
         "if_set_the_agent_verifies_against_this_each_cycl": "Se impostato, l'agente verifica questa condizione a ogni ciclo e completa quando è soddisfatta.",
         "loading": "Caricamento...",
+        "live_updates_paused": "Aggiornamenti in tempo reale in pausa — polling ogni pochi secondi",
         "max_cycles": "Numero massimo di cicli:",
         "max_cycles_2": "Numero massimo di cicli",
         "min": "min",

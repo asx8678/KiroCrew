@@ -537,6 +537,7 @@
         "idle_between_cycles_2": "Leerlauf zwischen Zyklen",
         "if_set_the_agent_verifies_against_this_each_cycl": "Wenn festgelegt, prüft der Agent dies in jedem Zyklus und schließt ab, sobald es erfüllt ist.",
         "loading": "Wird geladen…",
+        "live_updates_paused": "Live-Updates pausiert — Abfrage alle paar Sekunden",
         "max_cycles": "Max. Zyklen:",
         "max_cycles_2": "Max. Zyklen",
         "min": "Min.",
