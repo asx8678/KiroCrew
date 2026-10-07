@@ -732,6 +732,10 @@ _FRAMEWORK_OWNED_AGENT_KEYS = frozenset(
         # _preserve_user_agent_edits for why that distinction decides ownership.
         "managedToolPolicy",  # which managed tools an app agent may NOT reach
         "includeMcpJson",  # whether the global mcp.json bleeds into this agent
+        # SPEC-7: consumed at materialization — mapped to `skill://` resource
+        # entries and dropped before the spec is written, because kiro-cli's
+        # deny_unknown_fields validation refuses a spec carrying it.
+        "skills",
         # `resources` holds `file://` URIs into the app's own provisioned tree, written
         # with `{ENGINE_ROOT}`-style placeholders the GATEWAY renders (see
         # `_render_shipped_agent`). It is a generated path list, not a preference: a
@@ -1019,6 +1023,22 @@ def _register_agents(
                 )
                 continue
             agent_name = agent_data.get("name", agent_path.stem)
+
+            # SPEC-7: a template `skills` array is NOT a kiro-cli spec field —
+            # agent-spec-fields.md documents deny_unknown_fields, so a spec
+            # carrying it can be rejected whole and the agent silently falls
+            # back to kiro-cli's DEFAULT agent (no prompt, no tools, no
+            # containment). Map it to the kiro-cli-native `skill://` resource
+            # form (what the dashboard's editor writes and agent_discovery's
+            # _extract_skills reads) and drop the key before anything writes.
+            _tpl_skills = agent_data.pop("skills", None)
+            if isinstance(_tpl_skills, list) and _tpl_skills:
+                resources = agent_data.get("resources")
+                if not isinstance(resources, list):
+                    resources = []
+                mapped = [f"skill://{s}" for s in _tpl_skills if isinstance(s, str) and s.strip()]
+                if mapped:
+                    agent_data["resources"] = [*resources, *mapped]
 
             # The agent name is app-controlled (read from the agent JSON) and is
             # about to become a filesystem path component. Reject any path separator

@@ -487,6 +487,11 @@ prompt — and only with no project supplied does it fall back to three levels a
 the spec file (`<project>/.kiro/agents/foo.json` → `<project>`).
 `agent_skill_globs` is what the rest of the product asks.
 
+App templates declare skills as a `skills` array; the bridge maps each entry to
+a `skill://<name>` resource and drops the key at materialization (SPEC-7),
+because `skills` is not an accepted spec field and `deny_unknown_fields`
+would refuse the whole file. An operator pins skills as `skill://` resources.
+
 When a builtin skill moves (`_RELOCATED_SKILLS` in `skills.py`), its old
 `SKILL.md` is set aside, so a mapping of the old path would load nothing.
 `agent.migrate_relocated_skill_uris` runs on every agent-config rebuild and

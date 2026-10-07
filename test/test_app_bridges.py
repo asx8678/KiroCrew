@@ -3733,6 +3733,9 @@ class TestUserAgentEditsSurviveRefresh:
             "prompt",
             "managedToolPolicy",
             "includeMcpJson",
+            # SPEC-7: consumed at materialization — mapped to `skill://`
+            # resources and dropped, because kiro-cli refuses the unknown key.
+            "skills",
             # A generated `file://` path list into the app's provisioned tree, rendered
             # from `{ENGINE_ROOT}` placeholders by the gateway — CONTAINMENT-shaped like
             # `prompt`: a user-pinned copy would keep pointing at a previous engine root
@@ -3757,14 +3760,14 @@ class TestUserAgentEditsSurviveRefresh:
         # user-facing copy with no containment role, so a reworded greeting must
         # survive a template refresh — the same reasoning as `description`.
         #
-        # `skills` belongs here too, not in `_FRAMEWORK_OWNED_AGENT_KEYS`: it is a live field
-        # (`agent_discovery.py` reads `row.get("skills")` into `AgentInfo.skills`) naming which
-        # skills an agent loads, which is exactly the kind of choice an operator should be able
-        # to change and keep across a refresh — same category as `model`. Framework ownership is
-        # reserved for identity and CONTAINMENT keys, which this is not. Added when the
-        # auto-improvement builtin became the first template to declare it.
+        # SPEC-7: `skills` is NO LONGER a preference — it is not an accepted
+        # kiro-cli spec field (deny_unknown_fields refuses the whole file), so
+        # the bridge maps a template's `skills` array to `skill://` resource
+        # entries at materialization and drops the key. An operator pins
+        # skills the way the dashboard's editor writes them: `skill://`
+        # entries in `resources`.
         preferences = {
-            "description", "model", "toolsSettings", "$schema", "welcomeMessage", "skills",
+            "description", "model", "toolsSettings", "$schema", "welcomeMessage",
         }
         root = _REPO_ROOT / "src/kiro_crew/apps/builtins"
         templates = sorted(root.glob("*/agents/*.json"))
