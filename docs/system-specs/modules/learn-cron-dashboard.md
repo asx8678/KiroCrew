@@ -166,6 +166,8 @@ The downstream `_is_restricted_session` check can still reject the call with HTT
 | `claims.py` | `_RunClaim` (whose `cancelled` / `reaped` flags are the cancel and reap markers) and `RunClaims` -- the code that stores, fences, takes and releases a run claim (`stop()` alone drops them all, at shutdown), and the run-generation counter |
 | `execution.py` | the wake budget and its allowances, a finished run's terminal record (`close_run`), and the fields the locked merge copies onto the store copy (`apply_run_record`) |
 | `store.py` | the `crons.json` codec (`encode_store`, `decode_jobs`, `_job_from_record`, `store_digest`), `cron_store_lock`, the store error types, the record predicates |
+
+**Store durability (REL-24).** `CronService._save` writes with `atomic_write(..., fsync=True)` and then `fsync_dir` (best-effort) on the store directory: the temp-file-plus-rename is atomic against a PROCESS crash (the page cache survives), but without the fsyncs the rename can reach disk before the data, so an OS crash or power loss could leave an empty or stale `crons.json`. A save that has returned now survives power loss — the file is either the previous complete document or the new one. Same treatment for the identity store's migration write. The write stays off the event loop: every caller holds the file lock, and fsync adds latency only to that locked writer.
 | `fields.py` | the string-field caps table, `build_job` and `apply_job_update` -- what a valid job and a valid change are |
 | `readers.py` | the serviceless readers (the doctor's agent-name census, Agent templates delete guard, skill lifecycle, status and telemetry counts) |
 | `folders.py` | cron folder definitions (`cron_folders.json`, read-only) |
