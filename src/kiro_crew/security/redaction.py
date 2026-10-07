@@ -37,6 +37,12 @@ from typing import NamedTuple
 from kiro_crew.credential_patterns import AWS_KEY_ID, JWT_MULTI_SEGMENT
 from kiro_crew.security.redaction_switch import credential_pass_bypassed
 
+#: The PEM private-key header spelling, shared by the pass-1 branch, the
+#: record rule that names a private-key span, and ``StreamRedactor``'s
+#: PEM-in-JSON hold, so the batch and the stream cannot drift on what counts
+#: as a PEM header.
+_PRIVATE_KEY_HEADER = r"-----BEGIN [A-Z ]*PRIVATE KEY-----"
+
 # ── Credential Output Redaction ──
 # Catches raw credential patterns in LLM output / tool results,
 # including base64-encoded variants.  Applied on all output paths
@@ -115,7 +121,7 @@ _CREDENTIAL_PATTERNS = re.compile(
     #      the full-block cap). Because the lookahead consumes nothing, TWO+
     #      consecutive blank lines still terminate the run — trailing prose is
     #      preserved (no over-redaction).
-    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    f"|{_PRIVATE_KEY_HEADER}"
     r"(?:"
     r"[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
     r"|(?:\r?\n(?:Proc-Type:[^\n]*|DEK-Info:[^\n]*|[A-Za-z0-9+/=]+(?=\r?\n|\Z)"
@@ -546,8 +552,14 @@ def _might_contain_credential(text: str) -> bool:
 _PREFILTER_MIN_LEN = 16
 
 
+#: The base64 run class: the judgment unit of the b64-decode pass and the
+#: bare-secret entropy pass.  ``StreamRedactor`` reads it off this owner for
+#: its held-run discard, so the stream and the batch cannot disagree about
+#: where a bare secret's run ends.
+_BARE_SECRET_VALUE_CLASS = r"[A-Za-z0-9+/]"
+
 # Base64 alphabet: at least 40 chars of [A-Za-z0-9+/] ending with optional =
-_B64_CHUNK_RE = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
+_B64_CHUNK_RE = re.compile(rf"{_BARE_SECRET_VALUE_CLASS}{{40,}}={{0,2}}")
 
 
 # ── Label-independent bare-secret detection ──
@@ -574,7 +586,9 @@ _B64_CHUNK_RE = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
 # character class or the `{40,}` floor must be mirrored in `_B64_CHUNK_RE` above.
 # `test_the_two_base64_run_patterns_stay_structurally_coupled` pins both literals
 # so such an edit fails loudly rather than drifting.
-_BARE_SECRET_RUN_RE = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}(?![A-Za-z0-9+/])")
+_BARE_SECRET_RUN_RE = re.compile(
+    rf"(?<!{_BARE_SECRET_VALUE_CLASS}){_BARE_SECRET_VALUE_CLASS}{{40,}}(?!{_BARE_SECRET_VALUE_CLASS})"
+)
 
 # Exactly-40 is the AWS secret-key length. Keeping the shape check length-exact
 # (rather than ">=40") is what lets the structural gates below cleanly separate
@@ -1696,7 +1710,7 @@ _AWS_LABEL_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
 #: wins; a span none of them matches is ``credential_pattern``.
 _PASS1_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(AWS_KEY_ID), "aws_access_key_id"),
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*"), "private_key"),
+    (re.compile(rf"{_PRIVATE_KEY_HEADER}[\s\S]*"), "private_key"),
     (re.compile(r"xox[bpas]-[\s\S]*"), "slack_token"),
     (re.compile(r"[0-9]{6,}:[A-Za-z0-9_-]{30,}"), "telegram_bot_token"),
     (
