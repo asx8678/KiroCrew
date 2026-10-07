@@ -1305,6 +1305,21 @@ specified there — one account of one workflow, not two.
 
 First-class `DeniedCommandRule` records in `BUILTIN_DENIED_RULES` (`security/`) — each a stable `id`, a Python regex `pattern`, a `category`, and a human `description` — blocking destructive and credential-exfiltrating operations. They are enforced **only** at Kiro Crew's own `hooks.py` PreToolUse gate (`HookManager.on_tool_call` → the `deny-rules` row of `GATE_TIERS` → `PolicyAuthority.is_denied`), never by kiro-cli. They are no longer a raw `deniedCommands` array injected into a kiro agent JSON, so there is no `execute_bash`/`shell` tool-settings copy and no project-dir `agents/defaults.json` override for them. Built-ins are **default-ON but user-DISABLEABLE** from Settings → Security (see "Denied-command rules, opt-out state, and read-only auto-approve" below). Patterns for deployment-specific credential-vending CLIs are NOT in this catalog — a composed edition contributes those itself, either as an un-weakenable `SecurityOverlay` pattern or as a user-disableable rule through the `denied_rules` seam.
 
+**Limits of the shell gate.** Denied-command rules and governance `commands`
+patterns read a command LINE, so they do not bind a command whose effective
+text is produced at run time: the `git push --force` or
+`curl -d @$HOME/.aws/credentials` the rules deny passes when base64-encoded
+and piped into `sh`, wrapped as `bash -c "$(… | base64 -d)"`, or built by
+`python3 -c "exec(base64.b64decode(…))"`, because the gate cannot evaluate a
+substitution. The rules are accident rails against a typoed or pasted
+dangerous command, not an adversarial boundary — governance.md calls the
+`commands` scope egress defense-in-depth, not a bounded egress guarantee. No
+encoded-shape deny patterns are added; each closes one spelling of an
+unbounded set. The controls for encoded multi-stage execution are the OS
+sandbox tier (what the executed process can reach) and the approval mode —
+trust-reads already refuses a command whose expansion is unknowable, so a
+run-time-produced command prompts rather than auto-approving there.
+
 The two ACP transports' `approve_tool` methods run these security tiers once
 more before any `allow` leaves the process. Approval consumers run the complete
 identity-bearing gate first, including governance, while the transport repeats
