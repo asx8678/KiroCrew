@@ -4481,6 +4481,15 @@ name, truncated description, `SKILL.md` path, containing dir — rendered by
 affordance `## Available Skills` already directs it to. `split_triggered()`
 partitions one match into bodies and pointers, so a mixed match emits both.
 
+Two bounds (SKL-6) apply to the bodies themselves: every trigger-path body
+read is capped at `SKILL_READ_CAPACITY` (99,000 B — the same bound the `$key`
+and exact-read paths use; a matched GLOBAL body was injected whole at 153,062 B
+before), and one turn's delivered bodies share a single `SKILL_READ_CAPACITY`
+budget — a body past it arrives as its pointer line, in match order. A body
+the cap refuses (`size_cap`) also arrives as a pointer. Both bounds are
+decided BEFORE the per-session dedup record, so a body never delivered is
+never recorded as sent.
+
 That opt-out applies only to unconfined installed and provider skills. A project skill
 always goes through full-body injection even if its frontmatter says
 `inject_on_trigger: false`, and the catalog reports that effective behavior. Otherwise

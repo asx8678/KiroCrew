@@ -1262,6 +1262,14 @@ _BUILDER_MEMBERS: dict[str, tuple[str, str]] = {
         "method",
         "(self, session_key: 'str', thread_ts: 'str') -> 'str | None'",
     ),
+    "dollar_skills_already_held": (
+        "method",
+        "(self, session_key: 'str | None', agent: 'str | None', candidates: 'list[tuple[str, str]]') -> 'set[str]'",
+    ),
+    "record_dollar_skill_bodies": (
+        "method",
+        "(self, session_key: 'str | None', agent: 'str | None', candidates: 'list[tuple[str, str]]') -> 'None'",
+    ),
     "_live_shown_lessons": ("method", "(self, session_key: 'str') -> '_ShownLessons'"),
     "_load_agent_prompt": (
         "static",
