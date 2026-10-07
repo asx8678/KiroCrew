@@ -1762,6 +1762,7 @@ class CronService:
         minimal_context: bool = False,
         timeout: int = 0,
         timeout_secs: int = 0,
+        auto_pause_after: int | None = None,
     ) -> CronJob:
         """Add a new job. Provide one of ``every_secs``, ``at_ts``, or ``cron_expr``.
 
@@ -1823,6 +1824,7 @@ class CronService:
             minimal_context=minimal_context,
             timeout=timeout,
             timeout_secs=timeout_secs,
+            auto_pause_after=auto_pause_after,
         )
         self._persist_add_locked(job)
         self._arm_timer()
@@ -1976,6 +1978,7 @@ class CronService:
         minimal_context: bool = False,
         timeout: int = 0,
         timeout_secs: int = 0,
+        auto_pause_after: int | None = None,
         source_preset: str = "",
         source_template_prompt: str = "",
     ) -> CronJob:
@@ -2027,6 +2030,7 @@ class CronService:
             minimal_context=minimal_context,
             timeout=timeout,
             timeout_secs=timeout_secs,
+            auto_pause_after=auto_pause_after,
         )
         # Dashboard-only template provenance. Set on the freshly-built job
         # BEFORE the off-loop persist -- the object has no other reference yet,
@@ -2048,7 +2052,9 @@ class CronService:
 
         Accepted kwargs: name, message, every_secs, cron_expr, agent_id, channel,
         approval_mode, silent, skip_dates, timezone, thread_ts, model,
-        timeout_secs (per-wake execution budget, 1..86400).
+        timeout_secs (per-wake execution budget, 1..86400),
+        auto_pause_after (consecutive failures before auto-pause; None = the
+        global default 5, 0 = never auto-pause).
 
         Raises :class:`CronStoreBusy` if the store lock is contended past the
         timeout; see :meth:`update_job_async` for the event-loop-safe variant.

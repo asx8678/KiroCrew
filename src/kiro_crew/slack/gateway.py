@@ -67,7 +67,7 @@ from kiro_crew import (
     update_ownership,
     work_root,
 )
-from kiro_crew.acp.client import AcpError, AcpProcessDied
+from kiro_crew.acp.client import AcpAuthRequired, AcpError, AcpProcessDied
 from kiro_crew.agent_sdk import AgentTurnUsage
 from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.autonudge import (
@@ -5738,6 +5738,80 @@ class GatewayOrchestrator:
                 # inner call emits its own dashboard notify + Slack alert
                 # and advances dedup state, duplicating the outer handler.
                 if getattr(job, "_acp_retried", False):
+                    raise
+                # ── Authentication: an expired sign-in never charges the job ──
+                # AcpAuthRequired is non-transient (respawning the backend hits
+                # the same wall), so it skips the transient ladder above and
+                # would otherwise reach record_failure(): five sign-in lapses
+                # auto-pause a healthy schedule, and a paused job never fires,
+                # so every LLM cron that woke during an expired-credential
+                # window would stay disabled until the user re-enabled each
+                # one by hand. An expired sign-in is the operator's state, not
+                # this job's defect — alert once through the SAME dedup anchor
+                # every other failure alert uses, mark the run error, and
+                # re-raise so the run history stays truthful. The counter is
+                # left untouched: consecutive_failures does not move, and the
+                # run after a fresh sign-in that succeeds clears the error.
+                if isinstance(exc, AcpAuthRequired):
+                    _auth_text = f"{type(exc).__name__}: {exc}"
+                    _auth_text, _ = redact_exfiltration_urls(_auth_text)
+                    _auth_text, _ = redact_credentials(_auth_text)
+                    _auth_fh = _result_hash(_auth_text)
+                    job.clear_carried_result()
+                    job.last_status = "error"
+                    job.last_error = _auth_text[:_CRON_FAILURE_DETAIL_CAP]
+                    if not self._failure_alert_is_duplicate(job, _auth_fh):
+                        # Dashboard bell is best-effort — never mask the auth
+                        # exception if notification itself fails.
+                        try:
+                            if self.dashboard_state and not job.silent:
+                                _auth_title = f"Cron: {job.name} — sign-in required"
+                                _auth_title, _ = redact_exfiltration_urls(_auth_title)
+                                _auth_title, _ = redact_credentials(_auth_title)
+                                self.dashboard_state.notify(
+                                    "cron",
+                                    _auth_title,
+                                    "🔑 The backend sign-in has expired; the job stays "
+                                    f"scheduled and this does not count toward auto-pause.\n"
+                                    f"{job.last_error}",
+                                    meta={"job_id": job.id, "failure_hash": _auth_fh},
+                                )
+                        except Exception:
+                            logger.debug(
+                                "Dashboard notify failed in cron auth-failure path",
+                                exc_info=True,
+                            )
+                        _auth_host = socket.gethostname().split(".")[0]
+                        _auth_name = self._slack_safe_fenced(job.name)
+                        _auth_reason = self._slack_safe_fenced(job.last_error)
+                        _auth_mrkdwn = (
+                            f":key: *Cron: {_auth_name}* — _sign-in required on "
+                            f"{escape_mrkdwn(_auth_host)}; the job stays scheduled and this "
+                            "does not count toward auto-pause._\n"
+                            f"```{_auth_reason}```"
+                        )
+                        _auth_mrkdwn, _ = redact_exfiltration_urls(_auth_mrkdwn)
+                        _auth_mrkdwn, _ = redact_credentials(_auth_mrkdwn)
+                        _auth_plain = (
+                            f"Cron: {job.name} — sign-in required on {_auth_host}; the "
+                            "job stays scheduled and this does not count toward "
+                            f"auto-pause.\n{job.last_error}"
+                        )
+                        _auth_plain, _ = redact_exfiltration_urls(_auth_plain)
+                        _auth_plain, _ = redact_credentials(_auth_plain)
+                        _ch_ok, _sl_ok, _sl_fail = await self._deliver_failure_alert(
+                            job,
+                            mrkdwn=_auth_mrkdwn,
+                            plain=_auth_plain,
+                            actor_key=session_key,
+                            silent=job.silent,
+                        )
+                        self._advance_failure_dedup(
+                            job,
+                            _auth_fh,
+                            channel_delivered=_ch_ok,
+                            slack_failed=_sl_fail,
+                        )
                     raise
                 # Was this run's failure this JOB's, or its runtime's? A cron
                 # runtime hosts the job's own sub-agents, so a death there is a

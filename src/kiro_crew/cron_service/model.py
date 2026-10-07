@@ -167,6 +167,11 @@ class CronJob:
     last_failure_hash: str = ""  # hash of last failure notification (dedup crashes)
     last_failure_at: float = 0.0  # epoch of last failure Slack alert (dedup reminder)
     consecutive_failures: int = 0  # consecutive failed runs (any error); drives auto-pause
+    # Consecutive failed runs before auto-pause. None = the global default
+    # (_AUTO_PAUSE_THRESHOLD); 0 = never auto-pause. Auth failures never reach
+    # this counter at all (the gateway's cron failure handler exempts them),
+    # so this bounds only failures the job itself owns.
+    auto_pause_after: int | None = None
     skip_dates: list[str] = field(default_factory=list)  # ISO dates to skip ["YYYY-MM-DD"]
     timezone: str = ""  # IANA timezone for skip evaluation
     persistent_session: bool = True  # False → fresh ephemeral session per run
@@ -353,7 +358,14 @@ class CronJob:
         """
         self.consecutive_failures += 1
         self.failure_recorded = True
-        if self.consecutive_failures >= _AUTO_PAUSE_THRESHOLD and not self.auto_paused:
+        # Per-job override of the threshold: None = the global default, 0 = a
+        # job that opted out of auto-pause entirely (its failures accumulate on
+        # the record but never disable it). Validated at build/update time, so
+        # the arithmetic here stays unconditional.
+        _threshold = (
+            _AUTO_PAUSE_THRESHOLD if self.auto_pause_after is None else self.auto_pause_after
+        )
+        if _threshold and self.consecutive_failures >= _threshold and not self.auto_paused:
             self.enabled = False
             self.auto_paused = True
             self._audit_pause_change("auto_paused")
