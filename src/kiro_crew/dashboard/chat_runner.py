@@ -1105,6 +1105,43 @@ async def _steer_repeat_loop_notice(client: Any, notice: str) -> bool:
     return sent is not False
 
 
+async def _deliver_repeat_loop_notice(client: Any, slot: Any, notice: str) -> bool:
+    """Steer in-band when the harness can; otherwise PARK the notice (TOOL-21).
+
+    The steer is best-effort by design: a harness without
+    ``supports_refusal_steer`` never receives one at all, and a failed or
+    timed-out steer on one that has the capability is logged and dropped. What
+    was missing is that the notice was then LOST — a loop the model does not
+    break by itself ran until the turn ended. Either way the notice is now
+    parked on the SLOT (per-session state in the gateway, never a module
+    global) and delivered exactly once on the next model boundary Kiro Crew
+    controls: the next prompt built for this session. A newer notice replaces
+    an older parked one — they describe the same loop, and the newest streak
+    is the accurate one. Delivery path selection stays on the positive
+    capability, never on harness identity.
+    """
+    if not notice:
+        return True
+    if await _steer_repeat_loop_notice(client, notice):
+        return True
+    slot._parked_repeat_loop_notice = notice
+    return False
+
+
+def _take_parked_repeat_loop_notice(slot: Any) -> str:
+    """Take this slot's parked repeat-loop notice, exactly once (TOOL-21).
+
+    Returns "" when nothing is parked. The caller owns prepending the taken
+    notice to the prompt it is about to build; clearing here is what makes the
+    delivery exactly once.
+    """
+    notice = getattr(slot, "_parked_repeat_loop_notice", None)
+    if notice:
+        slot._parked_repeat_loop_notice = None
+        return str(notice)
+    return ""
+
+
 async def _steer_policy_notice(
     client: Any,
     title: str,
@@ -11065,6 +11102,17 @@ async def _run_chat(
         if regenerate_hint:
             full_message = f"[System: {regenerate_hint}]\n\n{full_message}"
 
+        # TOOL-21: a repeat-loop notice that could not be steered into the
+        # running turn — no refusal-steer capability, or a failed steer — is
+        # delivered HERE instead, exactly once, on the next prompt this session
+        # sends. Taken (cleared) before the prepend so nothing can double-send
+        # it, and placed above the egress scrub like every Crew-authored prefix.
+        # A slash turn is not a model boundary — the notice stays parked for the
+        # next real prompt rather than being taken and dropped.
+        _parked_repeat_notice = "" if is_slash else _take_parked_repeat_loop_notice(slot)
+        if _parked_repeat_notice:
+            full_message = f"[System: {_parked_repeat_notice}]\n\n{full_message}"
+
         # Enforce every structural boundary once more at provider egress.
         # ContextBuilder owns its trusted tail; everything added here is a pure
         # PREPEND. Scrub that complete dashboard-only prefix in one off-loop
@@ -12352,7 +12400,9 @@ async def _run_chat(
                     terminal=_tool_terminal,
                 )
                 if _loop_notice:
-                    await _steer_repeat_loop_notice(client, _redact_tool_field(_loop_notice))
+                    await _deliver_repeat_loop_notice(
+                        client, slot, _redact_tool_field(_loop_notice)
+                    )
                 if event.tool_output_credentials and _tcid_identifies:
                     # The call's own input (already redacted) names the source;
                     # the fingerprints say which credentials it produced. An id

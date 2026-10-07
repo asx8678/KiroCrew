@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import types
 
-from kiro_crew.dashboard.chat_runner import _steer_repeat_loop_notice
+from kiro_crew.dashboard.chat_runner import (
+    _deliver_repeat_loop_notice,
+    _steer_repeat_loop_notice,
+    _take_parked_repeat_loop_notice,
+)
 from kiro_crew.repeat_loop import _MAX_TRACKED, REPEAT_LOOP_THRESHOLD, RepeatLoopTracker
 
 
@@ -121,3 +126,50 @@ def test_steer_is_gated_on_capability() -> None:
     assert asyncio.run(_steer_repeat_loop_notice(capable, "note")) is True
     assert asyncio.run(_steer_repeat_loop_notice(plain, "note")) is False
     assert capable.sent == ["note"] and plain.sent == []
+
+
+def test_an_undeliverable_notice_is_parked_and_taken_exactly_once() -> None:
+    """TOOL-21: a notice the harness cannot receive in-band is not lost — it is
+    parked on the slot and delivered once on the next prompt this session sends."""
+    plain = _Client(False)
+    slot = types.SimpleNamespace(_parked_repeat_loop_notice=None)
+    assert asyncio.run(_deliver_repeat_loop_notice(plain, slot, "note")) is False
+    assert slot._parked_repeat_loop_notice == "note"
+    assert _take_parked_repeat_loop_notice(slot) == "note"
+    assert _take_parked_repeat_loop_notice(slot) == "", "the notice must deliver once"
+    assert slot._parked_repeat_loop_notice is None
+
+
+def test_a_failed_steer_parks_the_notice_too() -> None:
+    """TOOL-21: a steering client whose steer raises is as undeliverable as one
+    without the capability — the fallback path is the same."""
+
+    class _Raising:
+        supports_refusal_steer = True
+
+        async def steer(self, text: str) -> bool:
+            raise RuntimeError("transport gone")
+
+    slot = types.SimpleNamespace()
+    assert asyncio.run(_deliver_repeat_loop_notice(_Raising(), slot, "note")) is False
+    assert _take_parked_repeat_loop_notice(slot) == "note"
+
+
+def test_an_accepted_steer_parks_nothing() -> None:
+    """TOOL-21: an in-band delivery must not ALSO prepend on the next prompt."""
+    ok = _Client(True)
+    slot = types.SimpleNamespace()
+    assert asyncio.run(_deliver_repeat_loop_notice(ok, slot, "note")) is True
+    assert ok.sent == ["note"]
+    assert _take_parked_repeat_loop_notice(slot) == ""
+
+
+def test_a_newer_notice_replaces_an_older_parked_one() -> None:
+    """TOOL-21: both notices describe the same loop; the newest streak is the
+    accurate one, and replacement keeps the slot bounded."""
+    plain = _Client(False)
+    slot = types.SimpleNamespace(_parked_repeat_loop_notice=None)
+    asyncio.run(_deliver_repeat_loop_notice(plain, slot, "first"))
+    asyncio.run(_deliver_repeat_loop_notice(plain, slot, "second"))
+    assert _take_parked_repeat_loop_notice(slot) == "second"
+    assert _take_parked_repeat_loop_notice(slot) == ""
