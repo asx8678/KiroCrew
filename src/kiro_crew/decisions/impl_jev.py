@@ -154,10 +154,14 @@ def _to_wire(state: dict | str, model: str, questions: list[Question]) -> dict[s
 def _question_to_wire(q: object) -> dict[str, Any]:
     """One question in the provider's shape, or raise for a class it has none for."""
     if isinstance(q, Choice):
+        # LOOP-28: the option's meaning travels when the point supplied one —
+        # the judge answers the question it was asked, not a guess at what the
+        # option names mean. No rubric keeps the previous null mapping.
+        rubric = getattr(q, "option_rubric", None) or {}
         return {
             "type": "choice",
             "instructions": q.prompt,
-            "criteria": {opt: None for opt in q.options},
+            "criteria": {opt: rubric.get(opt) for opt in q.options},
         }
     if isinstance(q, Noul):
         wire: dict[str, Any] = {"type": "noul", "instructions": q.prompt}

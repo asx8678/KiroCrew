@@ -209,6 +209,42 @@ class TestRequestShape:
         assert q["instructions"] == CHOICE.prompt
         assert q["criteria"] == {"billing": None, "technical": None, "sales": None}
 
+    def test_a_choice_with_an_option_rubric_sends_it_as_criteria(self):
+        """LOOP-28: an option's meaning travels with it. A Choice carrying
+        ``option_rubric`` sends the rubric text per option; keys the point did
+        not map stay null, and a Choice without a rubric keeps the all-null
+        map the API shape pins."""
+        from kiro_crew.decisions.types import Choice
+
+        rubbed = Choice(
+            "department",
+            "Which department?",
+            options=["billing", "technical", "sales"],
+            option_rubric={
+                "billing": "Owns invoices and payment questions.",
+                "technical": "Owns outages and bugs.",
+            },
+        )
+        rec = _Recorder(
+            body=_ok_body(
+                {
+                    "department": {
+                        "type": "choice",
+                        "choice": "sales",
+                        "probabilities": {"sales": 1.0},
+                        "confidence": 0.9,
+                    }
+                }
+            )
+        )
+        asyncio.run(_run(rec, [rubbed]))
+        q = rec.requests[0]["questions"]["department"]
+        assert q["criteria"] == {
+            "billing": "Owns invoices and payment questions.",
+            "technical": "Owns outages and bugs.",
+            "sales": None,
+        }
+
     def test_an_object_of_no_question_type_is_refused(self):
         """The wire speaks the three question types; any other object is a caller bug."""
         from kiro_crew.decisions.impl_jev import _to_wire
