@@ -229,9 +229,14 @@ from kiro_crew.hooks import HookManager, HooksConfig, hooks_config_from_config_d
 from kiro_crew.kiro_cli import PATH_ONLY_INSTALL_NOTE, is_bundled_kiro_cli, pin_kiro_cli
 from kiro_crew.learn import LessonStore
 from kiro_crew.llm_helpers import (  # noqa: F401
+    SESSION_NOT_FOUND_GIVE_UP_TEXT,
+    SESSION_NOT_FOUND_NOT_REPLAYED_TEXT,
+    TOOL_ACTIVITY_ATTR,
     PromptBusyExhaustedError,
     ToolApprovalPolicy,
     _billing_stats,
+    acp_error_after_tool_activity,
+    acp_error_is_session_not_found,
     acp_error_is_transient,
     annotate_model_fallback,
     append_fallback_story,
@@ -4992,179 +4997,237 @@ class GatewayOrchestrator:
                 # done work, even if a later agent was blocked outright.
                 _gate = _GateTally()
                 for step in steps:
-                    agent = step.alias
-                    agent_session_key = step.session_key
-                    if self.cron_svc is not None:
-                        self.cron_svc.register_active_session_key(job.id, agent_session_key)
-                    _acq = False
-                    # Post-compaction re-injection bookkeeping for the finally:
-                    # consumed the one-shot flag / turn landed. The stream
-                    # returns text only, so the completion's stop reason is
-                    # captured through on_complete (last completion wins: a
-                    # post-token resume's continuation is the turn that ended).
-                    _seq_reinjection = False
-                    _seq_landed = False
-                    # None until a completion is observed: a stream that ends
-                    # without one is not landed.
-                    _seq_stop: dict[str, str | None] = {"reason": None}
+                    # One re-load per step when a live backend lost this step's
+                    # session: the step is re-run on a fresh runtime that
+                    # session/loads the same id. A second loss ends the fire.
+                    _seq_snf_retry_used = False
+                    while True:
+                        _seq_snf_retry = False
+                        _seq_snf_err = ""
+                        agent = step.alias
+                        agent_session_key = step.session_key
+                        if self.cron_svc is not None:
+                            self.cron_svc.register_active_session_key(job.id, agent_session_key)
+                        _acq = False
+                        # Post-compaction re-injection bookkeeping for the finally:
+                        # consumed the one-shot flag / turn landed. The stream
+                        # returns text only, so the completion's stop reason is
+                        # captured through on_complete (last completion wins: a
+                        # post-token resume's continuation is the turn that ended).
+                        _seq_reinjection = False
+                        _seq_landed = False
+                        # None until a completion is observed: a stream that ends
+                        # without one is not landed.
+                        _seq_stop: dict[str, str | None] = {"reason": None}
 
-                    def _seq_note_complete(
-                        ev: Any, _box: dict[str, str | None] = _seq_stop
-                    ) -> None:
-                        _box["reason"] = str(getattr(ev, "stop_reason", "") or "")
+                        def _seq_note_complete(
+                            ev: Any, _box: dict[str, str | None] = _seq_stop
+                        ) -> None:
+                            _box["reason"] = str(getattr(ev, "stop_reason", "") or "")
 
-                    try:
-                        _seq_execution = cron_execution.with_template(
-                            step.dispatch_agent, step.crew or step.alias
-                        )
-                        client, is_new, _resumed, _downgraded = await _acquire_with_model_fallback(
-                            step.session_key,
-                            step.dispatch_agent,
-                            step.cwd,
-                            step.crew,
-                            execution=_seq_execution,
-                            replace_execution=True,
-                        )
-                        _seq_downgraded = _seq_downgraded or _downgraded
-                        _acq = True
-                        # Publish this turn's session identity so managed MCP
-                        # tools resolve their parent session. The cron path was
-                        # the ONE turn-running surface that skipped this (every
-                        # other surface publishes — see messaging.identity), and
-                        # under session sharing the runtime env carries no
-                        # KIROCREW_SESSION_KEY and macOS sets no
-                        # KIROCREW_HOST_PID, so the ancestor PID-walk over the
-                        # per-turn pidfile mapping is the only identity source
-                        # left. Without the publish, spawn_run resolved an
-                        # empty parent ("notification only (parent=)") unless an
-                        # unrelated surface happened to be mid-turn.
-                        await publish_turn_identity(self.sessions, agent_session_key)
-                        # A compaction drops session-start context. Read-and-clear
-                        # the one-shot flag so this turn re-injects it exactly
-                        # once; the finally re-arms it if the turn never lands.
-                        _seq_reinjection = consume_reinjection(self.sessions, agent_session_key)
-                        # Off-loop: build_message embeds the episodic query.
-                        full_message, _ = await run_in_embed_pool(
-                            self.ctx_builder.build_message,
-                            msg,
-                            is_new,
-                            agent_session_key,
-                            interactive=False,
-                            agent=agent,
-                            memory_store=cron_memory_store or None,
-                            execution_context=cron_execution,
-                            context_provider=client,
-                            resumed=_resumed,
-                            needs_reinjection=_seq_reinjection,
-                            minimal_context=job.minimal_context,
-                        )
-                        # Wall clock for the cron agent turn: acp never assigns
-                        # TurnUsage.duration_ms, so the row falls back to this.
-                        # Brackets only the model turn — session acquisition and
-                        # the episodic-query embed above are setup, not the turn.
-                        _turn_t0 = time.monotonic()
-                        _prompt_dispatched = True
-                        # Pinned before dispatch for the usage row below: a turn
-                        # that never reached the model leaves this object in place.
-                        _seq_since = _billing_stats(client)
-                        _seq_carry: list[float] = []
-                        _seq_exc: BaseException | None = None
                         try:
-                            result_text, _ = await _cron_stream_with_posttoken_resume(
-                                client,
-                                full_message,
-                                job_name=job.name,
-                                credit_carry=_seq_carry,
-                                approval_policy=(
-                                    ToolApprovalPolicy.AUTO_APPROVE
-                                    if job.approval_mode == "auto"
-                                    else ToolApprovalPolicy.HOOK_BASED
-                                ),
-                                hooks=self.ctx_builder.hooks,
-                                on_tool_approval=(
-                                    None
-                                    if job.approval_mode == "auto"
-                                    else self._interactive_approval("cron")
-                                ),
-                                on_tool_gate=_gate.note,
-                                on_complete=_seq_note_complete,
-                                fallback_models=configured_fallback_chain(),
+                            _seq_execution = cron_execution.with_template(
+                                step.dispatch_agent, step.crew or step.alias
                             )
-                        except BaseException as _stream_exc:
-                            _seq_exc = _stream_exc
-                            raise
-                        finally:
-                            # ── Per-turn usage row: background spend, on EVERY
-                            # exit -- an error or the wake deadline's cancel
-                            # after dispatch still billed the account. ──
-                            await _record_cron_turn_row(
-                                client,
+                            client, is_new, _resumed, _downgraded = (
+                                await _acquire_with_model_fallback(
+                                    step.session_key,
+                                    step.dispatch_agent,
+                                    step.cwd,
+                                    step.crew,
+                                    execution=_seq_execution,
+                                    replace_execution=True,
+                                )
+                            )
+                            _seq_downgraded = _seq_downgraded or _downgraded
+                            _acq = True
+                            # Publish this turn's session identity so managed MCP
+                            # tools resolve their parent session. The cron path was
+                            # the ONE turn-running surface that skipped this (every
+                            # other surface publishes — see messaging.identity), and
+                            # under session sharing the runtime env carries no
+                            # KIROCREW_SESSION_KEY and macOS sets no
+                            # KIROCREW_HOST_PID, so the ancestor PID-walk over the
+                            # per-turn pidfile mapping is the only identity source
+                            # left. Without the publish, spawn_run resolved an
+                            # empty parent ("notification only (parent=)") unless an
+                            # unrelated surface happened to be mid-turn.
+                            await publish_turn_identity(self.sessions, agent_session_key)
+                            # A compaction drops session-start context. Read-and-clear
+                            # the one-shot flag so this turn re-injects it exactly
+                            # once; the finally re-arms it if the turn never lands.
+                            _seq_reinjection = consume_reinjection(self.sessions, agent_session_key)
+                            # Off-loop: build_message embeds the episodic query.
+                            full_message, _ = await run_in_embed_pool(
+                                self.ctx_builder.build_message,
+                                msg,
+                                is_new,
                                 agent_session_key,
-                                job=job,
-                                since=_seq_since,
-                                carry=_seq_carry,
-                                exc=_seq_exc,
-                                downgraded=_seq_downgraded,
-                                provider=(
-                                    self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
-                                ),
-                                agent=agent or "",
-                                t0=_turn_t0,
+                                interactive=False,
+                                agent=agent,
+                                memory_store=cron_memory_store or None,
+                                execution_context=cron_execution,
+                                context_provider=client,
+                                resumed=_resumed,
+                                needs_reinjection=_seq_reinjection,
+                                minimal_context=job.minimal_context,
                             )
-                        # The prompt reached the model and the turn completed, so
-                        # the finally must NOT restore the re-injection flag --
-                        # only for a succeeded stop reason.
-                        _seq_landed = stop_reason_landed(_seq_stop["reason"])
-                        if not result_text:
-                            result_text = _gate.empty_reply_placeholder()
-                        result_text = _annotate_model_fallback(result_text, client)
-                        logger.info("Cron '%s': agent '%s' completed", job.name, agent)
-                    finally:
-                        # Before the reset below: a turn that consumed the
-                        # post-compaction flag but never landed puts it back so
-                        # a session that survives (deferred reset) re-injects.
-                        rearm_reinjection(
-                            self.sessions,
-                            agent_session_key,
-                            consumed=_seq_reinjection,
-                            landed=_seq_landed,
-                        )
-                        rollback_skill_bodies(
-                            self.ctx_builder, agent_session_key, landed=_seq_landed
-                        )
-                        if _acq:
-                            self.sessions.release(agent_session_key)
-                            # Mirror the single-agent finally below: defer the
-                            # reset when this agent's sub-agents are still
-                            # running, QUEUED behind the concurrency/stagger
-                            # gate, or mid-injection — _subagent_done resets
-                            # after the last one. Now that this path publishes
-                            # turn identity, a non-final agent's spawn_run
-                            # resolves a REAL parent key, so an unconditional
-                            # reset here would tear down the session a pending
-                            # completion is about to inject into (cold-starting
-                            # a context-free replacement) and the completion's
-                            # own cleanup would clear the reaper registration
-                            # for the NEXT agent's still-in-flight turn.
-                            _has_pending = bool(
-                                self.subagent_mgr
-                                and await _subagent_work_pending(
-                                    self.subagent_mgr, agent_session_key
+                            # Wall clock for the cron agent turn: acp never assigns
+                            # TurnUsage.duration_ms, so the row falls back to this.
+                            # Brackets only the model turn — session acquisition and
+                            # the episodic-query embed above are setup, not the turn.
+                            _turn_t0 = time.monotonic()
+                            _prompt_dispatched = True
+                            # Pinned before dispatch for the usage row below: a turn
+                            # that never reached the model leaves this object in place.
+                            _seq_since = _billing_stats(client)
+                            _seq_carry: list[float] = []
+                            _seq_exc: BaseException | None = None
+                            try:
+                                result_text, _ = await _cron_stream_with_posttoken_resume(
+                                    client,
+                                    full_message,
+                                    job_name=job.name,
+                                    credit_carry=_seq_carry,
+                                    approval_policy=(
+                                        ToolApprovalPolicy.AUTO_APPROVE
+                                        if job.approval_mode == "auto"
+                                        else ToolApprovalPolicy.HOOK_BASED
+                                    ),
+                                    hooks=self.ctx_builder.hooks,
+                                    on_tool_approval=(
+                                        None
+                                        if job.approval_mode == "auto"
+                                        else self._interactive_approval("cron")
+                                    ),
+                                    on_tool_gate=_gate.note,
+                                    on_complete=_seq_note_complete,
+                                    fallback_models=configured_fallback_chain(),
                                 )
-                            )
-                            _has_injecting = self._cron_injecting.get(agent_session_key, 0) > 0
-                            if _has_pending or _has_injecting:
-                                logger.info(
-                                    "Cron '%s': deferring reset of %s, subagents pending",
-                                    job.name,
+                            except BaseException as _stream_exc:
+                                _seq_exc = _stream_exc
+                                raise
+                            finally:
+                                # ── Per-turn usage row: background spend, on EVERY
+                                # exit -- an error or the wake deadline's cancel
+                                # after dispatch still billed the account. ──
+                                await _record_cron_turn_row(
+                                    client,
                                     agent_session_key,
+                                    job=job,
+                                    since=_seq_since,
+                                    carry=_seq_carry,
+                                    exc=_seq_exc,
+                                    downgraded=_seq_downgraded,
+                                    provider=(
+                                        self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
+                                    ),
+                                    agent=agent or "",
+                                    t0=_turn_t0,
                                 )
-                            else:
-                                await self.sessions.reset(agent_session_key)
-                                if self.cron_svc is not None:
-                                    self.cron_svc.clear_active_session_key(
-                                        job.id, agent_session_key
+                            # The prompt reached the model and the turn completed, so
+                            # the finally must NOT restore the re-injection flag --
+                            # only for a succeeded stop reason.
+                            _seq_landed = stop_reason_landed(_seq_stop["reason"])
+                            if not result_text:
+                                result_text = _gate.empty_reply_placeholder()
+                            result_text = _annotate_model_fallback(result_text, client)
+                            logger.info("Cron '%s': agent '%s' completed", job.name, agent)
+                        except Exception as _seq_exc:
+                            if not acp_error_is_session_not_found(_seq_exc):
+                                raise
+                            # Re-running the step re-sends its prompt, which
+                            # could repeat a tool the lost turn already ran.
+                            if acp_error_after_tool_activity(_seq_exc):
+                                raise AcpError(
+                                    f"{SESSION_NOT_FOUND_NOT_REPLAYED_TEXT} {_seq_exc}"
+                                ) from _seq_exc
+                            if _seq_snf_retry_used:
+                                raise AcpError(
+                                    f"{SESSION_NOT_FOUND_GIVE_UP_TEXT} {_seq_exc}"
+                                ) from _seq_exc
+                            _seq_snf_retry_used = True
+                            _seq_snf_retry = True
+                            _seq_snf_err = str(_seq_exc)
+                            logger.warning(
+                                "Cron '%s': backend lost the session of step %r, "
+                                "re-loading it on a fresh runtime and retrying the step",
+                                job.name,
+                                agent,
+                            )
+                        finally:
+                            # Before the reset below: a turn that consumed the
+                            # post-compaction flag but never landed puts it back so
+                            # a session that survives (deferred reset) re-injects.
+                            rearm_reinjection(
+                                self.sessions,
+                                agent_session_key,
+                                consumed=_seq_reinjection,
+                                landed=_seq_landed,
+                            )
+                            rollback_skill_bodies(
+                                self.ctx_builder, agent_session_key, landed=_seq_landed
+                            )
+                            if _acq:
+                                self.sessions.release(agent_session_key)
+                                # Mirror the single-agent finally below: defer the
+                                # reset when this agent's sub-agents are still
+                                # running, QUEUED behind the concurrency/stagger
+                                # gate, or mid-injection — _subagent_done resets
+                                # after the last one. Now that this path publishes
+                                # turn identity, a non-final agent's spawn_run
+                                # resolves a REAL parent key, so an unconditional
+                                # reset here would tear down the session a pending
+                                # completion is about to inject into (cold-starting
+                                # a context-free replacement) and the completion's
+                                # own cleanup would clear the reaper registration
+                                # for the NEXT agent's still-in-flight turn.
+                                _has_pending = bool(
+                                    self.subagent_mgr
+                                    and await _subagent_work_pending(
+                                        self.subagent_mgr, agent_session_key
                                     )
+                                )
+                                _has_injecting = self._cron_injecting.get(agent_session_key, 0) > 0
+                                if _has_pending or _has_injecting:
+                                    logger.info(
+                                        "Cron '%s': deferring reset of %s, subagents pending",
+                                        job.name,
+                                        agent_session_key,
+                                    )
+                                else:
+                                    await self.sessions.reset(agent_session_key)
+                                    if self.cron_svc is not None:
+                                        self.cron_svc.clear_active_session_key(
+                                            job.id, agent_session_key
+                                        )
+                        if not _seq_snf_retry:
+                            break
+                        # The finally above defers its reset while sub-agents
+                        # are pending so a completion about to inject is not
+                        # torn down; honour that same deferral here. Spawning a
+                        # sub-agent is tool activity, so a loss with THIS turn's
+                        # sub-agents in flight already took the no-replay arm and
+                        # never reaches here; this guards a sibling step's
+                        # completion still injecting. When we must defer, let
+                        # _subagent_done do the reset and give up the retry (a
+                        # re-run against the un-reset stale binding would only
+                        # hit Session not found again), rather than reset under
+                        # the pending completion.
+                        _retry_has_pending = bool(
+                            self.subagent_mgr
+                            and await _subagent_work_pending(self.subagent_mgr, agent_session_key)
+                        )
+                        _retry_has_injecting = self._cron_injecting.get(agent_session_key, 0) > 0
+                        if _retry_has_pending or _retry_has_injecting:
+                            logger.info(
+                                "Cron '%s': lost session of step %r but sub-agents "
+                                "pending; deferring reset and not retrying this step",
+                                job.name,
+                                agent,
+                            )
+                            raise AcpError(f"{SESSION_NOT_FOUND_GIVE_UP_TEXT} {_seq_snf_err}")
+                        await self.sessions.reset(agent_session_key)
                 if _seq_downgraded:
                     result_text = _annotate_model_downgrade(result_text)
                 result_text = _annotate_partial_block(result_text, _gate)
@@ -5787,19 +5850,38 @@ class GatewayOrchestrator:
                     # frame skips its transient ladder, so no prompt is sent
                     # again after that attempt.
                     (
-                        isinstance(exc, AcpProcessDied)
+                        (
+                            (
+                                isinstance(exc, AcpProcessDied)
+                                or (
+                                    isinstance(exc, AcpError)
+                                    and ("not running" in exc_msg or "process exited" in exc_msg)
+                                )
+                            )
+                            and not _prompt_dispatched
+                        )
+                        # A live backend that lost the session under the mapped
+                        # id: the reset keeps the session-map entry, so the
+                        # retry's claim re-loads the SAME id on a fresh runtime.
+                        # The loss surfaces only once the prompt is sent, so the
+                        # dispatch bar above cannot hold it; its own bar is that
+                        # no tool ran, since the retry re-sends the prompt.
                         or (
-                            isinstance(exc, AcpError)
-                            and ("not running" in exc_msg or "process exited" in exc_msg)
+                            acp_error_is_session_not_found(exc)
+                            and not acp_error_after_tool_activity(exc)
                         )
                     )
-                    and not _prompt_dispatched
                     and not getattr(job, "_acp_retried", False)
                     and self.sessions is not None
                 ):
                     logger.warning(
-                        "Cron '%s': ACP process died, resetting session and retrying",
+                        "Cron '%s': %s, resetting session and retrying",
                         job.name,
+                        (
+                            "backend lost the session"
+                            if acp_error_is_session_not_found(exc)
+                            else "ACP process died"
+                        ),
                     )
                     job._acp_retried = True  # type: ignore[attr-defined]
                     try:
@@ -6089,6 +6171,19 @@ class GatewayOrchestrator:
                 # fragment the redaction regexes no longer match. The story is
                 # redacted+capped centrally in fallback_story_of.
                 _exc_text = f"{type(exc).__name__}: {exc}"
+                _snf_text = str(exc)
+                if (
+                    acp_error_is_session_not_found(exc)
+                    and SESSION_NOT_FOUND_GIVE_UP_TEXT not in _snf_text
+                    and SESSION_NOT_FOUND_NOT_REPLAYED_TEXT not in _snf_text
+                ):
+                    # Name the outcome, not just the backend's words: the retry
+                    # was skipped after a tool ran, or it ran and failed too.
+                    _exc_text = (
+                        f"{SESSION_NOT_FOUND_NOT_REPLAYED_TEXT} {_exc_text}"
+                        if acp_error_after_tool_activity(exc)
+                        else f"{SESSION_NOT_FOUND_GIVE_UP_TEXT} {_exc_text}"
+                    )
                 _exc_text, _ = redact_exfiltration_urls(_exc_text)
                 _exc_text, _ = redact_credentials(_exc_text)
                 # Delivery detail: the budget trims the ERROR part to leave the
@@ -9365,9 +9460,14 @@ class GatewayOrchestrator:
                 ran, the parent's window already holds the completion, so a
                 resend would pay its whole context again and could run the same
                 tools twice. Streamed text is delivered as the reply; a turn that
-                only ran tools ends as a failed injection.
+                only ran tools ends as a failed injection. A live backend that
+                lost the parent's session is answered once by a reset and a fresh
+                claim, which re-loads the same backend id; the caller's single
+                ``release(parent_key)`` balances against that claim.
                 """
-                for attempt in range(3):
+                _snf_reloaded = False
+                attempt = 0
+                while True:
                     streamed: list[str] = []
                     tools_ran: list[str] = []
 
@@ -9461,7 +9561,28 @@ class GatewayOrchestrator:
                                 reason="ACP process died",
                             )
                         return None
-                    except AcpError:
+                    except AcpError as exc:
+                        if acp_error_is_session_not_found(exc):
+                            if acp_error_after_tool_activity(exc):
+                                raise AcpError(
+                                    f"{SESSION_NOT_FOUND_NOT_REPLAYED_TEXT} {exc}"
+                                ) from exc
+                            if _snf_reloaded:
+                                raise AcpError(f"{SESSION_NOT_FOUND_GIVE_UP_TEXT} {exc}") from exc
+                            _snf_reloaded = True
+                            logger.warning(
+                                "Subagent %s: backend lost parent session %s during %s "
+                                "injection — re-loading it on a fresh runtime",
+                                info.id,
+                                parent_key,
+                                label,
+                            )
+                            assert self.sessions is not None
+                            await self.sessions.reset(parent_key)
+                            client, _is_new, _resumed = await self.sessions.get_or_create(
+                                parent_key
+                            )
+                            continue
                         if streamed:
                             logger.warning(
                                 "Subagent %s %s injection attempt %d failed after "
@@ -9491,7 +9612,7 @@ class GatewayOrchestrator:
                                 exc_info=True,
                             )
                         await asyncio.sleep(2**attempt)
-                return None  # unreachable, but satisfies type checker
+                        attempt += 1
 
             # A synthetic flush-only record is NOT a wave member (see
             # SubagentManager.force_digest_flush): it exists only to force the
