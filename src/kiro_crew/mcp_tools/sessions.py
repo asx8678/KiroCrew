@@ -480,25 +480,26 @@ def list_sessions(name: str, args: dict[str, Any]) -> str:
             summaries = {str(k): str(v) for k, v in resp["summaries"].items() if v}
 
     scope_label = "across all workspaces" if all_workspaces else "in this workspace"
-    lines = [f"\U0001f5c2\ufe0f Sessions {scope_label} ({len(rows)}, newest first):"]
+    lines = [
+        f"\U0001f5c2\ufe0f Sessions {scope_label} ({len(rows)}, newest first): "
+        "columns: key | title | agent | msgs | created"
+    ]
     for r in rows:
         key = r["key"]
         title = r.get("title") or key
         agent = r.get("agent")
         msgs = r.get("messages", 0)
         created = r.get("created", "")
-        meta_bits = []
+        bits = [f"`{key}`", title]
         if agent:
-            meta_bits.append(f"agent={agent}")
-        meta_bits.append(f"~{msgs} msgs")
+            bits.append(str(agent))
+        bits.append(f"~{msgs} msgs")
         if created:
-            meta_bits.append(str(created)[:16])
-        lines.append("\n---")
-        lines.append(f"**{title}**  ·  `{key}`")
-        lines.append(f"_{'  ·  '.join(meta_bits)}_")
+            bits.append(str(created)[:16])
+        lines.append(" | ".join(bits))
         summary = summaries.get(key)
         if summary:
-            lines.append(f"\n{summary}")
+            lines.append(f"  {summary}")
 
     output = mcp_core._redact_history_output("\n".join(lines))
     mcp_core.sel().log_tool_invocation(

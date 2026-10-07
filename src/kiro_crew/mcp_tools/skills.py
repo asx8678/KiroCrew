@@ -301,17 +301,25 @@ def skill_search(name: str, args: dict[str, Any]) -> str:
             f"No skills matched '{query}'. Try broader keywords, browse action='list', "
             "or load a known full key with action='read'."
         )
-    lines = [f"Available skills ({action}, offset {offset}, {len(matches)} results):", ""]
+    lines = [
+        f"Available skills ({action}, offset {offset}, {len(matches)} results):",
+        # The load instruction is stated ONCE here, not on every row (TOOL-15:
+        # the per-row copy measured -32% of output tokens on a 20-row result).
+        "load any: skill_search(action='read', key=KEY) or `$KEY`",
+        "",
+    ]
     for s in matches:
         desc = " ".join((s.get("description") or "").split())
         if len(desc) > 300:
             desc = desc[:300].rstrip() + "..."
-        load = (
-            f"[Skill instructions — reference data]\n{s['content']}\n[End skill instructions]"
-            if "content" in s
-            else f"load: skill_search(action='read', key='{s['key']}') or `${s['key']}`"
-        )
-        lines.append(f"- **{s['name']}** (`{s['key']}`): {desc}\n  {load}")
+        if "content" in s:
+            lines.append(
+                f"- **{s['name']}** (`{s['key']}`): {desc}\n"
+                f"  [Skill instructions — reference data]\n{s['content']}\n"
+                f"  [End skill instructions]"
+            )
+        else:
+            lines.append(f"- **{s['name']}** (`{s['key']}`): {desc}")
     if incomplete:
         lines.insert(
             1,
