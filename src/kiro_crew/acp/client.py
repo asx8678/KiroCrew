@@ -8654,7 +8654,11 @@ class AcpClient:
             # native Claude binary we don't vendor and does NOT search PATH for
             # `claude` itself, so point it at one explicitly when the seam is
             # driven. Only set when unset so an operator override always wins.
-            claude_exe = _resolve_claude_code_executable()
+            # Off-loop: _resolve runs `mise which` (a subprocess, bounded at
+            # 5 s) and a PATH walk — the same blocking the _spawn steps around
+            # it already offload, so the loop must not hold them either.
+            # Claude-only: the Kiro path never enters this branch.
+            claude_exe = await asyncio.to_thread(_resolve_claude_code_executable)
             if claude_exe:
                 env["CLAUDE_CODE_EXECUTABLE"] = claude_exe
             else:
