@@ -1063,6 +1063,33 @@ class AutoNudgeService:
                         loop_values["judge_quiet_streak"] = 0
                     else:
                         loop_values["judge_quiet_streak"] = min(_streak, _MAX_QUIET_STREAK)
+                # Partial-reading streak + its dropped-set key: same
+                # agent-writable store, same normalisation posture. A bad
+                # streak resets (the safe direction is to re-hear the partial
+                # once, not to silence it forever), and a non-string key
+                # clears so a malformed row cannot fake a "same dropped set".
+                if "judge_partial_streak" in loop_values:
+                    _pstk = loop_values["judge_partial_streak"]
+                    if isinstance(_pstk, bool) or not isinstance(_pstk, int) or _pstk < 0:
+                        logger.warning(
+                            "AutoNudge: loop %s stored a non-count partial-reading "
+                            "streak; resetting it",
+                            raw.get("id"),
+                        )
+                        loop_values["judge_partial_streak"] = 0
+                    else:
+                        loop_values["judge_partial_streak"] = min(_pstk, _MAX_QUIET_STREAK)
+                if "judge_partial_dropped" in loop_values:
+                    _pkey = loop_values["judge_partial_dropped"]
+                    if not isinstance(_pkey, str):
+                        logger.warning(
+                            "AutoNudge: loop %s stored a non-string partial-reading "
+                            "dropped-set key; clearing it",
+                            raw.get("id"),
+                        )
+                        loop_values["judge_partial_dropped"] = ""
+                    else:
+                        loop_values["judge_partial_dropped"] = _pkey[:512]
                 # ``self_armed`` is the ONE bit that relaxes the crew/member
                 # fire-time guard, and this store is agent-writable. A persisted
                 # non-boolean (the string "false" is truthy) must therefore

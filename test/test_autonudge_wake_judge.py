@@ -1046,6 +1046,87 @@ class TestEmptyDelta:
         assert verdict.outcome is Outcome.FALLBACK
         assert "could not read every target" in verdict.body
 
+
+class TestAPartialReadingThatPersistsCostsNoMoreThanACalmOne:
+    """LOOP-21: a permanently unreachable target buys at most one delivery per
+    floor interval, not a turn every tick.
+
+    A target the collector could not read makes the judge answer FALLBACK before
+    it ever looks at the delta, so a watch whose subject is fine but whose target
+    is unreachable fired EVERY interval. The first partial still fires (the owner
+    learns the watch cannot see everything); repeats with the same dropped count
+    count against the same floor a quiet streak does.
+    """
+
+    @staticmethod
+    def _partial_svc():
+        svc = _service()
+        dropped = {"n": 1}
+
+        async def collect(loop: NudgeLoop) -> tuple[list[dict], int, dict]:
+            return ([], dropped["n"], {})
+
+        async def persist(loop: NudgeLoop) -> bool:
+            return True
+
+        svc._collect_judge_evidence = collect
+        svc._persist_judge_state = persist  # type: ignore[method-assign]
+        svc._persist_soon = lambda: None  # type: ignore[method-assign]
+        svc._record_judge_verdict = lambda *a, **k: None  # type: ignore[method-assign]
+        svc._withdraw_judge_suppression = lambda loop: None  # type: ignore[method-assign]
+        svc._emit_judge_notice = None
+        svc._judge_quiet_streak_floor = lambda: 3  # type: ignore[method-assign]
+
+        async def tick(instruction: str, **kwargs: Any) -> Any:
+            return Verdict(outcome=Outcome.FALLBACK, body="wake judge could not read every target")
+
+        return svc, dropped, tick
+
+    def _run(self, svc: Any, loop: NudgeLoop, tick: Any) -> bool | None:
+        with (
+            patch("kiro_crew.decisions.is_enabled", lambda *a, **k: True),
+            patch("kiro_crew.decisions.judge_evidence_scope_granted", lambda **k: True),
+            patch("kiro_crew.decisions.points.nudge_wake.judge_tick", tick),
+        ):
+            return asyncio.run(svc._judge_tick_is_quiet(loop))
+
+    def test_first_partial_fires_and_repeats_count_to_the_floor(self) -> None:
+        svc, dropped, tick = self._partial_svc()
+        loop = _loop({"wake_when": "RULING"})
+        # The first partial is news: it fires.
+        assert self._run(svc, loop, tick) is False
+        assert (loop.judge_partial_streak, loop.judge_partial_dropped) == (1, "1")
+        loop.judge_wake_pending = False  # the delivery landed
+        # Repeats with the same dropped count are suppressed to the floor (3).
+        assert self._run(svc, loop, tick) is True
+        assert loop.judge_partial_streak == 2
+        # The floor tick delivers anyway and resets the streak.
+        assert self._run(svc, loop, tick) is False
+        assert loop.judge_partial_streak == 0
+        loop.judge_wake_pending = False
+        # The next repeat starts a fresh streak, suppressed again.
+        assert self._run(svc, loop, tick) is True
+        assert loop.judge_partial_streak == 1
+
+    def test_a_changed_dropped_count_is_news_and_fires(self) -> None:
+        svc, dropped, tick = self._partial_svc()
+        loop = _loop({"wake_when": "RULING"})
+        assert self._run(svc, loop, tick) is False
+        loop.judge_wake_pending = False
+        dropped["n"] = 2  # a DIFFERENT number of unreadable targets
+        assert self._run(svc, loop, tick) is False
+        assert (loop.judge_partial_streak, loop.judge_partial_dropped) == (1, "2")
+
+    def test_a_recovery_to_a_complete_reading_resets_the_partial_state(self) -> None:
+        svc, dropped, tick = self._partial_svc()
+        loop = _loop({"wake_when": "RULING"})
+        assert self._run(svc, loop, tick) is False
+        loop.judge_wake_pending = False
+        dropped["n"] = 0  # every target read again
+        assert self._run(svc, loop, tick) is False
+        assert loop.judge_partial_streak == 0
+        assert loop.judge_partial_dropped == ""
+
     def test_a_dropped_target_fires_even_when_another_target_yielded_rows(self) -> None:
         """One unread target is enough, whatever the readable ones produced.
 
