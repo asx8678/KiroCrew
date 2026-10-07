@@ -552,6 +552,7 @@ None-guard, and `validate` rejects the inline unguarded dereference.
 | Schema re-asks | `schema.DEFAULT_SCHEMA_RETRIES` | 2 | result is `None` |
 | Tracked runs in memory | `registry.DEFAULT_MAX_RUNS` | 200 | oldest **terminal** run evicted; a running run is never evicted |
 | Persisted agent-error text | `runner.MAX_AGENT_ERROR_CHARS` | 500 | truncated after redaction |
+| Step output handed to the script | `runner.DEFAULT_MAX_OUTPUT_CHARS` (WorkflowRunner `max_output_chars`) | 20000 | head+tail kept, `[… N chars truncated …]` marker; the resume record (`agent_results`) keeps the WHOLE value; `None` disables. The frozen `ctx.agent` signature does not grow a per-call kwarg — the bound is run-wide |
 
 `clamp_run_timeout(value, default=...)` is the one door to the wall-clock ceiling.
 `None`, non-numeric, and non-positive input fall back to the default, so a bad or

@@ -73,6 +73,39 @@ async def test_run_started_first_and_finished_last() -> None:
     assert res.events[-1].type == "run_finished"
 
 
+async def test_step_output_past_the_run_default_is_bounded_with_a_marker() -> None:
+    """WF-2: the value a step hands the SCRIPT is bounded (head+tail, marker
+    naming the cut); the resume record keeps the whole value; None disables."""
+    from kiro_crew.workflows.runner import DEFAULT_MAX_OUTPUT_CHARS
+
+    big = "x" * 200_000
+
+    async def _big_agent(prompt: str, opts: dict) -> str:
+        return big
+
+    script = (
+        'META = {"name": "demo", "description": "d"}\n'
+        "async def workflow(ctx):\n"
+        "    r = await ctx.agent('hello')\n"
+        "    return {'len': len(r), 'head': r[:3], 'marker': 'chars truncated' in r}\n"
+    )
+
+    res = await _runner(agent_fn=_big_agent).run(script, run_id="wf_cap", now=NOW)
+    assert res.ok
+    assert res.result["len"] <= DEFAULT_MAX_OUTPUT_CHARS + 200
+    assert res.result["marker"] is True
+    assert res.result["head"] == "xxx"
+    # The resume record keeps the WHOLE value.
+    assert any(len(str(v)) == 200_000 for v in res.agent_results.values())
+
+    # None disables the bound entirely.
+    res2 = await _runner(agent_fn=_big_agent, max_output_chars=None).run(
+        script, run_id="wf_uncap", now=NOW
+    )
+    assert res2.result["len"] == 200_000
+    assert res2.result["marker"] is False
+
+
 async def test_invalid_script_fails_at_validate_stage() -> None:
     bad = "import os\n" + GOOD_SCRIPT
     res = await _runner().run(bad, run_id="wf_3", now=NOW)
@@ -296,9 +329,7 @@ async def test_author_in_run_failure_becomes_run_failed() -> None:
     async def _bad_author(intent: str, *, on_progress=None):
         return {"ok": False, "errors": ["no META", "no workflow()"]}
 
-    res = await _runner().run(
-        "", run_id="wf_a2", now=NOW, intent="nonsense", author_fn=_bad_author
-    )
+    res = await _runner().run("", run_id="wf_a2", now=NOW, intent="nonsense", author_fn=_bad_author)
     assert not res.ok
     failed = [e for e in res.events if e.type == "run_failed"]
     assert failed and failed[-1].data["where"] == "author"
@@ -310,9 +341,7 @@ async def test_author_in_run_exception_is_captured() -> None:
     async def _explode(intent: str, *, on_progress=None):
         raise RuntimeError("model down")
 
-    res = await _runner().run(
-        "", run_id="wf_a3", now=NOW, intent="x", author_fn=_explode
-    )
+    res = await _runner().run("", run_id="wf_a3", now=NOW, intent="x", author_fn=_explode)
     assert not res.ok
     assert "model down" in (res.error or "")
     assert any(e.type == "run_failed" for e in res.events)
@@ -344,7 +373,11 @@ async def test_author_in_run_publishes_source_before_execution() -> None:
     runner = WorkflowRunner(agent_fn=_blocking_agent)
     task = asyncio.ensure_future(
         runner.run(
-            "", run_id="wf_src", now=NOW, intent="x", author_fn=_author_fn,
+            "",
+            run_id="wf_src",
+            now=NOW,
+            intent="x",
+            author_fn=_author_fn,
             on_source=published.append,
         )
     )
