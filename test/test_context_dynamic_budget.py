@@ -76,6 +76,24 @@ def test_global_ceiling_is_shared_not_additive():
     assert caps.max_context == caps.base
 
 
+def test_protected_ceiling_is_a_fixed_absolute_cap_not_window_scaled():
+    """CTX-9: the protected ceiling is the 99K floor, never a window-scaled
+    multiple of it — auto, empty and unregistered ids all resolve to the 1M
+    reference window, and a 500K ceiling let protected text alone cross the
+    70% compaction point of a session whose live window was 200k."""
+    assert ctx._resolve_caps(None).protected_context == ctx._PROTECTED_CONTEXT_FLOOR
+    assert ctx._resolve_caps(1_000_000).protected_context == ctx._PROTECTED_CONTEXT_FLOOR
+    assert ctx._PROTECTED_CONTEXT_FLOOR == 99_000
+
+
+def test_a_known_smaller_window_still_scales_the_ceiling_down():
+    """CTX-9's other half: a window KNOWN to be smaller than the floor keeps its
+    proportional ceiling (min, not the floor outright)."""
+    small = ctx._resolve_caps(32_000).protected_context
+    assert small == int(32_000 * 4.0 * 0.125)
+    assert small < ctx._PROTECTED_CONTEXT_FLOOR
+
+
 # ── Fail-safe fallbacks (must never shrink the default deployment) ───────────
 
 
