@@ -10539,7 +10539,18 @@ def _enqueue_pending_context(
     if err is not None:
         return err
     assert entry is not None
-    slot.append_pending_context(entry)
+    if not slot.append_pending_context(entry):
+        # CTX-30: the queue is at its ceiling — refuse rather than silently
+        # evict another producer's entry. The caller names the slot so the
+        # app can drain and retry.
+        return web.json_response(
+            {
+                "error": "capacity_reached",
+                "detail": f"pending context queue is full ({len(slot._pending_context)} entries); "
+                "drain the slot and retry",
+            },
+            status=429,
+        )
     return None
 
 
