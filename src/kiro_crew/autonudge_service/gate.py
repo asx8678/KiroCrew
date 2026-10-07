@@ -973,6 +973,14 @@ async def _monitor_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> boo
         # :meth:`_run_fire_cycle`. A process that dies in between charges
         # nothing, which is the right direction: never invent a turn.
         self._pending_monitor_wake.add(loop.id)
+        # LOOP-17: park the kernel's brief beside the claim — the plain fire
+        # path used to discard verdict.body, so a wake turn carried neither
+        # the banner nor the item id and the conductor's first act was a full
+        # board read on every cycle. Memory only, never persisted; a floor or
+        # liveness tick never reaches this branch, so its turn carries no
+        # brief. Consumed and re-owed with the claim in _run_fire_cycle.
+        if verdict.body:
+            self._pending_monitor_wake_body[loop.id] = verdict.body
     else:
         # A fallback is an OBSERVATION outcome, not a delivery, so it is
         # counted here where it happened.

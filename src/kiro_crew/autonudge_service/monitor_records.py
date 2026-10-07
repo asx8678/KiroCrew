@@ -1051,6 +1051,17 @@ async def record_monitor_dispatch_failure(
     self._emit("updated", loop)
 
 
+def peek_monitor_wake_body(self: "AutoNudgeService", loop_id: str) -> str:
+    """The gated WAKE brief parked for *loop_id*, if any (LOOP-17).
+
+    Read-only on purpose: the brief is CONSUMED where its claim is consumed
+    (:func:`firing._run_fire_cycle`'s settlement) and re-owed on a refused
+    fire exactly like the claim, so a peek from the fire path — including a
+    peek that precedes a refused dispatch — never loses it.
+    """
+    return self._pending_monitor_wake_body.get(loop_id) or ""
+
+
 async def monitor_dispatch_is_authorized(
     self: AutoNudgeService,
     monitor_id: str,

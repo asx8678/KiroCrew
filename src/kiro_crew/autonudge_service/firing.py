@@ -423,6 +423,10 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
             )
     claimed_wake = loop.id in self._pending_monitor_wake
     self._pending_monitor_wake.discard(loop.id)
+    # LOOP-17: the parked WAKE brief follows the claim's lifecycle exactly —
+    # consumed here, re-owed below on a refused fire, so a busy slot cannot
+    # lose the brief the next attempt still needs.
+    claimed_wake_body = self._pending_monitor_wake_body.pop(loop.id, "")
     claimed_floor = loop.id in self._pending_floor_tick
     self._pending_floor_tick.discard(loop.id)
     if claimed_wake and loop.monitor is not None:
@@ -464,6 +468,8 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
             # there. A retry that is refused again re-owes it, which is correct
             # and bounded by the same backoff that bounds the retry itself.
             self._pending_monitor_wake.add(loop.id)
+            if claimed_wake_body:
+                self._pending_monitor_wake_body[loop.id] = claimed_wake_body
         if claimed_floor:
             # Same reasoning: a refused floor delivery spent nothing, so the charge
             # stays owed rather than being recorded or dropped.
