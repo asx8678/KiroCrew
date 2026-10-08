@@ -963,9 +963,10 @@ for its monitor wakes, `channel`, `cli`, `optimizer`, `taskrunner_decompose`,
 `taskrunner_refine`, `compaction` (native `/compact` through the provider and the
 compaction coordinator), `code_review_sage`, `knowledge` (the knowledge pool's ACP
 workers), and `bg:<source>` / `bg:<task>` from the two background helpers, which
-share the same persist. Not metered: the offline eval harness (`eval/`), and the
-knowledge pool's external-CLI worker (`CCWorker`), which has no billing-stats seam
-to read. A caller that ALSO reads the turn's usage for
+share the same persist. The offline eval harness is metered too: `eval/runner.py`
+writes one `eval` row per scenario turn and `eval/judge.py` one `eval_judge` row
+per judge call, both through `metered_turn`. The knowledge pool's external-CLI
+worker (`CCWorker`) is metered as well, from its own result event (see above). A caller that ALSO reads the turn's usage for
 something else (cron's turn-stats footer, the monitor controller, the task runner's
 step, subagents, hooks, heartbeat) keeps writing its own row and passes no label —
 passing both would write two rows for one turn.

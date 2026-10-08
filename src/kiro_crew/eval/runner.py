@@ -488,9 +488,28 @@ class EvalRunner:
         return ""
 
     async def _run_turn(
-        self, provider: LLMProvider, turn_def: Turn, session_key: str,
+        self,
+        provider: LLMProvider,
+        turn_def: Turn,
+        session_key: str,
     ) -> TurnResult:
-        """Send a message and collect the response."""
+        """Send a message and collect the response.
+
+        USE-1: the turn is billed like any other, so it writes its one usage row
+        (surface ``eval``) on every exit, including a cancelled run.
+        """
+        # Function-local, like the rest of this module's host imports.
+        from kiro_crew.llm_helpers import metered_turn
+
+        async with metered_turn(provider, surface="eval"):
+            return await self._drive_turn(provider, turn_def, session_key)
+
+    async def _drive_turn(
+        self,
+        provider: LLMProvider,
+        turn_def: Turn,
+        session_key: str,
+    ) -> TurnResult:
         t0 = time.monotonic()
         chunks: list[str] = []
         tool_calls: list[str] = []

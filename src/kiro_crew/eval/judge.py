@@ -79,6 +79,18 @@ class LLMJudge:
     ) -> JudgeVerdict:
         if self._provider is None:
             raise RuntimeError("LLMJudge.start() must be called before judge_turn()")
+        # USE-1: the judge's call is a billed turn; one usage row (surface
+        # ``eval_judge``) on every exit.
+        from kiro_crew.llm_helpers import metered_turn
+
+        async with metered_turn(self._provider, surface="eval_judge"):
+            return await self._drive_judge(description, criteria, user_msg, assistant_msg)
+
+    async def _drive_judge(
+        self, description: str, criteria: str, user_msg: str, assistant_msg: str
+    ) -> JudgeVerdict:
+        if self._provider is None:
+            raise RuntimeError("LLMJudge.start() must be called before judge_turn()")
         prompt = self._prompt_template.format(
             scenario_description=description,
             criteria=criteria,
