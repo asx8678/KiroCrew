@@ -138,7 +138,6 @@ from kiro_crew.dashboard.chat_runner import (
     _resolve_channel_target,
     _run_chat,
     _slot_is_trusted,
-    _start_next_queued_turn,
     turn_stats_meta,
 )
 from kiro_crew.dashboard.chat_utils import (  # noqa: F401
@@ -568,42 +567,6 @@ SUBAGENT_DIGEST_CHUNK_SIZE = _digest_chunk_size()
 #: (EVT-2). The digest's own 60k body budget bounds the chunk as a whole; this
 #: keeps one narrated member from spending it alone.
 DIGEST_ANSWER_CHARS = 1500
-
-
-#: EVT-1 settle window: seconds an IDLE parent whose wave still has members
-#: out waits before draining a parked completion, so siblings finishing within
-#: the window share ONE turn instead of a full-context request each. Short by
-#: design — it only folds near-simultaneous siblings; a long wait would delay
-#: a parent's first answer for no merge gain.
-_INJECTION_SETTLE_WINDOW_SECS = 5.0
-
-
-def _arm_injection_settle_window(state: DashboardState, timers: dict, slot) -> None:
-    """Schedule ONE deferred queue drain after the settle window (EVT-1).
-
-    Re-arming while a window is already open is a no-op: the armed drain folds
-    every same-kind entry queued by its expiry, so a later sibling only joins
-    the batch. The timer registry is caller-owned (``timers``, keyed by slot
-    key) because a slot cannot carry a handle across serialization. At expiry
-    the drain re-checks everything: a slot that turned busy in the window is
-    left to the running turn's end-of-turn drain, and an emptied queue is a
-    no-op.
-    """
-    key = slot.key
-    if key in timers:
-        return
-
-    def _fire() -> None:
-        timers.pop(key, None)
-        if slot.task is not None:
-            # Busy at expiry: the running turn's finally-block drain takes the
-            # queued completions at its own end, merging whatever accumulated.
-            return
-        task = asyncio.create_task(_start_next_queued_turn(state, slot))
-        state._background_tasks.add(task)
-        task.add_done_callback(state._background_tasks.discard)
-
-    timers[key] = asyncio.get_running_loop().call_later(_INJECTION_SETTLE_WINDOW_SECS, _fire)
 
 
 def _digest_success_line(
@@ -9942,54 +9905,17 @@ class GatewayOrchestrator:
                             )
                             return
 
-                        # EVT-1 settle window: an idle parent whose wave still
-                        # has members out PARKS this completion for a short
-                        # window instead of starting a turn now — siblings
-                        # finishing seconds apart then share ONE turn, because
-                        # the drain folds the parked same-kind run. The result
-                        # cards show the member immediately either way; only
-                        # the parent MODEL's turn waits, and the window is
-                        # bounded by _INJECTION_SETTLE_WINDOW_SECS.
-                        # A digest or chunk announce (the batch-completion
-                        # prefix, or a flush-only synthetic record) is already
-                        # the BATCHED delivery — the one a hold deadline or a
-                        # chunk trigger released — and must inject when its own
-                        # machinery says so, never park behind it. Only a
-                        # MEMBER's own completion waits for its siblings: the
-                        # batch prefix is inside SUBAGENT_COMPLETION_PREFIXES,
-                        # so the exclusion is spelled positively on it.
-                        if (
-                            _batch_id
-                            and not _flush_only
-                            and not announce.startswith(SUBAGENT_BATCH_COMPLETION_PREFIX)
-                            and self.subagent_mgr
-                        ):
-                            try:
-                                _wave_outstanding = await _subagent_batch_pending(
-                                    self.subagent_mgr, _batch_id
-                                )
-                            except Exception:
-                                _wave_outstanding = False
-                            if _wave_outstanding:
-                                _injection_slot.queue_append(
-                                    announce,
-                                    kind=SUBAGENT_COMPLETION_KIND,
-                                    meta={SUBAGENT_COMPLETION_META_KEY: sub_meta},
-                                )
-                                self._defer_queued_delivery(
-                                    _injection_slot, announce, info, flush_only=_flush_only
-                                )
-                                _timers = self.__dict__.setdefault("_injection_settle_timers", {})
-                                _arm_injection_settle_window(
-                                    self.dashboard_state, _timers, _injection_slot
-                                )
-                                self.dashboard_state.push_slots_update()
-                                logger.info(
-                                    "Subagent %s → parked in %s for the settle window",
-                                    info.id,
-                                    _slot_name,
-                                )
-                                return
+                        # EVT-3: a member completion is HELD for the wave's
+                        # digest while any member is outstanding (the hold at
+                        # the digest accounting above), so members finishing
+                        # minutes apart all land in the ONE wave-close digest
+                        # — the item's done-when, with the 15-minute straggler
+                        # deadline (DIGEST_HOLD_SECS) bounding the wait for a
+                        # member that hangs. Completions reaching this routing
+                        # are therefore either a NON-batch completion (no
+                        # _batch_id: injects as its own turn, exactly as
+                        # before) or a digest/chunk announce — the batched
+                        # delivery its own machinery released.
 
                         # Slot is idle — start _run_chat.
                         #

@@ -2941,71 +2941,90 @@ class TestDigestSuccessLine:
         assert "(partial: backend failed to generate the final response)" in line
 
 
-class TestInjectionSettleWindow:
-    """EVT-1: an idle parent whose wave still has members out parks a
-    completion for a short settle window, so near-simultaneous siblings share
-    one turn instead of a full-context request each."""
+class TestOneTurnPerWave:
+    """EVT-3: members finishing minutes apart produce exactly ONE parent
+    turn — the digest machinery holds every member while the wave is out,
+    and the 15-minute straggler deadline (DIGEST_HOLD_SECS) is the only thing
+    that can force a partial digest before the wave closes."""
+
+    _capture_on_done = TestWaveDigest._capture_on_done
+
+    @staticmethod
+    def _wave_member(i: int) -> SubagentInfo:
+        info = SubagentInfo(
+            id=f"m{i}",
+            task=f"wave task {i}",
+            parent_session_key="dashboard:main",
+            batch_id="wv",
+            batch_total=3,
+        )
+        info.done = True
+        info.result = f"result {i}"
+        info.result_path = f"/tmp/m{i}/result.txt"
+        info.elapsed = 1.0 + i
+        info.credits = 0.1
+        return info
+
+    def _orch_with_slot(self):
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = MagicMock()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        slot = MagicMock()
+        slot.mode = "chat"
+        slot.running = False
+        slot.task = None
+        slot._subagent_deliveries_inflight = 0
+        slot._pending_synthesis = False
+        slot._synthesis_rechecks = 0
+        slot._synthesis_completion_turns = 0
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        return orch, slot
 
     @pytest.mark.asyncio
-    async def test_rearming_while_a_window_is_open_is_a_noop(self) -> None:
-        from kiro_crew.slack.gateway import _arm_injection_settle_window
+    async def test_members_minutes_apart_share_one_digest_turn(self):
+        """The item's done-against the real path: the first two members are
+        HELD (no turn), and the closing member delivers the ONE wave digest
+        carrying all three results."""
+        orch, slot = self._orch_with_slot()
+        mgr, on_done = self._capture_on_done(orch)
+        delivery = {"n": -1}
 
-        slot = MagicMock()
-        slot.key = "dashboard:main"
-        timers: dict = {}
-        loop = asyncio.get_running_loop()
-        with patch.object(loop, "call_later") as cl:
-            _arm_injection_settle_window(MagicMock(), timers, slot)
-            _arm_injection_settle_window(MagicMock(), timers, slot)
-        assert cl.call_count == 1, "a second sibling must join the armed window, not arm another"
-        assert "dashboard:main" in timers
+        def _running(_key):
+            return ["sib"] if delivery["n"] < 2 else []
 
-    @pytest.mark.asyncio
-    async def test_a_busy_slot_at_expiry_leaves_the_queue_to_the_running_turn(self) -> None:
-        from kiro_crew.slack.gateway import _arm_injection_settle_window
+        mgr.running_agents_for = MagicMock(side_effect=_running)
+        mgr.has_in_memory_pending_work_for = MagicMock(return_value=False)
+        # Members 1 and 2: the wave is still out (HELD). Member 3: closed.
+        mgr.batch_members_pending = MagicMock(side_effect=[True, True, False])
 
-        slot = MagicMock()
-        slot.key = "dashboard:main"
-        slot.task = object()  # a turn is running at expiry
-        timers: dict = {}
-        state = MagicMock()
-        state._background_tasks = set()
-        loop = asyncio.get_running_loop()
-        with patch.object(loop, "call_later") as cl:
-            _arm_injection_settle_window(state, timers, slot)
-            _delay, _fire = cl.call_args.args
-        with patch(
-            "kiro_crew.slack.gateway._start_next_queued_turn", new_callable=AsyncMock
-        ) as drain:
-            _fire()
-        drain.assert_not_awaited(), "a busy slot's queue drains at the running turn's end"
-        assert "dashboard:main" not in timers, "the window closed"
+        turns: list[str] = []
 
-    @pytest.mark.asyncio
-    async def test_expiry_drains_the_parked_queue(self) -> None:
-        from kiro_crew.slack.gateway import _arm_injection_settle_window
+        async def _cap_run_chat(_state, _slot, text, **_kw):
+            turns.append(text)
 
-        slot = MagicMock()
-        slot.key = "dashboard:main"
-        slot.task = None  # idle at expiry
-        timers: dict = {}
-        state = MagicMock()
-        state._background_tasks = set()
-        loop = asyncio.get_running_loop()
-        with patch.object(loop, "call_later") as cl:
-            _arm_injection_settle_window(state, timers, slot)
-            _delay, _fire = cl.call_args.args
-            assert _delay > 0
-        with patch(
-            "kiro_crew.slack.gateway._start_next_queued_turn", new_callable=AsyncMock
-        ) as drain:
-            _fire()
-            # The drain rides a task on the state's background set; await it
-            # directly so the assertion needs no clock.
-            task = next(iter(state._background_tasks))
-            await task
-        drain.assert_awaited_once_with(state, slot)
-        assert "dashboard:main" not in timers, "the window closed"
+        with patch("kiro_crew.slack.gateway._run_chat", _cap_run_chat):
+            for i in range(3):
+                delivery["n"] = i
+                await on_done(self._wave_member(i))
+                await asyncio.sleep(0)
+            # create_task'd injection turns need real event-loop time, not
+            # one sleep(0) — the file's _settle helper exists for exactly this.
+            await _settle(lambda: len(turns) == 1, what="the wave digest turn injected")
+
+        assert len(turns) == 1, "the wave must cost one parent turn, not one per member"
+        for i in range(3):
+            assert f"`m{i}`" in turns[0], "the one digest must carry every member's result"
+        assert "wave task 2" in turns[0]
+
+    def test_the_straggler_deadline_is_fifteen_minutes(self) -> None:
+        """The approved number, pinned: a member that hangs stops withholding
+        its siblings' results at 15 minutes — the deadline the hold-deadline
+        sweep (TestDigestHoldDeadline above) force-flushes at."""
+        from kiro_crew.subagent import DIGEST_HOLD_SECS
+
+        assert DIGEST_HOLD_SECS == 900.0
 
 
 class TestSynthesisRidesTheLastCompletion:

@@ -1487,10 +1487,16 @@ _SUPPRESS_CEILING = 4
 # finish within the deadline of each other still delivers ONE consolidated
 # digest — the deliberate small-wave behavior is unchanged.
 #
+# EVT-3 raised it from 120s to the 15-minute straggler deadline: a member
+# completion on an idle parent now parks until the wave closes (one turn per
+# wave, however far apart the members finish), so this deadline bounds THAT
+# wait too — the point where a hung member's siblings stop being withheld.
+# 0 still disables it (count-trigger-only).
+#
 # Tunable via ``KIROCREW_SUBAGENT_DIGEST_HOLD_SECS``; 0/negative disables the
 # deadline (count-trigger-only, i.e. pre-fix behavior). Guarded parse: a
 # malformed value must never crash import.
-_DEFAULT_DIGEST_HOLD_SECS = 120.0
+_DEFAULT_DIGEST_HOLD_SECS = 900.0
 
 
 def _digest_hold_secs() -> float:

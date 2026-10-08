@@ -2262,10 +2262,12 @@ per-sub-agent completion note. Dashboard chat only.
 - **Turn-per-completion retired (EVT-1)** — consecutive queued completions
   of the same kind now drain as ONE parent turn (a same-kind run folded by
   `_dequeue_next_message`/`_dequeue_next_system_message`, bounded at
-  `MERGED_INJECTION_MAX_CHARS`, 60k — the digest's own body budget), and an
-  IDLE parent whose wave still has members out parks a completion for a
-  5 s settle window (`_arm_injection_settle_window`) so siblings finishing
-  seconds apart share that one turn. Different kinds still drain separately,
+  `MERGED_INJECTION_MAX_CHARS`, 60k — the digest's own body budget). A
+  wave's members are HELD for the wave-close digest, so members finishing
+  minutes apart land in the ONE closing digest — one parent turn per wave
+  (EVT-3), bounded by the 15-minute straggler deadline (`DIGEST_HOLD_SECS`,
+  raised from 120 s: the hold-deadline sweep force-flushes a partial digest
+  at that age when a member hangs). Different kinds still drain separately,
   a held user entry still breaks a run, and each entry's delivery debt settles
   through the merged turn; a pre-consumption retry re-queues the ORIGINAL
   entries, never the merged string. A merged drain counts ONE completion turn
