@@ -80,6 +80,27 @@ class TestRecoveryPrompt:
         assert "`create`" in text
         assert "`complete`" in text
 
+    def test_the_rebuild_orders_one_batched_complete_not_one_call_per_row(self) -> None:
+        """The recovery block orders ONE `complete` covering every [x] row.
+
+        A 7-of-10 checklist used to order 8 calls on the cold-start prefix (one
+        `create` plus seven per-row completes). The person-edit block already
+        words a single `complete` with several ids; the rebuild now matches it.
+        The block is assembled text, so this pin is the only thing that keeps
+        the wording from regressing to a call per row.
+        """
+        text = _slot(
+            tasks=[(f"step {i}", i in (1, 3, 4, 6)) for i in range(1, 11)]
+        ).todo_recovery_prompt()
+        assert "one `create` call" in text
+        assert "ONE `complete` call" in text
+        assert "not one call per task" in text
+        # The OLD per-row wording ordered one complete per done task.
+        assert "`complete` call for every" not in text
+        # Every done row is still listed, for the agent to map onto fresh ids.
+        for done in (1, 3, 4, 6):
+            assert f"{done}. [x]" in text
+
     def test_an_empty_description_is_not_corrupted_into_a_placeholder(self) -> None:
         """The recovery prompt must emit an empty description UNCHANGED. A
         placeholder like "(none)" would be reproduced by the agent's `create`

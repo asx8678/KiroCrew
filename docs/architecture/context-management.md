@@ -253,7 +253,7 @@ CLI, tests) keeps no record and always sends whole — and the heartbeat passes
 | `[Learned corrections — relevant to this message …]` | vector `turn_lessons` | `memory.inject_lessons_per_turn` (off by default), `lessons` group, not temporary or minimal; up to 3 lessons / 2,000 chars the session has not been shown |
 | `[Hook context:]` | `hooks.on_message` returning `HOOK_INJECT_CONTEXT` | matching hook |
 | `[CURRENT USER] <name>` | the sender's display name (for example WeCom `allowed_users[].name`) | a channel turn that carries a display name |
-| `[Task checklist — automatic recovery]` | `todo_recovery_prompt`, prepended to the message by `dashboard/chat_turn/prompt_assembly.py`; task text inside the untrusted TODO fence | a cold start without provider history, or a recovery still pending; it settles on the provider's first event |
+| `[Task checklist — automatic recovery]` | `todo_recovery_prompt`, prepended to the message by `dashboard/chat_turn/prompt_assembly.py`; task text inside the untrusted TODO fence; the rebuild is TWO tool calls — one `create`, then ONE `complete` covering every [x] row together, never one call per row | a cold start without provider history, or a recovery still pending; it settles on the provider's first event |
 | `[Task checklist — person edited]` | `todo_sync_prompt`, prepended the same way | a warm turn with person edits not yet stated to the agent; marked stated on the provider's first event |
 | `[REPLY FORMAT RULES]` + guidance | `_interactive_guidance` | interactive sessions |
 | `[CURRENT USER REQUEST …]` + the user's text | the turn | always last |
