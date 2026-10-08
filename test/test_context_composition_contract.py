@@ -982,11 +982,16 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
             ("request_header", 51),
         ],
     ),
+    # OUT-2: the subagent scope now assembles the MODEL-READ rules variant
+    # (no diff mandate, no [OPTIONS:]; one line per changed file) — a
+    # deliberate byte-shape change from the channel-variant rules it carried.
     "subagent_scope": (
-        "d23ab1482b64c75cd64f60d870d0b716b94e0ff7d6fcaac9c8693cb2cec61620",
+        "d3f5f36a30c03fd247abb60b1edb7846585efc275f909fef3b3c84554f6c983e",
         [
             ("agent_instructions", 145),
-            ("session_wrapper", 296),
+            ("session_wrapper", 224),
+            ("critical_rules", 843),
+            ("date", 48),
             ("agent_identity", 25),
             ("surface", 195),
             ("context_scope", 249),

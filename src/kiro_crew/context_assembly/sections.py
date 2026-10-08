@@ -46,6 +46,15 @@ _RUNTIME_DISPLAY = {
 }
 
 
+#: OUT-2: the MODEL-READ runtime sources — subagent runs, workflow steps and
+#: task-runner steps. Their transcripts are consumed by a model, never
+#: rendered to a person, so the critical-rules block and the {{DIFF_RULE}}
+#: token select the no-diff, no-[OPTIONS:] variant for them (context.py).
+#: Workflow steps run through the subagent machinery today; the explicit
+#: "workflow" value keeps a future dedicated source selecting the same row.
+_MODEL_READ_SOURCES = frozenset({"subagent", "taskrunner", "workflow"})
+
+
 def _resolve_runtime_source(session_key: str, runtime_source: str | None = None) -> str:
     """Resolve the canonical runtime source key for a session.
 
@@ -469,7 +478,12 @@ def runtime_refresh_blocks(session_key: str, runtime_source: str) -> list[str]:
     # in a channel-started session at worst duplicates a diff, which
     # is cosmetic; the inverse — a channel turn under the relaxed
     # rule — leaves the user with no record of what changed).
-    if _resolve_runtime_source(session_key, runtime_source) != "dashboard":
+    # OUT-2: a MODEL-READ surface re-asserts nothing — its variant carries
+    # no mandate in the first place, and a re-asserted channel mandate would
+    # reintroduce exactly the diff blocks this row removes.
+    if _resolve_runtime_source(session_key, runtime_source) not in _MODEL_READ_SOURCES | {
+        "dashboard"
+    }:
         blocks.append(
             "For THIS turn: this surface renders no tool cards, so "
             "after ANY file change you MUST include a ```diff code "

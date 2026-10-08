@@ -2373,8 +2373,68 @@ class TestKeepVisibleMarkerRule:
 
 def test_critical_rules_forbid_assuming_a_persons_gender():
     """A named person whose pronouns were never given is not called "he"."""
-    from kiro_crew.context import _CRITICAL_RULES, _CRITICAL_RULES_CHANNEL
+    from kiro_crew.context import (
+        _CRITICAL_RULES,
+        _CRITICAL_RULES_CHANNEL,
+        _CRITICAL_RULES_MODEL_READ,
+    )
 
     rule = "Do not assume anyone's gender."
     assert rule in _CRITICAL_RULES
     assert rule in _CRITICAL_RULES_CHANNEL
+    assert rule in _CRITICAL_RULES_MODEL_READ
+
+
+def test_model_read_surfaces_get_no_diff_mandate_and_no_options():
+    """OUT-2: subagent, workflow and task-runner transcripts are read by a
+    MODEL, never rendered to a person, so their rules carry no diff mandate
+    and no [OPTIONS:] line — only the one-line-per-changed-file summary."""
+    from kiro_crew.context import _critical_rules_for, _diff_rule_for
+
+    for key, source in (
+        ("subagent:a1", None),
+        ("taskrunner:run-1", None),
+        ("workflow:step-2", "workflow"),
+    ):
+        rules = _critical_rules_for(key, source)
+        assert "MUST show a ```diff" not in rules
+        assert "```diff code block" not in rules
+        # No [OPTIONS:] MANDATE. The variant NAMES the token once, to forbid
+        # it — that mention is the instruction, not the mandate.
+        assert "you MUST end your response" not in rules
+        assert "renders interactive buttons" not in rules
+        assert "do NOT end with an [OPTIONS:] line" in rules
+        assert "+N/-M" in rules
+        diff_rule = _diff_rule_for(key, source)
+        assert diff_rule.startswith("File changes: this transcript is read by a MODEL")
+        assert "do NOT end with an [OPTIONS:] line" in diff_rule
+
+
+def test_the_rendered_surface_constants_stay_byte_identical():
+    """OUT-2's guard: the dashboard and channel variants are untouched by the
+    third row — a person-facing surface must never lose its record of what
+    changed."""
+    from kiro_crew.context import (
+        _CRITICAL_RULES,
+        _CRITICAL_RULES_CHANNEL,
+        _critical_rules_for,
+    )
+
+    assert _critical_rules_for("dashboard:chat-1", None) == _CRITICAL_RULES
+    assert _critical_rules_for("slack:C:123", None) == _CRITICAL_RULES_CHANNEL
+    assert "MUST show a ```diff" in _CRITICAL_RULES_CHANNEL
+
+
+def test_a_model_read_followup_turn_reasserts_no_channel_mandate():
+    """OUT-2: the per-turn [RUNTIME] refresh skips the channel diff mandate
+    for model-read surfaces — re-asserting it would reintroduce exactly the
+    diff blocks the variant removes."""
+    from kiro_crew.context_assembly.sections import runtime_refresh_blocks
+
+    blocks = runtime_refresh_blocks("subagent:a1", None)
+    joined = "".join(blocks)
+    assert "you MUST include a ```diff code block" not in joined
+    # A channel turn still gets the re-assertion.
+    assert "you MUST include a ```diff code block" in "".join(
+        runtime_refresh_blocks("slack:C:1", None)
+    )

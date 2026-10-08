@@ -168,6 +168,7 @@ from kiro_crew.context_assembly.replay import (  # noqa: F401
     build_interrupted_turn_preamble,
 )
 from kiro_crew.context_assembly.sections import (  # noqa: F401
+    _MODEL_READ_SOURCES,
     _RESPONSE_PREFERENCES_FOOTER,
     _RESPONSE_PREFERENCES_HEADER,
     _ROLE_OTHER_MAX_LEN,
@@ -1252,6 +1253,36 @@ _CRITICAL_RULES_TAIL = (
 _CRITICAL_RULES = _CRITICAL_RULES_HEAD + _DIFF_RULE_DASHBOARD + _CRITICAL_RULES_TAIL
 _CRITICAL_RULES_CHANNEL = _CRITICAL_RULES_HEAD + _DIFF_RULE_CHANNEL + _CRITICAL_RULES_TAIL
 
+# OUT-2: the model-read variant. A subagent, workflow-step or task-runner
+# transcript is consumed by a MODEL, never rendered to a person: no tool cards
+# and no human ever see its messages, so the diff-block mandate and the
+# [OPTIONS:] line are pure token spend there — measured at up to ~4.8k extra
+# output tokens per file change, pushing a subagent's transcript past the
+# completion keep and making the parent re-read the file it just changed.
+# Those surfaces end the turn with one line per changed file instead. The set
+# is exactly the plan's three; heartbeat and background are NOT included, and
+# Slack and cron are deliberately untouched here — that widening is
+# claude_verify_needed.md B1 and a take-away, not this change.
+_DIFF_RULE_MODEL_READ = (
+    "File changes: this transcript is read by a MODEL, not shown to a person "
+    "— no tool cards and no human ever see ```diff blocks here, so do NOT "
+    "emit them, and do NOT end with an [OPTIONS:] line. For every file you "
+    "changed, end the turn with one line: `absolute/path/to/file` +N/-M "
+    "(lines added/removed). The consumer reads files and diffs back through "
+    "its own tools when it needs detail.\n"
+)
+_CRITICAL_RULES_MODEL_READ = (
+    _CRITICAL_RULES_HEAD
+    + _DIFF_RULE_MODEL_READ
+    + "When referencing file paths, ALWAYS use the absolute path inside "
+    "inline `code` backticks (e.g. `/home/user/project/src/main.py`).\n"
+    "Backtick file PATHS only -- NEVER a URL: a backticked URL renders as a "
+    "click-to-copy chip, not a link. Write every URL as [text](url).\n"
+    "Do not assume anyone's gender. When you have not been told a person's "
+    "pronouns, refer to them by name or with singular they/them.\n"
+    "[END CRITICAL RULES]\n\n"
+)
+
 
 def _template_selected_on_member_store(execution_context: Any) -> bool:
     """Whether *execution_context* runs a member's store under a selected TEMPLATE.
@@ -1333,6 +1364,12 @@ def _critical_rules_for(session_key: str | None, runtime_source: str | None) -> 
     inverse failure leaves a channel user with no record at all).
     """
     source = _resolve_runtime_source(session_key or "", runtime_source)
+    if source in _MODEL_READ_SOURCES:
+        # OUT-2: the model-read surfaces — subagent runs, workflow steps,
+        # task-runner steps — get the no-diff, no-[OPTIONS:] variant. Checked
+        # before the dashboard/channel rows so a subagent or taskrunner source
+        # never falls through to the channel default.
+        return _CRITICAL_RULES_MODEL_READ
     return _CRITICAL_RULES if source == "dashboard" else _CRITICAL_RULES_CHANNEL
 
 
@@ -1345,6 +1382,11 @@ def _diff_rule_for(session_key: str | None, runtime_source: str | None) -> str:
     rule exactly once and in its runtime-selected form.
     """
     source = _resolve_runtime_source(session_key or "", runtime_source)
+    if source in _MODEL_READ_SOURCES:
+        # OUT-2: the model-read surfaces resolve the {{DIFF_RULE}} token to
+        # the no-diff variant, so prompt.md's unconditional line defers to
+        # this selection everywhere.
+        return _DIFF_RULE_MODEL_READ
     return _DIFF_RULE_DASHBOARD if source == "dashboard" else _DIFF_RULE_CHANNEL
 
 
@@ -3307,7 +3349,15 @@ class ContextBuilder:
 
         if essentials:
             prefix = next(
-                (r for r in (_CRITICAL_RULES, _CRITICAL_RULES_CHANNEL) if context.startswith(r)),
+                (
+                    r
+                    for r in (
+                        _CRITICAL_RULES,
+                        _CRITICAL_RULES_CHANNEL,
+                        _CRITICAL_RULES_MODEL_READ,
+                    )
+                    if context.startswith(r)
+                ),
                 "",
             )
             context = prefix + essentials + context[len(prefix) :]
@@ -3710,7 +3760,11 @@ class ContextBuilder:
                 _rules_prefix = next(
                     (
                         rb
-                        for rb in (_CRITICAL_RULES, _CRITICAL_RULES_CHANNEL)
+                        for rb in (
+                            _CRITICAL_RULES,
+                            _CRITICAL_RULES_CHANNEL,
+                            _CRITICAL_RULES_MODEL_READ,
+                        )
                         if session_ctx.startswith(rb)
                     ),
                     None,
