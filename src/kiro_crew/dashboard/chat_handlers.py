@@ -1164,6 +1164,15 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             {"error": "message is required", "code": "message_required"}, status=400
         )
 
+    from kiro_crew.chat_attachments import spill_large_paste
+
+    message, _paste_path = spill_large_paste(effective_session_key(slot), message)
+    if _paste_path:
+        if user_meta is None:
+            user_meta = {}
+        files = user_meta.get("files")
+        user_meta["files"] = [*(files if isinstance(files, list) else []), _paste_path]
+
     if slot.turn_running or slot._turn_admission_reserved:
         # Mid-turn steer: inject into the RUNNING turn instead of queueing for
         # the next turn. Gated on an explicit `steer` flag + a live, steer-capable

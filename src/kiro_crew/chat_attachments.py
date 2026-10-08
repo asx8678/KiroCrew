@@ -173,6 +173,50 @@ def attachments_dir(sessions_dir: Path, stem: str) -> Path:
     return sessions_dir / f"{stem}{ATTACHMENTS_DIR_SUFFIX}"
 
 
+PASTE_SPILL_BYTES = 32 * 1024
+PASTE_PROMPT_BUDGET = 4 * 1024
+
+
+def spill_large_paste(session_key: str, message: str) -> tuple[str, str]:
+    """Store a dashboard paste over 32 KB and return ``(prompt, path)``.
+
+    The prompt is at most 4 KB: a path marker plus a head-and-tail preview.
+    A short message is returned unchanged with an empty path. A store failure
+    returns the original text so the user's words are not dropped.
+    """
+    if len(message.encode("utf-8")) <= PASTE_SPILL_BYTES:
+        return message, ""
+    import tempfile
+
+    fd, src = tempfile.mkstemp(prefix="kirocrew-paste-", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(message)
+        kept = adopt_channel_file(session_key, src)
+        src = ""
+    except Exception:
+        logger.debug("paste spill failed", exc_info=True)
+        if src:
+            try:
+                os.unlink(src)
+            except OSError:
+                pass
+        return message, ""
+    marker = f"[attached_file 1] {kept}\n"
+    trailer = "\n[end of paste preview; full text at the path above]"
+    room = PASTE_PROMPT_BUDGET - len(marker) - len(trailer) - len("\n[…]\n")
+    if room < 64:
+        return marker.rstrip() + trailer, kept
+    head = room // 2
+    tail = room - head
+    preview = message[:head] + "\n[…]\n" + message[-tail:]
+    prompt = marker + preview + trailer
+    raw = prompt.encode("utf-8")
+    if len(raw) > PASTE_PROMPT_BUDGET:
+        prompt = raw[:PASTE_PROMPT_BUDGET].decode("utf-8", errors="ignore")
+    return prompt, kept
+
+
 def adopt_channel_file(session_key: str, src: str) -> str:
     """Move a channel download into the session attachments directory.
 
