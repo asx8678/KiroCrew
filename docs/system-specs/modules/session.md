@@ -669,11 +669,20 @@ against sweep completeness, and are torn down at `close_all`.
 ## Key Behaviors
 
 - **Empty-response recovery ladder** (dashboard chat runner, depth-0 turns
-  only): a completed turn with no visible output, no refusal reasons, and no
-  cancellation is treated as a transient provider failure and recovered
+  only): a completed turn with no visible output, no refusal reasons, no
+  cancellation, and no intentionally final applied outcome is treated as a
+  transient provider failure and recovered
   through a bounded three-rung ladder driven by `slot._empty_response_retries`,
   with `slot._empty_episode_productive` carrying one episode-scoped fact the
-  counter cannot (rung 3 below):
+  counter cannot (rung 3 below). An intentionally final outcome — a receipt
+  that TOLD the model to end its turn: a posted question card
+  (`ask_question`), a shown follow-up card (`suggest_followup`), an armed
+  monitor loop (`monitor_start`/`monitor_watch`, decided by
+  `applied_outcome_ends_turn` on the APPLIED outcome, never on the tool name,
+  so refusals stay recoverable), or a `spawn_run`/`spawn_continue` receipt
+  naming dispatched runs — never enters the ladder at all: ending there is
+  what the receipt instructed, and a synthetic continuation would spend a
+  full-context request answering nothing:
   1. **first empty** → the ORIGINAL message is silently re-queued at the
      front of the slot queue (no visible card). Reached ONLY by a turn with no
      activity — see the productive-turn exclusion below;

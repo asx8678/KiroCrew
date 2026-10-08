@@ -20867,6 +20867,224 @@ class TestProductiveTurnNeverReplaysVerbatim:
         assert (0, "test message") in calls, "the activity-free replay rung was removed"
         assert slot._empty_response_retries == 1
 
+    @staticmethod
+    def _terminal_tool_stream(client, executed, *, tool, result_text, server="kirocrew-core"):
+        """TEXT -> TOOL_CALL(our core server, canonical tool) -> TOOL_RESULT -> end_turn.
+
+        The incident's own shape with the tool swapped for one whose receipt
+        tells the model to END ITS TURN. ``mcp_server_name`` + ``tool_name``
+        are the trusted identity the runner keys directives and spawn
+        exemptions on, so the fake event carries both.
+        """
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TEXT_CHUNK,
+            EVENT_TOOL_CALL,
+            EVENT_TOOL_RESULT,
+            LLMEvent,
+        )
+
+        async def _stream(msg):
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="on it")
+            executed.append(msg)
+            yield LLMEvent(
+                kind=EVENT_TOOL_CALL,
+                title=tool,
+                tool_call_id="tc-1",
+                tool_name=tool,
+                mcp_server_name=server,
+                tool_identity_trusted=True,
+            )
+            # The runner reads a result frame's payload from ``tool_output``
+            # (``_out = _redact_tool_field(event.tool_output)``), the same
+            # field the ACP layer fills for a real MCP result.
+            yield LLMEvent(kind=EVENT_TOOL_RESULT, tool_call_id="tc-1", tool_output=result_text)
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
+
+        client.stream = _stream
+        client.stream_command = _stream
+
+    def _assert_no_recovery(self, calls, executed, message: str) -> None:
+        from kiro_crew.dashboard.chat_utils import (
+            _ACTIVITY_NO_REPLY_CONTINUE_MSG,
+            _EMPTY_AUTO_CONTINUE_MSG,
+        )
+
+        assert (
+            0,
+            _ACTIVITY_NO_REPLY_CONTINUE_MSG,
+        ) not in calls, "an intentionally final tool call queued a productive continuation"
+        assert (0, _EMPTY_AUTO_CONTINUE_MSG) not in calls
+        assert (0, message) not in calls, "the turn was verbatim-replayed"
+        assert len(executed) == 1, f"{len(executed)} stream runs; the turn was continued"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("kind", "args", "applied"),
+        (
+            pytest.param(
+                "ask_question",
+                {"questions": [{"question": "q", "options": [{"label": "a"}]}]},
+                "Question card shown in this session. End your turn now — the "
+                "user's answer will arrive as your next message.",
+                id="ask-question",
+            ),
+            pytest.param(
+                "suggest_followup",
+                {"items": [{"title": "t", "description": "d", "prompt": "p"}]},
+                "Follow-up card shown below the composer.",
+                id="suggest-followup",
+            ),
+            pytest.param(
+                "monitor_start",
+                {"message": "watch the thing", "idle_secs": 60},
+                "Monitor loop loop-1 started on this session: observing the PR "
+                "every 60s. End your turn now — the loop wakes you. Call "
+                "autonudge_stop when the exit condition is met.",
+                id="monitor-start",
+            ),
+            pytest.param(
+                "monitor_watch",
+                {
+                    "kind": "pr",
+                    "target": "example/repo",
+                    "objective": "watch",
+                    "max_runtime_secs": 600,
+                    "max_agent_turns": 10,
+                    "max_tokens": 100000,
+                    "max_provider_errors": 5,
+                    "cadence_secs": 60,
+                },
+                "Structured monitor loop-1 started on this session; first probe in ~60s.",
+                id="monitor-watch",
+            ),
+        ),
+    )
+    async def test_a_terminal_directive_outcome_never_queues_a_continuation(
+        self, tmp_path: Path, monkeypatch, kind, args, applied
+    ) -> None:
+        """OUT-1: a turn ending on an applied outcome whose receipt says END YOUR
+        TURN is final. The empty-response ladder must not spend a full-context
+        request "recovering" a turn that ended exactly as instructed.
+
+        The applier is patched to the success outcome because the harness has
+        no dashboard client to deliver a card to; the marker decode, the apply
+        seam and the ladder are all real.
+        """
+        from kiro_crew import session_directive
+        from kiro_crew.dashboard import chat_runner as chat_runner_mod
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        executed: list[str] = []
+        receipt = session_directive.encode(kind, args, "Requested.")
+        self._terminal_tool_stream(client, executed, tool=kind, result_text=receipt)
+        monkeypatch.setattr(
+            chat_runner_mod, "apply_session_directive", AsyncMock(return_value=applied)
+        )
+        calls, spy = self._spy_queue()
+
+        with patch.object(_ChatSlot, "queue_insert", spy):
+            await _run_chat(state, slot, "arm it")
+            await self._cancel_background_tasks(state)
+
+        self._assert_no_recovery(calls, executed, "arm it")
+
+    @pytest.mark.asyncio
+    async def test_a_directive_refusal_outcome_keeps_the_ladder(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The exemption is scoped to SUCCESS outcomes only (OUT-1).
+
+        ask_question's no-client refusal tells the model to ask in plain text
+        instead — the one thing the recovery ladder exists to rescue — so a
+        turn that ends silently after it keeps the continuation.
+        """
+        from kiro_crew import session_directive
+        from kiro_crew.dashboard import chat_runner as chat_runner_mod
+        from kiro_crew.dashboard.chat_utils import _ACTIVITY_NO_REPLY_CONTINUE_MSG
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        executed: list[str] = []
+        refusal = (
+            "Question posted, but no dashboard client is attached to see it — "
+            "ask in plain text and end your turn instead."
+        )
+        receipt = session_directive.encode(
+            "ask_question", {"questions": [{"question": "q"}]}, "Requested."
+        )
+        self._terminal_tool_stream(client, executed, tool="ask_question", result_text=receipt)
+        monkeypatch.setattr(
+            chat_runner_mod, "apply_session_directive", AsyncMock(return_value=refusal)
+        )
+        calls, spy = self._spy_queue()
+
+        with patch.object(_ChatSlot, "queue_insert", spy):
+            await _run_chat(state, slot, "ask them")
+            await self._cancel_background_tasks(state)
+
+        assert (0, _ACTIVITY_NO_REPLY_CONTINUE_MSG) in calls, (
+            "a refusal outcome (which asks the model to answer in text) was "
+            "wrongly treated as intentionally final"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("tool", "receipt", "final"),
+        (
+            pytest.param(
+                "spawn_run",
+                "Spawned 2 subagent(s). Results will arrive as completion events:\n"
+                "  a-1 (worker): first task\n"
+                "  a-2 (worker): second task\n"
+                "\nEND YOUR TURN now: this caller has no confirmed parent-work "
+                "delivery boundary. Wait for the [Subagent completion event] "
+                "messages. Dispatch is not completion.",
+                True,
+                id="spawn-run-naming-runs",
+            ),
+            pytest.param(
+                "spawn_continue",
+                "Continued conversation c-1 as run a-9. The result will arrive "
+                "as a [Subagent completion event] — END YOUR TURN and wait for it.",
+                True,
+                id="spawn-continue",
+            ),
+            pytest.param(
+                "spawn_run",
+                "Error: 2 task(s) failed to start; none of the requested "
+                "subagents were started:\n  - the gateway refused the wave",
+                False,
+                id="spawn-error-keeps-the-ladder",
+            ),
+        ),
+    )
+    async def test_a_spawn_receipt_ends_the_turn_only_when_it_names_runs(
+        self, tmp_path: Path, tool, receipt, final
+    ) -> None:
+        """OUT-1, the non-directive arm: spawn receipts tell the model to END ITS
+        TURN, so a wave that dispatched runs is final — but a failed spawn
+        (an ``Error:`` receipt naming no run) keeps the recovery ladder armed,
+        because the model may still need to say why nothing started.
+        """
+        from kiro_crew.dashboard.chat_utils import _ACTIVITY_NO_REPLY_CONTINUE_MSG
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        executed: list[str] = []
+        self._terminal_tool_stream(client, executed, tool=tool, result_text=receipt)
+        calls, spy = self._spy_queue()
+
+        with patch.object(_ChatSlot, "queue_insert", spy):
+            await _run_chat(state, slot, "run the checks")
+            await self._cancel_background_tasks(state)
+
+        if final:
+            self._assert_no_recovery(calls, executed, "run the checks")
+        else:
+            assert (0, _ACTIVITY_NO_REPLY_CONTINUE_MSG) in calls, (
+                "a failed spawn (Error receipt, no dispatched runs) lost the " "recovery ladder"
+            )
+
 
 class TestEmptyTurnDiagnostics:
     """The empty-response WARNING must name a CLOSED cause, and carry no content.

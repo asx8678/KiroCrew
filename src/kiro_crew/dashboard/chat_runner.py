@@ -362,8 +362,14 @@ from kiro_crew.dashboard.recovery_replays import (
     cancel_notice,
     replays_of,
 )
+
+# QUESTION_CARD_SHOWN_PREFIX stays importable through the runner for the
+# composition contract's bound surface (every name the module held at its
+# base still resolves); the ladder reads it through applied_outcome_ends_turn
+# now, so the import itself is unused here.
+from kiro_crew.dashboard.session_directive_apply import QUESTION_CARD_SHOWN_PREFIX  # noqa: F401
 from kiro_crew.dashboard.session_directive_apply import (
-    QUESTION_CARD_SHOWN_PREFIX,
+    applied_outcome_ends_turn,
     apply_session_directive,
 )
 from kiro_crew.dashboard.slot_queue_repository import RESTORED_QUEUE_KEY
@@ -8094,6 +8100,22 @@ async def _persist_abnormal_turn_usage(
         return False
 
 
+# Spawn receipts that name at least one dispatched run (OUT-1). The wave — or
+# the continued conversation — reports itself through [Subagent completion
+# event] messages, and the receipt ends by telling the model to END ITS TURN,
+# so a turn whose last call produced one is intentionally final and the
+# empty-response ladder must not append a synthetic continuation after it.
+# Keyed by canonical tool name; the values are markers only a SUCCESS receipt
+# carries — ``subagent(s).`` is the same launch shape the dashboard's inline
+# run card recognises, kept stable on purpose in ``mcp_tools/spawn.py`` — so
+# every ``Error:`` / ``no subagents were started`` refusal matches none of them
+# and a failed spawn keeps the recovery ladder armed.
+_TERMINAL_SPAWN_RECEIPTS: dict[str, tuple[str, ...]] = {
+    "spawn_run": ("subagent(s). ",),
+    "spawn_continue": ("Continued conversation ", "as run "),
+}
+
+
 @_hands_off_queue_on_exit
 async def _run_chat(
     state: DashboardState,
@@ -9197,15 +9219,40 @@ async def _run_chat(
     # text and overwrite the applied outcome in the transcript. Replaying the
     # stored output keeps every frame consistent and marker-free.
     _dir_consumed_out: dict[str, str] = {}
-    # A successfully posted non-blocking question card is the intended terminal
-    # output of this turn. The tool tells the model to end without assistant
-    # text, so empty-response recovery must not inject a closing continuation.
-    _terminal_question_posted = False
+    # An intentionally final APPLIED outcome is the intended terminal output of
+    # this turn. The receipts that produce one (a posted question card, a shown
+    # follow-up card, an armed monitor loop, a spawn receipt naming dispatched
+    # runs) tell the model to END its turn without assistant text, so
+    # empty-response recovery must not "rescue" the turn with a synthetic
+    # continuation — one more full-context request that answers nothing the
+    # user asked (OUT-1).
+    _intentionally_final_outcome = False
 
-    def _record_terminal_question(kind: str, outcome: str) -> None:
-        nonlocal _terminal_question_posted
-        if kind == "ask_question" and outcome.startswith(QUESTION_CARD_SHOWN_PREFIX):
-            _terminal_question_posted = True
+    def _record_terminal_outcome(kind: str, outcome: str) -> None:
+        nonlocal _intentionally_final_outcome
+        if applied_outcome_ends_turn(kind, outcome):
+            _intentionally_final_outcome = True
+
+    def _record_terminal_spawn_receipt(tool_call_id: str, receipt: str) -> None:
+        """Mark the turn final when a spawn tool's receipt names dispatched runs.
+
+        ``spawn_run``/``spawn_continue`` receipts tell the model to END ITS TURN
+        and wait for the [Subagent completion event] messages, so a turn that
+        ends there ended exactly as instructed. Keyed on the trusted canonical
+        identity — Kiro Crew's own core MCP server plus the tool name, the same
+        trust basis the directive gate uses — and on the marker only a SUCCESS
+        receipt carries: the ``N subagent(s).`` launch shape the dashboard's
+        inline run card already recognises, and spawn_continue's ``Continued
+        conversation … as run …`` line. An ``Error:`` receipt names no run and
+        matches nothing, so a failed spawn keeps the recovery ladder armed.
+        """
+        nonlocal _intentionally_final_outcome
+        server, tool = _seen_tool_identity.get(tool_call_id, ("", ""))
+        if server != session_directive.CORE_MCP_SERVER:
+            return
+        marks = _TERMINAL_SPAWN_RECEIPTS.get(tool)
+        if marks and all(mark in receipt for mark in marks):
+            _intentionally_final_outcome = True
 
     # When this turn began, for bounding an out-of-band directive claim to it.
     # A directive belongs to the turn that asked for it: a record parked by a turn
@@ -12769,7 +12816,7 @@ async def _run_chat(
                             producer_is_channel=_directive_producer_is_channel(),
                             producer_wake_loop_id=_directive_loop_id,
                         )
-                        _record_terminal_question(_applied_kind, _applied_one)
+                        _record_terminal_outcome(_applied_kind, _applied_one)
                         logger.info(
                             "session-directive applied OUT OF BAND for %s "
                             "(tool_call_id=%s, kind=%s): the marker was unavailable; "
@@ -12982,13 +13029,20 @@ async def _run_chat(
                                 producer_is_channel=_directive_producer_is_channel(),
                                 producer_wake_loop_id=_directive_loop_id,
                             )
-                            _record_terminal_question(_dir_tool, _applied_one)
+                            _record_terminal_outcome(_dir_tool, _applied_one)
                             _out = _redact_tool_field(_applied_one)
                             _dir_consumed_out[event.tool_call_id] = _out
                         else:
                             # Recorded directive tool but no valid marker in the
                             # result — strip any stray sentinel from the transcript.
                             _out = session_directive.strip_marker(_out)
+                # OUT-1: a spawn receipt that names dispatched runs ends the turn
+                # by instruction ("END YOUR TURN"), so the ladder must not append
+                # a synthetic continuation after it. Checked here, where the
+                # finalized output is known for every result frame; the directive
+                # outcomes were recorded at their apply sites above.
+                if not _intentionally_final_outcome and _tcid:
+                    _record_terminal_spawn_receipt(_tcid, _out)
                 state.broadcast_ws(
                     "tool_result",
                     {
@@ -16124,7 +16178,7 @@ async def _run_chat(
         elif (
             _stop_reason != STOP_REASON_CANCELLED
             and not _produced_visible_output
-            and not _terminal_question_posted
+            and not _intentionally_final_outcome
             and not _refusal_reasons
         ):
             _had_empty_response_verdict = True

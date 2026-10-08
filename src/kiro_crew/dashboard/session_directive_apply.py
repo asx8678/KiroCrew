@@ -67,6 +67,46 @@ logger = logging.getLogger(__name__)
 
 QUESTION_CARD_SHOWN_PREFIX = "Question card shown in this session."
 
+#: Applied outcomes that END the turn intentionally (OUT-1): each of these
+#: receipts tells the model to END its turn without assistant text, so the
+#: consumer's empty-response recovery must not append a synthetic continuation
+#: to a turn that did exactly what it was told — a full-context request that
+#: answers nothing the user asked. Keyed by directive kind; the values are
+#: substrings only a SUCCESS outcome carries, so every refusal ("NOT armed",
+#: "could not be delivered", "no dashboard client is attached … restate …")
+#: matches none of them and stays recoverable — load-bearing, because those
+#: refusals ask the model to answer in text instead, the one thing the
+#: recovery ladder exists to rescue.
+TERMINAL_DIRECTIVE_OUTCOMES: dict[str, tuple[str, ...]] = {
+    # The success return of ``_ask_question``.
+    "ask_question": (QUESTION_CARD_SHOWN_PREFIX,),
+    # Both success variants of ``_suggest_followup`` open with this sentence
+    # (the no-project variant continues with a Note the prefix still matches).
+    "suggest_followup": ("Follow-up card shown below the composer.",),
+    # The success return of ``_monitor_start`` ("Monitor loop {id} started on
+    # this session: …"); its refusals say "NOT armed" or "Failed to start".
+    "monitor_start": ("Monitor loop", "started on this session:"),
+    # The success return of ``_monitor_watch`` ("Structured monitor {id}
+    # started on this session…"); same refusal shapes as monitor_start.
+    "monitor_watch": ("Structured monitor", "started on this session"),
+}
+
+
+def applied_outcome_ends_turn(kind: str, outcome: str) -> bool:
+    """True when an APPLIED outcome's receipt makes the turn intentionally final.
+
+    Positive on the outcome text, never on the tool name alone: only a success
+    whose receipt tells the model to end its turn counts, so the ladder in the
+    consumer stays armed for every refusal and for every ordinary directive
+    (``chat_tag``, ``set_project``, ``monitor_stop`` …) whose receipt expects
+    the model to keep talking.
+    """
+    marks = TERMINAL_DIRECTIVE_OUTCOMES.get(kind)
+    if not marks:
+        return False
+    return all(mark in outcome for mark in marks)
+
+
 # Card directives require a connected dashboard surface. ``set_project`` is
 # admitted by the user-surface provenance gate below, then separately requires
 # the current turn to own the slot it would mutate.
