@@ -943,6 +943,13 @@ with the provider as `model_source` fallback), the agent that served the turn
   pins the stats object on entry and calls `record_turn_usage` on every exit;
   `TurnDriver(usage_surface=...)` does the same around `run()`.
 
+**Per-surface daily total (USE-1 follow-up).** `dashboard/handlers/usage.py`
+`surface_daily_credits(day)` sums a local day's `tokens` rows by canonical surface,
+and `surfaces_over_daily_credits(day, threshold)` returns the surfaces above a
+threshold. A threshold of `0` or less is off and returns nothing. Nothing calls
+these yet: the threshold's config key and where its alert surfaces are the
+maintainer's decision, and the usage page does not show the per-surface day total.
+
 Labels in use: `workflow` (cold and pooled stages), `workflow_author`, `bg:judge`,
 `side`, `thread`, `subagent_completion` (the Slack gateway's completion injection,
 filed under the parent key), `taskrunner_lesson`, `issue_radar`, `meetings`,

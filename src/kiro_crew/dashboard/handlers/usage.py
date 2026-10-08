@@ -386,6 +386,63 @@ NAVIGABLE_CATEGORY = "dashboard"
 _LEGACY_TELEMETRY_SURFACES = {"task_runner": "taskrunner"}
 
 
+def surface_daily_credits(day: str) -> dict[str, float]:
+    """Credits spent per usage surface on one LOCAL calendar day (USE-1 follow-up).
+
+    *day* is ``YYYY-MM-DD``. Admits the same rows as :func:`daily_credits` (a
+    ``tokens`` row, inside the window, with a finite numeric ``credits``), keyed by
+    the row's canonical surface, and filters to the requested day. A row with no
+    surface files under ``""``. The map is a read of the stored rows, so a past
+    day's total does not change when the function runs again.
+    """
+    out: dict[str, float] = {}
+    for path in _shards_in_window(_SESSIONS_HISTORY_DAYS):
+        try:
+            with path.open("rb") as fh:
+                for line in bounded_records(fh, path, label="usage"):
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(obj, dict) or obj.get("_type") != "tokens":
+                        continue
+                    ts_raw = obj.get("ts")
+                    if _parse_row_day(ts_raw) != day:
+                        continue
+                    credits = obj.get("credits")
+                    if isinstance(credits, bool) or not isinstance(credits, (int, float)):
+                        continue
+                    try:
+                        value = float(credits)
+                    except OverflowError:
+                        continue
+                    if not math.isfinite(value):
+                        continue
+                    surface = _canonical_telemetry_surface(str(obj.get("surface") or ""))
+                    total = out.get(surface, 0.0) + value
+                    if math.isfinite(total):
+                        out[surface] = total
+        except (OSError, UnicodeDecodeError):
+            # Same policy as the other shard readers: a bad shard costs its own rows.
+            continue
+    return out
+
+
+def surfaces_over_daily_credits(day: str, threshold: float) -> dict[str, float]:
+    """The surfaces whose *day* total exceeds *threshold* credits (USE-1 follow-up).
+
+    ``threshold <= 0`` means the alert is off and the result is empty, so a caller
+    that reads the default config gets no alert until the operator sets a number.
+    """
+    if threshold <= 0:
+        return {}
+    return {
+        surface: credits
+        for surface, credits in surface_daily_credits(day).items()
+        if credits > threshold
+    }
+
+
 def _canonical_telemetry_surface(surface: str) -> str:
     """Return the operational telemetry spelling used for new and stored rows.
 
