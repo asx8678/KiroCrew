@@ -34,6 +34,28 @@ class TestSummarizeResult:
         assert "middle truncated" in out
         assert "spawn_status" in out  # steers to on-demand read, not re-run
 
+    def test_closing_segment_rides_the_envelope_whole(self):
+        """EVT-2 done-when: a long narrated transcript ending in an answer
+        produces an envelope that contains the whole answer, even when the kept
+        copy is head-only (the default keep mode) and dropped it."""
+        head = "narration about tool calls " * 300  # the head-kept copy
+        # No trailing whitespace: the seam strips the segment, and the assert
+        # must hold against exactly what the envelope carries.
+        answer = ("ANSWER: " + "concrete item " * 130).strip()  # ~2k chars
+        out = summarize_result(head, "/tmp/x.txt", words=200, final_segment=answer)
+        assert answer in out, "the whole closing answer must reach the parent"
+        assert "Closing output (the run's final answer, preserved whole):" in out
+        # The head preview still stands beside it.
+        assert "Preview (first+last 100 words):" in out
+
+    def test_closing_segment_already_in_the_copy_is_not_duplicated(self):
+        """tail/both keep modes retain the closing segment in the copy, so the
+        envelope must not emit a second, duplicate section for it."""
+        copy = "narration … ANSWER: ship it"
+        out = summarize_result(copy, "/tmp/x.txt", words=200, final_segment="ANSWER: ship it")
+        assert "Closing output" not in out
+        assert out.count("ANSWER: ship it") == 1
+
     def test_size_annotation_when_file_exists(self, tmp_path):
         p = tmp_path / "result.txt"
         p.write_text("x" * 1234, encoding="utf-8")

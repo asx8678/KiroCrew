@@ -561,6 +561,38 @@ def _digest_chunk_size() -> int:
 
 SUBAGENT_DIGEST_CHUNK_SIZE = _digest_chunk_size()
 
+#: Cap on a member's closing segment inside a wave-digest success line
+#: (EVT-2). The digest's own 60k body budget bounds the chunk as a whole; this
+#: keeps one narrated member from spending it alone.
+DIGEST_ANSWER_CHARS = 1500
+
+
+def _digest_success_line(
+    info_id: str,
+    task_text: str,
+    model_tag: str,
+    usage: str,
+    result_path: str,
+    *,
+    partial: bool,
+    final_segment: str,
+) -> str:
+    """One wave-digest success line, carrying its member's closing segment.
+
+    Exception-first digest content keeps successes to one pointer line — but a
+    pointer alone makes every member cost the parent a file read for the one
+    part that matters, so the closing segment (the text after the member's last
+    tool call, the deliverable) rides the line tail-capped (EVT-2). Empty on
+    runs that streamed nothing after their last tool call; the path pointer
+    still stands for the rest.
+    """
+    kept = " (partial: backend failed to generate the final response)" if partial else ""
+    seg = (final_segment or "")[:DIGEST_ANSWER_CHARS]
+    ell = "…" if len(final_segment or "") > DIGEST_ANSWER_CHARS else ""
+    return f"— `{info_id}` ✅{kept} {task_text[:80]}" f"{model_tag} · {usage}" + (
+        f"\n  → {result_path}" if result_path else ""
+    ) + (f"\n  Answer: {seg}{ell}" if seg else "")
+
 
 def _injection_slot_busy(slot: Any) -> bool:
     """True when *slot* already owns a turn a new injection must wait behind.
@@ -9257,7 +9289,17 @@ class GatewayOrchestrator:
                         f"this as a completed result):\n{info.result}"
                     )
             elif result_path and info.result_truncated:
-                detail = summarize_result(info.result, result_path)
+                # EVT-2: the closing segment rides the envelope WHOLE — the kept
+                # copy can be head-only, and the deliverable of a narrated
+                # transcript sits at its end. Type-guarded like the digest
+                # accounting below: tests drive this consumer with MagicMock
+                # infos, and only a real str participates.
+                _seg = getattr(info, "final_segment", "")
+                detail = summarize_result(
+                    info.result,
+                    result_path,
+                    final_segment=_seg if isinstance(_seg, str) else "",
+                )
             else:
                 detail = info.result or "_No response._"
             detail, _ = redact_exfiltration_urls(detail)
@@ -9392,12 +9434,17 @@ class GatewayOrchestrator:
                 # Exception-first digest content: failures/stops carry detail,
                 # successes are one pointer line (full output stays on disk).
                 if _oc == "completed":
-                    # A run that kept its output after a generate failure is
-                    # completed but partial; the digest must say so.
-                    _kept = " (partial: backend failed to generate the final response)"
+                    _seg_full = getattr(info, "final_segment", "")
                     bp["ok_lines"].append(
-                        f"— `{info.id}` ✅{_kept if info.partial else ''} {task_text[:80]}"
-                        f"{_model_tag} · {usage}" + (f"\n  → {result_path}" if result_path else "")
+                        _digest_success_line(
+                            info.id,
+                            task_text,
+                            _model_tag,
+                            usage,
+                            result_path or "",
+                            partial=bool(info.partial),
+                            final_segment=_seg_full if isinstance(_seg_full, str) else "",
+                        )
                     )
                 else:
                     bp["fail_lines"].append(

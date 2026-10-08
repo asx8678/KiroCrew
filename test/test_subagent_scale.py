@@ -2893,3 +2893,49 @@ class TestQueuedDepthReachesZero:
             await mgr._drain_queue_pass()  # must not raise
         assert any("drain pump failed" in r.getMessage() for r in caplog.records)
         assert not any("UnboundLocalError" in (r.exc_text or "") for r in caplog.records)
+
+
+class TestDigestSuccessLine:
+    """EVT-2: each wave-digest success line carries its member's closing
+    segment — the deliverable — instead of leaving every member a file read."""
+
+    def test_a_member_answer_rides_the_line(self) -> None:
+        from kiro_crew.slack.gateway import _digest_success_line
+
+        line = _digest_success_line(
+            "a-1",
+            "fix the label",
+            " · model foo",
+            "12.3s · 0.4 cr",
+            "/path/result.txt",
+            partial=False,
+            final_segment="ANSWER: label fixed in two places",
+        )
+        assert line.startswith("— `a-1` ✅ fix the label")
+        assert "→ /path/result.txt" in line
+        assert "Answer: ANSWER: label fixed in two places" in line
+
+    def test_a_long_segment_is_tail_capped_with_an_ellipsis(self) -> None:
+        from kiro_crew.slack.gateway import DIGEST_ANSWER_CHARS, _digest_success_line
+
+        line = _digest_success_line(
+            "a-1", "t", "", "u", "", partial=False, final_segment="x" * (DIGEST_ANSWER_CHARS * 2)
+        )
+        assert "Answer: " in line
+        assert line.endswith("…")
+        assert len(line) < DIGEST_ANSWER_CHARS + 200
+
+    def test_a_run_with_no_closing_segment_keeps_the_pointer_line(self) -> None:
+        from kiro_crew.slack.gateway import _digest_success_line
+
+        line = _digest_success_line(
+            "a-2", "t", "", "u", "/p/r.txt", partial=False, final_segment=""
+        )
+        assert "Answer:" not in line
+        assert "→ /p/r.txt" in line
+
+    def test_a_partial_run_says_so(self) -> None:
+        from kiro_crew.slack.gateway import _digest_success_line
+
+        line = _digest_success_line("a-3", "t", "", "u", "", partial=True, final_segment="")
+        assert "(partial: backend failed to generate the final response)" in line

@@ -3485,11 +3485,17 @@ configurable. Defaults preserve original behavior — opt-in to the others
 when a particular agent style benefits from the change.
 
 When truncation drops content (`SubagentInfo.result_truncated`), the completion
-event is not a raw truncated blob: it carries a **first+last-words preview + the
+event is not a raw truncated blob: it carries the run's **closing segment** —
+the text streamed after its last tool call, tail-capped at the same
+`completion_keep_chars` budget (`SubagentInfo.final_segment`) — emitted WHOLE
+as a "Closing output" section, ahead of a **first+last-words preview + the
 `result_path`** (via `context_management.summarize_result`) so the parent reads
 the full transcript on demand (read / grep / `spawn_status`) instead of
-re-running the subagent. It is gated on `result_truncated`, so small results
-still inline in full.
+re-running the subagent. A copy that already contains the segment (`tail`/`both`
+modes, or a short result) adds no section. Each wave-digest success line carries
+its member's closing segment the same way, tail-capped at 1,500 characters. It
+is gated on `result_truncated` for the summary, so small results still inline
+in full.
 
 | Config key | Values | Default | Effect |
 |------------|--------|---------|--------|

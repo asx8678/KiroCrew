@@ -2109,6 +2109,68 @@ class TestSubagentPostToolUseHook:
 
         assert info.done is True
 
+    @pytest.mark.asyncio
+    async def test_final_segment_tracks_text_after_the_last_tool_call(self) -> None:
+        """EVT-2: the closing segment is the text after the LAST tool call.
+
+        A narrated transcript's deliverable sits at its end, and the default
+        head keep mode drops it from the completion copy — so the run records
+        it separately, and the envelope built from the truncated copy plus the
+        segment carries the whole answer (the item's done-when).
+        """
+        from kiro_crew.context_management import summarize_result
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TEXT_CHUNK,
+            EVENT_TOOL_CALL,
+            EVENT_TOOL_RESULT,
+            LLMEvent,
+        )
+        from kiro_crew.subagent import SubagentInfo, SubagentManager
+
+        narration = "Reading the files and thinking aloud. " * 400  # ~16k chars
+        answer = "ANSWER: 1) ship it 2) test it 3) document it"
+
+        async def _stream(*_a, **_kw):  # type: ignore[no-untyped-def]
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text=narration)
+            yield LLMEvent(kind=EVENT_TOOL_CALL, title="read", tool_call_id="t-9")
+            yield LLMEvent(kind=EVENT_TOOL_RESULT, tool_call_id="t-9", tool_output="ok")
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text=answer)
+            yield LLMEvent(kind=EVENT_COMPLETE)
+
+        sessions = _mock_sessions()
+        provider = AsyncMock()
+        provider.start = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.context_usage_pct = lambda: 0.0
+        provider.stream = MagicMock(side_effect=lambda *a, **kw: _stream())
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+
+        ctx = _mock_ctx_builder_auto_spawn()
+        ctx.hooks.auto_approve_subagent_tools = True
+        manager = SubagentManager(sessions=sessions, ctx_builder=ctx)
+        info = SubagentInfo(
+            execution_context=execution_for_store(""),
+            id="t05",
+            task="test",
+            parent_session_key="slack:C:T",
+        )
+        manager._log_spawned(info)
+
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            await manager._run_inner(info, "subagent:t05")
+
+        assert info.done is True
+        # The head-kept completion copy holds the narration and drops the
+        # answer; the closing segment holds exactly the post-tool answer.
+        assert info.result_truncated is True
+        assert answer not in info.result
+        assert answer in info.final_segment
+        assert "Reading the files" not in info.final_segment
+        # Done-when: the envelope contains the WHOLE answer.
+        envelope = summarize_result(info.result, "/tmp/x.txt", final_segment=info.final_segment)
+        assert answer in envelope
+
 
 class TestSubagentParallelToolAttribution:
     """The run loop keeps a slow parallel call judged after a fast one returns."""

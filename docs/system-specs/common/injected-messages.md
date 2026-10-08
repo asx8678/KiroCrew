@@ -91,7 +91,9 @@ Usage: <credits> credits · <elapsed>
   The agent-name parenthetical is present only when the sub-agent ran under a named
   agent.
 - The detail is the trimmed result when it fits. When the completion copy dropped
-  content, it is a summary plus a `result_path` pointer, so
+  content, it is a summary plus a `result_path` pointer — carrying the run's
+  closing segment (the text streamed after its last tool call) whole, ahead of
+  the first+last-words preview — so
   the parent reads the full transcript on demand (`read`, `grep`, `spawn_status`)
   instead of re-running the sub-agent.
 - Usage is cumulative across all attempted turns in the run, including billed

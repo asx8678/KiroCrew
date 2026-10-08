@@ -158,14 +158,23 @@ def apply_completion_keep(text: str, mode: str, max_chars: int) -> str:
     return text[:max_chars]
 
 
-def summarize_result(result: str, result_path: str, words: int = RESULT_SUMMARY_WORDS) -> str:
+def summarize_result(
+    result: str,
+    result_path: str,
+    words: int = RESULT_SUMMARY_WORDS,
+    final_segment: str = "",
+) -> str:
     """Build a completion-event body that points at the full transcript on disk.
-
     Emits a first+last ``words`` preview of *result* plus the ``result_path`` to
     the full (up to ``RESULT_FILE_MAX_BYTES``) transcript, and instructs the
     parent to read it on demand (``read`` with offset/limit, ``grep``, or the
     ``spawn_status`` MCP tool) instead of re-running the subagent.
-
+    *final_segment* is the run's closing assistant segment (the text after its
+    last tool call). When the kept copy dropped it — the default ``head`` keep
+    mode on a narrated transcript — it is emitted WHOLE as a "Closing output"
+    section ahead of the preview, so the deliverable reaches the parent without
+    a file read; a copy that already contains it (``tail``/``both`` modes, or a
+    short result) adds nothing and the preview alone stands.
     Used when the completion-event copy was truncated (``head``/``tail``/``both``
     dropped content) or for orchestrator-mode delivery, so the deliverable at the
     end of a long transcript is never silently lost. The preview reflects whatever
@@ -181,6 +190,10 @@ def summarize_result(result: str, result_path: str, words: int = RESULT_SUMMARY_
             + "\n[...middle truncated — read the full transcript below...]\n"
             + " ".join(tokens[-half:])
         )
+    closing = ""
+    seg = (final_segment or "").strip()
+    if seg and seg not in (result or ""):
+        closing = f"Closing output (the run's final answer, preserved whole):\n{seg}\n\n"
     size = ""
     try:
         size = f" ({os.path.getsize(result_path):,} bytes)"
@@ -188,6 +201,7 @@ def summarize_result(result: str, result_path: str, words: int = RESULT_SUMMARY_
         pass
     return (
         f"Full transcript: {result_path}{size}\n"
+        f"{closing}"
         f"Preview (first+last {half} words):\n{preview}\n\n"
         f"The full result is on disk — read it on demand with the read tool "
         f"(offset/limit), grep the path above, or call "

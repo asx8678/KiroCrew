@@ -2570,6 +2570,14 @@ class SubagentInfo:
     result: str = ""
     result_path: str = ""
     result_truncated: bool = False  # completion-event copy dropped content → summary+path
+    # The run's FINAL assistant segment: the text streamed after its LAST tool
+    # call, redacted, ``[OPTIONS:]``-stripped, tail-capped at
+    # ``agent.completion_keep_chars``. The kept ``result`` copy can drop it (the
+    # default ``head`` keep mode retains the narration), and it is where the
+    # deliverable of a narrated transcript lives, so the completion envelope
+    # and the wave digest surface it whole (EVT-2) instead of leaving the
+    # parent to re-read the file for the one part that matters.
+    final_segment: str = ""
     error: str = ""
     # Machine-readable identifier for ``error``, forwarded by ``POST /api/spawn``
     # as the response's ``code`` so a client can switch on the decision instead of

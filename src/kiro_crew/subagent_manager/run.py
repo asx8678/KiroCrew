@@ -2540,6 +2540,11 @@ class RunEventCoordinator(ManagerComponent):
         )
 
         result_text = ""
+        # EVT-2: the text streamed since the run's LAST tool call — the closing
+        # assistant segment a narrated transcript ends with. Reset at every
+        # tool call, appended (redacted) per chunk, tail-capped so a long
+        # final turn cannot grow the accumulator unbounded.
+        _final_segment = ""
         turns = 0
         turn_limit = self._manager._effective_turn_limit(info)
         # Separate volume bound for child-origin permission escalations —
@@ -3115,6 +3120,12 @@ class RunEventCoordinator(ManagerComponent):
                 info.streaming_text += redacted
                 if len(info.streaming_text) > 50_000:
                     info.streaming_text = "…(truncated)\n" + info.streaming_text[-40_000:]
+                # EVT-2: the closing segment accumulates the same redacted
+                # chunks, keeping its TAIL (the end is the part that matters)
+                # under the same 50k ceiling the streaming partial obeys.
+                _final_segment += redacted
+                if len(_final_segment) > 50_000:
+                    _final_segment = "…(truncated)\n" + _final_segment[-40_000:]
                 if _result_file_started:
                     # A refused append starts the file over on the next
                     # chunk, so a lost chunk leaves no hole mid-file either.
@@ -3222,6 +3233,10 @@ class RunEventCoordinator(ManagerComponent):
                 _policy = _policy_for(_spec)
                 await refuse_stale_switch(client, event.text or "")
             elif event.kind == EVENT_TOOL_CALL:
+                # EVT-2: a tool call ends the current assistant segment; the
+                # closing segment the envelope carries is the text after the
+                # LAST call.
+                _final_segment = ""
                 # Auto-allowed (kiro-internal) tools surface here as informational
                 # tool_call updates and NEVER as EVENT_PERMISSION_REQUEST, so this
                 # is the only progress signal a simple/read-only subagent task emits.
@@ -3359,6 +3374,14 @@ class RunEventCoordinator(ManagerComponent):
             self._manager._completion_keep,
             self._manager._completion_keep_chars,
         )
+        # EVT-2: record the closing segment for the completion envelope and the
+        # wave digest. Tail-capped at the same budget the kept copy obeys (an
+        # uncapped keep_chars means the whole result is inline already, so the
+        # accumulator's own bound is enough), and ``[OPTIONS:]``-stripped to
+        # match how ``cleaned`` was derived.
+        _seg, _ = extract_options(_final_segment) if _final_segment else ("", [])
+        _seg_cap = self._manager._completion_keep_chars
+        info.final_segment = (_seg[-_seg_cap:] if _seg_cap > 0 else _seg).rstrip()
         if _kept_after_generate_failure:
             # Added AFTER the keep cap, so no keep mode can cut it off.
             _warn = (
