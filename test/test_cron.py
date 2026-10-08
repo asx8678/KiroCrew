@@ -552,6 +552,13 @@ class TestLastResultTimestamp:
         job.set_run_result("output")
         assert job.last_result_ts >= before
 
+    def test_set_run_result_caps_at_2000_chars(self, tmp_path: Path) -> None:
+        svc = CronService(base_dir=tmp_path)
+        svc._load()
+        job = svc.add_job(name="capped", message="go", every_secs=300)
+        job.set_run_result("x" * 10_000)
+        assert len(job.last_result or "") == 2000
+
     def test_stamp_persists(self, tmp_path: Path) -> None:
         svc1 = CronService(base_dir=tmp_path)
         svc1._load()

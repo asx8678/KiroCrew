@@ -286,7 +286,9 @@ class CronJob:
         deserialization paths, which restore prior state rather than
         produce a new result.
         """
-        self.last_result = value
+        # A repeating job must not carry an unbounded report into the next
+        # prompt. 2000 chars is the cross-run context, not the delivery.
+        self.last_result = value[:2000]
         self.result_produced = True
         # Stamped and RENDERED here rather than at injection time so all of a
         # run's injection sites emit one identical header -- see
