@@ -260,9 +260,16 @@ TRANSLATION_LANGS: tuple[tuple[str, str], ...] = (
 
 TRANSLATION_LANG_CODES: frozenset[str] = frozenset(code for code, _ in TRANSLATION_LANGS)
 
-#: Off. Live translation costs one model call per spoken line, so it is opt-in —
-#: a default-on feature would bill every meeting for something most do not need.
+#: Off. Live translation is opt-in — a default-on feature would bill every
+#: meeting for something most do not need.
 DEFAULT_TRANSLATION_LANG = ""
+#: One model call covers the lines that arrived in this window. 50 lines in
+#: 10s is at most three calls (LOOP-5).
+TRANSLATION_BATCH_SECS = 5.0
+TRANSLATION_BATCH_LINES = 25
+#: The panel polls every 5s while open. A poll older than this means nobody
+#: is reading, so the queue must not call the model.
+TRANSLATION_VIEWER_STALE_SECS = 20.0
 
 #: Lines waiting to be translated before the OLDEST are dropped.
 #:

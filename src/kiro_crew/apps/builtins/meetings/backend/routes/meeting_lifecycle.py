@@ -808,6 +808,8 @@ async def handle_get_translations(request: web.Request) -> web.Response:
     payload = await asyncio.to_thread(_read_translations_since, meeting_id, since, root)
     live = ACTIVE.get(meeting_id)
     queue = live.translations if live is not None else None
+    if queue is not None:
+        queue.note_viewer()
     payload["pending"] = queue.pending if queue is not None else 0
     payload["dropped"] = queue.dropped if queue is not None else 0
     return web.json_response(payload)

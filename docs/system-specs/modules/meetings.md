@@ -387,11 +387,12 @@ language. The accepted language set is published by `GET /config`
 reason the provider registries are: the backend validates the saved value, so it
 must also be what publishes the accepted set.
 
-It is **not** an `AgentQueue` variant. That one exists to BATCH so an agent
-gets context; this exists to avoid batching, so it is a bounded SEQUENTIAL
-per-meeting queue running one tool-less call on `kirocrew-lite` per line with the
-ephemeral session destroyed after. This is the app's first non-agent LLM path;
-anything else needing a quick model call should reuse it.
+It is **not** an `AgentQueue` variant. Lines batch for `TRANSLATION_BATCH_SECS`
+(5s), at most `TRANSLATION_BATCH_LINES` (25) per call, on one `kirocrew-lite`
+session per meeting. A call happens only after `GET …/translations` — the panel
+poll, which runs only while that panel is open. No poll means no model call.
+The session is destroyed when the queue is cleared. Usage is recorded on
+`meetings_translate`.
 
 Hooked into `MeetingSession.broadcast`, **not** the dispatch route, and the
 difference matters twice over: broadcast is where the text is already

@@ -52,6 +52,7 @@ def _queue(root: Path, *, language: str = "ja", runner=None) -> translate.Transl
         language=language,
         runner=runner or _echo,
         root=root,
+        batch_secs=0,
     )
 
 
@@ -177,9 +178,10 @@ class TestDrain:
 
         async def runner(prompt: str) -> str:
             seen.append(prompt)
-            return f"OUT{len(seen)}"
+            return "OUT1\nOUT2"
 
         queue = _queue(root, runner=runner)
+        queue.note_viewer()
         queue.enqueue("First real sentence.")
         queue.enqueue("Second real sentence.")
         await queue.drain()
@@ -194,6 +196,7 @@ class TestDrain:
         # Monotonic, and it is what the client's `since` cursor refers to.
         assert [line["n"] for line in doc["lines"]] == [0, 1]
         assert doc["next_n"] == 2
+        assert len(seen) == 1
 
     @pytest.mark.asyncio
     async def test_one_call_at_a_time(self, root: Path):
@@ -209,6 +212,7 @@ class TestDrain:
             return "ok"
 
         queue = _queue(root, runner=runner)
+        queue.note_viewer()
         for i in range(5):
             queue.enqueue(f"Sentence number {i} here.")
         await queue.drain()
@@ -222,6 +226,7 @@ class TestDrain:
             raise RuntimeError("model unavailable")
 
         queue = _queue(root, runner=runner)
+        queue.note_viewer()
         queue.enqueue("A real sentence here.")
         await queue.drain()
 
@@ -243,7 +248,9 @@ class TestDrain:
             return "recovered"
 
         queue = _queue(root, runner=runner)
+        queue.note_viewer()
         queue.enqueue("First real sentence.")
+        await queue.drain()
         queue.enqueue("Second real sentence.")
         await queue.drain()
 
@@ -256,6 +263,7 @@ class TestDrain:
             return "token AKIAIOSFODNN7EXAMPLE here"
 
         queue = _queue(root, runner=runner)
+        queue.note_viewer()
         queue.enqueue("A real sentence here.")
         await queue.drain()
 
@@ -270,6 +278,41 @@ class TestDrain:
         queue.clear()
         assert queue.pending == 0
         await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_no_viewer_makes_no_call(self, root: Path):
+        calls = {"n": 0}
+
+        async def runner(_prompt: str) -> str:
+            calls["n"] += 1
+            return "no"
+
+        queue = _queue(root, runner=runner)
+        for i in range(5):
+            queue.enqueue(f"Sentence number {i} here.")
+        await queue.drain()
+        assert calls["n"] == 0
+        assert queue.pending == 5
+
+    @pytest.mark.asyncio
+    async def test_fifty_lines_are_at_most_three_calls(self, root: Path):
+        calls = {"n": 0}
+        keys: list[str] = []
+
+        async def runner(prompt: str) -> str:
+            calls["n"] += 1
+            keys.append(translate.translation_session_key("m1"))
+            count = prompt.count("\n")
+            return "\n".join(f"t{i}" for i in range(count))
+
+        queue = _queue(root, runner=runner)
+        queue.note_viewer()
+        for i in range(50):
+            queue.enqueue(f"Sentence number {i} of the meeting.")
+        await queue.drain()
+        assert calls["n"] <= 3
+        assert calls["n"] >= 1
+        assert len(set(keys)) == 1
 
 
 # ---------------------------------------------------------------------------

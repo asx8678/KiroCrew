@@ -33,6 +33,7 @@ from kiro_crew.apps.builtins.meetings.backend import store
 from kiro_crew.apps.builtins.meetings.backend.domain.dictionary import DomainDictionary
 from kiro_crew.apps.builtins.meetings.backend.domain.translate import (
     TranslationQueue,
+    close_translation_session,
     run_oneshot_translation,
 )
 from kiro_crew.context import (
@@ -667,11 +668,17 @@ class MeetingSession:
         language = str(config.get("translation_language") or "")
         if language in k.TRANSLATION_LANG_CODES and self.sessions is not None:
             sessions = self.sessions
+            meeting_id = self.meeting_id
+
+            async def _close() -> None:
+                await close_translation_session(sessions, meeting_id)
+
             self.translations = TranslationQueue(
-                meeting_id=self.meeting_id,
+                meeting_id=meeting_id,
                 language=language,
-                runner=lambda prompt: run_oneshot_translation(sessions, prompt),
+                runner=lambda prompt: run_oneshot_translation(sessions, prompt, meeting_id),
                 root=self.root,
+                closer=_close,
             )
 
     def _make_queue(self, agent_id: str, agent: str) -> AgentQueue:
