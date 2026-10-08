@@ -126,7 +126,7 @@ def build_job(
     env: dict[str, str] | None = None,
     persistent_session: bool = True,
     session_key: str = "",
-    minimal_context: bool = False,
+    minimal_context: bool = True,
     timeout: int = 0,
     timeout_secs: int = 0,
     auto_pause_after: int | None = None,
@@ -244,6 +244,8 @@ def build_job(
     else:
         raise ValueError("Must provide every_secs, at_ts, or cron_expr")
 
+    if not agent_id.strip() and not command and not script and not agent_sequence:
+        agent_id = "kirocrew-cron"
     return CronJob(
         id=uuid.uuid4().hex[:8],
         name=name,

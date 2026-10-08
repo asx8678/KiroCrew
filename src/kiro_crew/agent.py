@@ -3808,6 +3808,11 @@ def rebuild_agent_config(
     except Exception:
         logger.debug("kirocrew-heartbeat agent install failed", exc_info=True)
 
+    try:
+        _install_cron_agent()
+    except Exception:
+        logger.debug("kirocrew-cron agent install failed", exc_info=True)
+
     # Install kirocrew-conductor agent (goal decomposition + session-control dispatch).
     # ``clean`` is passed through: the conductor installers carry the user's own
     # ``allowedTools`` entries forward across a rebuild, and a clean rebuild is the
@@ -5355,6 +5360,27 @@ and side-effect-free kirocrew-core reads). Anything outside that list is
 rejected. If you find yourself wanting a tool that isn't available, say so in
 the response — the operator will add it after observing the SEL `denied` event.
 """
+
+
+_CRON_AGENT_PROMPT = (
+    "You are kirocrew-cron, an unattended job. Do the task in the message, "
+    "then stop. Do not greet, do not recap standing rules, and do not wait "
+    "for a person. If nothing changed, say so in one line."
+)
+
+
+def _install_cron_agent() -> None:
+    """Install the slim agent new unattended cron jobs run as (LOOP-6)."""
+    kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
+    path = kiro_agents_dir_path() / "kirocrew-cron.json"
+    spec = {
+        "name": "kirocrew-cron",
+        "description": "Unattended cron job. One task, then stop.",
+        "prompt": _CRON_AGENT_PROMPT,
+        "tools": ["@builtin"],
+        "includeMcpJson": False,
+    }
+    path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
 
 
 def _install_heartbeat_agent() -> None:
