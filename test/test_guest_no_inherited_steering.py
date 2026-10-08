@@ -33,6 +33,10 @@ def _projection_specs(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -
     agent_mod.kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
     service_agents._install_guest_agent()
     service_agents._install_knowledge_agent()
+    service_agents._install_lite_agent_fallback()
+    agents = agent_mod.kiro_agents_dir_path()
+    (agents / "kirocrew.json").write_text('{"name": "kirocrew"}', encoding="utf-8")
+    (agents / "my-agent.json").write_text('{"name": "my-agent"}', encoding="utf-8")
 
     import kiro_crew.acp.skill_projection as sp
 
@@ -55,15 +59,23 @@ class TestGuestViewCarriesNoSteering:
         self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         specs = _projection_specs(tmp_path, monkeypatch)
-        others = [n for n in specs if n != "kirocrew-guest"]
-        assert others, "expected at least one other materialized agent view"
-        assert any(
-            "steering" in str(r) or "AGENTS.md" in str(r)
-            for n in others
-            for r in specs[n].get("resources", [])
-        ), "the exemption widened past the guest"
+        def steered(name: str) -> bool:
+            return any(
+                "steering" in str(r) or "AGENTS.md" in str(r)
+                for r in specs[name].get("resources", [])
+            )
 
-    def test_the_exemption_set_names_only_the_shipped_guest(self) -> None:
+        assert "kirocrew-lite" in specs and "kirocrew-knowledge" in specs
+        assert not steered("kirocrew-lite")
+        assert not steered("kirocrew-knowledge")
+        assert steered("kirocrew")
+        assert steered("my-agent")
+
+    def test_the_exemption_set_names_only_shipped_internal_agents(self) -> None:
         from kiro_crew.acp.skill_projection import _NO_INHERITED_STEERING_AGENTS
+        from kiro_crew.config.sections import BACKGROUND_WORKER_AGENTS
 
-        assert _NO_INHERITED_STEERING_AGENTS == frozenset({"kirocrew-guest"})
+        assert _NO_INHERITED_STEERING_AGENTS == frozenset(
+            {*BACKGROUND_WORKER_AGENTS, "kirocrew-knowledge", "kirocrew-guest"}
+        )
+        assert "kirocrew" not in _NO_INHERITED_STEERING_AGENTS
