@@ -504,18 +504,20 @@ class TestPoolSizeConfig:
 # --- Extraction model resolution ---
 
 class TestExtractionModelResolution:
-    def test_empty_extraction_model_uses_agent_model(self):
-        """When extraction_model is empty, _install_knowledge_agent uses agent.model."""
+    def test_empty_extraction_model_uses_background_role(self):
+        """When extraction_model is empty, the background role is used, not chat."""
         with patch("kiro_crew.config.loader.KiroCrewConfig.load") as mock_load:
             mock_load.return_value.knowledge.extraction_model = ""
             mock_load.return_value.agent.model = "claude-sonnet-4.5"
+            mock_load.return_value.agent.resolve_model.return_value = "auto"
             with patch("kiro_crew.agent._atomic_json_write") as mock_write:
                 with patch("kiro_crew.agent.kiro_agents_dir_path") as mock_path:
                     mock_path.return_value = Path("/tmp/agents")
                     from kiro_crew.agent import _install_knowledge_agent
                     _install_knowledge_agent()
                     written = mock_write.call_args[0][1]
-                    assert written["model"] == "claude-sonnet-4.5"
+                    assert written["model"] == "auto"
+                    mock_load.return_value.agent.resolve_model.assert_called_with("background")
 
     def test_explicit_extraction_model_overrides(self):
         """When extraction_model is set, it overrides agent.model."""

@@ -78,22 +78,19 @@ def _install_knowledge_agent() -> None:
     """Generate and install the kirocrew-knowledge agent config.
 
     This agent is used by the Knowledge Library's LLMPool for document
-    extraction. By default it uses the user's configured agent.model (so
-    extraction runs on the same model as chat). If the user sets
-    knowledge.extraction_model explicitly, that model is used instead —
-    allowing a cheaper model for extraction without changing the chat default.
+    extraction. An explicit knowledge.extraction_model wins. Otherwise the
+    background role model is used, never the interactive chat model.
     """
     from kiro_crew.config.loader import KiroCrewConfig
 
     path = agent_mod.kiro_agents_dir_path() / _KNOWLEDGE_AGENT_FILENAME
 
-    # Resolve model: knowledge.extraction_model > agent.model > "auto"
+    # Resolve model: knowledge.extraction_model > background role > "auto"
     try:
         cfg = KiroCrewConfig.load()
         model = cfg.knowledge.extraction_model.strip()
         if not model:
-            # Use the user's default model (same as chat).
-            model = cfg.agent.model or "auto"
+            model = cfg.agent.resolve_model("background") or "auto"
     except Exception:
         model = "auto"
 

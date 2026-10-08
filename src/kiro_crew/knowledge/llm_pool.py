@@ -78,9 +78,10 @@ DEFAULT_POOL_SIZE = 3
 DEFAULT_TIMEOUT = 60.0
 FETCH_TIMEOUT = 120.0
 AGENT_NAME = "kirocrew-knowledge"
-# Knowledge extraction is deliberately high-effort by default. URL fetching uses
-# a separate pool and passes no explicit effort, so it retains provider default.
-DEFAULT_EXTRACTION_EFFORT = "high"
+# Knowledge extraction is low-effort by default (MOD-2). An operator pin in
+# knowledge.extraction_effort still wins. URL fetching uses a separate pool
+# and passes no explicit effort, so it retains the provider default.
+DEFAULT_EXTRACTION_EFFORT = "low"
 
 # Seconds the pool may sit FULLY idle (no worker checked out) before it is
 # scaled to zero — all workers shut down, freeing ~1GB of held process trees.
@@ -102,7 +103,7 @@ DEFAULT_IDLE_TTL_SECS = 300.0
 # real signal; the call count is the fallback for backends that report no context
 # telemetry at all (a 0% reading is indistinguishable from an empty transcript).
 WORKER_RECYCLE_PCT = 50.0
-WORKER_RECYCLE_CALLS = 20
+WORKER_RECYCLE_CALLS = 1
 
 
 # Sandbox modes accepted by ``kiro_crew.sandbox.wrap_argv`` (see its docstring).
@@ -258,9 +259,8 @@ def _get_workload_effort(
        default instead.
 
     The chain deliberately has NO role-policy leg: extraction effort is a
-    Knowledge policy, independent of ``agent.role_efforts.background`` (which
-    controls other background workers) — an unset key keeps the historical
-    always-``high`` behavior rather than silently following a role change.
+    Knowledge policy, independent of ``agent.role_efforts.background``. An
+    unset key uses ``DEFAULT_EXTRACTION_EFFORT`` (low), not the chat effort.
     A key present but invalid or typed-wrong also lands on *fallback* (the
     pre-config default), and logs — nothing silently changes cost.
     Pure: never raises, works on a raw (possibly hand-edited) config dict.

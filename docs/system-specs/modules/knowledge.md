@@ -21,19 +21,19 @@ pools. The extraction pool uses `knowledge.extraction_pool_size` and requests
 reasoning effort `knowledge.extraction_effort`; the URL-fetch pool has one
 worker and sends no explicit effort, so it retains the provider default. The
 extraction effort resolves through the chain in `llm_pool._get_workload_effort`:
-`knowledge.extraction_effort` → fallback (`DEFAULT_EXTRACTION_EFFORT` = `high`
-as the last resort). The chain has no role-policy leg: extraction effort is a
-Knowledge policy, independent of `agent.role_efforts.background` (which
-controls other background workers) — an unset or invalid key keeps the
-historical always-`high` behavior, so a typo cannot silently change cost.
-`""` means the default (`high`); the key is
+`knowledge.extraction_effort` → fallback (`DEFAULT_EXTRACTION_EFFORT` = `low`).
+The chain has no role-policy leg: extraction effort is a Knowledge policy,
+independent of `agent.role_efforts.background`. An unset or invalid key stays
+`low`, so a typo cannot silently raise cost. `""` means that default. The key is
 dashboard-editable (`_EDITABLE_CONFIG` enum `["", *EFFORT_LEVELS]`), with the
 controls on the Knowledge tab's settings (model, extraction effort, pool size —
 effort requires a worker restart to reach the live workers; pool size applies
 at the next idle boundary without one). Both pools drive the same
 `kirocrew-knowledge` agent and preserve the
-existing model resolution: `knowledge.extraction_model` → `agent.model` →
-provider/`auto`.
+existing model resolution: `knowledge.extraction_model` →
+`agent.resolve_model("background")` → `auto`. It does not inherit the chat
+model. Each prompt also starts a fresh worker conversation
+(`WORKER_RECYCLE_CALLS` = 1), and each call records one `knowledge` usage row.
 
 For the Kiro ACP backend, the worker applies the resolved level through the
 `/effort` command after reading the session's advertised effort levels; Claude

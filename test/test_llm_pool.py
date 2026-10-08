@@ -1623,7 +1623,7 @@ class TestLLMPoolEffortResolution:
     def test_empty_key_with_role_unset_lands_on_fallback(self):
         config = {"knowledge": {"extraction_effort": ""}, "agent": {}}
         assert (
-            _get_workload_effort(config, "extraction_effort", DEFAULT_EXTRACTION_EFFORT) == "high"
+            _get_workload_effort(config, "extraction_effort", DEFAULT_EXTRACTION_EFFORT) == "low"
         )
 
     @pytest.mark.parametrize("bad", ["ultra", 7, True, []])
@@ -1638,7 +1638,7 @@ class TestLLMPoolEffortResolution:
         assert _get_workload_effort(config, "extraction_effort", "high") == "high"
 
     def test_chain_absent_lands_on_fallback(self):
-        assert _get_workload_effort({}, "extraction_effort", DEFAULT_EXTRACTION_EFFORT) == "high"
+        assert _get_workload_effort({}, "extraction_effort", DEFAULT_EXTRACTION_EFFORT) == "low"
         assert _get_workload_effort({}, "other_key", "") is None
 
     @pytest.mark.asyncio
@@ -2307,14 +2307,17 @@ class TestWorkerConversationRecycle:
         assert worker.calls_since_reset == 0
 
     @pytest.mark.asyncio
-    async def test_no_recycle_below_threshold(self):
-        worker = _PctWorker(pct=WORKER_RECYCLE_PCT - 1)
+    async def test_every_call_starts_a_fresh_conversation(self):
+        """A knowledge prompt is self-contained. The next one must not pay
+        for this one's transcript, even when context telemetry is quiet."""
+        worker = _PctWorker(pct=0.0)
         pool = _pool_with(worker)
 
-        await pool.send("prompt")
+        for _ in range(25):
+            await pool.send("prompt")
 
-        assert worker.resets == 0
-        assert worker.calls_since_reset == 1
+        assert worker.resets == 25
+        assert worker.calls_since_reset == 0
 
     @pytest.mark.asyncio
     async def test_recycles_on_call_count_when_backend_reports_no_pct(self):

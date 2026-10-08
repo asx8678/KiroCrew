@@ -63,14 +63,13 @@ class TestKnowledgePoolSetup:
     @pytest.mark.parametrize(
         "extraction_effort,background_effort,expected_extraction",
         [
-            # Default ("" everywhere, no role pin): extraction falls to the
-            # high last resort.
-            ("", None, "high"),
+            # Default ("" everywhere, no role pin): extraction falls to low.
+            ("", None, "low"),
             # An explicit pin beats the fallback.
             ("low", "high", "low"),
-            # No explicit pin: the background-role effort does NOT apply —
-            # extraction keeps the historical high regardless of the role.
-            ("", "medium", "high"),
+            # No explicit pin: the background-role effort does NOT apply.
+            # Extraction stays on its own low default.
+            ("", "medium", "low"),
         ],
     )
     def test_setup_resolves_pool_efforts(
@@ -118,7 +117,7 @@ class TestKnowledgePoolSetup:
         extraction, fetch = pools
         assert extraction.pool_size == 3
         assert extraction.effort_key == "extraction_effort"
-        assert extraction.fallback_effort == "high"
+        assert extraction.fallback_effort == "low"
         assert extraction.config_pool_size_key == "extraction_pool_size"
         # The fetch pool takes no effort binding at all: it keeps the
         # provider/model default.
