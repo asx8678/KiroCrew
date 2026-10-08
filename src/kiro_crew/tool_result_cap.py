@@ -19,11 +19,12 @@ from module state, which keeps the MCP servers stateless.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from kiro_crew import platform_compat
 
@@ -43,6 +44,25 @@ SPILL_DIR_NAME = "mcp_spill"
 _TAIL_SHARE = 3
 
 _UNSAFE_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_\-]")
+
+
+def tool_json(obj: Any, *, sort_keys: bool = False) -> str:
+    """*obj* as the compact UTF-8 JSON a model-facing tool result carries.
+
+    The ONE serializer for JSON a tool hands the model: no indentation (it is
+    whitespace the model pays for in tokens and reads nothing from) and
+    ``ensure_ascii=False`` (a ``\\uXXXX`` escape costs six characters, and
+    several tokens, for one character of CJK or emoji). A tool that bounds its
+    result measures THIS string, so the size it budgets is the size it sends.
+
+    Not for files on disk or wire frames: those keep their own encoders. Hidden
+    characters (bidi controls, zero-width marks) that ``ensure_ascii=False`` now
+    leaves literal are stripped at egress by ``validation.build_tool_response``,
+    which every Kiro Crew MCP server frames its results through.
+    """
+    return json.dumps(
+        obj, separators=(",", ":"), ensure_ascii=False, default=str, sort_keys=sort_keys
+    )
 
 
 def safe_name_part(value: object, limit: int = 64) -> str:

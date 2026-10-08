@@ -88,6 +88,7 @@ from kiro_crew.security import (
 )
 from kiro_crew.security.readonly_bash import _EXTGLOB_RE
 from kiro_crew.sel import sel
+from kiro_crew.tool_result_cap import tool_json
 from kiro_crew.validation import (
     MAX_RESPONSE_LEN,
     MCP_CRON_SCHEMAS,
@@ -2370,10 +2371,10 @@ _JSON_HISTORY_LIMIT = 40
 #: bound bytes.
 _JSON_MAX_JOBS = 100
 
-#: Serialized characters the records may occupy. A COUNT cap does not bound size:
-#: ``json.dumps`` escapes a non-ASCII character to ``\uXXXX``, six characters for
-#: one, so 100 ordinary 400-character prompts in Chinese serialize to ~296,000
-#: characters -- several times the response ceiling. Measured, not estimated.
+#: Serialized characters the records may occupy, measured with ``tool_json`` (the
+#: compact UTF-8 encoder the payload is sent in). A COUNT cap does not bound size:
+#: 100 jobs with 400-character prompts are ~50,000 characters of prompt text alone,
+#: past the response ceiling before any other field.
 #: Crossing that ceiling matters more than losing a row, because
 #: ``build_tool_response`` cuts an over-budget result in the middle and inserts a
 #: notice OUTSIDE the JSON grammar, so the consumer gets a document that does not
@@ -2543,7 +2544,9 @@ def _render_cron_list_json(jobs: list[Any]) -> str:
         # alternative -- assemble everything and check at the end -- has no way
         # to shed a row without re-serializing, and guessing a per-record size
         # is what the count cap already got wrong.
-        cost = len(json.dumps(record, indent=2, sort_keys=True)) + 4
+        # Measured with the serializer the payload is sent in, plus the one
+        # separating comma, so the budgeted size is the sent size.
+        cost = len(tool_json(record, sort_keys=True)) + 1
         if records and used + cost > _JSON_BYTE_BUDGET:
             dropped = True
             break
@@ -2560,7 +2563,7 @@ def _render_cron_list_json(jobs: list[Any]) -> str:
     }
     if unavailable:
         payload["history_unavailable_reason"] = unavailable
-    return json.dumps(payload, indent=2, sort_keys=True)
+    return tool_json(payload, sort_keys=True)
 
 
 def _job_kind(job: Any) -> str:

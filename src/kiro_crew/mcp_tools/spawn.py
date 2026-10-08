@@ -17,7 +17,6 @@ every existing patch site.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import uuid
@@ -46,6 +45,7 @@ from kiro_crew.subagent import (
 )
 from kiro_crew.subagent_persistence import agent_dir_for_display
 from kiro_crew.subagent_wait_reasons import MEMORY_PRESSURE_PHRASE, queued_wait_text
+from kiro_crew.tool_result_cap import tool_json
 from kiro_crew.validation import (
     MAX_MEDIUM_STRING,
     MAX_SHORT_STRING,
@@ -1543,7 +1543,7 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
                     "accepted at spawn time; its state couldn't be read now; "
                     "check spawn_status before re-spawning"
                 )
-            sa_results.append(json.dumps(failure))
+            sa_results.append(tool_json(failure))
         elif not sa_st.get("done"):
             still_running += 1
             if sa_st.get("awaiting_approval"):
@@ -1570,7 +1570,7 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
                 if result_path:
                     result_text = mcp_core.summarize_result(result_text, result_path)
             sa_results.append(
-                json.dumps(
+                tool_json(
                     {
                         "agent": label,
                         "status": "completed",
@@ -1580,7 +1580,7 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
             )
     if _unsettled:
         sa_results.append(
-            json.dumps(
+            tool_json(
                 {
                     "status": "still_running",
                     "task_ids": list(_unsettled),
@@ -1601,7 +1601,7 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
     # change -- would stay in the gateway log.
     if never_started:
         sa_results.append(
-            json.dumps(
+            tool_json(
                 {
                     "status": "queued",
                     "agents": never_started,
@@ -1615,9 +1615,9 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
             )
         )
     if _resume_note:
-        sa_results.append(json.dumps(_resume_note))
+        sa_results.append(tool_json(_resume_note))
     if sa_errors:
-        sa_results.append(json.dumps({"status": "spawn_errors", "errors": sa_errors}))
+        sa_results.append(tool_json({"status": "spawn_errors", "errors": sa_errors}))
     mcp_core.sel().log_tool_invocation(
         session_key=_audit_owner(parent_session),
         source="mcp_core",

@@ -46,6 +46,7 @@ from kiro_crew.apps.builtins.mochi.pinned_files_service import (
     read_pins_for_update,
 )
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
+from kiro_crew.tool_result_cap import tool_json
 from kiro_crew.validation import ValidationError, validate_mcp_tool_arguments
 
 logger = logging.getLogger(__name__)
@@ -100,7 +101,7 @@ def _now_ms() -> int:
 
 
 def _ok(payload: Any) -> str:
-    return json.dumps(payload, indent=2)
+    return tool_json(payload)
 
 
 def _err(tool: str, exc: Exception) -> str:

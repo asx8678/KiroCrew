@@ -69,6 +69,7 @@ from urllib.parse import urlencode
 from kiro_crew.mcp_core import _get, _post, _resolve_session_key, require_strict_session_key
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.platform import redact_via_context as redact
+from kiro_crew.tool_result_cap import tool_json
 from kiro_crew.validation import (
     MAX_RESPONSE_LEN,
     MCP_WORK_SCHEMAS,
@@ -168,7 +169,7 @@ def _render(doc: Any) -> str:
     harmless (it is idempotent) and makes ``len(_render(doc))`` the delivered
     length, so the budget is measured on what egress actually emits.
     """
-    return sanitize_string(redact(json.dumps(doc, indent=2, ensure_ascii=False)))
+    return sanitize_string(redact(tool_json(doc)))
 
 
 def _created(row: dict[str, Any]) -> datetime | None:
@@ -620,7 +621,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         # Redacted on the way OUT as well as in: the brief carries the conductor's
         # own `decision` prose and this worker's last summary, and a resume reads
         # both back into context.
-        return redact(json.dumps(brief, indent=2, ensure_ascii=False))
+        return redact(tool_json(brief))
 
     if name == "work_report":
         payload = {k: v for k, v in args.items() if k in ("status", "summary", "artifacts", "pr")}

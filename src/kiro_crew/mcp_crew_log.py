@@ -81,6 +81,7 @@ from urllib.parse import quote, urlencode
 from kiro_crew.mcp_core import _get, _resolve_session_key, require_strict_session_key
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.platform import redact_via_context as redact
+from kiro_crew.tool_result_cap import tool_json
 from kiro_crew.validation import MAX_RESPONSE_LEN, MCP_CREW_LOG_SCHEMAS, validate_tool_args
 
 logger = logging.getLogger(__name__)
@@ -302,7 +303,7 @@ def _error(code: str, message: str) -> str:
     flag, ``forbidden`` means stop asking, ``unknown_unit`` means look the unit up
     again. Prose alone makes every failure look like the same dead end.
     """
-    return redact(json.dumps({"error": {"code": code, "message": message}}, indent=2))
+    return redact(tool_json({"error": {"code": code, "message": message}}))
 
 
 def _proxy_error(payload: dict[str, Any], *, fallback: str) -> str:
@@ -454,7 +455,7 @@ def _fit(envelope: dict[str, Any], rows: list[dict[str, Any]]) -> str:
             body["truncated_to_fit"] = True
             body["returned"] = len(kept)
             body["next_from"] = int(kept[-1]["seq"] or 0) + 1
-        rendered = json.dumps(body, indent=2, ensure_ascii=False)
+        rendered = tool_json(body)
         if len(rendered.encode("utf-8")) <= MAX_READ_BYTES:
             if body.get("truncated_to_fit"):
                 logger.debug("crew log page cut to fit: %d of %d rows", len(kept), len(rows))
@@ -490,7 +491,7 @@ def _one_row_within_budget(body: dict[str, Any], kept: list[dict[str, Any]]) -> 
         # an unbounded one on a shape nobody predicted.
         body["entries"] = []
         body["returned"] = 0
-        return json.dumps(body, indent=2, ensure_ascii=False)
+        return tool_json(body)
     body["returned"] = 1
     original = json.dumps(kept[0].get("data"), ensure_ascii=False, separators=(",", ":"))
     budget = MAX_READ_BYTES
@@ -498,7 +499,7 @@ def _one_row_within_budget(body: dict[str, Any], kept: list[dict[str, Any]]) -> 
         row = dict(kept[0])
         row["data"] = {"_trimmed": f"{original[:budget]}… ({len(original)} chars)"}
         body["entries"] = [row]
-        rendered = json.dumps(body, indent=2, ensure_ascii=False)
+        rendered = tool_json(body)
         if len(rendered.encode("utf-8")) <= MAX_READ_BYTES or budget == 0:
             return rendered
         budget = budget // 2
@@ -537,7 +538,7 @@ def _list(args: dict[str, Any], caller_key: str) -> str:
         return _proxy_error(
             payload if isinstance(payload, dict) else {}, fallback="the listing could not be read"
         )
-    return redact(json.dumps(payload, indent=2, ensure_ascii=False))
+    return redact(tool_json(payload))
 
 
 def _read(args: dict[str, Any], caller_key: str) -> str:
@@ -593,7 +594,7 @@ def _projection(args: dict[str, Any], caller_key: str) -> str:
             payload if isinstance(payload, dict) else {},
             fallback=f"no {name!r} projection for {unit!r}",
         )
-    return redact(json.dumps({"unit": unit, **payload}, indent=2, ensure_ascii=False))
+    return redact(tool_json({"unit": unit, **payload}))
 
 
 def _call_tool(name: str, raw_args: dict[str, Any]) -> str:

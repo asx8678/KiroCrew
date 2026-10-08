@@ -16,7 +16,6 @@ every existing patch site.
 
 from __future__ import annotations
 
-import json
 import mimetypes
 import uuid
 from collections.abc import Callable
@@ -30,6 +29,7 @@ from kiro_crew.platform import binary_content_is_flagged
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.platform import wide_content_is_flagged
 from kiro_crew.security import BINARY_MIME_ALLOWLIST, redact_credentials, redact_exfiltration_urls
+from kiro_crew.tool_result_cap import tool_json
 from kiro_crew.validation import _SLACK_TS_RE, CHANNEL_ID_RE, CHANNEL_MAX_LEN
 
 #: ``session`` values that name a chat channel rather than a delivery mode. Each
@@ -882,7 +882,7 @@ def read_slack_profile(name: str, args: dict[str, Any]) -> str:
             val, _ = redact_exfiltration_urls(val)
             val, _ = redact_credentials(val)
             profile[key] = val
-    return json.dumps(profile, indent=2)
+    return tool_json(profile)
 
 
 def _describe_channel_skip(reason: str) -> str:

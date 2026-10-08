@@ -2757,6 +2757,16 @@ parseable JSON size themselves under the budget (`mcp_cron._JSON_BYTE_BUDGET`,
 `mcp_tools/skills._READ_CEILING`, `mcp_tools/learn._LIST_RENDER_BUDGET`), so the
 transport cut is a backstop they never reach.
 
+**Model-facing JSON is compact UTF-8.** A tool that returns JSON to the model
+serializes it with `tool_result_cap.tool_json` (no indentation, `ensure_ascii=False`,
+`default=str`): indentation is whitespace the model pays tokens for, and a
+`\uXXXX` escape costs six characters for one CJK or emoji character. A tool
+that bounds its own result measures the `tool_json` string, so the budgeted size
+is the sent size. Files on disk and wire frames keep their own encoders. The
+bidi controls and zero-width characters `ensure_ascii=False` leaves literal are
+stripped at egress by `build_tool_response`, which every Kiro Crew MCP server
+(the auto-improvement app server included) frames its results through.
+
 ### An `Error:` prose result can also be framed as an MCP error
 
 `build_tool_response` is the single exit point for every tool result. The
