@@ -2846,7 +2846,22 @@ async def _route_message(
 
         # ── Process non-audio files (images, text, opaque files, etc.) ──
         attachment_paths, text_blocks = await process_slack_files(orch, files)
-        _attachment_temp_paths = attachment_paths
+        from kiro_crew.chat_attachments import adopt_channel_file
+
+        _session_for_files = thread_ts or msg_ts
+        adopted: list[str] = []
+        for _src in attachment_paths:
+            try:
+                _kept = adopt_channel_file(_session_for_files, _src)
+            except Exception:
+                logger.debug("attachment adopt failed", exc_info=True)
+                adopted.append(_src)
+                continue
+            for _i, _block in enumerate(text_blocks):
+                text_blocks[_i] = _block.replace(_src, _kept)
+            adopted.append(_kept)
+        attachment_paths = adopted
+        _attachment_temp_paths = [p for p in adopted if ".attachments" not in p]
 
         # Image paths are inlined by ACP; opaque paths remain available to agent tools.
         if attachment_paths:

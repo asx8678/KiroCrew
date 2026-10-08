@@ -173,6 +173,27 @@ def attachments_dir(sessions_dir: Path, stem: str) -> Path:
     return sessions_dir / f"{stem}{ATTACHMENTS_DIR_SUFFIX}"
 
 
+def adopt_channel_file(session_key: str, src: str) -> str:
+    """Move a channel download into the session attachments directory.
+
+    The directory is the one :func:`stage_attachments_removal` deletes with the
+    session. The returned path replaces *src*; the source is gone.
+    """
+    from kiro_crew.history import transcript_stem
+    from kiro_crew.platform_compat import restrict_dir_to_owner
+    from kiro_crew.session_storage import _crew_sessions_dir
+
+    dest_dir = attachments_dir(_crew_sessions_dir(), transcript_stem(session_key or "channel"))
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    restrict_dir_to_owner(dest_dir)
+    name = _safe_name(Path(src).name) or "attachment"
+    dest = dest_dir / name
+    if dest.exists():
+        dest = dest_dir / f"{secrets.token_hex(4)}-{name}"
+    os.replace(src, dest)
+    return str(dest)
+
+
 @dataclass
 class ImageBudget:
     """What one MESSAGE may still spend on images, across every text it carries.

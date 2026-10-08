@@ -77,7 +77,8 @@ _LIMITS = IngestLimits(
     max_text_bytes=512 * 1024,
     max_document_bytes=20 * 1024 * 1024,
     max_opaque_bytes=50 * 1024 * 1024,
-    max_text_inject=50 * 1024,
+    max_text_inject=8 * 1024,
+    max_inline_total=48 * 1024,
 )
 
 # Re-exported names. `test_slack_files.py` asserts against these directly, so

@@ -96,8 +96,11 @@ class IngestLimits:
     max_document_bytes: int = 20 * 1024 * 1024
     max_audio_bytes: int = 25 * 1024 * 1024
     max_opaque_bytes: int = 50 * 1024 * 1024
-    #: Characters of extracted text injected into the prompt.
-    max_text_inject: int = 50 * 1024
+    #: Characters of extracted text injected into the prompt, per file.
+    #: A head+tail preview. The full file is kept by path.
+    max_text_inject: int = 8 * 1024
+    #: Characters of extracted text injected into one message, all files.
+    max_inline_total: int = 48 * 1024
     #: Per-message attachment cap. Slack had none, so a single message could
     #: trigger unbounded downloads.
     max_attachments: int = 10
@@ -285,24 +288,25 @@ async def _fetch(download: DownloadFn, url: str, suffix: str) -> str:
 
 
 def _read_text_file(path: str, limit: int) -> str:
-    """Read a text attachment and redact+truncate it (blocking; call offloaded)."""
+    """Read a text attachment and redact+preview it (blocking; call offloaded)."""
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        return _clean_text(fh.read(), limit)
+        return _preview(fh.read(), limit)
 
 
-def _truncate(content: str, limit: int) -> tuple[str, str]:
-    if len(content) > limit:
-        return content[:limit], "\n[… truncated]"
-    return content, ""
+def _preview(content: str, limit: int) -> str:
+    """Redact, then a head+tail preview of at most *limit* characters.
 
-
-def _clean_text(content: str, limit: int) -> str:
-    """Redact then truncate. Redaction runs FIRST so a secret cannot survive by
-    sitting past the truncation point."""
+    Redaction runs first so a secret cannot survive by sitting past the cut.
+    """
     content, _ = redact_exfiltration_urls(content)
     content, _ = redact_credentials(content)
-    body, tail = _truncate(content, limit)
-    return body + tail
+    if len(content) <= limit:
+        return content
+    marker = "\n[… truncated; full file kept at the path below]\n"
+    room = max(0, limit - len(marker))
+    head = room // 2
+    tail = room - head
+    return content[:head] + marker + (content[-tail:] if tail else "")
 
 
 async def ingest_attachments(
@@ -328,6 +332,7 @@ async def ingest_attachments(
     """
     lim = limits or IngestLimits()
     out = IngestResult()
+    inline_left = lim.max_inline_total
 
     # A CANCELLATION mid-batch (gateway shutdown) must not orphan the files
     # already written. ``except Exception`` inside the loop deliberately keeps one
@@ -348,10 +353,12 @@ async def ingest_attachments(
                 _audit(source, f"{source}.attachment_skip", "skipped", att.name, "no url")
                 continue
 
+            # Text and documents over the old inject cap are kept by path, not
+            # rejected. The store cap is the opaque-file cap.
             cap = {
                 IMAGE: lim.max_image_bytes,
-                TEXT: lim.max_text_bytes,
-                DOCUMENT: lim.max_document_bytes,
+                TEXT: max(lim.max_text_bytes, lim.max_opaque_bytes),
+                DOCUMENT: max(lim.max_document_bytes, lim.max_opaque_bytes),
                 AUDIO: lim.max_audio_bytes,
                 VIDEO: lim.max_opaque_bytes,
                 OTHER: lim.max_opaque_bytes,
@@ -492,8 +499,14 @@ async def ingest_attachments(
                     # this reads file CONTENT (up to max_text_bytes) on the gateway
                     # event loop. Leaving plain text inline while offloading PDF
                     # parsing would be an arbitrary split -- both are blocking reads.
-                    body = await asyncio.to_thread(_read_text_file, dest, lim.max_text_inject)
-                    out.text_blocks.append(f"[File: {att.name}]\n{body}\n[End of file]")
+                    budget = min(lim.max_text_inject, inline_left)
+                    body = await asyncio.to_thread(_read_text_file, dest, budget)
+                    inline_left = max(0, inline_left - len(body))
+                    out.file_paths.append(dest)
+                    out.text_blocks.append(
+                        f"[File: {att.name}]\nPath: {dest}\n{body}\n[End of file]"
+                    )
+                    dest = ""
                     _audit(source, f"{source}.attachment_download", "success", att.name)
 
                 else:  # DOCUMENT
@@ -523,8 +536,14 @@ async def ingest_attachments(
                             "no_text_extracted",
                         )
                         continue
-                    body = _clean_text(raw, lim.max_text_inject)
-                    out.text_blocks.append(f"[Document: {att.name}]\n{body}\n[End of document]")
+                    budget = min(lim.max_text_inject, inline_left)
+                    body = _preview(raw, budget)
+                    inline_left = max(0, inline_left - len(body))
+                    out.file_paths.append(dest)
+                    out.text_blocks.append(
+                        f"[Document: {att.name}]\nPath: {dest}\n{body}\n[End of document]"
+                    )
+                    dest = ""
                     _audit(source, f"{source}.attachment_download", "success", att.name)
             except Exception:
                 logger.exception("%s: failed to process attachment %s", source, att.name)
