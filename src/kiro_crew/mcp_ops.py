@@ -21,9 +21,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from kiro_crew import mcp_core
 from kiro_crew.mcp_core import _call_tool
 from kiro_crew.mcp_shared import run_mcp_stdio_loop
-from kiro_crew.mcp_tools import build_ops_tool_list
+from kiro_crew.mcp_tools import OPS_TOOL_NAMES, build_ops_tool_list
 
 SERVER_NAME = "kirocrew-ops"
 SERVER_VERSION = "1.0.0"
@@ -36,6 +37,9 @@ def _list_tools() -> list[dict[str, Any]]:
 
 def run_mcp_server() -> None:
     """Run the MCP stdio server -- reads JSON-RPC from stdin, writes to stdout."""
+    # Before the loop, so no call is served while this process still answers as
+    # the default core: only the opt-in set is runnable here (see mcp_core).
+    mcp_core._SERVED_TOOL_NAMES = OPS_TOOL_NAMES
     run_mcp_stdio_loop(
         SERVER_NAME,
         SERVER_VERSION,
