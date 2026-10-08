@@ -1030,7 +1030,11 @@ Three tiers, each where it fits:
    performance authoring retain completed edits for the deterministic gate.
    Per-role provider-reported USD totals feed the existing combined run budget.
    Kiro credit usage is not converted to dollars; the USD cap does not bound
-   credit spend. Cycle, time and tool-call limits still apply. The deterministic
+   credit spend. `BudgetCaps.max_credits` (USE-3; 0 = off) bounds it: each
+   streamed turn's reported credits are summed in `SessionAgentRunner`, and the
+   driver stops once they pass the cap. When the runner's USD and credit meters are
+   both still zero after five cycles, the driver logs a warning, since neither cap
+   can trip. Cycle, time and tool-call limits still apply. The deterministic
    gate, ruler, keeper and publication policy retain their authority.
    Only the two named memory tools (`memory_recall`, `learn_add`) supplement a
    stage's existing tool allowlist, and only with trusted MCP identity; an empty

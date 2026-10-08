@@ -1253,6 +1253,9 @@ class SessionAgentRunner:
         self.default_timeout_s = default_timeout_s
         self._cost_lock = threading.Lock()
         self._total_cost_usd = 0.0
+        # USE-3: a backend that bills credits (kiro) reports no USD; its spend is
+        # summed here so a credits cap can trip on it.
+        self._total_credits = 0.0
         self._stop_check = stop_check
         self._on_activity = on_activity if callable(on_activity) else None
         # The Kiro Crew provider factory (``cfg.create_provider_factory()``). Injectable for
@@ -1263,6 +1266,10 @@ class SessionAgentRunner:
     def total_cost_usd(self) -> float:
         with self._cost_lock:
             return self._total_cost_usd
+
+    def total_credits(self) -> float:
+        with self._cost_lock:
+            return self._total_credits
 
     @staticmethod
     def available() -> bool:
@@ -1460,6 +1467,7 @@ class SessionAgentRunner:
         session_key = session_key or f"auto-improvement-{digest}"
         owns_provider = provider is None
         cost = 0.0
+        credits = 0.0
         cost_accounted = False
         try:
             if owns_provider:
@@ -1514,6 +1522,7 @@ class SessionAgentRunner:
                 nonlocal cost_accounted
                 with self._cost_lock:
                     self._total_cost_usd += cost
+                    self._total_credits += credits
                 cost_accounted = True
                 return AgentResult(
                     ok=ok,
@@ -1546,6 +1555,10 @@ class SessionAgentRunner:
                 )
                 if reported_cost:
                     cost = float(reported_cost) or cost
+                # USE-3: the same last-report-wins read for the backend's credits.
+                reported_credits = getattr(getattr(ev, "usage", None), "credits", 0.0)
+                if reported_credits:
+                    credits = float(reported_credits) or credits
                 if kind == EVENT_PERMISSION_REQUEST:
                     # AUTO-APPROVE EVERY tool/MCP the provider asks for — never block on a
                     # permission prompt (the subagent runs unattended; a blocked tool would
@@ -1717,6 +1730,7 @@ class SessionAgentRunner:
             if not cost_accounted:
                 with self._cost_lock:
                     self._total_cost_usd += cost
+                    self._total_credits += credits
             if provider is not None and owns_provider:
                 try:
                     await provider.shutdown()
