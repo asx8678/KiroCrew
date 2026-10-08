@@ -1869,6 +1869,11 @@ loop runs with nobody at the keyboard and must not block on an approval no one i
 there to give. An operator who wants folder tools without session control names the
 folder tools individually.
 
+A dashboard paste over 32 KB does not enter the prompt whole. `POST /api/chat`
+stores it in the session attachments directory and sends a path marker plus a
+preview of at most 4 KB (`chat_attachments.spill_large_paste`). The file is
+removed with the session.
+
 The chat routes check the switch for a script cron as well. While it is off, the
 gateway refuses a caller that presents a `cron:` session key on
 `POST /api/chat/slots`, `POST /api/chat` and `POST /api/chat/mode` with
