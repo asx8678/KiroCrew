@@ -2617,7 +2617,7 @@ unexplained session reset reads as a crash. Pinned by
 | `website/src/pages/settings/ComputerUsePanel.tsx` | Settings → Computer Use |
 | `website/src/components/ComputerUseLiveView.tsx` | The floating live view (PiP) panel |
 | `website/src/hooks/useComputerUseFrame.ts` | Frame-stream subscription + session-title lookup |
-| `src/kiro_crew/builtin_skills/computer-use/SKILL.md` | The agent-facing workflow. **Bundled**, not in the top-level `skills/` dir: `config/prompt.md` tells the model to read it by name, so per AGENTS.md it is load-bearing and must reach every pip/DMG install |
+| `src/kiro_crew/builtin_skills/computer-use/SKILL.md` | The agent-facing workflow. **Bundled**, not in the top-level `skills/` dir: `config/prompt.md` tells the model to read it by name (its opening and "The loop" before the first call, "Reading the refusals correctly" on a refusal), so per AGENTS.md it is load-bearing and must reach every pip/DMG install |
 
 Cross-references: [governance.md](governance.md) for why computer use is
 deliberately NOT governed; [security.md](security.md) for the keystone leaf and the
