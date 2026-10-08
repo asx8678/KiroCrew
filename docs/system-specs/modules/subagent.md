@@ -2259,9 +2259,19 @@ per-sub-agent completion note. Dashboard chat only.
   drain) keeps the count. A `held` or `unknown` answer, as for a user message
   drained while a child is still out, leaves the count alone, so that batch
   keeps its synthesis.
-- **Per-result turns kept** — each completion is still processed in its own turn
-  (no raw buffering) to avoid a context-window blowup; the synthesis works over
-  the already-condensed per-result turns.
+- **Turn-per-completion retired (EVT-1)** — consecutive queued completions
+  of the same kind now drain as ONE parent turn (a same-kind run folded by
+  `_dequeue_next_message`/`_dequeue_next_system_message`, bounded at
+  `MERGED_INJECTION_MAX_CHARS`, 60k — the digest's own body budget), and an
+  IDLE parent whose wave still has members out parks a completion for a
+  5 s settle window (`_arm_injection_settle_window`) so siblings finishing
+  seconds apart share that one turn. Different kinds still drain separately,
+  a held user entry still breaks a run, and each entry's delivery debt settles
+  through the merged turn; a pre-consumption retry re-queues the ORIGINAL
+  entries, never the merged string. A merged drain counts ONE completion turn
+  for the synthesis fire gate, so a whole batch that reached the slot in a
+  single turn drops its synthesis (`_drop_single_turn_synthesis`). The
+  synthesis then works over the already-condensed merged turns.
 - **Delivery-race guard** — `_subagent_deliveries_inflight` is incremented in
   `_subagent_done` from entry until the completion is queued/launched
   (try/finally). Because a concurrently-finishing sibling holds this count while

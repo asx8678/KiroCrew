@@ -7,8 +7,9 @@ composes is fragile: a reword can silently break rendering with no failing test.
 
 The gateway now stamps those facts as a structured dict on the injected row's
 ``meta[SUBAGENT_COMPLETION_META_KEY]``. These tests pin the helper shapes and
-prove the queue-drain path carries the meta onto the row (and does not invent it
-for a plain user message or a merged turn).
+prove the queue-drain path carries the meta onto the row — as a dict on a
+single completion, as a LIST when several completions drain merged (EVT-1) —
+and does not invent it for a plain user message.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from chat_test_helpers import _make_state
 
 from kiro_crew.constants import SUBAGENT_COMPLETION_META_KEY
 from kiro_crew.dashboard.chat_runner import _start_next_queued_turn
+from kiro_crew.dashboard.chat_utils import SUBAGENT_COMPLETION_KIND
 from kiro_crew.dashboard.state import (
     SUBAGENT_BATCH_COMPLETION_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
@@ -190,18 +192,91 @@ class TestDrainStampsMetaOntoRow:
         assert SUBAGENT_COMPLETION_META_KEY not in meta
 
     @pytest.mark.asyncio
-    async def test_meta_is_dropped_when_a_completion_is_merged(self, tmp_path) -> None:
-        """Per-entry facts are meaningless once several entries merge under one
-        synthetic header, so meta is only attached to a single un-merged system
-        injection. Subagent completions never merge in practice (they break a
-        user-message merge and drain one at a time); this guards the invariant
-        directly by staging a completion carrying meta behind a user message and
-        confirming the drained (user) row is unstamped."""
+    async def test_a_merged_completion_drain_carries_each_meta_as_a_list(self, tmp_path) -> None:
+        """EVT-1: several completions drain as ONE turn now, and the row carries
+        each member's structured facts as a LIST under the one key — a plain
+        last-writer-wins merge would silently keep only the final member's
+        dict. The frontend reads the dict shape on single rows and degrades to
+        the prose parse on anything else, so the list is safe to stamp."""
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("meta-merged")
+        for i in (1, 2, 3):
+            slot.queue_append(
+                f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `a{i}` (kirocrew) completed ✅\n"
+                f"Task: thing {i}\n\ndone {i}",
+                kind=SUBAGENT_COMPLETION_KIND,
+                meta={
+                    SUBAGENT_COMPLETION_META_KEY: single_completion_meta(
+                        agent_id=f"a{i}", outcome=OUTCOME_OK
+                    )
+                },
+            )
+        with patch("kiro_crew.dashboard.chat_runner.spawn_guarded_turn", side_effect=_swallow_turn):
+            await _start_next_queued_turn(state, slot)
+
+        row = [m for m in slot.messages if m["role"] == "subagent"][0]
+        stamped = row["meta"][SUBAGENT_COMPLETION_META_KEY]
+        assert isinstance(stamped, list) and len(stamped) == 3
+        assert [m["agentId"] for m in stamped] == ["a1", "a2", "a3"]
+
+    @pytest.mark.asyncio
+    async def test_five_completions_drain_as_one_turn_and_settle_all_five_debts(
+        self, tmp_path
+    ) -> None:
+        """EVT-1's done-when: 5 queued SUBAGENT_COMPLETION_KIND entries drain as
+        ONE _run_chat carrying all 5 announces, every member's delivery debt
+        settles through that single turn, and the drain counts ONE completion
+        turn for the synthesis fire gate."""
+        from kiro_crew.subagent import SubagentDelivery
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("meta-five")
+        announces = []
+        for i in range(1, 6):
+            announce = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `m{i}` completed ✅\nresult {i}"
+            announces.append(announce)
+            slot.queue_append(
+                announce,
+                kind=SUBAGENT_COMPLETION_KIND,
+                meta={
+                    SUBAGENT_COMPLETION_META_KEY: single_completion_meta(
+                        agent_id=f"m{i}", outcome=OUTCOME_OK
+                    )
+                },
+            )
+            slot.note_pending_subagent_delivery(announce, [SubagentDelivery(f"m{i}", 1.0, 0.1)])
+
+        started: list = []
+        settles: list = []
+
+        def _record_turn(_state, _slot, coro):
+            started.append(coro)
+            coro.close()
+            return MagicMock()
+
+        with (
+            patch("kiro_crew.dashboard.chat_runner.spawn_guarded_turn", side_effect=_record_turn),
+            patch(
+                "kiro_crew.dashboard.chat_runner._arm_queued_delivery_settlement",
+                side_effect=lambda *a, **k: settles.append(a[3]),
+            ),
+        ):
+            assert await _start_next_queued_turn(state, slot) is True
+
+        assert len(started) == 1, "5 completions must dispatch ONE turn"
+        row = [m for m in slot.messages if m["role"] == "subagent"][0]
+        for announce in announces:
+            assert announce in row["content"], "the merged turn must carry every announce"
+        assert sorted(settles[0]) == sorted(announces), "every debt must settle"
+        assert slot._synthesis_completion_turns == 1, "a merged drain counts once"
+
+    @pytest.mark.asyncio
+    async def test_meta_stays_off_a_user_row_drained_ahead_of_a_completion(self, tmp_path) -> None:
+        """A user message drains first (a completion never merges with it), so
+        the first drained row is the user's and must carry no completion meta
+        even though a completion with meta sits behind it in the queue."""
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot("meta-merge")
-        # A user message drains first (a completion never merges with it), so the
-        # first drained row is the user's and must carry no completion meta even
-        # though a completion with meta sits behind it in the queue.
         slot.queue_append("do a thing")
         slot.queue_append(
             SINGLE,

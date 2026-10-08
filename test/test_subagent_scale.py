@@ -2939,3 +2939,70 @@ class TestDigestSuccessLine:
 
         line = _digest_success_line("a-3", "t", "", "u", "", partial=True, final_segment="")
         assert "(partial: backend failed to generate the final response)" in line
+
+
+class TestInjectionSettleWindow:
+    """EVT-1: an idle parent whose wave still has members out parks a
+    completion for a short settle window, so near-simultaneous siblings share
+    one turn instead of a full-context request each."""
+
+    @pytest.mark.asyncio
+    async def test_rearming_while_a_window_is_open_is_a_noop(self) -> None:
+        from kiro_crew.slack.gateway import _arm_injection_settle_window
+
+        slot = MagicMock()
+        slot.key = "dashboard:main"
+        timers: dict = {}
+        loop = asyncio.get_running_loop()
+        with patch.object(loop, "call_later") as cl:
+            _arm_injection_settle_window(MagicMock(), timers, slot)
+            _arm_injection_settle_window(MagicMock(), timers, slot)
+        assert cl.call_count == 1, "a second sibling must join the armed window, not arm another"
+        assert "dashboard:main" in timers
+
+    @pytest.mark.asyncio
+    async def test_a_busy_slot_at_expiry_leaves_the_queue_to_the_running_turn(self) -> None:
+        from kiro_crew.slack.gateway import _arm_injection_settle_window
+
+        slot = MagicMock()
+        slot.key = "dashboard:main"
+        slot.task = object()  # a turn is running at expiry
+        timers: dict = {}
+        state = MagicMock()
+        state._background_tasks = set()
+        loop = asyncio.get_running_loop()
+        with patch.object(loop, "call_later") as cl:
+            _arm_injection_settle_window(state, timers, slot)
+            _delay, _fire = cl.call_args.args
+        with patch(
+            "kiro_crew.slack.gateway._start_next_queued_turn", new_callable=AsyncMock
+        ) as drain:
+            _fire()
+        drain.assert_not_awaited(), "a busy slot's queue drains at the running turn's end"
+        assert "dashboard:main" not in timers, "the window closed"
+
+    @pytest.mark.asyncio
+    async def test_expiry_drains_the_parked_queue(self) -> None:
+        from kiro_crew.slack.gateway import _arm_injection_settle_window
+
+        slot = MagicMock()
+        slot.key = "dashboard:main"
+        slot.task = None  # idle at expiry
+        timers: dict = {}
+        state = MagicMock()
+        state._background_tasks = set()
+        loop = asyncio.get_running_loop()
+        with patch.object(loop, "call_later") as cl:
+            _arm_injection_settle_window(state, timers, slot)
+            _delay, _fire = cl.call_args.args
+            assert _delay > 0
+        with patch(
+            "kiro_crew.slack.gateway._start_next_queued_turn", new_callable=AsyncMock
+        ) as drain:
+            _fire()
+            # The drain rides a task on the state's background set; await it
+            # directly so the assertion needs no clock.
+            task = next(iter(state._background_tasks))
+            await task
+        drain.assert_awaited_once_with(state, slot)
+        assert "dashboard:main" not in timers, "the window closed"

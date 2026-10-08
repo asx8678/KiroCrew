@@ -1851,8 +1851,10 @@ SUBAGENT_COMPLETION_PREFIXES = (
     SUBAGENT_BATCH_COMPLETION_PREFIX,
 )
 # One-shot synthesis turn fired after ALL sub-agents in a fan-out complete and
-# each result has been processed in its own turn (see gateway._subagent_done arm
-# + chat_runner drain/idle branch). Its visible reply is the consolidated,
+# every completion turn has run (see gateway._subagent_done arm + chat_runner
+# drain/idle branch). Consecutive completions drain as ONE merged turn (EVT-1)
+# and count once, so this fires only over what the parent has not already
+# seen. Its visible reply is the consolidated,
 # user-facing summary. Rendered as an "inject" message (not a user bubble); the
 # prefix marks it as a synthetic continuation so it is NOT mirrored to linked
 # surfaces (Slack/Telegram) as though the user typed it.

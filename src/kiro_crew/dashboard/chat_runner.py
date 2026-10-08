@@ -102,6 +102,7 @@ from kiro_crew.config.sections import ResolvedBindings
 from kiro_crew.connections import get_visible_providers  # noqa: F401
 from kiro_crew.constants import (
     STEER_NOTICE_BOUND_SECS,
+    SUBAGENT_COMPLETION_META_KEY,
     reflow_and_label_glued_option_marker,
     strip_control_comments,
 )
@@ -6926,9 +6927,16 @@ async def _start_next_queued_turn(
     # idle-slot twin writes an `inject` row with `injectKind: mcp_app`. The
     # enqueue-time kind is the unforgeable source (a user typing the banner
     # text has no kind tag and still correctly drains as user speech). An app
-    # message never merges (it is a system-injection kind, so the merge stops
-    # at it), so `consumed` holds it alone.
+    # message drains ALONE unless another app message is queued right behind
+    # it (EVT-1 folds only same-kind runs); mixed kinds never fold.
     is_app_message = any(item.get("kind") == MCP_APP_MESSAGE_KIND for item in consumed)
+    if any(item.get("kind") == SUBAGENT_COMPLETION_KIND for item in consumed):
+        # EVT-1: a merged system drain is ONE completion turn for the synthesis
+        # fire gate, however many completions it folded. The gateway's queued
+        # branch no longer counts per completion, so the count tracks TURNS —
+        # and `_drop_single_turn_synthesis` can now see a whole batch that
+        # reached the slot in a single turn.
+        slot._synthesis_completion_turns += 1
     if not (is_cron or is_subagent or is_recovery or is_app_message):
         # A user message after the last completion takes over from the armed
         # synthesis and ends its batch, so its count starts over. Only the
@@ -7031,10 +7039,10 @@ async def _start_next_queued_turn(
     # no row for its delivery and append a duplicate. The row stands for all of
     # them, so it has to name all of them.
     #
-    # Accumulating generally does not undo the narrow rule above: per-entry
-    # subagent facts would be meaningless on a merged row, but a subagent
-    # completion never merges (it drains alone and breaks any user-message
-    # merge), so a merged row cannot carry them in the first place.
+    # EVT-1 changed the last clause: completions DO merge now (a same-kind
+    # queue run drains as one turn), so a merged row CAN carry per-entry facts.
+    # They ride as a LIST under the one key — the plain update above is
+    # last-writer-wins and would silently drop every member but the last.
     _drained_ids: list[str] = []
     # Client send-correlation ids accumulate for the same reason: a merged row
     # stands for every queued send folded into it, and a sender proving its own
@@ -7080,6 +7088,18 @@ async def _start_next_queued_turn(
             _drained_meta.update(
                 (k, v) for k, v in _item_meta.items() if k != QUEUED_CONTAINMENT_META_KEY
             )
+    # EVT-1: per-entry completion facts ride as a LIST when the drain folded
+    # several completions (see the comment above _drained_ids). The frontend
+    # reads the dict shape on single rows and degrades to the prose parse when
+    # the value is not one, so the list is safe to stamp today and the card
+    # renderer can adopt the list without a backend change.
+    _completion_facts = [
+        facts
+        for item in consumed
+        if isinstance(facts := (item.get("meta") or {}).get(SUBAGENT_COMPLETION_META_KEY), dict)
+    ]
+    if len(_completion_facts) > 1:
+        _drained_meta[SUBAGENT_COMPLETION_META_KEY] = _completion_facts
     # Model input only: the row keeps the user's text as typed.
     _possibly_delivered_steer = bool(_drained_meta.pop(STEER_POSSIBLY_DELIVERED_META, False))
     # Queue plumbing like the steer mark above, read the way the channel origin is:
@@ -7233,6 +7253,21 @@ async def _start_next_queued_turn(
     # whoever could write the session file.
     if any(item.get(RESTORED_QUEUE_KEY) for item in consumed):
         _run_kwargs["_turn_provenance_restored"] = True
+    # EVT-1: a merged system drain re-queues its ORIGINAL entries on a
+    # pre-consumption retry — the merged string settles no content-keyed
+    # delivery debt, so re-queuing it would strand every member's
+    # delivered-tombstone. Only a merged drain (len(consumed) > 1) carries
+    # parts; every other turn stays on the plain verbatim requeue.
+    if len(consumed) > 1:
+        _run_kwargs["_merged_delivery_parts"] = [
+            {
+                "content": item["content"],
+                "kind": item.get("kind") or "",
+                "meta": dict(item.get("meta") or {}),
+            }
+            for item in consumed
+            if item.get("kind") in SUBAGENT_DELIVERY_KINDS
+        ]
     if _settleable or _delivery_callbacks:
         _run_kwargs["_on_consumed"] = _note_consumed
     if _irreversible_delivery_callbacks:
@@ -8126,6 +8161,11 @@ async def _run_chat(
     message: str,
     *,
     _prompt_depth: int = 0,
+    # EVT-1: the ORIGINAL queue entries a merged system drain folded, so a
+    # pre-consumption retry re-queues THEM (per-entry, debt-claimable) instead
+    # of the merged string, which matches no content-keyed delivery debt.
+    # Empty (the default) for every unmerged turn.
+    _merged_delivery_parts: "list[dict] | None" = None,
     # Attachment identifiers of the message this turn runs -- `meta.files` and
     # `meta.dirs`, the same lists the renderer resolves `[attached_file N]` markers
     # against. Passed by the two sites that OBSERVED them (the accepting handler and
@@ -8964,6 +9004,11 @@ async def _run_chat(
                 except Exception:
                     logger.debug("consumption report failed for slot %s", slot.key, exc_info=True)
 
+    # EVT-1: the merged drain's ORIGINAL entries (see the parameter's comment).
+    # Materialized once, before the recovery helper below, so every retry site
+    # shares one decision.
+    merged_parts = list(_merged_delivery_parts or [])
+
     def _queue_recovery(
         index: int,
         content: str,
@@ -8984,6 +9029,31 @@ async def _run_chat(
         """
         # circular import: session_control imports this package's modules at module level.
         from kiro_crew.dashboard.session_control import containment_meta
+
+        if merged_parts and content == message:
+            # EVT-1: this retry re-queues a MERGED system drain before the
+            # model consumed it. The merged string matches no content-keyed
+            # delivery debt, so re-queueing it would strand every member's
+            # delivered-tombstone; re-queue the ORIGINAL entries instead —
+            # same contents and metas, under the recovery kind a single
+            # failed completion already uses — each with a fresh admission
+            # stamp, exactly as if each had failed its own turn.
+            _last_qid = ""
+            for _part in merged_parts:
+                _part_meta = {
+                    **containment_meta(state, slot),
+                    **(dict(_part.get("meta") or {})),
+                }
+                if _commands_off:
+                    _part_meta[COMMANDS_OFF_META_KEY] = True
+                _last_qid = slot.queue_insert(
+                    index,
+                    str(_part.get("content") or ""),
+                    kind=SYNTHETIC_RECOVERY_KIND,
+                    payload=payload,
+                    meta=_part_meta,
+                )
+            return _last_qid
 
         _recovery_meta = {
             **containment_meta(state, slot),

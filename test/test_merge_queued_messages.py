@@ -31,13 +31,19 @@ class TestDequeueNextMessage:
     def test_merge_two_plus_messages_when_enabled(self):
         """When enabled and 2+ messages queued, they are joined with \\n\\n."""
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": "fix the bug"}, {"id": "b", "content": "also add tests"}, {"id": "c", "content": "use junit5"}]
+        slot._queue = [
+            {"id": "a", "content": "fix the bug"},
+            {"id": "b", "content": "also add tests"},
+            {"id": "c", "content": "use junit5"},
+        ]
         for item in list(slot._queue):
             slot.append("queued", item["content"], "msg msg-queued")
 
         next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
 
-        assert next_msg == "[3 queued messages merged]\n\nfix the bug\n\nalso add tests\n\nuse junit5"
+        assert (
+            next_msg == "[3 queued messages merged]\n\nfix the bug\n\nalso add tests\n\nuse junit5"
+        )
         assert [c["content"] for c in consumed] == ["fix the bug", "also add tests", "use junit5"]
         assert len(slot._queue) == 0
 
@@ -90,9 +96,7 @@ class TestDequeueNextMessage:
             build_refusal_recovery_prompt,
         )
 
-        body = build_refusal_recovery_prompt(
-            [("write /tmp/x", "not on read-only allowlist")]
-        )
+        body = build_refusal_recovery_prompt([("write /tmp/x", "not on read-only allowlist")])
         injection = f"{REFUSAL_RECOVERY_PREFIX}\n{body}"
 
         slot = _ChatSlot("s1")
@@ -120,7 +124,11 @@ class TestDequeueNextMessage:
     def test_multiple_messages_fifo_when_disabled(self):
         """When disabled, only first message is popped (original FIFO)."""
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": "first"}, {"id": "b", "content": "second"}, {"id": "c", "content": "third"}]
+        slot._queue = [
+            {"id": "a", "content": "first"},
+            {"id": "b", "content": "second"},
+            {"id": "c", "content": "third"},
+        ]
         for item in slot._queue:
             slot.append("queued", item["content"], "msg msg-queued")
 
@@ -146,7 +154,11 @@ class TestDequeueNextMessage:
         """Cron-prefixed messages are never merged — popped individually."""
         cron_msg = f"{CRON_NOTIFY_PREFIX}daily-check]: run report"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": "user msg"}, {"id": "b", "content": cron_msg, "kind": CRON_NOTIFICATION_KIND}, {"id": "c", "content": "another user msg"}]
+        slot._queue = [
+            {"id": "a", "content": "user msg"},
+            {"id": "b", "content": cron_msg, "kind": CRON_NOTIFICATION_KIND},
+            {"id": "c", "content": "another user msg"},
+        ]
         for item in slot._queue:
             slot.append("queued", item["content"], "msg msg-queued")
 
@@ -161,7 +173,12 @@ class TestDequeueNextMessage:
         """Multiple user messages before a cron are merged; cron and later messages stay."""
         cron_msg = f"{CRON_NOTIFY_PREFIX}daily]: run report"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": "msg1"}, {"id": "b", "content": "msg2"}, {"id": "c", "content": cron_msg, "kind": CRON_NOTIFICATION_KIND}, {"id": "d", "content": "msg3"}]
+        slot._queue = [
+            {"id": "a", "content": "msg1"},
+            {"id": "b", "content": "msg2"},
+            {"id": "c", "content": cron_msg, "kind": CRON_NOTIFICATION_KIND},
+            {"id": "d", "content": "msg3"},
+        ]
         for item in slot._queue:
             slot.append("queued", item["content"], "msg msg-queued")
 
@@ -175,7 +192,10 @@ class TestDequeueNextMessage:
         """If cron message is first, it pops as single (no merge)."""
         cron_msg = f"{CRON_NOTIFY_PREFIX}hourly]: check status"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": cron_msg, "kind": CRON_NOTIFICATION_KIND}, {"id": "b", "content": "user follow-up"}]
+        slot._queue = [
+            {"id": "a", "content": cron_msg, "kind": CRON_NOTIFICATION_KIND},
+            {"id": "b", "content": "user follow-up"},
+        ]
         for item in slot._queue:
             slot.append("queued", item["content"], "msg msg-queued")
 
@@ -189,7 +209,10 @@ class TestDequeueNextMessage:
         """Subagent completions are never merged — popped individually like crons."""
         subagent_msg = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `abc123` completed ✅\nResult text"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": "user msg"}, {"id": "b", "content": subagent_msg, "kind": SUBAGENT_COMPLETION_KIND}]
+        slot._queue = [
+            {"id": "a", "content": "user msg"},
+            {"id": "b", "content": subagent_msg, "kind": SUBAGENT_COMPLETION_KIND},
+        ]
         for item in slot._queue:
             slot.append("queued", item["content"], "msg msg-queued")
 
@@ -203,7 +226,10 @@ class TestDequeueNextMessage:
         """If subagent completion is first, it pops as single (no merge)."""
         subagent_msg = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `xyz` completed ✅\nDone"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": subagent_msg, "kind": SUBAGENT_COMPLETION_KIND}, {"id": "b", "content": "user follow-up"}]
+        slot._queue = [
+            {"id": "a", "content": subagent_msg, "kind": SUBAGENT_COMPLETION_KIND},
+            {"id": "b", "content": "user follow-up"},
+        ]
         for item in slot._queue:
             slot.append("queued", item["content"], "msg msg-queued")
 
@@ -213,24 +239,108 @@ class TestDequeueNextMessage:
         assert [c["content"] for c in consumed] == [subagent_msg]
         assert [q["content"] for q in slot._queue] == ["user follow-up"]
 
-    def test_multiple_subagent_completions_not_merged(self):
-        """Multiple subagent completions in queue are each popped individually."""
+    def test_consecutive_subagent_completions_merge_into_one_drain(self):
+        """EVT-1: each queued completion was its own full-context parent turn;
+        consecutive same-kind entries now drain as ONE turn (no synthetic
+        header — the first announce's structural prefix still leads, so the
+        row keeps classifying by it)."""
         sa1 = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `a1` completed ✅\nResult 1"
         sa2 = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `a2` completed ✅\nResult 2"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": sa1, "kind": SUBAGENT_COMPLETION_KIND}, {"id": "b", "content": sa2, "kind": SUBAGENT_COMPLETION_KIND}]
+        slot._queue = [
+            {"id": "a", "content": sa1, "kind": SUBAGENT_COMPLETION_KIND},
+            {"id": "b", "content": sa2, "kind": SUBAGENT_COMPLETION_KIND},
+        ]
         for item in slot._queue:
             slot.append("queued", item["content"], "msg msg-queued")
 
-        # First pop: sa1
         next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
-        assert next_msg == sa1
-        assert [q["content"] for q in slot._queue] == [sa2]
 
-        # Second pop: sa2
-        next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
-        assert next_msg == sa2
+        assert next_msg == f"{sa1}\n\n{sa2}"
+        assert [c["content"] for c in consumed] == [sa1, sa2]
         assert len(slot._queue) == 0
+
+    def test_a_different_system_kind_breaks_the_merge_run(self):
+        """Only SAME-kind runs fold: a cron notice behind a completion drains on
+        its own turn, not inside the completion's."""
+        sa = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `a1` completed ✅\nResult 1"
+        cron = f"{CRON_NOTIFY_PREFIX} job nightly: ok"
+        slot = _ChatSlot("s1")
+        slot._queue = [
+            {"id": "a", "content": sa, "kind": SUBAGENT_COMPLETION_KIND},
+            {"id": "b", "content": cron, "kind": CRON_NOTIFICATION_KIND},
+        ]
+        for item in slot._queue:
+            slot.append("queued", item["content"], "msg msg-queued")
+
+        next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
+
+        assert [c["content"] for c in consumed] == [sa]
+        assert next_msg == sa
+        assert [q["content"] for q in slot._queue] == [cron]
+
+    def test_a_user_message_breaks_the_merge_run(self):
+        """A held user entry between two completions keeps them on separate
+        turns — order is preserved and nothing drains past the user."""
+        sa1 = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `a1` completed ✅\nR1"
+        sa2 = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `a2` completed ✅\nR2"
+        slot = _ChatSlot("s1")
+        slot._queue = [
+            {"id": "a", "content": sa1, "kind": SUBAGENT_COMPLETION_KIND},
+            {"id": "b", "content": "user follow-up"},
+            {"id": "c", "content": sa2, "kind": SUBAGENT_COMPLETION_KIND},
+        ]
+        for item in slot._queue:
+            slot.append("queued", item["content"], "msg msg-queued")
+
+        next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
+
+        assert [c["content"] for c in consumed] == [sa1]
+        assert [q["content"] for q in slot._queue] == ["user follow-up", sa2]
+
+    def test_the_system_drain_merges_past_held_user_entries(self):
+        """The hold_users path (subagents running) drains the same-kind RUN:
+        completions on either side of nothing still fold, while the held user
+        entries stay queued."""
+        from kiro_crew.dashboard.chat_utils import _dequeue_next_system_message
+
+        sa1 = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `a1` completed ✅\nR1"
+        sa2 = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `a2` completed ✅\nR2"
+        slot = _ChatSlot("s1")
+        slot._queue = [
+            {"id": "u", "content": "held user text"},
+            {"id": "a", "content": sa1, "kind": SUBAGENT_COMPLETION_KIND},
+            {"id": "b", "content": sa2, "kind": SUBAGENT_COMPLETION_KIND},
+        ]
+        for item in slot._queue:
+            slot.append("queued", item["content"], "msg msg-queued")
+
+        next_msg, consumed = _dequeue_next_system_message(slot)
+
+        assert next_msg == f"{sa1}\n\n{sa2}"
+        assert [c["content"] for c in consumed] == [sa1, sa2]
+        assert [q["content"] for q in slot._queue] == ["held user text"]
+
+    def test_the_merge_respects_the_body_budget(self, monkeypatch):
+        """The fold stops at MERGED_INJECTION_MAX_CHARS; the entries beyond it
+        stay queued for the next turn instead of flooding one prompt."""
+        from kiro_crew.dashboard import chat_utils
+
+        sa1 = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `a1` completed ✅\nR1"
+        sa2 = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `a2` completed ✅\nR2"
+        slot = _ChatSlot("s1")
+        slot._queue = [
+            {"id": "a", "content": sa1, "kind": SUBAGENT_COMPLETION_KIND},
+            {"id": "b", "content": sa2, "kind": SUBAGENT_COMPLETION_KIND},
+        ]
+        for item in slot._queue:
+            slot.append("queued", item["content"], "msg msg-queued")
+
+        monkeypatch.setattr(chat_utils, "MERGED_INJECTION_MAX_CHARS", len(sa1) + 1)
+        next_msg, consumed = _dequeue_next_message(slot, merge_enabled=True)
+
+        assert [c["content"] for c in consumed] == [sa1]
+        assert [q["content"] for q in slot._queue] == [sa2]
 
 
 # ── API tests: /api/dashboard/config ──
@@ -263,9 +373,7 @@ class TestDashboardConfigMergeQueued:
     @pytest.mark.asyncio
     async def test_get_includes_merge_queued_messages(self, tmp_path, monkeypatch):
         """GET /api/dashboard/config returns merge_queued_messages field."""
-        monkeypatch.setattr(
-            "kiro_crew.config.loader.config_path", lambda: tmp_path / "config.json"
-        )
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: tmp_path / "config.json")
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         with patch("kiro_crew.sel.sel") as mock_sel:
             mock_sel.return_value = MagicMock()
@@ -281,9 +389,7 @@ class TestDashboardConfigMergeQueued:
     async def test_put_persists_merge_queued_messages(self, tmp_path, monkeypatch):
         """PUT merge_queued_messages=true persists to config.json."""
         cfg_file = tmp_path / "config.json"
-        monkeypatch.setattr(
-            "kiro_crew.config.loader.config_path", lambda: cfg_file
-        )
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: cfg_file)
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         with patch("kiro_crew.sel.sel") as mock_sel:
             mock_sel.return_value = MagicMock()
@@ -308,9 +414,7 @@ class TestDashboardConfigMergeQueued:
     @pytest.mark.asyncio
     async def test_put_rejects_non_dict_body(self, tmp_path, monkeypatch):
         """PUT with a non-object JSON body returns 400."""
-        monkeypatch.setattr(
-            "kiro_crew.config.loader.config_path", lambda: tmp_path / "config.json"
-        )
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: tmp_path / "config.json")
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         with patch("kiro_crew.sel.sel") as mock_sel:
             mock_sel.return_value = MagicMock()
@@ -324,17 +428,13 @@ class TestDashboardConfigMergeQueued:
     @pytest.mark.asyncio
     async def test_put_rejects_unknown_fields(self, tmp_path, monkeypatch):
         """PUT with unknown fields returns 400."""
-        monkeypatch.setattr(
-            "kiro_crew.config.loader.config_path", lambda: tmp_path / "config.json"
-        )
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: tmp_path / "config.json")
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         with patch("kiro_crew.sel.sel") as mock_sel:
             mock_sel.return_value = MagicMock()
             app = _make_config_app(tmp_path)
             async with TestClient(TestServer(app)) as client:
-                resp = await client.put(
-                    "/api/dashboard/config", json={"bogus_field": True}
-                )
+                resp = await client.put("/api/dashboard/config", json={"bogus_field": True})
                 assert resp.status == 400
                 data = await resp.json()
                 assert "Unknown fields" in data["error"]
@@ -342,9 +442,7 @@ class TestDashboardConfigMergeQueued:
     @pytest.mark.asyncio
     async def test_put_rejects_non_boolean_merge_queued(self, tmp_path, monkeypatch):
         """PUT merge_queued_messages with non-boolean returns 400."""
-        monkeypatch.setattr(
-            "kiro_crew.config.loader.config_path", lambda: tmp_path / "config.json"
-        )
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: tmp_path / "config.json")
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         with patch("kiro_crew.sel.sel") as mock_sel:
             mock_sel.return_value = MagicMock()

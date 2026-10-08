@@ -3848,6 +3848,49 @@ _SYSTEM_INJECTION_KINDS = SUBAGENT_DELIVERY_KINDS | frozenset(
     (CRON_NOTIFICATION_KIND, MCP_APP_MESSAGE_KIND, FALSE_TOOL_BLOCKER_REPLAY_KIND)
 )
 
+#: Body budget for a merged system-injection drain (EVT-1): consecutive queued
+#: entries of the same system kind fold into ONE turn, and the fold stops
+#: here — the same body budget the wave digest composes to (``_digest_body`` in
+#: ``slack/gateway.py``), so one turn's prompt stays bounded whatever the
+#: queue holds. Entries beyond the budget stay queued for the next drain.
+MERGED_INJECTION_MAX_CHARS = 60_000
+
+
+def _drain_system_run(slot, first_index: int) -> tuple:
+    """Pop the same-kind system run at *first_index*, folding it into one turn.
+
+    EVT-1: each queued system injection was its own full-context request, so
+    siblings finishing seconds apart — the common shape of a wave — cost one
+    parent turn each. Consecutive entries of the SAME kind now drain as one
+    turn. The run stops at the first entry of a different kind (a held user
+    message, a cron notice, a recovery) and at ``MERGED_INJECTION_MAX_CHARS``;
+    whatever remains stays queued. The joined text carries no synthetic
+    header, so the first entry's structural prefix (``[Subagent completion
+    event …]`` / ``[Cron notification …]``) still leads the turn and the row
+    keeps classifying by it.
+    """
+    head = slot._queue[first_index]
+    kind = head.get("kind", "")
+    run_len = 1
+    total = len(head.get("content") or "")
+    i = first_index + 1
+    while i < len(slot._queue) and total < MERGED_INJECTION_MAX_CHARS:
+        nxt = slot._queue[i]
+        if nxt.get("kind") != kind or not is_system_injection_item(nxt):
+            break
+        # A single oversize entry still drains alone (run_len stays 1); a run
+        # stops BEFORE an entry that would cross the budget.
+        if total + len(nxt.get("content") or "") > MERGED_INJECTION_MAX_CHARS:
+            break
+        total += len(nxt.get("content") or "")
+        run_len += 1
+        i += 1
+    # Popping ``first_index`` repeatedly walks the run: each pop shifts the
+    # next same-kind entry into that slot, whatever sits before it stays.
+    popped = [slot.queue_pop(first_index) for _ in range(run_len)]
+    merged = "\n\n".join(item["content"] for item in popped)
+    return merged, popped
+
 
 def app_inject_row(label: str) -> tuple[str, str, dict]:
     """The ONE builder for an app-delivery transcript row.
@@ -3990,12 +4033,16 @@ def _stamped_turn_actor(item: dict) -> Any:
 def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
     """Drain the queue: merge non-cron messages or pop the first one.
 
-    A merge run stops at a system injection, at an attachment-bearing entry
-    (see :func:`carries_attachments`), at a possibly-delivered steer
+    A system injection at the head drains with its same-kind run (EVT-1,
+    :func:`_drain_system_run`) instead of alone. The user-merge run stops at a
+    system injection, at an attachment-bearing entry (see
+    :func:`carries_attachments`), at a possibly-delivered steer
     (``STEER_POSSIBLY_DELIVERED_META``) and where the stamped turn actor
     changes, so an app's queued send never folds into the user's own words; an
     entry that starts no run pops alone.
     """
+    if slot._queue and is_system_injection_item(slot._queue[0]):
+        return _drain_system_run(slot, 0)
     if merge_enabled and len(slot._queue) > 1:
         to_merge: list[dict] = []
         for item in list(slot._queue):
@@ -4019,20 +4066,20 @@ def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
 
 
 def _dequeue_next_system_message(slot) -> tuple:
-    """Pop the first queued system injection, leaving plain user messages
-    queued.
+    """Pop the first queued system injection's same-kind run, leaving plain
+    user messages queued.
 
     Implements the (always-on) queue-during-subagents behavior: while background
     sub-agents run for a slot, a tangential user message is held (not drained)
     so it does not start a main turn mid-run, while system injections that must
     keep flowing (sub-agent completions, cron notifications) are still drained.
-    Returns ``(content, [item])`` for the drained item, or ``(None, [])`` when
-    only held (user) messages remain queued.
+    Consecutive entries of the SAME kind fold into one turn (EVT-1,
+    :func:`_drain_system_run`). Returns ``(content, [items])`` for the drained
+    run, or ``(None, [])`` when only held (user) messages remain queued.
     """
     for i, item in enumerate(slot._queue):
         if is_system_injection_item(item):
-            popped = slot.queue_pop(i)
-            return popped["content"], [popped]
+            return _drain_system_run(slot, i)
     return None, []
 
 
