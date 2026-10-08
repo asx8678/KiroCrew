@@ -788,6 +788,9 @@ class TestThreadFollowAddressedToOthers:
         orch.channel_history = None
         orch.sessions = MagicMock()
         orch.sessions.has_session.return_value = True
+        from kiro_crew.slack.thread_follow import note_bot_post
+
+        note_bot_post("1700.1")
         orch.sessions.enqueue.return_value = False
         orch.sessions.dequeue.return_value = None
         orch.conv_log = None

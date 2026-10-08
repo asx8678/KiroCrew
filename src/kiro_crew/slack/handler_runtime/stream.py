@@ -812,6 +812,15 @@ class _AnswerStream:
         nothing to notice.
         """
         assert self.stream_ts is not None
+        from kiro_crew.slack.thread_follow import is_silent_reply, note_bot_post
+
+        if is_silent_reply(clean_text):
+            try:
+                await self.slack.delete_message(self.channel, self.stream_ts)
+            except Exception:
+                logger.debug("silent reply delete failed", exc_info=True)
+            return
+        note_bot_post(self.reply_ts)
         if self.debt:
             await self.settle_debt(self.stream_ts)
         # The seal is decoration: the answer is already on screen, so a

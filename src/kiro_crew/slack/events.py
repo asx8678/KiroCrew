@@ -2341,9 +2341,12 @@ def _thread_follow_admits(
     bot is admitted by that same rule: Slack also delivers it as a plain
     ``message`` event, which reaches here with ``is_mention`` False.
     """
+    from kiro_crew.slack.thread_follow import follow_is_fresh
+
     in_active_thread = (
         thread_follow
         and thread_ts
+        and follow_is_fresh(thread_ts)
         and orch.sessions
         and (
             orch.sessions.has_session(thread_ts)

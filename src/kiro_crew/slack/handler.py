@@ -2735,7 +2735,10 @@ async def handle_message(
                 # No stream and no placeholder — post the answer directly.
                 # Answer-carrying: a raise means the reader got nothing; a return
                 # is confirmed delivery.
-                await slack.post_message(channel, clean_text or _NO_RESPONSE, reply_ts)
+                from kiro_crew.slack.thread_follow import is_silent_reply
+
+                if not is_silent_reply(clean_text):
+                    await slack.post_message(channel, clean_text or _NO_RESPONSE, reply_ts)
                 _answer_reached = True
         except Exception:
             # An answer-carrying send failed: the reader received no answer.

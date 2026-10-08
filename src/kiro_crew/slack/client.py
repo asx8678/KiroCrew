@@ -430,6 +430,10 @@ class RealSlackClient(SlackClientOps):
             kwargs["reply_broadcast"] = True
         self._inject_team(channel, kwargs)
         resp = await self._web.chat_postMessage(**kwargs)
+        if thread_ts is not None:
+            from kiro_crew.slack.thread_follow import note_bot_post
+
+            note_bot_post(thread_ts)
         return resp["ts"]
 
     async def post_blocks(
