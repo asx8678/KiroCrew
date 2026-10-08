@@ -2183,7 +2183,7 @@ Native kiro-cli subagents run inside the parent ACP turn and are owned by the pa
 | Parent Session | Backend Delivery | Client Follow-up | User Sees |
 |---|---|---|---|
 | Dashboard (`dashboard:*`) | Append as user message + broadcast via WS | TUI/web re-injects via `sendMessage` → LLM round-trip | LLM's response summarizing the result |
-| Slack (thread ts) | Post to Slack channel thread + dashboard notification | _(none — raw result posted directly)_ | Raw subagent result text |
+| Slack (thread ts) | Injected into the parent's ACP session as a `_run_chat` turn (or queued on a busy slot); the model's synthesized reply is posted to the thread + dashboard notification | _(none — the reply is already posted)_ | LLM's synthesized reply |
 | Non-Slack channel (`telegram:*`, `discord:*`, `unified:*`, …) | Inject into the parent ACP session, then send the synthesized reply through the governed cross-surface transport ladder (`_deliver_channel_reply` → `_resolve_channel_target` → `MessagingTransport.send_message`) + dashboard notification. Target resolution: origin link (recorded by Discord's inbound dispatch) → non-Slack mirror link (e.g. Telegram `/link`) → for **direct (1:1) sessions only**, the stored `"{namespace}:{user_id}"` channel value, resolved to a postable conversation via `transport.resolve_configured_target`. Group/forum sessions without an origin/mirror link, channels whose dispatcher records neither, and denied/unsupported egress all degrade to notification-only — never a cross-conversation send. | _(none)_ | LLM's synthesized reply in the channel conversation |
 | Cron/no parent | Dashboard notification only | _(none)_ | Notification panel entry |
 
