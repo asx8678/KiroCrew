@@ -2365,11 +2365,14 @@ class Backend:
                     exc_info=True,
                 )
         # Spill oversized (but under the read limit) responses to a
-        # sidecar file and truncate inline, so a large-but-legitimate
-        # tool result doesn't balloon the shared daemon's memory or the
-        # agent's context. Offloaded to the maintenance executor (short
-        # filesystem I/O); a spill failure falls back to the raw line.
-        if len(line) > RESPONSE_SPILL_THRESHOLD_BYTES:
+        # sidecar file and cut them head+tail to the threshold -- by
+        # default the same 48 KiB budget every first-party result gets,
+        # so there is no band where a result passes whole -- so a
+        # large-but-legitimate tool result doesn't balloon the shared
+        # daemon's memory or the agent's context. Offloaded to the
+        # maintenance executor (short filesystem I/O); a rewrite that
+        # cannot run falls back to the raw line. 0 disables the layer.
+        if 0 < RESPONSE_SPILL_THRESHOLD_BYTES < len(line):
             try:
                 line = await asyncio.get_running_loop().run_in_executor(
                     maintenance_executor(),

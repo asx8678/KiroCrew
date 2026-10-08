@@ -25,6 +25,7 @@ from kiro_crew import mcp_core
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.skills import SKILL_READ_CAPACITY, SkillReadRefusal
 from kiro_crew.validation import (
+    MAX_RESPONSE_LEN,
     SKILL_DISCOVER_SCHEMA,
     SKILL_FETCH_SCHEMA,
     SKILL_SEARCH_SCHEMA,
@@ -335,12 +336,14 @@ def _read_capacity(key: str, offset: int) -> int:
 
     The gateway sizes a page by the capacity it is given, this tool then wraps
     the page in a header, a page line and the reference-data markers, and
-    ``build_tool_response`` cuts the whole at ``MAX_RESPONSE_LEN`` characters from
-    the TAIL. A page sized to the bare ceiling would therefore lose its last
-    lines to the cut while the next offset already counted them as delivered.
-    So the page is sized for the wrapped response: the framing is rendered with
-    an empty body and the widest numbers a page can carry, and its length comes
-    off ``SKILL_READ_CAPACITY``, which remains the ceiling. The framing repeats
+    ``build_tool_response`` cuts a whole over ``MAX_RESPONSE_LEN`` characters in
+    the MIDDLE. A page sized past it would therefore lose lines to the cut while
+    the next offset already counted them as delivered. So the page is sized for
+    the wrapped response: the framing is rendered with an empty body and the
+    widest numbers a page can carry, and its length comes off
+    :data:`_READ_CEILING` -- the smaller of ``SKILL_READ_CAPACITY`` and the tool
+    result budget, so a body counted in bytes always fits a budget counted in
+    characters. The framing repeats
     the key, so a longer key leaves a smaller page; the delivered-bytes figure is
     the one number an empty rendering understates, and its widest form is added.
     """
@@ -361,7 +364,14 @@ def _read_capacity(key: str, offset: int) -> int:
         },
         offset,
     )
-    return max(1, SKILL_READ_CAPACITY - len(frame) - len(f"{SKILL_READ_CAPACITY:,}"))
+    return max(1, _READ_CEILING - len(frame) - len(f"{_READ_CEILING:,}"))
+
+
+#: What one ``skill_search`` read response may carry: the skill read capacity, or
+#: the tool-result budget when that is smaller (it is: 48 KiB against 99,000 B).
+#: ``SKILL_READ_CAPACITY`` itself is unchanged -- it also bounds the skill bodies
+#: the prompt builder injects, which no tool-result cut touches.
+_READ_CEILING = min(SKILL_READ_CAPACITY, MAX_RESPONSE_LEN)
 
 
 def _refused_read(key: str, refusal: dict[str, Any] | None, offset: int) -> str:
@@ -424,9 +434,9 @@ def _refused_read(key: str, refusal: dict[str, Any] | None, offset: int) -> str:
 def _render_read(key: str, match: dict[str, Any], offset: int) -> str:
     """The delivered body, whole or as one page whose navigation leads the body.
 
-    The page line sits in the header rather than after the body because the
-    response cap truncates the TAIL, and a page is sized to run close to it: a
-    trailer is the one line that could be cut.
+    The page line sits in the header rather than after the body because a page
+    is sized to run close to the response cap, and the header is the part of a
+    response no cut ever drops.
     """
     content = str(match.get("content") or "")
     desc = " ".join((match.get("description") or "").split())
@@ -537,8 +547,8 @@ def skill_discover(name: str, args: dict[str, Any]) -> str:
     # _redact_external only scrubs credential shapes and exfil URLs — so a
     # listing whose description is imperative prose arrives looking exactly
     # like tool instructions. A trailing label would not survive the
-    # adversarial case it exists for: validation.sanitize_response truncates
-    # the TAIL at MAX_RESPONSE_LEN, and these fields have no per-field bound
+    # adversarial case it exists for: validation.sanitize_response cuts the
+    # MIDDLE past MAX_RESPONSE_LEN, and these fields have no per-field bound
     # upstream (SkillSearchResult), so a publisher could pad a listing until
     # the label was cut off. Leading it is truncation-proof, and matches how
     # skill_fetch prefixes a body it returns.

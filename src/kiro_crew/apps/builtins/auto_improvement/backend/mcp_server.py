@@ -25,6 +25,7 @@ from typing import Any, Callable
 from kiro_crew.json_line import parse_json_object_line, recover_line_id
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
+from kiro_crew.validation import build_tool_response
 
 from . import deps, progress, runner
 
@@ -36,10 +37,6 @@ _INTERNAL_ERROR = -32603
 
 #: Protocol version echoed on initialize.
 _PROTOCOL_VERSION = "2024-11-05"
-
-#: Cap on a single tool result. An agent asking for a finding must not be able to
-#: pull an unbounded diff into its context and blow the window.
-_MAX_RESULT_CHARS = 60_000
 
 
 def _redact_result(text: str) -> str:
@@ -372,9 +369,13 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
         # ledger note comes back verbatim in `list_findings`.
         #
         # Order matters — truncating first could split a credential across the cut and
-        # leave a fragment the scanner does not recognize.
-        text = _redact_result(json.dumps(payload, default=str))[:_MAX_RESULT_CHARS]
-        return _result(req_id, {"content": [{"type": "text", "text": text}]})
+        # leave a fragment the scanner does not recognize. The cut itself is the shared
+        # egress frame's (``build_tool_response``): hidden-character sanitization, then
+        # the one tool-result budget with head and tail kept and the full redacted text
+        # spilled to a file the note names — so an agent asking for a finding cannot
+        # pull an unbounded diff into its context, and loses no part of it either.
+        text = _redact_result(json.dumps(payload, default=str))
+        return _result(req_id, build_tool_response(text, spill_label=f"auto-improvement-{req_id}"))
     return _error(req_id, _METHOD_NOT_FOUND, f"unknown method: {method}")
 
 

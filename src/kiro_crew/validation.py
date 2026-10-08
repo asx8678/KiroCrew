@@ -39,6 +39,7 @@ from kiro_crew.artifact_store.rules import normalize_tag as _normalize_artifact_
 # no native library is loaded on any platform. Aliased so the schema block below
 # reads as "the computer-use vocabulary" rather than bare names.
 from kiro_crew.computer_use import types as _cu_types
+from kiro_crew.config.paths import config_dir
 from kiro_crew.config.sections import SUBAGENT_MAX_TURNS_CEILING
 
 # ``MAX_SHORT_STRING`` is re-exported, not just used: it is part of this
@@ -77,6 +78,14 @@ from kiro_crew.monitoring.registry import (
     publicly_armable_objectives,
 )
 from kiro_crew.project_scope import SCOPE_FRAGMENT_RE
+from kiro_crew.tool_result_cap import (
+    MAX_TOOL_RESULT_CHARS,
+    SPILL_DIR_NAME,
+    cut_head_tail,
+    spill_filename,
+    truncation_note,
+    write_spill_file,
+)
 from kiro_crew.work_vocab import WORK_ITEM_STATES, WORK_VERDICTS, WORK_WORKER_STATUSES
 
 # ── Constants ──
@@ -163,7 +172,10 @@ MAX_ACP_SESSION_ID_LEN = 128
 # (_build_job/update_job), so the CLI and apps SDK cannot admit a larger value
 # than the validated surfaces.
 MAX_CRON_MESSAGE = 50_000
-MAX_RESPONSE_LEN = 100_000  # truncate tool responses
+# The inline budget for one tool result, in characters: 48 KiB. One number for
+# every path (first-party servers, the auto-improvement app server, the broker's
+# spill threshold), so it lives in the ``tool_result_cap`` leaf both import.
+MAX_RESPONSE_LEN = MAX_TOOL_RESULT_CHARS
 
 # Allowed categories for lessons
 ALLOWED_LESSON_CATEGORIES = frozenset({"tool", "preference", "knowledge"})
@@ -1200,20 +1212,49 @@ def sanitize_json_values(value: Any) -> Any:
 
 
 def sanitize_response(text: str, max_len: int = MAX_RESPONSE_LEN) -> str:
-    """Sanitize and truncate a tool response before returning to caller."""
-    text = sanitize_string(text)
-    if len(text) > max_len:
-        # Truncation drops the TAIL, and tail-anchored payloads live there —
-        # a session directive's marker is the last line, so a response over the
-        # cap loses its effect entirely. Never silent.
-        logging.getLogger(__name__).warning(
-            "tool response truncated: %d chars over the %d cap — a "
-            "tail-anchored marker (e.g. a session directive) would be lost",
-            len(text) - max_len,
-            max_len,
+    """Sanitize and bound a tool response, keeping its head AND its tail.
+
+    Pure: no spill file. :func:`build_tool_response` is the egress path and adds
+    the spill copy whose path the truncation note then names.
+    """
+    return _cap_sanitized(sanitize_string(text), max_len, spill_path=None)
+
+
+def _cap_sanitized(text: str, max_len: int, *, spill_path: str | None) -> str:
+    """Bound already-sanitized *text* with a head+tail cut (see ``tool_result_cap``).
+
+    The cut is in the MIDDLE: tail-anchored payloads live at the end -- a session
+    directive's marker is the last line -- so keeping the tail is what keeps them.
+    Never silent.
+    """
+    if len(text) <= max_len:
+        return text
+    logging.getLogger(__name__).warning(
+        "tool response over the %d-char cap by %d chars: head and tail kept%s",
+        max_len,
+        len(text) - max_len,
+        f", full text spilled to {spill_path}" if spill_path else ", full text not saved",
+    )
+    total = len(text)
+    return cut_head_tail(text, max_len, lambda omitted: truncation_note(total, omitted, spill_path))
+
+
+def _spill_tool_text(text: str, label: str) -> str | None:
+    """Save the full *text* for a capped result; its path, or ``None`` on failure.
+
+    The directory is the data home's spill dir, resolved per call (never cached),
+    and the filename derives from the call's *label* -- so nothing here is module
+    state an MCP server could carry between callers.
+    """
+    try:
+        return write_spill_file(
+            config_dir() / SPILL_DIR_NAME, spill_filename(label), text.encode("utf-8")
         )
-        text = text[:max_len] + "\n…[response truncated]"
-    return text
+    except Exception:  # noqa: BLE001 - a failed spill degrades to a pathless cut
+        logging.getLogger(__name__).warning(
+            "tool response spill failed; capping without a full copy", exc_info=True
+        )
+        return None
 
 
 # ── JSON-RPC Envelope Validation ──
@@ -4575,7 +4616,11 @@ class McpTextContent:
 
 
 def build_tool_response(
-    text: str, max_len: int = MAX_RESPONSE_LEN, *, is_error: bool = False
+    text: str,
+    max_len: int = MAX_RESPONSE_LEN,
+    *,
+    is_error: bool = False,
+    spill_label: str = "",
 ) -> dict[str, Any]:
     """Build a validated, sanitized MCP tools/call response.
 
@@ -4586,8 +4631,15 @@ def build_tool_response(
     response conforms to the MCP TextContent schema and is sanitized.
     ``is_error`` adds the MCP ``isError`` flag so a client can tell a refusal
     from an answer without pattern-matching the prose.
+
+    A result over *max_len* keeps its head and its tail, and the full sanitized
+    text is written to a spill file under ``<data home>/mcp_spill/`` whose path
+    the truncation note names. *spill_label* names that file after the call (the
+    server and request id); it is the only per-call input the spill takes.
     """
-    text = sanitize_response(text, max_len)
+    text = sanitize_string(text)
+    if len(text) > max_len:
+        text = _cap_sanitized(text, max_len, spill_path=_spill_tool_text(text, spill_label))
     content = McpTextContent(type="text", text=text)
     frame: dict[str, Any] = {"content": [content.to_dict()]}
     if is_error:

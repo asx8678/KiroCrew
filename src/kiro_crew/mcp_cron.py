@@ -89,6 +89,7 @@ from kiro_crew.security import (
 from kiro_crew.security.readonly_bash import _EXTGLOB_RE
 from kiro_crew.sel import sel
 from kiro_crew.validation import (
+    MAX_RESPONSE_LEN,
     MCP_CRON_SCHEMAS,
     ValidationError,
     infer_use_case,
@@ -2358,13 +2359,13 @@ _JSON_MAX_JOBS = 100
 #: Serialized characters the records may occupy. A COUNT cap does not bound size:
 #: ``json.dumps`` escapes a non-ASCII character to ``\uXXXX``, six characters for
 #: one, so 100 ordinary 400-character prompts in Chinese serialize to ~296,000
-#: characters -- almost three times the response ceiling. Measured, not estimated.
+#: characters -- several times the response ceiling. Measured, not estimated.
 #: Crossing that ceiling matters more than losing a row, because
-#: ``sanitize_response`` truncates with a blind tail slice that appends a notice
-#: OUTSIDE the JSON grammar, so the consumer gets a document that does not parse
-#: at all rather than a short one. Held below ``MAX_RESPONSE_LEN`` with room for
-#: the envelope and the unavailable-reason string.
-_JSON_BYTE_BUDGET = 88_000
+#: ``build_tool_response`` cuts an over-budget result in the middle and inserts a
+#: notice OUTSIDE the JSON grammar, so the consumer gets a document that does not
+#: parse at all rather than a short one. Held below ``MAX_RESPONSE_LEN`` (48 KiB)
+#: with room for the envelope and the unavailable-reason string.
+_JSON_BYTE_BUDGET = MAX_RESPONSE_LEN - 6_000
 
 #: Prompt text carried per job. Longer than the compact preview, because a
 #: consumer classifies the prompt rather than displaying it, and shorter than the

@@ -311,14 +311,15 @@ _PROJECT_SKILL_MAX_DEPTH = 64
 # skipped rather than loaded whole.
 PROJECT_SKILL_BODY_CAP = 24_750
 PINNED_SKILL_BODIES_CAP = 99_000
-# What one exact-key read may deliver, in UTF-8 bytes. A tool response is cut at
-# ``validation.MAX_RESPONSE_LEN`` characters and the cut takes the TAIL, so a body
-# that does not fit under that ceiling with its framing would lose its closing
-# instructions silently. A larger body is therefore refused whole and served in
-# whole-line pages that each fit; the bound is a context budget, not a file limit,
-# so it neither grows for a large skill nor shrinks what is on disk. The pinning
-# path's ``PINNED_SKILL_BODIES_CAP`` above is the same number; if this capacity
-# is ever revisited, the two move together.
+# What one exact-key read may deliver into context, in UTF-8 bytes; a larger
+# body is refused whole and served in whole-line pages that each fit. The bound is
+# a context budget, not a file limit, so it neither grows for a large skill nor
+# shrinks what is on disk. The pinning path's ``PINNED_SKILL_BODIES_CAP`` above is
+# the same number; if this capacity is ever revisited, the two move together. The
+# ``skill_search`` MCP read is additionally held to the smaller tool-result budget
+# (``validation.MAX_RESPONSE_LEN``, 48 KiB, cut in the middle past it) by
+# ``mcp_tools/skills._READ_CEILING``; the prompt-builder paths that read this
+# constant inject bodies directly and are not tool results.
 SKILL_READ_CAPACITY = 99_000
 
 # Why an exact-key read delivered no body. Three values because the caller acts

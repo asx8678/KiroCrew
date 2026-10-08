@@ -3830,16 +3830,17 @@ term frequency, metadata coverage, usage and stable full key. This prevents comm
 metadata words from burying a result carrying multiple query words in its body.
 Search/list have stable-key results and offset pagination; search does not record
 usage. Exact reads share the resolved mapping and the bounded file reader.
-One exact read delivers at most `SKILL_READ_CAPACITY` (99,000 UTF-8 bytes): a tool
-response is cut at `MAX_RESPONSE_LEN` characters and the cut takes the tail, so a
-body that does not fit under that ceiling with its framing would lose its closing
-instructions silently. A call naming neither `offset` nor `limit` delivers a body
+One exact read delivers at most `SKILL_READ_CAPACITY` (99,000 UTF-8 bytes), and
+the `skill_search` MCP read at most `_READ_CEILING` -- the smaller of that and the
+tool-result budget `MAX_RESPONSE_LEN` (48 KiB): a tool response past that budget is
+cut in the middle, so a body that does not fit under it with its framing would
+lose instructions silently. A call naming neither `offset` nor `limit` delivers a body
 whole when it fits and refuses it when it does not, naming the body's size, the
 capacity and the paging parameters. A call naming either pages in LINES, the unit
 the file and transcript readers already page in: `offset` is the 0-based first
 line, `limit` the most lines, and the answer holds as many whole lines as fit the
-capacity with the next offset in its header, ahead of the body, where tail
-truncation cannot reach it. The tool sizes the page for the WRAPPED response: it
+capacity with the next offset in its header, ahead of the body, where no
+truncation reaches it. The tool sizes the page for the WRAPPED response: it
 renders its own framing (header, page line, reference-data markers, the key
 repeated) with an empty body and the widest numbers a page can carry, takes
 that length off the ceiling, and passes the remainder as the read's `capacity`;
@@ -4164,9 +4165,9 @@ reaches the model verbatim: `skill_fetch` prefixes the body, and `skill_discover
 leads with the label. The gateway's `_redact_external` scrubs credential shapes
 and exfiltration URLs but cannot tell imperative prose from a description, so the
 label is the only signal — and it must **lead**, not trail. `sanitize_response`
-drops the TAIL at `MAX_RESPONSE_LEN` (100k) and `SkillSearchResult` puts no bound
-on `id` / `name` / `author`, so a trailing label could be padded off the end by
-the very publisher it warns about. `skill_discover` additionally clamps those
+cuts the middle past `MAX_RESPONSE_LEN` (48 KiB) and `SkillSearchResult` puts no
+bound on `id` / `name` / `author`, so a trailing label could be pushed into the
+cut, or past the reader's attention, by the very publisher it warns about. `skill_discover` additionally clamps those
 fields per entry (name 120, id 200, author 80, description 240) so one padded
 entry cannot crowd the other candidates out of the response.
 

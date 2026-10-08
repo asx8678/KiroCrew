@@ -21,13 +21,16 @@ JSON-RPC -32000 error.
 
 ### `mcp_gateway.response_spill_threshold_bytes`
 
-Tool-call results larger than this (but under the read limit) have their text
-content written to a sidecar file and truncated inline to 16 KiB + a file path
-marker. This prevents large responses from bloating the LLM's context window.
+Tool-call results larger than this (but under the read limit) are written to a
+sidecar file and each text item is cut head+tail until the whole frame fits the
+threshold, with a file path marker between the kept ends. This prevents large
+responses from bloating the LLM's context window.
 
-- **Default:** 262144 (256 KiB)
+- **Default:** 49152 (48 KiB) -- `tool_result_cap.MAX_TOOL_RESULT_CHARS`, the
+  same budget every first-party tool result is held to, so there is no band
+  where a stubbed server's result passes whole
 - **Env override:** `KIROCREW_MCP_SPILL_THRESHOLD`
-- **Set to 0:** Disables spilling (all under-limit responses pass through)
+- **Set to 0:** Disables the layer (all under-limit responses pass through)
 
 ## Behavior
 
@@ -61,14 +64,19 @@ For responses that fit within the read limit but exceed the spill threshold:
 
 1. Parse the response as JSON-RPC.
 2. Check if it's a `tools/call` result (has `result.content` list with `text` items).
-3. Write the **full original response** to `<data home>/mcp_spill/<server>-<request_id>-<timestamp>.json` (`KIROCREW_HOME`, default `~/.kiro/crew`).
-4. Truncate each text item to the first 16 KiB.
-5. Append a marker: `[KiroCrew: response truncated -- full <N> bytes at <path>. Read with bash: head/grep/jq.]`
+3. Write the **full original response** to `<data home>/mcp_spill/<server>-<request_id>-<random>.json` (`KIROCREW_HOME`, default `~/.kiro/crew`).
+4. Cut each text item in the middle (head and tail kept, the same
+   `tool_result_cap.cut_head_tail` first-party results get), with a marker
+   between the kept ends: `[KiroCrew: response truncated -- <N> chars omitted from the middle; full <M>-byte response at <path>. Read with bash: head/grep/jq.]`
+5. Shrink the per-item budget until the re-serialized frame fits the threshold
+   (JSON escaping can cost up to six bytes per character).
 6. Forward the rewritten (smaller) response.
 
 Non-tool-result frames, errors, and small responses are **never** spilled.
 
-Any spill failure (disk full, permissions) → original forwarded unmodified.
+A spill-file failure (disk full, permissions, a linked spill dir) still cuts the
+frame, with a marker saying the full response could not be saved. A frame that
+does not parse, or a rewrite that fails, is forwarded unmodified.
 
 ### Layer 3: Inline-image budget (tool-result image blocks)
 
@@ -143,14 +151,16 @@ no brokered path renders resource blobs to the model today.
 ### Spill file format
 
 - **Directory:** `<data home>/mcp_spill/` (mode 0700; `KIROCREW_HOME`, default `~/.kiro/crew`)
-- **Filename:** `<server_name>-<request_id>-<unix_timestamp>.json`
+- **Filename:** `<server_name>-<request_id>-<random hex>.json` (random, so two
+  frames of one request id never collide on the exclusive create); first-party
+  results spill beside them as `<server>-<request_id>-<random hex>.txt`
 - **Content:** Complete original JSON-RPC response line
 - **Cleanup:** Files older than 24h are deleted on gatewayd startup
 
 ### Inline marker format
 
 ```
-[KiroCrew: response truncated -- full 1482937 bytes at /home/user/.kiro/crew/mcp_spill/example-mcp-gw-12345-7-1721200000.json. Read with bash: head/grep/jq.]
+[KiroCrew: response truncated -- 1433102 chars omitted from the middle; full 1482937-byte response at /home/user/.kiro/crew/mcp_spill/example-mcp-gw-12345-7-3f9c0e1a2b4d4c6e8f7a9b0c1d2e3f40.json. Read with bash: head/grep/jq.]
 ```
 
 ## Troubleshooting

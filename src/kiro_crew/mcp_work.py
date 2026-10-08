@@ -70,6 +70,7 @@ from kiro_crew.mcp_core import _get, _post, _resolve_session_key, require_strict
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.validation import (
+    MAX_RESPONSE_LEN,
     MCP_WORK_SCHEMAS,
     clamp_report,
     sanitize_string,
@@ -129,11 +130,10 @@ _RECORD_FIELDS: tuple[str, ...] = (
 _READ_FIELDS: tuple[str, ...] = ("events", "item_id", "state", "since", "compact")
 
 #: The most characters a ``work_ledger_read`` reply may be, measured on the text
-#: the model receives (:func:`_render`). kiro-cli cuts a tool result at 100,000
-#: chars and ``MAX_RESPONSE_LEN`` truncates at the same length; a cut tears the
-#: JSON and loses whatever was serialized last, which on a board is the newest
-#: item. The margin leaves room for the runtime's own framing.
-_READ_BUDGET_CHARS = 90_000
+#: the model receives (:func:`_render`). ``build_tool_response`` cuts a result
+#: over ``MAX_RESPONSE_LEN`` (48 KiB) in the middle; a cut tears the JSON and
+#: drops part of the board. The margin leaves room for the runtime's own framing.
+_READ_BUDGET_CHARS = MAX_RESPONSE_LEN - 4_000
 
 #: An acceptance larger than this, serialized, is replaced by an elision marker
 #: when a read is over budget. Real bars are a few hundred chars; one bloated bar

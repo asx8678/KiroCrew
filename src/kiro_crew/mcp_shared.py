@@ -1641,10 +1641,14 @@ def _run_stdio_dispatch_loop(
             tools = [t for t in tools if t.get("name") not in policy.excluded]
         return tools
 
-    def _tool_response(text: str) -> dict[str, Any]:
-        """Frame a tool result, flagging ``Error:`` prose when opted in."""
+    def _tool_response(text: str, req_id: Any = None) -> dict[str, Any]:
+        """Frame a tool result, flagging ``Error:`` prose when opted in.
+
+        An over-cap result's spill file is named after THIS call (server and
+        request id), passed down per call so the server keeps no spill state.
+        """
         flagged = error_prefix_is_error and text.startswith("Error:")
-        return build_tool_response(text, is_error=flagged)
+        return build_tool_response(text, is_error=flagged, spill_label=f"{server_name}-{req_id}")
 
     def _run_tool(
         req_id: Any,
@@ -1698,7 +1702,7 @@ def _run_stdio_dispatch_loop(
         # per request (a failed+late-cancel race must not emit two).
         with _result_lock:
             if not cancel_evt.is_set():
-                _result_box.append(_tool_response(result_text))
+                _result_box.append(_tool_response(result_text, req_id))
                 if _tool_errored:
                     # Exception escaped call_tool_fn (may bypass its internal
                     # logging) -- audit the failure.
@@ -2154,7 +2158,7 @@ def _run_stdio_dispatch_loop(
                 finally:
                     set_current_caller(None)
                     set_current_tenant_nonce("")
-                respond(req_id, _tool_response(result_text))
+                respond(req_id, _tool_response(result_text, req_id))
             else:
                 # Dispatch tool in worker thread so we can receive cancel notifications
                 _cancel_event = threading.Event()
