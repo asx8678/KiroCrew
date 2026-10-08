@@ -72,8 +72,17 @@ CALENDAR_PRECREATE_LEAD_MAX_MINUTES = 24 * 60
 #: calendar fetch is not part of the startup path.
 CALENDAR_POLL_STARTUP_DELAY_SECS = 20
 
-# Per-agent batching dispatcher.
-BATCH_INTERVAL_SECS = 30.0
+# Per-agent batching dispatcher. Notes and tasks share the 120s gap; the
+# sketch artist is slower. Three agents at these gaps stay under 100 turns
+# per meeting-hour (LOOP-4). Unknown agents use the notes gap, not the old
+# 30s default.
+BATCH_INTERVAL_SECS = 120.0
+SKETCH_BATCH_INTERVAL_SECS = 180.0
+AGENT_BATCH_INTERVALS = {
+    "note-taker": BATCH_INTERVAL_SECS,
+    "task-extractor": BATCH_INTERVAL_SECS,
+    "sketch-artist": SKETCH_BATCH_INTERVAL_SECS,
+}
 MAX_DISPATCH_FAILURES = 3
 BACKOFF_STEP_SECS = 60.0
 BACKOFF_CAP_SECS = 180.0

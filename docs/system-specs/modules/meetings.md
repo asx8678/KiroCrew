@@ -215,7 +215,10 @@ evidence that every caller passed through action-item review.
 ## Agent dispatch
 
 `domain/session.py`. One `AgentQueue` per enabled agent plus the always-on task
-extractor. A queue batches lines and flushes every `BATCH_INTERVAL_SECS` (30s),
+extractor. A queue batches lines and flushes on its own interval:
+`BATCH_INTERVAL_SECS` (120s) for the note taker and the task extractor,
+`SKETCH_BATCH_INTERVAL_SECS` (180s) for the sketch artist. Three default
+agents therefore stay under 100 turns per meeting-hour.
 so an agent gets a paragraph of context rather than one interruption per
 utterance. Three consecutive dispatch failures trip a circuit breaker (backoff
 60s → 120s → stop); `POST …/reset` resumes.
@@ -303,7 +306,7 @@ leave later transcript batches in a
 session that never received its output-file contract. If speech accumulated during
 initialization, each queue schedules that opening for the next event-loop turn
 instead of waiting through the ordinary
-30-second batch interval. If another turn is already live, the queue remembers
+batch interval. If another turn is already live, the queue remembers
 that request and skips the next delay after the live turn rather than treating
 `flush_soon()` as a no-op. The request flag is consumed even when that live turn
 emptied the queue, so it cannot make a later unrelated multi-batch flush skip an
@@ -384,7 +387,7 @@ language. The accepted language set is published by `GET /config`
 reason the provider registries are: the backend validates the saved value, so it
 must also be what publishes the accepted set.
 
-It is **not** an `AgentQueue` variant. That one exists to BATCH (30 s) so an agent
+It is **not** an `AgentQueue` variant. That one exists to BATCH so an agent
 gets context; this exists to avoid batching, so it is a bounded SEQUENTIAL
 per-meeting queue running one tool-less call on `kirocrew-lite` per line with the
 ephemeral session destroyed after. This is the app's first non-agent LLM path;

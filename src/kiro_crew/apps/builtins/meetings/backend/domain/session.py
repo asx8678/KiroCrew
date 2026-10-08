@@ -681,6 +681,7 @@ class MeetingSession:
             agent=agent,
             sessions=self.sessions,
             hooks=self.hooks,
+            batch_interval=k.AGENT_BATCH_INTERVALS.get(agent_id, k.BATCH_INTERVAL_SECS),
         )
 
     def add_agent(self, agent_id: str, agent: str) -> AgentQueue:

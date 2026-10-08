@@ -605,6 +605,11 @@ class TestMeetingSession:
     def test_creates_a_queue_per_enabled_agent_plus_extractor(self, root: Path):
         session = self._session(root)
         assert set(session.agents) == {"note-taker", "sketch-artist", k.TASK_EXTRACTOR_ID}
+        assert session.agents["note-taker"].batch_interval == 120.0
+        assert session.agents[k.TASK_EXTRACTOR_ID].batch_interval == 120.0
+        assert session.agents["sketch-artist"].batch_interval == 180.0
+        turns = sum(3600 / q.batch_interval for q in session.agents.values())
+        assert turns <= 100
 
     def test_agents_enabled_filter(self, root: Path):
         session = self._session(root, agents_enabled=["note-taker"])
