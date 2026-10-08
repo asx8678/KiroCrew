@@ -328,6 +328,14 @@ OPERATOR_LINES: Tuple[_LineSpec, ...] = (
 #: DEFECT rather than an absent feature, and a card that listed defect classes in
 #: front of someone choosing a harness would be worse than one line shorter.
 OFF_CARD_SETS: Mapping[str, str] = {
+    "ACP_BACKENDS_NATIVE_AGENT_PROMPT": (
+        "whether the harness delivers a custom agent spec's own prompt as the "
+        "system prompt, so Crew withholds its injected copy. A custom agent's "
+        "persona reaches the model once on every harness either way -- natively "
+        "on a member, injected on a non-member -- so a reader choosing a harness "
+        "loses nothing. A wrong membership either sends the persona twice or, for "
+        "a host that does not read the spec prompt, drops it, which is a defect"
+    ),
     "ACP_BACKENDS_SERIAL_SESSION_STARTS": (
         "which backend's process answers session starts and mode switches one at a "
         "time. It decides only what a timed-out start's error says about the "

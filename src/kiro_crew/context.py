@@ -2669,6 +2669,22 @@ class ContextBuilder:
         agent: str, project: str | None = None, *, owner_template: str = ""
     ) -> str:
         """Read the resolved execution prompt, excluding an owner source in essentials."""
+        return ContextBuilder._load_agent_prompt_source(
+            agent, project, owner_template=owner_template
+        )[0]
+
+    @staticmethod
+    def _load_agent_prompt_source(
+        agent: str, project: str | None = None, *, owner_template: str = ""
+    ) -> tuple[str, bool]:
+        """Return ``(prompt text, the spec carries that text itself)``.
+
+        The flag is True only when the text came from the spec's OWN ``prompt``
+        (inline, or the ``file://`` it names) -- the copy a harness in
+        ``ACP_BACKENDS_NATIVE_AGENT_PROMPT`` already delivers as the system
+        prompt. It is False for the managed contract (the spec carries only the
+        stub pointing at the injected block) and for every empty answer.
+        """
         from kiro_crew.agent_discovery import _read_agent_spec
         from kiro_crew.member_essential_context import (
             resolve_relative_prompt_path,
@@ -2678,13 +2694,13 @@ class ContextBuilder:
         try:
             path = resolve_template_path(agent, project)
             if path is None:
-                return ""
+                return "", False
             data = _read_agent_spec(path, operation="agent_prompt", source="context")
             if data is None:
-                return ""
+                return "", False
             prompt = data.get("prompt") or ""
             if not isinstance(prompt, str):
-                return ""
+                return "", False
             # The managed contract resolves to the contract file for EVERY spec
             # carrying it, owner template or not: a fork or template copy
             # inherits _NATIVE_PROMPT_STUB verbatim, and returned literally the
@@ -2694,25 +2710,27 @@ class ContextBuilder:
             # takes the same reader: a bad user override degrades to the shipped
             # prompt with a WARNING instead of silently erasing the contract.
             if is_managed_prompt(prompt):
-                return _read_prompt_file(_prompt_path())
+                return _read_prompt_file(_prompt_path()), False
             if agent == owner_template:
-                return ""
+                return "", False
             if prompt.startswith("file://"):
                 source = Path(prompt[7:]).expanduser()
                 if not source.is_absolute():
                     resolved_source = resolve_relative_prompt_path(source, path, project)
                     if resolved_source is None:
-                        return ""
+                        return "", False
                     source, root = resolved_source
                     prompt_bytes = safe_read_file_bytes_nolink(str(source), within_root=str(root))
                     if prompt_bytes is None:
                         logger.debug("Skipping relative agent prompt rejected at read time")
-                        return ""
-                    return prompt_bytes.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-                return safe_read_file(str(source))
-            return prompt
+                        return "", False
+                    text = prompt_bytes.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+                    return text, bool(text)
+                text = safe_read_file(str(source))
+                return text, bool(text)
+            return prompt, bool(prompt)
         except (OSError, ValueError, FileTooLargeError):
-            return ""
+            return "", False
 
     def _build_member_section(
         self,
@@ -3321,6 +3339,7 @@ class ContextBuilder:
         session_start: bool,
         minimal_context: bool = False,
         runtime_source: str | None = None,
+        native_agent_prompt: bool = False,
     ) -> str:
         """Return the agent contract for the ``[AGENT SYSTEM PROMPT]`` block, or "".
 
@@ -3335,9 +3354,17 @@ class ContextBuilder:
         beside it — every session start except a minimal-context one, and every
         post-compaction reinjection — and carries the runtime-selected rule
         itself elsewhere, so each build states the rule exactly once.
+        *native_agent_prompt* is the serving provider's answer (membership in
+        ``ACP_BACKENDS_NATIVE_AGENT_PROMPT``): the harness already delivers the
+        spec's own prompt as the system prompt. A custom agent's prompt is then
+        withheld here (SPEC-2) when the resolved text is byte-identical to the
+        spec's, so it reaches the session once. A prompt the resolution
+        changes (``{bot_name}``, ``{{MAX_SUBAGENTS}}``, ``{{WIDGET_BLOCK}}``) and
+        the managed contract keep the block: the native copy is not that text.
         """
         is_custom = bool(agent) and agent != "kirocrew"
         agent_prompt: str
+        spec_carries_prompt = False
         if is_cc and not is_custom:
             # CC gets the same Kiro Crew persona prompt as kiro — including
             # the Output Format rules (diff blocks, image embeds, OPTIONS)
@@ -3354,7 +3381,7 @@ class ContextBuilder:
             except Exception:
                 agent_prompt = ""
         elif is_custom:
-            agent_prompt = self._load_agent_prompt(
+            agent_prompt, spec_carries_prompt = self._load_agent_prompt_source(
                 agent or "", project, owner_template=(agent or "") if private_owner else ""
             )
         else:
@@ -3371,6 +3398,7 @@ class ContextBuilder:
             if self._MAX_SUBAGENTS_TOKEN in agent_prompt
             else ""
         )
+        raw_prompt = agent_prompt
         sections = (
             _prompt_section_gates(session_key or "", runtime_source, minimal_context)
             if "{{#" in agent_prompt
@@ -3390,7 +3418,10 @@ class ContextBuilder:
                 else _diff_rule_for(session_key, runtime_source)
             ),
         )
-        return self._substitute_bot_name(agent_prompt)
+        agent_prompt = self._substitute_bot_name(agent_prompt)
+        if native_agent_prompt and spec_carries_prompt and agent_prompt == raw_prompt:
+            return ""
+        return agent_prompt
 
     def build_message(
         self,
@@ -3630,6 +3661,9 @@ class ContextBuilder:
                     session_start=True,
                     minimal_context=minimal_context,
                     runtime_source=runtime_source,
+                    native_agent_prompt=(
+                        context_provider is not None and context_provider.native_agent_prompt
+                    ),
                 )
             )
             if agent_prompt:

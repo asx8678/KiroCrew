@@ -174,6 +174,11 @@ with no row here.
    * - ``ACP_BACKENDS_OPEN_EXTERNAL_URL``
      - driver-internal (whether the reader loop answers ``_kiro/openExternalUrl``
        and a session starts MCP sign-ins with ``_kiro/mcp/resetServer``)
+   * - ``ACP_BACKENDS_NATIVE_AGENT_PROMPT``
+     - semantic question (``ContextPromptProvider.native_agent_prompt``: whether
+       the harness delivers a custom agent spec's own ``prompt`` as the
+       session's system prompt, so Crew's ``[AGENT SYSTEM PROMPT]`` copy of the
+       same text is withheld)
    * - ``ACP_BACKENDS_SIDE_READONLY``
      - pre-session registry query (whether a side-chat turn may execute
        read-only tools under the derived ``<agent>--readonly`` spec; asked
@@ -2139,6 +2144,21 @@ ACP_BACKENDS_CLIENT_META_SETTINGS = frozenset({ACP_BACKEND_KAS})
 # deepseek is not a member: its MCP servers arrive as a ``session/new`` array, so its
 # running set is described by the request that made the session and by no file.
 ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD = frozenset({ACP_BACKEND_KIRO})
+
+# Backends that deliver an agent spec's own ``prompt`` to the model natively, as
+# the session's system prompt, on every request (SPEC-2). kiro-cli reads it off
+# the launch view (a ``file://`` prompt re-anchored, still read by kiro-cli) and
+# KAS inlines it as ``customAgents[].prompt`` (``kas_agents.resolve_prompt``).
+# For a member, ``context.py`` withholds its own ``[AGENT SYSTEM PROMPT]`` copy of
+# a custom agent's prompt when that copy is byte-identical to what the spec
+# carries, so the prompt reaches the session once; a system prompt also survives
+# a compaction, so the post-compaction re-injection is withheld on the same rule.
+# The managed contract is never withheld: its spec carries only the stub that
+# points at the injected block. Every mirrored harness (claude, codex, opencode,
+# goose, pi, deepseek) is handed no spec prompt and keeps the injection, which is
+# why this is opt-in membership and never "not mirrored". Read through
+# ``ContextPromptProvider.native_agent_prompt``.
+ACP_BACKENDS_NATIVE_AGENT_PROMPT = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
 # Backends on which a Side Chat turn may EXECUTE read-only tools under
 # ``ToolApprovalPolicy.READ_ONLY``. The allowance rests on a kiro-cli agent-spec

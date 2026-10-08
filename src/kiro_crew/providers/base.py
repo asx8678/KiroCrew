@@ -126,6 +126,15 @@ class LLMProvider(ABC):
         return False
 
     @property
+    def native_agent_prompt(self) -> bool:
+        """Whether the harness delivers a custom agent spec's prompt natively.
+
+        False keeps Crew's ``[AGENT SYSTEM PROMPT]`` injection, the only copy a
+        harness handed no spec prompt receives.
+        """
+        return False
+
+    @property
     def native_context_documents(self) -> dict[str, str]:
         """Exact documents supplied at native startup, empty without evidence."""
         return {}

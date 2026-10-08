@@ -573,6 +573,12 @@ class AcpSessionProvider(LLMProvider):
 
         return self.backend == ACP_BACKEND_KAS
 
+    @property
+    def native_agent_prompt(self) -> bool:
+        from kiro_crew.acp_backends import ACP_BACKENDS_NATIVE_AGENT_PROMPT
+
+        return self.backend in ACP_BACKENDS_NATIVE_AGENT_PROMPT
+
     async def stream(self, message: str, *, allow_image: bool = True) -> AsyncIterator[LLMEvent]:
         """Send a prompt and yield LLMEvent objects until the turn completes."""
         # Re-establish this session's gateway claim before the turn can call a
