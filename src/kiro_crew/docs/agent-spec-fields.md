@@ -510,6 +510,15 @@ Capabilities.
 pattern against `$HOME`, and admits only `*.md` files that stay under the trust
 base and are not sensitive locations.
 
+The kiro-cli launch view adds kiro-cli's three inherited resources
+(`~/.kiro/steering/**/*.md`, `.kiro/steering/**/*.md`, `AGENTS.md`) to every
+view while workspace inheritance is on, except for the shipped agents in
+`skill_projection._NO_INHERITED_STEERING_AGENTS`: `kirocrew-guest` (a trust
+boundary) and the internal background agents `kirocrew-lite`,
+`kirocrew-heartbeat` and `kirocrew-knowledge`, which run Crew-authored one-shot
+jobs. Your own agents and `kirocrew` keep all three. It is a Crew-side set, not
+a spec key, because kiro-cli rejects unknown spec fields.
+
 A knowledge base is the one entry that is an **object**, not a URI: kiro-cli
 documents `{"type": "knowledgeBase", "source": "file://./docs", "name": ...}` in
 the same list and no string spelling exists for it. This reader checks shape

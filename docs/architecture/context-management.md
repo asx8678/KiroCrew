@@ -505,7 +505,13 @@ unbounded. Crew's native launch view therefore removes `skill://` entries while
 retaining the authored mapping for Crew discovery. Managed transport aliases
 preserve the original agent identity in Crew. The workspace CLI overlay disables
 inherited native resources; inherited steering and AGENTS.md are carried as explicit
-file resources unless inheritance was already disabled. Authored specs stay intact.
+file resources unless inheritance was already disabled. Shipped Crew agents named in
+`skill_projection._NO_INHERITED_STEERING_AGENTS` get none of the three: the guest
+(a trust boundary, SEC-22) and the internal background agents — the
+`BACKGROUND_WORKER_AGENTS` pair (`kirocrew-lite`, `kirocrew-heartbeat`) and
+`kirocrew-knowledge` — whose Crew-authored one-shot jobs would otherwise pay the
+operator's global steering on every call (SPEC-4). `kirocrew` and user custom agents
+keep all three. Authored specs stay intact.
 This applies to native CLI launch paths; it does not redefine ACP, which is the
 transport protocol. MCP Tool Search discovers tool schemas, not skill bodies.
 

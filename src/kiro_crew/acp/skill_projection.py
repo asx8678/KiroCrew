@@ -35,6 +35,7 @@ from kiro_crew.agent_discovery import SCOPE_PROJECT, _read_agent_spec, list_agen
 from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
 from kiro_crew.atomic_write import atomic_write, on_event_loop
 from kiro_crew.config.paths import data_home, kiro_agents_dir, kiro_home, project_agents_dir
+from kiro_crew.config.sections import BACKGROUND_WORKER_AGENTS
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes
 from kiro_crew.security import _PATH_RESOLVE_TIMEOUT_SECS
 from kiro_crew.validation import is_registered_agent_name
@@ -45,15 +46,33 @@ logger = logging.getLogger(__name__)
 _MANAGED_SETTING = "kirocrew.skillDiscovery.inheritFiles"
 _INHERIT_SETTING = "chat.disableInheritingDefaultResources"
 
-#: Agents whose projected views carry NO inherited steering or AGENTS.md
-#: (SEC-22). ``kirocrew-guest`` is the tool-less agent a NON-operator channel
-#: sender talks to, a trust boundary that mounts nothing; the inherited
-#: resources are operator-authored instruction content, so they stay out of
-#: its view. Crew-side rather than a spec key (the spec format denies unknown
-#: fields, and the guest's config is shipped, never user-authored). Add ONLY
-#: shipped, boundary-defined agents here -- never a user-authored name, which
-#: would let a config file silently un-steer any agent it names.
-_NO_INHERITED_STEERING_AGENTS: frozenset[str] = frozenset({"kirocrew-guest"})
+#: The trust-boundary exemption (SEC-22). ``kirocrew-guest`` is the tool-less
+#: agent a NON-operator channel sender talks to, a trust boundary that mounts
+#: nothing; the inherited resources are operator-authored instruction content,
+#: so they stay out of its view.
+_GUEST_NO_STEERING_AGENTS: frozenset[str] = frozenset({"kirocrew-guest"})
+
+#: The cost exemption (SPEC-4). Crew's internal background agents -- the
+#: background-role pair (titles, summaries, consolidation, heartbeat polls) and
+#: the Knowledge Library's extraction agent -- run Crew-authored one-shot jobs,
+#: not the operator's conversation, so the operator's global steering would be
+#: a fixed per-call cost with no reader. Their pools run in the data-home
+#: workspace, where the two workspace-relative globs normally match nothing,
+#: so in practice this is the ``~/.kiro/steering`` glob they stop paying for.
+_INTERNAL_BACKGROUND_NO_STEERING_AGENTS: frozenset[str] = frozenset(
+    {*BACKGROUND_WORKER_AGENTS, "kirocrew-knowledge"}
+)
+
+#: Agents whose projected views carry NO inherited steering or AGENTS.md: the
+#: union of the two exemptions above. Crew-side rather than a spec key (the
+#: spec format denies unknown fields, and these configs are shipped, never
+#: user-authored). Add ONLY shipped Crew agents here -- never a user-authored
+#: name, which would let a config file silently un-steer any agent it names.
+#: ``kirocrew`` and user custom agents keep the inheritance the operator
+#: configured.
+_NO_INHERITED_STEERING_AGENTS: frozenset[str] = (
+    _GUEST_NO_STEERING_AGENTS | _INTERNAL_BACKGROUND_NO_STEERING_AGENTS
+)
 _INHERIT_SOURCE = "kirocrew.skillDiscovery.inheritSource"
 _PREVIOUS_INHERITANCE = "kirocrew.skillDiscovery.previousInheritance"
 _SEARCH_TOOL = "@kirocrew-core/skill_search"
@@ -3042,9 +3061,16 @@ def prepare_native_skill_projection(
                         # admitted non-operator can ask about what sits in the
                         # view. A Crew-side set rather than a spec field: the
                         # spec format denies unknown fields, and the guest's
-                        # config is shipped, never user-authored. Other agents
-                        # (``kirocrew`` itself, user custom agents) keep the
-                        # inheritance the operator configured.
+                        # config is shipped, never user-authored. Crew's
+                        # internal background agents are exempt too (SPEC-4):
+                        # their one-shot jobs would pay the operator's global
+                        # steering on every call with nothing reading it.
+                        # Other agents (``kirocrew`` itself, user custom
+                        # agents) keep the inheritance the operator
+                        # configured. An exempt view is still published with
+                        # its ownership record, so the steering-glob mark
+                        # ``_is_legacy_projected_view`` reads is needed only
+                        # for unrecorded pre-lifecycle views, which carried it.
                         if view_name in _NO_INHERITED_STEERING_AGENTS:
                             continue
                         for resource in (
