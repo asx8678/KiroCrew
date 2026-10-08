@@ -93,58 +93,21 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "send_message",
             "description": (
-                "Send a message to the user. By default delivers a dashboard "
-                "notification only. Use this whenever you decide someone should "
-                "be notified — most commonly in silent cron jobs, but applicable "
-                "any time proactive notification is needed."
-                "\n\nsession param (optional):"
-                "\n  omitted   — dashboard notification only (default)."
-                '\n  "slack"   — Slack DM + dashboard notification.'
-                '\n  a channel name ("discord", "telegram", "webex", "teams",'
-                ' "whatsapp", "imessage", "feishu") — a DM to'
-                " that channel's own configured owner + dashboard notification."
-                " Only a destination the user already allow-listed for that channel"
-                " is reachable, and only when exactly one is configured: an"
-                " ambiguous allow-list, a channel that is not connected, and a"
-                " channel that cannot DM proactively all fall back to the"
-                " dashboard notification and say so rather than reporting success."
-                ' Not "wecom" or "weixin": each advertises peers learned from'
-                " inbound traffic beside configured ones, so an owner cannot be told"
-                " apart from whoever messaged the bot. Reach those with channel_type,"
-                " which addresses a conversation instead of inferring a recipient."
-                '\n  "origin"  — inject into the dashboard session that spawned'
-                " this cron. Falls through to notification-only if origin is"
-                " unreachable (tab closed, history deleted, or cron has no origin)."
-                "\n\nSlack only: set 'channel' to target a tracked channel, or "
-                "'user' to DM an allowed user, at most one, not both, and either "
-                "one always sends to Slack. channel, user, blocks, thread_ts, "
-                "reply_broadcast and unfurl_links/unfurl_media are Slack protocol "
-                "options: combining any of them with a channel session is REFUSED, "
-                "not silently ignored."
-                "\n\nOn a non-Slack messaging channel (Telegram, Discord, Teams, "
-                "Webex, WeCom, Weixin, WhatsApp, iMessage) set 'channel_type' to "
-                "that channel's name to post into the conversation you are already "
-                "talking in. Use it in preference to a channel session whenever you "
-                "are talking on that channel — it reaches the conversation at hand, "
-                "where a channel session reaches the channel's configured owner "
-                "wherever the call came from. The Slack-only options above are "
-                "rejected alongside it."
-                "\n\nTo reach a NON-Slack channel (Webex, Telegram, Discord, …) at"
-                " a specific destination, pass channel_type plus target_id, where"
-                " target_id is one of the opaque ids that channel exposes as a"
-                " configured destination. The channel's own allow-list is"
-                " re-checked when the message is sent, so an id that is no longer"
-                " configured is refused. This pair addresses the destination"
-                " directly, so combining it with session or any Slack option"
-                " (channel, user, blocks, thread_ts, reply_broadcast, unfurl_*) is"
-                " REFUSED, not silently ignored."
+                "Send the user a message; by default a dashboard notification only. Use "
+                "whenever someone should be told proactively, e.g. from a silent cron. "
+                "Route with ONE of: `session` (owner DM on slack/discord/telegram/..., "
+                'or "origin" for the cron\'s dashboard session); `channel_type` (the '
+                "non-Slack conversation you are talking in) with optional `target_id`; "
+                "or the Slack-only `channel`/`user`/`blocks`/`thread_ts` options. "
+                "Mixing a Slack-only option with a non-Slack route is REFUSED, not "
+                "ignored. Unreachable routes fall back to the notification and say so."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "Message text. Also used as fallback when blocks are provided.",
+                        "description": "Message text; also the fallback when blocks are given.",
                     },
                     "title": {
                         "type": "string",
@@ -153,117 +116,64 @@ def schemas() -> list[dict[str, Any]]:
                     "blocks": {
                         "type": "array",
                         "description": (
-                            "Optional Slack Block Kit blocks array. When provided, "
-                            "the message is sent as rich Block Kit with text as "
-                            "fallback. Agent-supplied blocks cannot contain image "
-                            "or video blocks, or image_url, thumbnail_url, or "
-                            "video_url fields; those server-fetched media forms are "
-                            "refused."
+                            "Slack-only Block Kit blocks; image/video blocks and media "
+                            "URL fields are refused."
                         ),
                         "items": {"type": "object"},
                         "maxItems": 50,
                     },
                     "channel": {
                         "type": "string",
-                        "description": "Slack-only. Target channel ID (e.g. C0123ABC456). Must be a tracked channel. Omit to send to owner DM.",
+                        "description": "Slack-only tracked channel ID (C0123ABC456).",
                     },
                     "user": {
                         "type": "string",
-                        "description": "Slack-only. Target user ID (e.g. U0123ABC456) to DM. Must be an allowed user. Omit to send to owner DM.",
+                        "description": "Slack-only allowed user ID (U0123ABC456) to DM.",
                     },
                     "channel_type": {
                         "type": "string",
                         "description": (
-                            "Deliver into the non-Slack messaging conversation this "
-                            "session belongs to, named by its transport: "
-                            '"telegram", "discord", "teams", "webex", "wecom", '
-                            '"weixin", "whatsapp" or "imessage". Use it when the '
-                            "[RUNTIME] marker says you are talking over one of "
-                            "those channels and you want a proactive message "
-                            "(a silent cron's report, a finished background task) "
-                            "to reach the user THERE rather than only in the "
-                            'dashboard bell. Not for Slack — use session="slack". '
-                            "Cannot be combined with 'channel', 'user' or "
-                            "'thread_ts', which are Slack-only routing fields. "
-                            "Pass target_id alongside it to name an EXPLICIT "
-                            "destination on that transport instead of this "
-                            "session's own conversation."
+                            "Non-Slack transport this session talks over (telegram, "
+                            "discord, teams, webex, wecom, weixin, whatsapp, imessage)."
                         ),
                     },
                     "target_id": {
                         "type": "string",
                         "description": (
-                            "Opaque configured-destination id on channel_type "
-                            "(e.g. 'user:someone@example.com'), as that channel "
-                            "advertises it. Requires channel_type. Omit it to reach "
-                            "the conversation this session already belongs to. The "
-                            "channel's own allow-list is re-checked at send time, so "
-                            "an id that is no longer configured is refused."
+                            "Configured destination id on channel_type; re-checked "
+                            "against its allow-list at send time."
                         ),
                     },
                     "unfurl_links": {
                         "type": "boolean",
-                        "description": (
-                            "Deprecated. Link previews are always off on bot "
-                            "posts (a preview is a zero-click fetch of the "
-                            "URL). false is accepted; true is refused."
-                        ),
+                        "description": "Deprecated; previews are always off. true is refused.",
                     },
                     "unfurl_media": {
                         "type": "boolean",
-                        "description": (
-                            "Deprecated. Media previews are always off on bot "
-                            "posts. false is accepted; true is refused."
-                        ),
+                        "description": "Deprecated; previews are always off. true is refused.",
                     },
                     "thread_ts": {
                         "type": "string",
-                        "description": (
-                            "Optional Slack thread timestamp (e.g. '1712793600.123456'). "
-                            "When provided, the message is posted as a threaded reply under "
-                            "that parent message. Works with 'channel' (thread in channel) "
-                            "or 'user' (thread in DM)."
-                        ),
+                        "description": "Slack-only parent timestamp to reply in a thread.",
                     },
                     "reply_broadcast": {
                         "type": "boolean",
-                        "description": (
-                            "When true and 'thread_ts' is set, also broadcast the threaded reply "
-                            "to the channel's main message list. Requires 'thread_ts' — passing "
-                            "reply_broadcast=true without thread_ts returns 400. Defaults to false."
-                        ),
+                        "description": "Also post the threaded reply to the channel; needs thread_ts.",
                     },
                     "include_session_link": {
                         "type": "boolean",
                         "description": (
-                            "When true and the message is delivered to Slack, append an "
-                            '"Open session" button that deep-links to THIS session\'s '
-                            "dashboard chat (a cron links to its origin session). The link "
-                            "is built server-side from the verified caller identity, so it "
-                            "always points at the calling session — you never assemble it. "
-                            "The button's embedded sign-in credential expires ~5 minutes "
-                            "after send: a later tap still opens the session for a browser "
-                            "holding a dashboard session cookie, and otherwise lands on "
-                            "the sign-in page — so do not present the button as a durable "
-                            "link. Silently omitted (message still delivered) for non-Slack "
-                            "delivery, a caller with no resolvable session, or when no "
-                            "dashboard origin/tunnel is available. Defaults to false."
+                            "Slack only: append an Open session button for THIS "
+                            "session. Its sign-in expires in ~5 minutes."
                         ),
                     },
                     "session": {
                         "type": "string",
                         "enum": list(_SESSION_TARGETS),
                         "description": (
-                            "Delivery routing. Omit for notification bell only (default). "
-                            '"slack" adds Slack DM delivery. A channel name (e.g. '
-                            '"discord", "webex", "telegram") sends a DM on that channel '
-                            "to its configured owner instead; it takes none of the "
-                            "Slack-only options above, and falls back to the "
-                            "notification (saying so) when that channel is not "
-                            "connected or no single configured recipient can be "
-                            'resolved. "origin" injects into the dashboard session '
-                            "that spawned this cron (falls back to notification if "
-                            "unreachable)."
+                            'Omit for the bell only. "slack" or a channel (e.g. discord) '
+                            'DMs its configured owner; "origin" injects into the cron\'s '
+                            "dashboard session."
                         ),
                     },
                 },
@@ -273,12 +183,8 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "send_notification",
             "description": (
-                "Publish a notification to the Kiro Crew notification center "
-                "(bell feed) through the system.agent channel (RFC notification "
-                "bus Phase 5). Unlike send_message, this is a pure notification: "
-                "it never sends chat messages or DMs. "
-                "Supports priority tiers, a dashboard-internal "
-                "deep link, and group stacking. Use for structured, glanceable "
+                "Publish a bell-feed notification only (never a chat message or DM), with"
+                " priority, a dashboard deep link and group stacking. Use for glanceable "
                 "signals (job done, threshold crossed); use send_message for "
                 "conversational delivery."
             ),
@@ -364,14 +270,10 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "update_message",
             "description": (
-                "Edit a message previously sent by this bot, in place. Only works "
-                "on messages authored by the Kiro Crew bot itself (Slack API "
-                "constraint). Use for a rolling status message — progress, a live "
-                "checklist, a result that supersedes an earlier one — instead of "
-                "posting a follow-up that buries the original. Either text or "
-                "blocks is required, and what you pass REPLACES the message: an "
-                "edit carrying only blocks drops the old text, and one carrying "
-                "only text drops the old blocks."
+                "Edit a message this bot sent on Slack, in place: for a rolling status "
+                "instead of a follow-up. Pass text or blocks; what you pass REPLACES the "
+                "message, so blocks alone drop the old text and text alone drops the old "
+                "blocks."
             ),
             "inputSchema": {
                 "type": "object",
@@ -423,25 +325,13 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "file_send",
             "description": (
-                "Send a file to the user. Copies the file to the outbox and "
-                "notifies the dashboard with a download link. When this "
-                "session is linked to a Telegram conversation the file is "
-                "also delivered there natively; otherwise it uploads to "
-                "Slack when the caller's Slack identity permits it. Use "
-                "when you've generated a report, export or artifact the "
-                "user should receive. Any text file is accepted, but a "
-                "binary file only when it is audio, video, an image or a "
-                "PDF: other binary formats (zip, tar, Office "
-                "documents) are refused, so give the user their path "
-                "instead. Native channel delivery is "
-                "not guaranteed: the result reports skips and failures, and "
-                "a Slack-linked session reports a successful Slack upload. "
-                "If neither delivers, the file remains available from the "
-                "dashboard. To put an IMAGE inline in a "
-                "messaging conversation, reference it in your reply as "
-                "![alt](/abs/path) from the session's working directory — "
-                "the channel renderer uploads it as a native picture, which "
-                "this tool's outbox copy is not eligible for."
+                "Send the user a file: copies it to the outbox and posts a dashboard "
+                "download link; a Telegram-linked session also gets it natively, else "
+                "Slack when the caller's identity permits. Any text file is accepted; "
+                "binaries only when audio, video, an image or a PDF (zip, tar and Office "
+                "files are refused: give the path). Native delivery is not guaranteed; "
+                "the result reports skips. To show an IMAGE inline in a conversation, "
+                "write ![alt](/abs/path) in your reply instead."
             ),
             "inputSchema": {
                 "type": "object",

@@ -62,9 +62,8 @@ def schemas() -> list[dict[str, Any]]:
                     "offset": {
                         "type": "integer",
                         "description": (
-                            "search/list: result offset for the next page. read: 0-based "
-                            "first line of the page; pass it to read a body larger than "
-                            "one response in pages, each answer naming the next offset."
+                            "Next-page offset for search/list; for read, the 0-based first line "
+                            "of a paged body"
                         ),
                     },
                     "action": {

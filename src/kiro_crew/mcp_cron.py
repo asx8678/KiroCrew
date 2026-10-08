@@ -1892,55 +1892,31 @@ def _list_tools() -> list[dict[str, Any]]:
         {
             "name": "cron_list",
             "description": (
-                "List scheduled cron jobs. By default returns a compact "
-                "summary per job (id, name, status, schedule, next-run, "
-                "kind, agent, channel, last-status, last-error/result "
-                "preview, message preview) — sized to stay well under "
-                "context budget even for large registries (50+ jobs). "
-                "NOTE: the default response shape was compacted from the "
-                "legacy verbose layout; programmatic callers that need "
-                "byte-identical legacy output must pass verbose=true, or "
-                'ids=["<job_id>", ...] to drill in on specific jobs. Set '
-                "verbose=true for the full output (full message body and "
-                'full last_error/last_result). Pass ids=["<job_id>", ...] '
-                "to fetch full bodies for only those jobs (drill-in "
-                "pattern after a compact list). ids takes precedence over "
-                "verbose. SCOPED TO THE CALLING SESSION: only jobs this "
-                "session owns are listed, so an empty result means none are "
-                "owned HERE, not that none are scheduled. Jobs owned by "
-                "another session, or created without one (the CLI, the "
-                "onboarding importer), are managed with `kirocrew cron list` "
-                "or on the dashboard Schedule page."
+                "List cron jobs as a compact summary per job (id, name, status, "
+                "schedule, next run, last status, previews). verbose=true returns full "
+                "bodies; ids drills into chosen jobs (and wins over verbose). SCOPED TO "
+                "THE CALLING SESSION: an empty result means none are owned HERE, not "
+                "that none are scheduled; manage other jobs with `kirocrew cron list` "
+                "or the Schedule page."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "verbose": {
                         "type": "boolean",
-                        "description": "If true, return full per-job bodies "
-                        "(legacy shape). Default false (compact summary).",
+                        "description": "Full per-job bodies (legacy shape). Default false.",
                     },
                     "ids": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional list of job IDs. When set, "
-                        "returns full bodies for matching jobs only.",
+                        "description": "Job IDs to return in full.",
                     },
                     "json": {
                         "type": "boolean",
-                        "description": "If true, return a JSON document instead "
-                        "of text: one record per owned job with its mode, "
-                        "schedule, context settings, prompt, and folded "
-                        "run-history counts (runs, failures, distinct results, "
-                        "runs that found nothing to do). Takes precedence over "
-                        "verbose and over ids' implied verbose, because it "
-                        "serves a program rather than a reader. Run history is "
-                        "read through the gateway, which is the only reader "
-                        "that can see it; when that read cannot happen, "
-                        "history_available is false and each UNFETCHED job's "
-                        "history is null rather than an empty tally, so a job "
-                        "whose history is unknown is never mistaken for an idle "
-                        "one. A partial read keeps the history it did fetch.",
+                        "description": (
+                            "JSON records with folded run history; wins over verbose/ids. "
+                            "history_available=false means history is unknown, not idle."
+                        ),
                     },
                 },
             },
@@ -1948,12 +1924,10 @@ def _list_tools() -> list[dict[str, Any]]:
         {
             "name": "cron_add",
             "description": (
-                "Add a scheduled cron job. Use when the user says 'every', "
-                "'daily', 'weekly', 'remind me', 'check regularly', or "
-                "'schedule'. Requires name + message, plus one of: every "
-                "(seconds), cron_expr, at (unix timestamp), delay (seconds "
-                "from now), or at_time (human string like '5pm', "
-                "'tomorrow 9am', 'in 2 hours')."
+                "Add a scheduled cron job ('every', 'daily', 'remind me', 'check "
+                "regularly'). Requires name + message (or script/command) and one of "
+                "every, cron_expr, at, delay or at_time. Field details: the "
+                "`kirocrew-commands` skill, Cron Jobs."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1966,158 +1940,111 @@ def _list_tools() -> list[dict[str, Any]]:
                     },
                     "cron_expr": {
                         "type": "string",
-                        "description": "Standard 5-field cron expression: "
-                        '"min hour dom month dow" where dow: 0=Sun,1=Mon..6=Sat '
-                        '(e.g. "0 9 * * 1-5" for weekdays at 9AM, '
-                        '"30 15 * * 2,4" for Tue/Thu at 3:30PM), evaluated in '
-                        "the job's timezone (default: the global config "
-                        "timezone, then UTC)",
+                        "description": (
+                            '5-field cron "min hour dom month dow" (dow 0=Sun), in the '
+                            "job's timezone"
+                        ),
                     },
                     "at": {
                         "type": "number",
-                        "description": "Unix timestamp for one-shot job (auto-deletes after)",
+                        "description": "Unix timestamp for a one-shot job (auto-deletes after)",
                     },
                     "delay": {
                         "type": "number",
-                        "description": "Seconds from now for one-shot job (e.g. 120 for 2 minutes). "
-                        "Converted to 'at' internally. Prefer this over 'at'.",
+                        "description": "Seconds from now for a one-shot job; prefer over 'at'",
                     },
                     "at_time": {
                         "type": "string",
-                        "description": "Human time string for one-shot job, parsed server-side. "
-                        "Examples: '5pm', '17:00', 'tomorrow 9:30am', 'in 2 hours', "
-                        "'2026-03-28 14:00'. A clock time is read in 'timezone' when given, "
-                        "else the global config timezone, then UTC. "
-                        "Prefer this over 'at' for absolute times.",
+                        "description": (
+                            "One-shot human time ('5pm', 'tomorrow 9:30am', 'in 2 hours'), "
+                            "read in 'timezone'"
+                        ),
                     },
                     "channel": {
                         "type": "string",
-                        "description": "Slack channel ID to post results to (e.g. 'C0AP3QR7Z4M'). "
-                        "If omitted, posts in the originating thread/DM.",
+                        "description": "Slack channel ID for results; omit for the originating thread/DM",
                     },
                     "thread_ts": {
                         "type": "string",
-                        "description": "Slack thread timestamp to reply in. "
-                        "Use with channel to post results as a thread reply instead of a new message. "
-                        "When omitted and the cron is scheduled from inside a Slack thread in the "
-                        "same channel it posts to, it DEFAULTS to the caller's own thread. "
-                        "Pass an empty string to opt out and deliver at the channel top level.",
+                        "description": (
+                            "Slack thread to reply in; defaults to the caller's own thread, "
+                            '"" opts out'
+                        ),
                     },
                     "agent": {
                         "type": "string",
-                        "description": "Agent name for this job (e.g. 'customer360-code-agent'). "
-                        "Empty or omitted uses the default kirocrew agent.",
+                        "description": "Agent name; omit for the default kirocrew agent",
                     },
                     "member_id": {
                         "type": "string",
-                        "description": "Crew Member responsible for this schedule. Uses that "
-                        "member's memory. Omit to inherit the creating conversation's "
-                        "member; ordinary conversations retain global V1 memory.",
+                        "description": "Crew Member whose memory the job uses; omit to inherit",
                     },
                     "silent": {
                         "type": "boolean",
-                        "description": "When true, suppress automatic message delivery. "
-                        "The agent controls when to notify via send_message.",
+                        "description": "Suppress automatic delivery; notify via send_message",
                     },
                     "approval_mode": {
                         "type": "string",
                         "enum": ["", "auto"],
-                        "description": "Tool approval mode for this job. "
-                        "'auto' auto-approves all tools without prompting. "
-                        "Empty or omitted uses default hook-based approval.",
+                        "description": "'auto' auto-approves all tools; omit for hook approval",
                     },
                     "model": {
                         "type": "string",
-                        "description": "Model override for this job (canonical key or provider id, "
-                        "e.g. 'sonnet', 'opus'). Empty or omitted inherits from the agent config "
-                        "or global default. Applies when the job's session is created; a running "
-                        "persistent session keeps its current model until it is reset.",
+                        "description": "Model override; omit to inherit the agent or global default",
                     },
                     "skip_dates": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": 'ISO dates to skip (e.g. ["2026-04-06", "2026-12-25"]). '
-                        "Job silently does not fire on these dates. Evaluated in job's timezone.",
+                        "description": "ISO dates on which the job does not fire",
                     },
                     "timezone": {
                         "type": "string",
-                        "description": "IANA timezone for cron expression evaluation, an at_time "
-                        "clock time, and skip_dates (e.g. 'America/New_York'). Cron hour/minute "
-                        "fields and an at_time such as '9am' are interpreted in this timezone. "
-                        "Falls back to global config timezone, then UTC.",
+                        "description": (
+                            "IANA timezone for cron_expr, at_time and skip_dates; else "
+                            "global config, then UTC"
+                        ),
                     },
                     "folder": {
                         "type": "string",
-                        "description": "Schedule-page folder to file this job in, by name or "
-                        "id (e.g. 'Veille'). A missing name is created. Empty or omitted "
-                        "leaves the job ungrouped.",
+                        "description": "Schedule-page folder name or id (a missing name is created)",
                     },
                     "persistent_session": {
                         "type": "boolean",
-                        "description": "Whether this cron reuses one agent session across "
-                        "runs (True, default) or opens a fresh session per run (False). "
-                        "Set False for polling/scanner jobs with no conversational state — "
-                        "avoids unbounded context growth. Set True (or omit) for "
-                        "conversational reminders that should remember prior runs.",
+                        "description": (
+                            "Reuse one session across runs (default true); false for "
+                            "polling jobs"
+                        ),
                     },
                     "minimal_context": {
                         "type": "boolean",
-                        "description": "When true, skip memory, lessons, skills, and "
-                        "thread history injection — only date/time and agent identity "
-                        "are included (~200 tokens vs ~30-55k). Also caps last_result "
-                        "to 2000 chars. Use for simple polling/checker jobs.",
+                        "description": "Skip memory, lessons, skills and history (~200 tokens a wake)",
                     },
                     "hide_in_chat": {
                         "type": "boolean",
-                        "description": "When true, this cron's runs do NOT appear as a chat "
-                        "session in the dashboard active-session list (default false). Set true "
-                        "for fire-and-forget jobs (digests, cleanups, polling) so they stay out "
-                        "of the Chats sidebar — the result still goes to Slack/dashboard "
-                        "notification and the History tab. Only applies to agent crons "
-                        "(LLM jobs with a message); script/command crons never create a slot.",
+                        "description": "Keep agent-cron runs out of the Chats sidebar",
                     },
                     "strict_schedule": {
                         "type": "boolean",
-                        "description": "When true, fire exactly on schedule with no jitter. "
-                        "Default false — jobs get random delay (0-5min hourly, 0-59min daily) "
-                        "to spread load.",
+                        "description": "Fire exactly on schedule, with no load-spreading jitter",
                     },
                     "script": {
                         "type": "string",
-                        "description": "Python callable path for code-based cron execution "
-                        "(bypasses LLM entirely). Format: "
-                        "'~/.kiro/crew/crons/file.py:function'. Scripts must be under "
-                        "~/.kiro/crew/crons/. Function receives a "
-                        "ScriptContext and can raise Skip() to retry or Done() to "
-                        "remove the job. Use ctx.notify() to deliver messages, and "
-                        "ctx.open_session() / ctx.send_to_session() / "
-                        "ctx.set_session_mode() to open, seed and set the approval "
-                        "mode (trust or trust_reads) of a dashboard session (never "
-                        "shell out to 'kirocrew token'; the sandboxed child is "
-                        "refused). "
-                        "When set, 'message' is passed to the script as ctx.message "
-                        "(used for arguments) rather than being sent to an LLM.",
+                        "description": (
+                            "No-LLM Python callable '~/.kiro/crew/crons/file.py:function'; "
+                            "'message' becomes ctx.message"
+                        ),
                     },
                     "command": {
                         "type": "string",
-                        "description": "Shell command for code-based cron execution "
-                        "(bypasses LLM entirely). Mutually exclusive with 'script'. "
-                        "When set, 'message' is passed as arguments rather than "
-                        "being sent to an LLM.",
+                        "description": "No-LLM shell command; exclusive with 'script'",
                     },
                     "timeout": {
                         "type": "integer",
-                        "description": "Execution timeout in seconds. "
-                        "Defaults: 30s for scripts, 300s for commands. "
-                        "Set higher for long-running tasks.",
+                        "description": "Script/command subprocess timeout (default 30s / 300s)",
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Per-wake execution budget in seconds "
-                        "(1..86400; the asyncio deadline for one run of this "
-                        "job, default 1800). Distinct from 'timeout', which "
-                        "bounds only script/command subprocesses. Raise it for "
-                        "agents whose single wake legitimately outgrows 30 min.",
+                        "description": "Whole-wake budget in seconds (1..86400, default 1800)",
                     },
                 },
                 "required": ["name"],
@@ -2125,7 +2052,10 @@ def _list_tools() -> list[dict[str, Any]]:
         },
         {
             "name": "cron_update",
-            "description": "Update an existing cron job's name, message, schedule, agent, or channel.",
+            "description": (
+                "Update an existing cron job in place (id and history are kept); "
+                "omitted fields stay. Fields mean what they mean on cron_add."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2136,25 +2066,17 @@ def _list_tools() -> list[dict[str, Any]]:
                     "every": {"type": "integer", "description": "New interval in seconds (min 60)"},
                     "timeout": {
                         "type": "integer",
-                        "description": "Script/command subprocess timeout in "
-                        "seconds (0..3600; 0 = defaults: 30s script, 300s "
-                        "command).",
+                        "description": "Subprocess timeout (0..3600; 0 = defaults)",
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Per-wake execution budget in seconds "
-                        "(1..86400; the asyncio deadline for one run of this "
-                        "job, default 1800). Distinct from 'timeout', which "
-                        "bounds only script/command subprocesses. Raise it for "
-                        "jobs whose single run legitimately outgrows 30 min.",
+                        "description": "Whole-wake budget in seconds (1..86400)",
                     },
                     "agent": {"type": "string", "description": "New agent name"},
                     "channel": {"type": "string", "description": "New channel ID"},
                     "folder": {
                         "type": "string",
-                        "description": "Move the job to this Schedule-page folder, by name "
-                        "or id. A missing name is created. Empty string moves the job out "
-                        "of its folder (ungrouped).",
+                        "description": 'Folder name or id; "" ungroups the job',
                     },
                     "thread_ts": {
                         "type": "string",
@@ -2171,37 +2093,14 @@ def _list_tools() -> list[dict[str, Any]]:
                         "items": {"type": "string"},
                         "description": "ISO dates to skip. Replaces existing list.",
                     },
-                    "timezone": {
-                        "type": "string",
-                        "description": "IANA timezone for cron expression evaluation and "
-                        "skip_dates. Falls back to global config timezone, then UTC.",
-                    },
-                    "strict_schedule": {
-                        "type": "boolean",
-                        "description": "When true, fire exactly on schedule with no jitter.",
-                    },
-                    "persistent_session": {
-                        "type": "boolean",
-                        "description": "Whether this cron reuses one agent session across runs.",
-                    },
-                    "minimal_context": {
-                        "type": "boolean",
-                        "description": "When true, skip memory/lessons/skills/history "
-                        "injection. Only date/time + agent identity are included.",
-                    },
-                    "hide_in_chat": {
-                        "type": "boolean",
-                        "description": "When true, this cron's runs do NOT appear as a chat "
-                        "session in the dashboard active-session list. Set true to keep "
-                        "fire-and-forget jobs out of the Chats sidebar (result still goes to "
-                        "Slack/bell + History).",
-                    },
+                    "timezone": {"type": "string", "description": "New IANA timezone"},
+                    "strict_schedule": {"type": "boolean"},
+                    "persistent_session": {"type": "boolean"},
+                    "minimal_context": {"type": "boolean"},
+                    "hide_in_chat": {"type": "boolean"},
                     "model": {
                         "type": "string",
-                        "description": "Model override for this job (canonical key or provider id). "
-                        "Empty string clears the override (inherits from agent/global). Applies "
-                        "when the job's session is created; a running persistent session keeps "
-                        "its current model until it is reset.",
+                        "description": 'Model override; "" clears it',
                     },
                 },
                 "required": ["job_id"],
@@ -2252,15 +2151,10 @@ def _list_tools() -> list[dict[str, Any]]:
         {
             "name": "cron_secret_request",
             "description": (
-                "Request vault secrets for a SCRIPT cron job you own. "
-                "This does NOT grant anything: it records a PENDING request "
-                "(env-var name -> vault secret name, pinned to the job's "
-                "current code) that the operator must approve in the dashboard "
-                "(Schedule > job > Secrets) before the values are injected "
-                "into the job's subprocess env at fire time. Tell the user to "
-                "approve it. Secrets must already exist in the vault "
-                "(Settings > Secrets). An empty 'secrets' object withdraws a "
-                "pending request."
+                "Request vault secrets for a SCRIPT cron job you own. Grants nothing: it "
+                "records a PENDING request (env var -> vault secret, pinned to the job's "
+                "code) that the operator approves under Schedule > job > Secrets; tell "
+                "the user. An empty 'secrets' withdraws it."
             ),
             "inputSchema": {
                 "type": "object",

@@ -252,6 +252,47 @@ writes.
 | `kirocrew cron preview SCRIPT` | Run a script cron locally with real MCP tools; notifications are printed, not delivered |
 | `kirocrew cron preview SCRIPT -m "msg" -e K=V` | Preview with an input message / extra env vars |
 
+### `cron_add` / `cron_update` tool fields
+
+The MCP tools take the same fields as the CLI flags above. What the short
+schema text leaves out:
+
+- **Schedule.** Exactly one of `every` (seconds, min 60), `cron_expr`, `at` (Unix
+  timestamp), `delay` (seconds from now) or `at_time` (`'5pm'`, `'17:00'`,
+  `'tomorrow 9:30am'`, `'in 2 hours'`, `'2026-03-28 14:00'`). `cron_expr` is
+  `"min hour dom month dow"` with `dow` 0=Sun..6=Sat (`"0 9 * * 1-5"` is weekdays at
+  9AM). `cron_expr`, an `at_time` clock time and `skip_dates` are read in `timezone`,
+  else the global config timezone, then UTC. One-shot jobs delete themselves after
+  firing.
+- **Slack delivery.** `channel` posts results to a tracked channel. `thread_ts`
+  replies in a thread; when omitted and the job is scheduled from inside a Slack
+  thread in the same channel, it defaults to that thread. Pass `""` to post at the
+  channel top level.
+- **Session shape.** `persistent_session=true` (default) reuses one session so a
+  conversational reminder remembers prior runs; set it false for polling or scanner
+  jobs, which otherwise grow their context without bound. `minimal_context=true`
+  injects only date/time and agent identity (~200 tokens instead of ~30-55k) and
+  caps `last_result` at 2000 chars. `hide_in_chat=true` keeps an agent cron's runs
+  out of the Chats sidebar (results still reach Slack, the bell and History);
+  script and command crons never create a chat slot. `strict_schedule=false`
+  (default) adds load-spreading jitter (0-5 min hourly, 0-59 min daily).
+- **Code crons.** `script='~/.kiro/crew/crons/file.py:function'` (the file must be
+  under `crons/`) or `command` bypass the LLM; `message` is passed as arguments
+  (`ctx.message`). The function receives a `ScriptContext`: `ctx.notify()` delivers,
+  `raise Skip()` retries, `Done(msg)` delivers and removes the job, and
+  `ctx.open_session()` / `ctx.send_to_session()` / `ctx.set_session_mode()` open,
+  seed and set the approval mode (`trust` or `trust_reads`) of a dashboard session.
+  Never shell out to `kirocrew token`: the sandboxed child is refused.
+- **Budgets.** `timeout` bounds only the script/command subprocess (defaults 30s
+  script, 300s command); `timeout_secs` bounds the whole wake (1..86400, default
+  1800) and is the one to raise for an agent whose single wake outgrows 30 minutes.
+- **Model.** `model` applies when the job's session is created; a running
+  persistent session keeps its model until it is reset. `cron_update(model="")`
+  clears the override.
+- **Listing.** `cron_list(json=true)` returns one record per owned job with folded
+  run-history counts; `history_available=false` means the gateway could not be
+  read and an unfetched job's history is `null`, never an empty tally.
+
 ## Learning & Memory
 
 | Command | Description |

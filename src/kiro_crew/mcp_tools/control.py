@@ -247,15 +247,11 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "route_crew",
             "description": (
-                "Rank the crews whose triggers match a task, best first, and return each "
-                "one's score, description and memory store. Use this when you want the "
-                "same task to reach the same crew every time; use select_crew when you "
-                "want the roster and intend to judge the fit yourself. Only when both "
-                "`matches` and `unavailable` are empty does no crew claim the task; "
-                "handle that case on the default crew. Report unavailable members and "
-                "their reasons without substituting Global memory. Acting on a match means "
-                "spawn_run(crew=<name>), which is what gives that run the crew's memory "
-                "and template and keeps another crew's memory out of it."
+                "Rank the crews whose triggers match a task, best first, with score, "
+                "description and memory store; use select_crew to judge the roster "
+                "yourself. Empty matches AND unavailable means no crew claims it: stay on"
+                " the default crew. Report unavailable members without substituting "
+                "Global memory. Act on a match with spawn_run(crew=<name>)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -271,19 +267,12 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "select_crew",
             "description": (
-                "Orchestrator crew routing. Call with NO argument to get the roster of "
-                "selectable crews (name + triggers) so you can decide whether a specialist "
-                "crew fits the task better than handling it yourself. Call with `crew` set "
-                "to a roster name to bind it: returns the crew's resolved {workspace, "
-                "memory_store, kiro_agent, model}, which you then run via "
-                "spawn_run(crew=<name>) -- `crew=`, NOT `agent=`: `agent` names a "
-                "kiro-cli template, and passing a crew name there gives the run the "
-                "DEFAULT memory store, silently, which is how one crew's work ends up "
-                "in another's memory. Selection rules: (1) pick a crew ONLY when its "
-                "triggers clearly and specifically match the task with high confidence; "
-                "(2) if no crew is a strong match, do NOT route — fall back to the default "
-                "crew (default_agent); (3) crews without triggers are omitted from the "
-                "roster and are never auto-selected."
+                "Crew routing. With no argument, list the selectable crews (name + "
+                "triggers); with crew=<name>, bind it and return its workspace, memory "
+                "store, agent and model. Run it via spawn_run(crew=<name>), NOT agent=: "
+                "an agent name gives the run the DEFAULT memory store. Pick a crew only "
+                "when its triggers clearly match; otherwise stay on the default crew. "
+                "Crews without triggers are never listed."
             ),
             "inputSchema": {
                 "type": "object",
@@ -345,21 +334,13 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "ask_question",
             "description": (
-                "Ask the dashboard user 1-4 multiple-choice questions by posting a "
-                "question card to the chat: the user clicks an option (or types a "
-                "custom answer in the card's free-text field). The tool is "
-                "NON-BLOCKING — it returns as soon as the card is requested, so END "
-                "YOUR TURN immediately after calling it. The answer arrives as the "
-                "user's next ordinary message, NOT as this tool's result, so do not "
-                "re-ask or guess in the meantime. Use it when a decision is genuinely "
-                "needed before the work can continue (which of these approaches, "
-                "which account, confirm before I refactor). When you are ending your "
-                "turn anyway a final [OPTIONS: a | b | c] tag is cheaper and renders "
-                "on every channel — the card's advantage is several questions at "
-                "once, multi-select and the free-text field, not saving a turn. "
-                "Dashboard sessions only: from another surface the call returns an "
-                "[OPTIONS:] steer instead of a card, and if no dashboard client is "
-                "attached the card is dropped."
+                "Ask the dashboard user 1-4 multiple-choice questions as a card (options "
+                "plus a free-text field). NON-BLOCKING: END YOUR TURN right after "
+                "calling; the answer arrives as the user's next ordinary message, not as "
+                "this result. Use only for a decision the user alone can make that blocks"
+                " the work. When ending your turn anyway, a final [OPTIONS: a | b | c] "
+                "tag is cheaper and works on every channel. Other surfaces get an "
+                "[OPTIONS:] steer instead of a card."
             ),
             "inputSchema": {
                 "type": "object",
@@ -500,59 +481,25 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "monitor_start",
             "description": (
-                "Start a finite prompt loop for repeated work on YOUR CURRENT session, "
-                "including first-class self-session patrol by conductor agents. For "
-                "monitoring targets, this is also the legacy fallback for targets, "
-                "objectives, or required evidence unsupported by monitor_watch. "
+                "Start a finite prompt loop on YOUR CURRENT session, including conductor "
+                "self-patrol; also the legacy fallback for targets, objectives or evidence "
+                "unsupported by monitor_watch. "
                 + (
                     _ARMING_STEER_STRUCTURED_BY_DEFAULT
                     if prefer_structured
                     else _ARMING_STEER_STRUCTURED_ON_CONDITION
                 )
-                + "Start a prompt loop on YOUR CURRENT session: every "
-                "interval_secs the given message is re-injected into this same "
-                "session as your next turn — same context, same tools, same "
-                "conversation. The countdown is deadline-preserving: user "
-                "messages defer a due fire until their turn ends but do NOT "
-                "restart the interval, so checks stay on schedule even in an "
-                "actively-used session. Works from dashboard chat, Slack "
-                "threads, Discord DMs, and Webex conversations. Put the check instructions and "
-                "the exit "
-                "condition in the message, then END YOUR TURN — the loop wakes you on the "
-                "interval. When the exit condition is met (or the user says "
-                "stop), call autonudge_stop — reaching max_cycles is a runaway "
-                "backstop, NOT a successful finish. From dashboard, Slack, or "
-                "Discord, use monitor_update to revise or re-arm the instruction "
-                "if what you are watching changes. On Webex, stop the loop and "
-                "create a new finite one instead. One automation may occupy a "
-                "session; monitor_start "
-                "is create-only and refuses while an ACTIVE one exists (a "
-                "system-stopped or expired automation — an approval stall, a "
-                "spent cap or budget, a finished subject — is replaced by the "
-                "new arm; manual pauses, user stops and retained tombstones "
-                "are preserved). "
-                "Survives gateway restarts. Every cycle appends a full turn to "
-                "this same session, so keep per-cycle output small and report "
-                "only real signals. "
-                "COST: naming exactly ONE GitHub pull request BY ITS FULL URL "
-                "(https://github.com/<owner>/<repo>/pull/<N>) makes the loop "
-                "observe it each interval and re-inject your message only when "
-                f"the tick needs you: {screen_phrase()}. Where the screen is "
-                "available, progress that asks nothing of you raises no wake and "
-                "costs no model turn -- one "
-                "lane of many finishing, a pending count shrinking, a bot "
-                "posting its own status -- and a raised wake is held briefly, "
-                "so it lands up to about one interval after the tick that "
-                f"observed it. {_ending_clause()} ends the watch rather than "
-                "waking you. "
-                "max_cycles then counts the turns actually "
-                "DELIVERED to you -- wakes, plus the periodic delivery that "
-                "breaks a long quiet streak and any tick that could not observe "
-                "the subject -- rather than intervals elapsed. If your loop must "
-                "run every "
-                "interval regardless -- it acts while the subject is quiet, e.g. "
-                "refreshing a heartbeat -- do not name a single pull request, or "
-                "pass gate=false."
+                + "Every interval_secs `message` is re-injected as your next turn; user "
+                "turns defer a due fire without restarting the deadline. Works from "
+                "dashboard, Slack, Discord and Webex. Put the checks and exit condition in "
+                "`message`, END YOUR TURN, and call autonudge_stop when done: max_cycles is "
+                "a runaway backstop, NOT success. Create-only while an ACTIVE automation "
+                "exists; revise with monitor_update. On Webex, stop the loop and create a "
+                "new finite one instead. Naming ONE GitHub pull request by full URL gates "
+                "the loop, re-injecting only when the tick needs you: "
+                f"{screen_phrase()}; one lane of many finishing raises no wake, and a "
+                "raised wake lands up to about one interval after the tick that observed "
+                f"it. {_ending_clause()} ends the watch. Read the `babysit` skill first."
             ),
             "inputSchema": {
                 "type": "object",
@@ -560,40 +507,23 @@ def schemas() -> list[dict[str, Any]]:
                     "message": {
                         "type": "string",
                         "description": (
-                            "The recurring instruction to re-inject each cycle, "
-                            "including what to check and when to stop (max 8000 chars)"
+                            "Instruction re-injected each cycle: what to check and when "
+                            "to stop (max 8000 chars)"
                         ),
                     },
                     "interval_secs": {
                         "type": "integer",
                         "description": (
-                            "Seconds between cycles, counted from the loop's "
-                            "last cycle (its own turn's end) toward a fixed "
-                            "deadline. User messages defer a due fire to their "
-                            "turn's end without restarting the countdown. A "
-                            "cycle whose own work runs long still pushes the "
-                            "next deadline out, so real cadence is at least "
-                            "interval_secs + turn time (15-86400, default 300)"
+                            "Seconds between cycles, toward a fixed deadline; turn time "
+                            "adds to it (15-86400, default 300)"
                         ),
                     },
                     "gate": {
                         "type": "boolean",
                         "description": (
-                            "Default true. Pass false to opt this loop OUT of "
-                            "observation-gating, so it is re-injected every "
-                            "interval even when the tick needs nothing from you. "
-                            "Use it for a loop whose duty is to act "
-                            "WHILE the subject is quiet -- refresh a heartbeat "
-                            "file, chase a reviewer who still has not replied, "
-                            "keep a branch rebased on a moving base -- since the "
-                            "screen reads the pull request and continued "
-                            "silence is invisible to it. Pass it too for a loop "
-                            "that must see lanes land one at a time, since "
-                            "per-lane progress raises no wake unless your own "
-                            "wake criteria ask for it. A gated loop is "
-                            "never starved (it is delivered anyway after enough "
-                            "quiet intervals) so reach for this only when every "
-                            "interval genuinely has work"
+                            "Default true. false re-injects every interval even when a "
+                            "tick raises no wake: for duties while the subject is quiet, "
+                            "or to see lanes land one at a time"
                         ),
                     },
                     "max_cycles": {
@@ -602,8 +532,7 @@ def schemas() -> list[dict[str, Any]]:
                         "maximum": 1000,
                         "description": (
                             "Safety cap on delivered cycles (default "
-                            f"{_MONITOR_DEFAULT_MAX_CYCLES}). Use a larger finite "
-                            "value for a longer watch"
+                            f"{_MONITOR_DEFAULT_MAX_CYCLES})"
                         ),
                     },
                     "max_runtime_secs": {
@@ -611,90 +540,39 @@ def schemas() -> list[dict[str, Any]]:
                         "minimum": 1,
                         "maximum": runtime_ceiling,
                         "description": (
-                            "Wall-clock budget in seconds, measured from when "
-                            "the loop is armed (default "
+                            "Wall-clock budget from arming (default "
                             f"{min(_MONITOR_DEFAULT_MAX_RUNTIME_SECS, runtime_ceiling)}; "
-                            f"configured max {runtime_ceiling}). "
-                            "Unlike max_cycles this "
-                            "bounds elapsed TIME, so a loop with slow turns or "
-                            "a long interval still stops on schedule. The "
-                            "budget gates when turns START and re-checks the "
-                            "moment a turn ends — an already-running turn is "
-                            "never cancelled, so the loop can overshoot by at "
-                            "most one turn (itself bounded by the per-turn "
-                            "transport timeout). When the budget is spent the "
-                            "loop deactivates and the user is notified"
+                            f"configured max {runtime_ceiling})"
                         ),
                     },
                     "banner": {
                         "type": "string",
                         "description": (
-                            "Optional SHORT line shown in the transcript row "
-                            "instead of the full message (max 500 chars). The "
-                            "model still receives `message` whole every cycle — "
-                            "this changes only what is stored and displayed. Set "
-                            "it whenever `message` is long: a multi-KB "
-                            "instruction is otherwise re-stored and re-broadcast "
-                            "as a transcript row on every single cycle, which "
-                            "measured 51.8% of one long-running session's file. "
-                            'Something like "watching PR #123 for CI" is '
-                            "enough. Omit it for a short message, and omit it on "
-                            "a channel-bound loop (`slack:`/`discord:`/`webex:`) "
-                            "— a banner there is refused with a 400, since only "
-                            "the dashboard transcript renders it"
+                            "Short transcript line shown instead of a long `message` "
+                            "(max 500 chars). Dashboard only; refused on channel loops"
                         ),
                     },
                     "judge": {
                         "type": ["object", "boolean"],
                         "description": (
-                            "Optional WAKE JUDGE: say in plain words what is worth "
-                            "waking this session for, and a cycle with nothing new "
-                            "costs no turn at all. Before each cycle the evidence "
-                            "your watched targets produced since the last one — a "
-                            "watched session's new assistant lines, a watched pull "
-                            "request's typed state and check tallies — is read and "
-                            "answered against these two sentences. Reach for it "
-                            "whenever what decides the answer is PROSE no typed "
-                            "check can evaluate: worker transcripts you are "
-                            "patrolling, or your own criterion applied to a pull "
-                            "request's state. It never ends "
-                            "the loop and it never silences one indefinitely — after "
-                            "a run of quiet cycles one fires anyway — so a wrong "
-                            "answer costs a late turn, not a missed one. You do not "
-                            "have to pass it: once the evidence scope is granted, a "
-                            "gated loop is screened on every cycle under a default "
-                            "brief that asks whether the subject needs its owner, and "
-                            "these two sentences REPLACE that default with your own. "
-                            "Pass `false` to bypass the judge entirely; a `gate=false` "
-                            "loop is never screened, since its duty is to act while "
-                            "its subject is quiet"
+                            "Optional wake judge: two sentences on what is worth a turn. "
+                            "Replaces the default brief; false bypasses it"
                         ),
                         "properties": {
                             "wake_when": {
                                 "type": "string",
-                                "description": (
-                                    "What genuinely needs this session's attention, "
-                                    'in one sentence, e.g. "a worker line starts '
-                                    'with RULING or BLOCKED" or "a reviewer asked '
-                                    'for a change"'
-                                ),
+                                "description": "What needs this session, in one sentence",
                             },
                             "quiet_when": {
                                 "type": "string",
-                                "description": (
-                                    "What is progress not worth a turn, in one "
-                                    'sentence, e.g. "workers report WORKING with '
-                                    'no new status" or "checks are still running"'
-                                ),
+                                "description": "What progress is not worth a turn, in one sentence",
                             },
                             "targets": {
                                 "type": "array",
                                 "items": {"type": "string"},
                                 "description": (
-                                    "Optional. What to read evidence from: dashboard "
-                                    "chat keys (`chat-...`) and pull-request URLs. "
-                                    "Omit it and the ones named in `message` are "
-                                    "used, which is usually what you want"
+                                    "Chat keys and PR URLs to read; defaults to those "
+                                    "named in `message`"
                                 ),
                             },
                         },
@@ -703,20 +581,8 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "string",
                         "enum": [_WATCH_WORK_LEDGER],
                         "description": (
-                            "Optional. Name the SUBJECT this loop observes, for the one "
-                            "subject your instruction cannot name. Pass "
-                            f'"{_WATCH_WORK_LEDGER}" to gate this loop on YOUR OWN work '
-                            "ledger: a cycle where no worker you dispatched said "
-                            "anything you must act on costs no turn, and a worker's "
-                            "report, a worker session closing, or a worker turn ending "
-                            "pulls the next cycle forward to within seconds instead of "
-                            "waiting out interval_secs. For a conductor patrolling "
-                            "dispatched workers this is the field to use, and it lets "
-                            "you set interval_secs in hours -- the timer becomes the "
-                            "liveness fallback, not the delivery path. Omit it and the "
-                            "subject is inferred from `message`, which is how a pull "
-                            "request is named. Gating does not need `gate` as well: "
-                            "naming a watch gates the loop on its own"
+                            f'"{_WATCH_WORK_LEDGER}" gates the loop on YOUR OWN work '
+                            "ledger: a worker report wakes it within seconds"
                         ),
                     },
                 },
@@ -726,51 +592,34 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "monitor_update",
             "description": (
-                "Revise the monitoring loop already running on YOUR CURRENT "
-                "session — change the recurring instruction, the interval, or "
-                "the cycle cap without tearing the loop down and losing its "
-                "cycle count. Use when what you are watching has moved on and "
-                "the instruction you armed is now stale (the PR advanced past "
-                "the blocker you described, the check you were told to run "
-                "changed, the exit condition needs tightening). Only ever "
-                "touches your own session's loop. To stop the loop entirely, "
-                "use autonudge_stop instead."
+                "Revise the loop already on YOUR CURRENT session (instruction, interval, "
+                "caps, banner, judge, watch) without losing its cycle count; omitted "
+                "fields stay. Structured monitors take target/objective/budgets. To "
+                "stop, use autonudge_stop."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "message": {
                         "type": "string",
-                        "description": (
-                            "Replacement instruction for future cycles "
-                            "(max 8000 chars). Omit to leave it unchanged"
-                        ),
+                        "description": "Replacement instruction (max 8000 chars)",
                     },
                     "interval_secs": {
                         "type": "integer",
-                        "description": (
-                            "New IDLE gap between cycles, measured from when "
-                            "your turn ENDS (15-86400). Omit to leave unchanged"
-                        ),
+                        "description": "New gap between cycles (15-86400)",
                     },
                     "max_cycles": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 1000,
-                        "description": (
-                            "New cap on delivered cycles; raise it when a loop "
-                            "is close to its cap but the work is still live. "
-                            "Omit to leave unchanged"
-                        ),
+                        "description": "New cap on delivered cycles",
                     },
                     "max_runtime_secs": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": runtime_ceiling,
                         "description": (
-                            "New wall-clock budget in seconds, measured from "
-                            f"when the loop was first armed (configured max {runtime_ceiling}). "
-                            "Omit to leave unchanged"
+                            "New budget from first arming (configured max " f"{runtime_ceiling})"
                         ),
                     },
                     "target": {
@@ -782,11 +631,7 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "integer",
                         "minimum": 0,
                         "maximum": MAX_MONITOR_AGENT_TURNS,
-                        "description": (
-                            "New wake ceiling for a structured monitor. 0 removes the "
-                            "ceiling, leaving the runtime, token and provider-error "
-                            "budgets as the watch's only bounds."
-                        ),
+                        "description": "New structured wake ceiling; 0 removes it",
                     },
                     "max_tokens": {
                         "type": "integer",
@@ -805,65 +650,24 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "banner": {
                         "type": "string",
-                        "description": (
-                            "Replacement SHORT transcript row for future cycles "
-                            "(max 500 chars); the model still receives `message` "
-                            'whole. Pass "" to CLEAR it and go back to showing '
-                            "the full message. Omit to leave it unchanged. A "
-                            "non-blank banner on a channel-bound loop "
-                            "(`slack:`/`discord:`/`webex:`) is refused with a 400"
-                        ),
+                        "description": 'Replacement transcript line; "" clears it',
                     },
                     "judge": {
                         "type": ["object", "boolean"],
                         "description": (
-                            "Revise the WAKE JUDGE on this loop, or arm one on a loop "
-                            "that has none. Pass the two sentences again to replace "
-                            "them; pass an empty object to drop your own criteria, "
-                            "after which a gated loop runs under the default brief; "
-                            "pass `false` to bypass the judge entirely, after which "
-                            "every cycle fires as a plain timer again. Omit it "
-                            "to leave the current brief untouched. Revising resets "
-                            "the quiet-cycle count and the read positions, because "
-                            "both describe the brief you are replacing"
+                            "Replace the wake judge; {} restores the default brief, "
+                            "false bypasses it"
                         ),
                         "properties": {
-                            "wake_when": {
-                                "type": "string",
-                                "description": (
-                                    "What genuinely needs this session's attention, "
-                                    "in one sentence"
-                                ),
-                            },
-                            "quiet_when": {
-                                "type": "string",
-                                "description": (
-                                    "What is progress not worth a turn, in one " "sentence"
-                                ),
-                            },
-                            "targets": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": (
-                                    "Optional. What to read evidence from: dashboard "
-                                    "chat keys (`chat-...`) and pull-request URLs. "
-                                    "Omit it and the ones named in `message` are used"
-                                ),
-                            },
+                            "wake_when": {"type": "string"},
+                            "quiet_when": {"type": "string"},
+                            "targets": {"type": "array", "items": {"type": "string"}},
                         },
                     },
                     "watch": {
                         "type": "string",
                         "enum": [_WATCH_WORK_LEDGER],
-                        "description": (
-                            "Optional. Point this loop's observation at YOUR OWN work "
-                            f'ledger by passing "{_WATCH_WORK_LEDGER}", on a loop that '
-                            "was armed as a plain timer -- without tearing it down and "
-                            "losing its cycle count. After it, a cycle where no worker "
-                            "said anything actionable costs no turn, and a worker's "
-                            "report pulls the next cycle forward. Omit it to leave the "
-                            "loop's current subject alone"
-                        ),
+                        "description": f'"{_WATCH_WORK_LEDGER}" re-points the loop at your work ledger',
                     },
                 },
             },
@@ -871,26 +675,12 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "set_project",
             "description": (
-                "Set the calling chat slot's project directory. The directory scopes "
-                "file search, @-mention auto-complete, the [PROJECT] context line, "
-                "and project-level .kiro/steering/**/*.md. "
-                "\n\n"
-                "Use after a skill scaffolds a new working tree (e.g. a new workspace) "
-                "so the agent retargets to the new source instead of the old one. "
-                "Also use when the user asks you to work on a specific repository or "
-                "project folder — calling set_project ensures the session's CWD is "
-                "updated and future tool calls (file reads, bash commands) default to "
-                "the correct location. "
-                'To clear the project, pass path="" with clear=true. '
-                "\n\n"
-                "Restrictions: headless callers (cron jobs, subagents, task "
-                "runners) are rejected — a cron turn can run on a user's "
-                "dashboard slot and a subagent shares its parent's slot, so "
-                "they must not retarget it. Sensitive paths (~/.aws, ~/.ssh, "
-                "etc.) are blocked by the underlying endpoint. "
-                "\n\n"
-                "The session is reset on the NEXT turn boundary (not inline) so this "
-                "tool returns cleanly without killing its own caller."
+                "Set this chat slot's project directory, which scopes file search, "
+                "@-mentions, the [PROJECT] line and project steering. Use after "
+                "scaffolding or cloning a tree, or when the user names a repo. "
+                'Clear with path="" and clear=true. Applies at the NEXT turn '
+                "boundary, not inline. Headless callers (cron, subagents, task "
+                "runners) are refused; sensitive paths are blocked."
             ),
             "inputSchema": {
                 "type": "object",
@@ -913,34 +703,12 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "reset_conversation",
             "description": (
-                "Give the calling chat session a clean context: the next message "
-                "starts a fresh conversation with no memory of this one. The tab "
-                "stays open and the TRANSCRIPT IS NOT TOUCHED — earlier messages "
-                "remain visible and on disk, so this drops the model's memory, not "
-                "the user's record."
-                "\n\n"
-                "Use when a session walks a list of independent items one at a time "
-                "(reviewing a queue, triaging tickets) and carrying item N's context "
-                "into item N+1 buys nothing but tokens. Also use when a long-lived "
-                "conversation has drifted off the thing it was about."
-                "\n\n"
-                "Do NOT use to escape a context you still need: anything not written "
-                "down somewhere durable — a file, a ticket, a memory — is gone from "
-                "the model's view after the reset, even though the user can still "
-                "read it in the tab. Record what carries forward BEFORE calling this."
-                "\n\n"
-                "Restrictions: headless callers (cron jobs, subagents, task runners) "
-                "are rejected — a cron turn can run on a user's dashboard slot and a "
-                "subagent shares its parent's slot, so neither may wipe it."
-                "\n\n"
-                "The reset lands at a turn BOUNDARY, not inline, so this tool returns "
-                "cleanly without tearing down its own caller mid-write. Normally that "
-                "is the end of this turn, so the next message starts fresh. It waits, "
-                "however, for anything whose work the teardown would destroy: a turn "
-                "still in flight on the session, or sub-agents running, queued, or "
-                "delivering a result. So it can land a turn or more later than the "
-                "next message, and the rest of the current turn always still sees the "
-                "full conversation."
+                "Give this chat a fresh model context; the tab and TRANSCRIPT ARE NOT "
+                "TOUCHED. Use between independent items or after topic drift, and "
+                "record anything needed later FIRST: unrecorded context is gone. Lands "
+                "at a turn boundary once in-flight turns and running, queued or "
+                "delivering subagents finish, so possibly later than the next message. "
+                "Headless callers (cron, subagents, task runners) are refused."
             ),
             "inputSchema": {
                 "type": "object",
@@ -950,61 +718,27 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "chat_tag",
             "description": (
-                "Tag THIS chat session on the dashboard board so a human scanning "
-                "many sessions can see what each one needs. Use to move your own "
-                "conversation between workflow states (e.g. flip it to Review when "
-                "there is nothing left for you to do and it awaits the user), and to "
-                "add or remove non-state labels."
-                "\n\n"
-                "Arguments (at least one required): set_state=<state tag id> sets the "
-                "single mutually-exclusive workflow state (planned / todo / "
-                "implementation / review / done), replacing whichever state tag the "
-                "session currently carries; add=[ids] adds non-state labels; "
-                "remove=[ids] removes labels. Each entry may be a tag id or a "
-                "tag's display name; both resolve case-insensitively against "
-                "the board's vocabulary (an id wins when a name collides with "
-                "a different tag's id)."
-                "\n\n"
-                "PERMISSION: each tag carries an agent policy — a tag the human "
-                "reserved for themselves is refused (tag_policy_denied), an "
-                "add-only tag can be added but not removed, and workflow states "
-                "are agent-writable by default on a fresh install or when newly "
-                "created as status tags (an upgraded install starts with every "
-                "tag human-only until granted: a set_state that meets a custom "
-                "status tag with no protected record is refused "
-                "status_identity_unprotected, and the dashboard owner restores it "
-                "by choosing Set up agent permissions on that tag in the tag "
-                "manager, then choosing Agent: add & remove). "
-                "tag_grants_unavailable means the grants store itself is "
-                "unreadable or was quarantined at boot (for example after a "
-                "token-key rotation), not that a human reserved the tag: tell the "
-                "user, who re-grants it from the tag manager. The result reports the "
-                "session's RESULTING tag list, so this is also how you READ your own "
-                "current tags — call it with just the change you want (or a no-op "
-                "add of a tag already present) to see them."
-                "\n\n"
-                "Restrictions: slot-backed sessions only (a dashboard chat, or a "
-                "messaging thread bound to a dashboard slot) — a standalone channel "
-                "session with no slot is refused. Headless callers "
-                "(cron jobs, subagents) are refused — a cron turn can run on a user's "
-                "slot and a subagent shares its parent's, so neither may retag it. "
-                "The change applies when this turn's result is processed."
+                "Tag THIS chat on the dashboard board: set_state sets the one workflow "
+                "state (planned / todo / implementation / review / done), add/remove "
+                "change other labels (ids or display names, case-insensitive). The "
+                "result lists the session's resulting tags, so a no-op call reads them. "
+                "A human-reserved tag is refused (tag_policy_denied); "
+                "status_identity_unprotected means the owner must choose Set up agent "
+                "permissions on that tag; tag_grants_unavailable means the grants store "
+                "is unreadable, so tell the user. Slot-backed sessions only; cron and "
+                "subagents are refused."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "set_state": {
                         "type": "string",
-                        "description": (
-                            "A workflow-state tag id (planned / todo / implementation "
-                            "/ review / done). Replaces any state tag the session "
-                            "currently carries — the states are mutually exclusive."
-                        ),
+                        "description": ("Workflow-state tag id; replaces the current state tag."),
                     },
                     "add": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Tag ids to add (non-state labels only; a workflow-state id is refused — use set_state).",
+                        "description": "Non-state tag ids to add (a state id is refused).",
                     },
                     "remove": {
                         "type": "array",
@@ -1017,35 +751,13 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "suggest_followup",
             "description": (
-                "Offer the user up to 3 follow-up items as a card below the chat "
-                "composer in the CURRENT dashboard session. Each item shows a title "
-                "and description with three buttons: 'Start in new worktree' (creates "
-                "a git worktree off the project's default branch, opens a new chat "
-                "session scoped to it, and pre-fills the composer with your prompt), "
-                "'Add to this session' (pre-fills this session's composer with your "
-                "prompt), and 'Skip'. Both non-skip buttons PRE-FILL the composer — "
-                "the user still presses send — so nothing runs without their consent. "
-                "The worktree button requires the session to have a project directory "
-                "and is disabled otherwise (the tool result tells you when that is "
-                "the case); 'Add to this session' always works."
-                "\n\n"
-                "Call this at the END of a turn when you have finished the requested "
-                "work and see concrete next steps worth doing. Do NOT call it to ask a "
-                "clarifying question you need answered to continue (just ask), and do "
-                "not call it every turn — silence is the correct default when there is "
-                "no substantive follow-up."
-                "\n\n"
-                "The 'prompt' field is the real payload: write a COMPLETE, standalone "
-                "handoff instruction for the next agent, which may have none of this "
-                "session's context. Name the files, paths, constraints, and acceptance "
-                "criteria explicitly. 'title'/'description' are only the human-facing "
-                "label. Prefer 'branch' + the worktree route for work that should not "
-                "share this session's working tree."
-                "\n\n"
-                "Restrictions: dashboard sessions only (Slack, cron, and subagent "
-                "contexts are rejected — they have no card surface). One card at a "
-                "time per slot: a new call replaces any card the user has not yet "
-                "acted on."
+                "Offer up to 3 follow-ups as a card under the composer of the CURRENT "
+                "dashboard session, at the END of a finished task with concrete next "
+                "steps. Buttons only PRE-FILL the composer (new worktree, or this "
+                "session); the user sends. Each 'prompt' must be a COMPLETE standalone "
+                "handoff naming files, constraints and acceptance criteria. Not for "
+                "blocking questions and not every turn: silence is the default. Dashboard"
+                " only; a new card replaces an unanswered one."
             ),
             "inputSchema": {
                 "type": "object",

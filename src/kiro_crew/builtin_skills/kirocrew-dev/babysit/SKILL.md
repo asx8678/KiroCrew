@@ -163,6 +163,39 @@ security. Fix, commit and push only within the user's authorization.
   stops stay preserved; retained evidence needs the owner action above. Do not
   rearm merged/closed work as if it still needed repairs.
 
+### `monitor_start` fields in full
+
+The tool schema keeps these short; the rules they stand for:
+
+- `interval_secs` (15-86400, default 300) counts toward a fixed deadline from the
+  loop's last cycle. A user turn defers a due fire to its end without restarting
+  the countdown; a cycle whose own work runs long pushes the next deadline out, so
+  real cadence is at least `interval_secs` plus turn time.
+- `max_runtime_secs` bounds elapsed time from arming. It gates when turns START
+  and re-checks when one ends: a running turn is never cancelled, so a loop can
+  overshoot by at most one turn. When it is spent the loop deactivates and the
+  user is notified. `monitor_update(max_runtime_secs=...)` measures from the first
+  arming.
+- `banner` exists because a multi-KB `message` is otherwise re-stored and
+  re-broadcast as a transcript row on every cycle (measured at 51.8% of one
+  long-running session's file).
+- `judge` takes two sentences, `wake_when` and `quiet_when`, plus optional
+  `targets` (chat keys and pull-request URLs; default: those named in `message`).
+  Each cycle the evidence the targets produced since the last one -- a watched
+  session's new assistant lines, a pull request's typed state and check tallies --
+  is read against them. It never ends a loop and never silences one forever: after
+  a run of quiet cycles one fires anyway. Without `judge`, a gated loop whose
+  owner granted the evidence scope is screened under the default brief. `false`
+  bypasses the judge; a `gate=false` loop is never screened. On `monitor_update`,
+  `{}` drops your own criteria (back to the default brief), and revising resets
+  the quiet-cycle count and read positions.
+- `watch="work-ledger"` gates the loop on the conductor's own work ledger: a quiet
+  cycle costs no turn, and a worker's report, a worker session closing or a worker
+  turn ending pulls the next cycle forward to within seconds. Set `interval_secs`
+  in hours then: the timer becomes the liveness fallback. Naming a watch gates the
+  loop by itself; `monitor_update(watch=...)` re-points a plain timer without
+  losing its count.
+
 ## Execute the legacy loop
 
 1. Write a self-contained instruction naming subject, allowed actions, success,

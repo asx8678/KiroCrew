@@ -56,18 +56,12 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "session_ledger_record",
             "description": (
-                "Record one step of long-running work into THIS session's "
-                "durable ledger, so the state survives context compaction and "
-                "is re-injected into monitor-loop cycles. Write what a cold "
-                "resume needs: `next` as a concrete intent (not a status "
-                "word), approaches you tried and rejected, and artifact "
-                "pointers (worktree, branch, PR). Fields you omit keep their "
-                "stored values — partial updates are the norm. Changing "
-                f"`phase` REQUIRES an `event` (+ `event_kind`); phases "
-                f"{terminal} mark the workstream finished and stop the "
-                "ledger's snapshot injection. Use it for genuinely "
-                "long-horizon work (babysit loops, goal loops, multi-wake "
-                "tasks), not for single-turn requests."
+                "Record a step of long-running work in THIS session's durable ledger, "
+                "which survives compaction and is re-injected into monitor cycles. Write "
+                "what a cold resume needs: a concrete `next`, rejected approaches, "
+                "artifact pointers. Omitted fields keep their values. Changing `phase` "
+                f"REQUIRES `event` + `event_kind`; {terminal} end the workstream. For "
+                "multi-wake work, not single-turn requests."
             ),
             "inputSchema": {
                 "type": "object",
@@ -81,11 +75,8 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "string",
                         "maxLength": 128,
                         "description": (
-                            "Current phase (free-form, e.g. 'implementing', "
-                            f"'awaiting-ci'; {terminal} are terminal). "
-                            "REQUIRES `event` AND a recognized `event_kind` "
-                            "in the same call — a phase never moves without "
-                            "a logged, classified reason."
+                            f"Free-form phase (e.g. 'awaiting-ci'; {terminal} are terminal). "
+                            "Needs event + event_kind."
                         ),
                     },
                     "next": {

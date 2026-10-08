@@ -77,21 +77,16 @@ def schemas() -> list[dict[str, Any]]:
                     "slug": {
                         "type": "string",
                         "description": (
-                            "Optional explicit slug (lowercase, digits, hyphens). "
-                            "A taken or malformed slug is REFUSED, never renamed — "
-                            "call artifact_update on the existing slug to version "
-                            "it in place. Omit to derive one from name and let a "
-                            "collision resolve by suffixing (-2, -3, ...)."
+                            "Optional slug; a taken or malformed one is REFUSED (use "
+                            "artifact_update). Omit to derive one"
                         ),
                     },
                     "kind": {
                         "type": "string",
                         "enum": ["widget", "html", "markdown", "svg", "json", "text", "webapp"],
                         "description": (
-                            "Artifact kind. Optional — inferred from the content "
-                            "when omitted (HTML-ish body -> widget, markdown text "
-                            "-> markdown). Pass explicitly to override; markdown "
-                            "documents should set kind='markdown'."
+                            "Optional kind; inferred from content (HTML -> widget, text -> "
+                            "markdown)"
                         ),
                     },
                     "source": {
@@ -111,20 +106,15 @@ def schemas() -> list[dict[str, Any]]:
                     "folder": {
                         "type": "string",
                         "description": (
-                            "Optional folder to file the artifact in — a folder id "
-                            "OR a '/'-separated human path (e.g. 'Reports/Q3'). "
-                            "Missing path segments are auto-created (mkdir -p). "
-                            "Omit or pass 'root' to leave it unfiled."
+                            "Folder id or '/' path (e.g. 'Reports/Q3'), auto-created; omit or "
+                            "'root' for unfiled"
                         ),
                     },
                     "webapp_metadata": {
                         "type": "object",
                         "description": (
-                            "For kind='webapp' only — metadata for the app-artifact "
-                            "control card. Shape: {slug, origin_session, "
-                            "deploy_target:{provider,account,region,public_url}, "
-                            "architecture, lifecycle, cost, teardown}. "
-                            "For draft apps: set lifecycle.status='draft'"
+                            "kind='webapp' only: app-card metadata (deploy_target, lifecycle, "
+                            "cost, teardown)"
                         ),
                         "additionalProperties": True,
                     },
@@ -797,7 +787,9 @@ def artifact_get(name: str, args: dict[str, Any]) -> str:
     # the slug in front of it twice and still emitted without it.
     kind = d.get("kind", "widget")
     if kind == "widget":
-        out_body += "\n\n" + mcp_core._artifact_reemit_hint(d.get("slug", "?"), d.get("name", ""), kind)
+        out_body += "\n\n" + mcp_core._artifact_reemit_hint(
+            d.get("slug", "?"), d.get("name", ""), kind
+        )
     else:
         out_body += "\n\n" + mcp_core._artifact_ref_link(d.get("slug", "?"), d.get("name", ""))
     return out_body
@@ -1192,6 +1184,7 @@ def deploy_artifact(name: str, args: dict[str, Any]) -> str:
     # canonical credential redaction -- error/scan/message fields can
     # carry file content.
     from kiro_crew.deploy.handlers import _redact_text as _deploy_redact
+
     if d.get("error"):
         # `error` is now the plain human sentence and `details` carries the stack
         # and parameter names. Relay BOTH: the LLM is the caller that needs to
@@ -1209,29 +1202,31 @@ def deploy_artifact(name: str, args: dict[str, Any]) -> str:
         findings = _deploy_redact(str(d.get("findings", "")))
         if d.get("credential"):
             # Credential-class findings are a HARD block — never pending.
-            return (f"Deploy BLOCKED by scan ({d.get('count', '?')} finding(s)):\n"
-                    f"{findings}")
+            return f"Deploy BLOCKED by scan ({d.get('count', '?')} finding(s)):\n" f"{findings}"
         # Non-credential findings are documented as human-overridable.
         # Persist a pending entry flagged override_scan_required so the
         # dashboard can present the explicit "deploy anyway" action for
         # these previews.
         from kiro_crew.deploy.pending import add_pending
-        add_pending({
-            "site_id": args["site_id"],
-            "artifact_slug": args.get("artifact_slug", ""),
-            "local_dir": args.get("local_dir", ""),
-            "profile": d.get("profile", args.get("profile", "")),
-            "region": d.get("region", ""),
-            "ttl_hours": args.get("ttl_hours", 72),
-            "scan_summary": findings,
-            "content_digest": d.get("content_digest", ""),
-            "override_scan_required": True,
-        })
+
+        add_pending(
+            {
+                "site_id": args["site_id"],
+                "artifact_slug": args.get("artifact_slug", ""),
+                "local_dir": args.get("local_dir", ""),
+                "profile": d.get("profile", args.get("profile", "")),
+                "region": d.get("region", ""),
+                "ttl_hours": args.get("ttl_hours", 72),
+                "scan_summary": findings,
+                "content_digest": d.get("content_digest", ""),
+                "override_scan_required": True,
+            }
+        )
         return (
             f"Deploy blocked by scan ({d.get('count', '?')} non-credential "
             f"finding(s)):\n{findings}\n\n"
             f"These findings are overridable by a HUMAN: the deploy now "
-            f"appears under \"Pending confirmations\" in the dashboard at "
+            f'appears under "Pending confirmations" in the dashboard at '
             f"Artifacts -> Artifact Deploy (/deploy), where the user can "
             f"review the findings and "
             f"explicitly deploy anyway (or dismiss).\n"
@@ -1242,6 +1237,7 @@ def deploy_artifact(name: str, args: dict[str, Any]) -> str:
     # Preview response (requires_confirm is always true for the tool path)
     # Persist as a pending confirmation so the dashboard UI can execute it.
     from kiro_crew.deploy.pending import add_pending
+
     pending_params = {
         "site_id": args["site_id"],
         "artifact_slug": args.get("artifact_slug", ""),
@@ -1266,7 +1262,7 @@ def deploy_artifact(name: str, args: dict[str, Any]) -> str:
         f"\nWARNING: Anyone with the published link can view this content. "
         f"It is served on the public internet with no authentication. Relay "
         f"this warning to the user before they confirm.\n"
-        f"\nThis deploy now appears under \"Pending confirmations\" in the "
+        f'\nThis deploy now appears under "Pending confirmations" in the '
         f"dashboard: Artifacts -> Artifact Deploy (/deploy) -> Pending "
         f"confirmations. Open it there to confirm or dismiss."
     )

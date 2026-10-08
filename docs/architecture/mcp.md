@@ -2864,6 +2864,15 @@ request I saw".
 - Durable state lives behind a gateway endpoint keyed by session.
 - The tool behaves identically whether it is the only caller or one of many
   sharing the backend.
+- Descriptions stay short: about 600 characters for the tool and about 120 for
+  each property. Every request a session makes resends the definitions of every
+  server its spec mounts, so how-to prose is paid on every turn whether the tool
+  is called or not. Put the how-to in the skill the tool points at (the `babysit`
+  skill for the monitor tools, `kirocrew-commands` for the cron fields, the
+  conductor skills for the work ledger) and keep in the schema what a caller needs
+  to pick the tool and call it correctly: the routing rule, the refusals it will
+  meet, and any limit, quoted from `mcp_tools/_limits.py` or the module constant
+  rather than a literal.
 
 ## Troubleshooting
 
