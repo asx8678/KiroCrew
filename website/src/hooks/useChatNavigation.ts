@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import type { ChatMessage } from '../types'
 import { extractChatLinks, type ExtractedLink } from '../utils/extractChatLinks'
@@ -50,10 +50,15 @@ function extractContext(text: string, url: string): string {
   return text.slice(start === -1 ? 0 : start, end === -1 ? undefined : end).trim().slice(0, 400)
 }
 
+const labelCache = new Map<string, string>()
+
 export function useChatNavigation(
   messages: ChatMessage[],
   messageToDisplayIdx: Map<number, number>,
+  options?: { resolve?: boolean },
 ): ChatNavigationData {
+  const resolve = options?.resolve !== false
+  const [labels, setLabels] = useState(() => new Map(labelCache))
   const links = useMemo(() => extractChatLinks(messages), [messages])
 
   // Compute which links need LLM resolution (bare URLs, not from markdown)
@@ -64,31 +69,36 @@ export function useChatNavigation(
   }, [links, messages])
 
   // Stable batch key for the entire set of links to resolve
-  const batchKey = useMemo(
-    () => linksToResolve.map(l => l.url).join('|'),
-    [linksToResolve],
+  const pending = useMemo(
+    () => linksToResolve.filter(link => !labels.has(link.url)).slice(0, 20),
+    [linksToResolve, labels],
   )
+  const batchKey = useMemo(() => pending.map(l => l.url).join('|'), [pending])
 
-  // Single batched query for all bare URLs
-  const { data: summaries = [], isLoading: resolving } = useQuery({
+  const { isLoading: resolving } = useQuery({
     queryKey: ['nav-link-summaries', batchKey],
     queryFn: () =>
-      api.resolveNavLinks(linksToResolve.map(({ url, context }) => ({ url, context }))).then(r => r.summaries),
+      api.resolveNavLinks(pending.map(({ url, context }) => ({ url, context }))).then(r => {
+        pending.forEach((link, i) => {
+          const summary = r.summaries[i]
+          if (summary && summary.length >= 3) labelCache.set(link.url, summary)
+        })
+        setLabels(new Map(labelCache))
+        return r.summaries
+      }),
     staleTime: Infinity,
-    enabled: linksToResolve.length > 0,
+    gcTime: Infinity,
+    enabled: resolve && pending.length > 0,
   })
 
-  // Merge resolved summaries back into links
   const resolvedLinks = useMemo(() => {
     const result = [...links]
-    for (let i = 0; i < linksToResolve.length; i++) {
-      const summary = summaries[i]
-      if (summary && summary.length >= 3) {
-        result[linksToResolve[i].idx] = { ...result[linksToResolve[i].idx], label: summary }
-      }
+    for (const link of linksToResolve) {
+      const summary = labels.get(link.url)
+      if (summary) result[link.idx] = { ...result[link.idx], label: summary }
     }
     return result
-  }, [links, linksToResolve, summaries])
+  }, [links, linksToResolve, labels])
 
   const sections = useMemo(() => {
     const result: ChatSection[] = []

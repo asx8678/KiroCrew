@@ -3943,7 +3943,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Navigation tab. Both read the deferred snapshot, so the link list trails a
   // landing history page by one deferred commit -- deliberate, and harmless for
   // a side panel.
-  const chatNav = useChatNavigation(renderedTranscript.messages, messageToDisplayIdx)
+  const linksTabOpen = activityOpen && !search.isOpen && tabsCtl.tabs.find(t => t.id === tabsCtl.activeId)?.kind === 'links'
+  const chatNav = useChatNavigation(renderedTranscript.messages, messageToDisplayIdx, { resolve: linksTabOpen })
 
   // ── Chat Pins ──────────────────────────────────────────────────────────────
   const {

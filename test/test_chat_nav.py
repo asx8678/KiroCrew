@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import pytest
 
+from kiro_crew.dashboard import chat_nav
 from kiro_crew.dashboard.chat_nav import (
     _build_link_summary_prompt,
     _normalize_link,
     _resolve_link_summaries,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_label_cache():
+    chat_nav._LABEL_CACHE.clear()
+    yield
+    chat_nav._LABEL_CACHE.clear()
 
 
 class TestBuildLinkSummaryPrompt:

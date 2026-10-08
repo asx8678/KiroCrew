@@ -130,4 +130,12 @@ describe('useChatNavigation', () => {
     expect(call[0].context).toContain('line2')
     expect(call[0].context).toContain('line4')
   })
+
+  it('does not resolve while the Links tab is closed', async () => {
+    const { api } = await import('../api/client')
+    const messages = [msg('user', 'https://example.com/closed')]
+    renderHook(() => useChatNavigation(messages, new Map([[0, 0]]), { resolve: false }), { wrapper })
+    await new Promise(r => setTimeout(r, 50))
+    expect(api.resolveNavLinks).not.toHaveBeenCalled()
+  })
 })

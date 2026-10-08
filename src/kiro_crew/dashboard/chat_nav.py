@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
+import time
 from urllib.parse import urlparse
 
 from aiohttp import web
@@ -103,17 +105,44 @@ _PREAMBLE_RE = re.compile(
 )
 
 
+_LABEL_CACHE: dict[str, tuple[float, str]] = {}
+_LABEL_TTL_SECS = 24 * 60 * 60
+_LABEL_CACHE_MAX = 256
+
+
+def _label_key(url: str, context: str) -> str:
+    bare = url.split("?", 1)[0]
+    return hashlib.sha256(f"{bare}\n{context}".encode()).hexdigest()
+
+
+def _cached_label(url: str, context: str) -> str | None:
+    hit = _LABEL_CACHE.get(_label_key(url, context))
+    if hit is None or time.time() - hit[0] > _LABEL_TTL_SECS:
+        return None
+    return hit[1]
+
+
+def _store_label(url: str, context: str, label: str) -> None:
+    if not label:
+        return
+    if len(_LABEL_CACHE) >= _LABEL_CACHE_MAX:
+        _LABEL_CACHE.clear()
+    _LABEL_CACHE[_label_key(url, context)] = (time.time(), label)
+
+
 async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> list[str]:
     """Generate summaries for a batch of links using the background session."""
-    prompt = _build_link_summary_prompt(links)
-    # Link labeling is a trivial classification task — run on the cheapest model
-    # via the shared background one-liner helper (denials are SEL-logged).
-    text = await run_bg_oneliner(
-        # No model: inherit the pinned background spec model.
-        state.sessions,
-        prompt,
-        sel_source="chat_nav",
-    )
+    missing = [link for link in links if _cached_label(str(link.get("url") or ""), str(link.get("context") or "")) is None]
+    fresh: list[str] = []
+    text = ""
+    if missing:
+        prompt = _build_link_summary_prompt(missing)
+        text = await run_bg_oneliner(
+            # No model: inherit the pinned background spec model.
+            state.sessions,
+            prompt,
+            sel_source="chat_nav",
+        )
 
     # Parse: one label per line. The frontend merges the reply POSITIONALLY
     # (label i -> link i), so alignment matters as much as content.
@@ -163,7 +192,25 @@ async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> l
             results.append("")
             continue
         results.append(ln[:80])
-    return results
+    fresh = results
+    if len(missing) == len(links):
+        for link, label in zip(missing, fresh):
+            _store_label(str(link.get("url") or ""), str(link.get("context") or ""), label)
+        return fresh
+    out: list[str] = []
+    fresh_i = 0
+    for link in links:
+        url = str(link.get("url") or "")
+        context = str(link.get("context") or "")
+        cached = _cached_label(url, context)
+        if cached is not None:
+            out.append(cached)
+            continue
+        label = fresh[fresh_i] if fresh_i < len(fresh) else ""
+        fresh_i += 1
+        _store_label(url, context, label)
+        out.append(label)
+    return out
 
 
 async def api_chat_nav_resolve_links(request: web.Request) -> web.Response:
