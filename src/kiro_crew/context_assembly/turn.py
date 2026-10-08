@@ -52,6 +52,7 @@ def post_compaction_parts(
     essentials: str,
     provider_type: str,
     context_provider: Any,
+    minimal_context: bool = False,
 ) -> list[str]:
     """What a turn re-injects after a confirmed compaction dropped session start.
 
@@ -84,6 +85,10 @@ def post_compaction_parts(
         is_cc=is_cc,
         private_owner=private_owner,
         session_start=False,
+        # Same capability/surface section gates as session start; the
+        # ``{{DIFF_RULE}}`` token points at the critical rules re-injected below.
+        minimal_context=minimal_context,
+        runtime_source=runtime_source,
     )
     if _agent_prompt:
         parts.append(f"[AGENT SYSTEM PROMPT]\n{_agent_prompt}\n[END AGENT SYSTEM PROMPT]\n\n")
