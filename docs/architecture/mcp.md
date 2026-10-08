@@ -880,7 +880,8 @@ effect at the next gateway start.
 (`gatewayd`), which runs no config watcher — `config.live.snapshot()` is always
 `None` there — so a per-use read of the live snapshot would be inert and the
 field stays boot-only (`RESPONSE_SPILL_THRESHOLD_BYTES`, resolved once at import:
-env pin `KIROCREW_MCP_SPILL_THRESHOLD` → config key → built-in 256 KiB), marked
+env pin `KIROCREW_MCP_SPILL_THRESHOLD` → config key → built-in 48 KiB, the
+tool-result budget below), marked
 `restart=True` like the rest of the section. `read_buffer_limit_bytes` is boot-only
 for a second reason as well: it is handed to asyncio readers as `limit=` when they
 are CONSTRUCTED and cannot be changed afterwards. The stub reads no config: the
@@ -2719,6 +2720,42 @@ CONTAINED the refusal token, so a stop whose reason quoted that token would be f
 as a refusal, skip both the publish and the vouch, and have its genuine marker
 defanged downstream: the stop would be lost. A gate against imitable content cannot itself be
 built on imitable content.
+
+### Every tool result is held to one 48 KiB budget
+
+`tool_result_cap.MAX_TOOL_RESULT_CHARS` (49,152, re-exported as
+`validation.MAX_RESPONSE_LEN`) is the most a tool result may put into context, on
+every path Kiro Crew can reach:
+
+- **First-party servers** (every `run_mcp_stdio_loop` server, mochi included):
+  `build_tool_response` sanitizes hidden characters, then cuts an over-budget text
+  in the MIDDLE -- about two thirds head, one third tail, each cut moved to a line
+  boundary -- and writes the full sanitized text to
+  `<data home>/mcp_spill/<server>-<request id>-<random>.txt`, whose path the
+  truncation note names. The tail is kept because tail-anchored payloads live
+  there: a session directive's marker is the last line of its result and fits the
+  ~16 KiB tail whole. A failed spill still caps, and the note says so.
+  `sanitize_response` is the pure (no-file) form of the same cut.
+- **The auto-improvement app's own server** frames its results through
+  `build_tool_response` too, after redacting (redaction runs before any cut, so
+  no credential is split across one).
+- **Stubbed third-party servers**: the broker's
+  `response_spill_threshold_bytes` defaults to the same number (compared against
+  the frame's UTF-8 bytes, the stricter reading), and an over-threshold frame is
+  spilled and each text item cut head+tail until the whole frame fits -- no band
+  where a result passes whole and no cliff past it. Image blocks are downscaled
+  before that step (`image_budget`). A third-party server that is not stubbed
+  (`mcp_gateway.stub_servers` is empty by default) is launched by kiro-cli
+  directly and gets no Kiro Crew cap; whether to stub them by default is an open
+  maintainer decision.
+
+The spill file is named from the call (server, request id) passed down per call,
+never module state, so the servers stay stateless. Tools that must stay
+parseable JSON size themselves under the budget (`mcp_cron._JSON_BYTE_BUDGET`,
+`mcp_work._READ_BUDGET_CHARS`, `mcp_crew_log.MAX_READ_BYTES`,
+`mcp_debug.MAX_OUTPUT_BYTES`, `diagnostics._MAX_LOG_RESPONSE_CHARS`,
+`mcp_tools/skills._READ_CEILING`, `mcp_tools/learn._LIST_RENDER_BUDGET`), so the
+transport cut is a backstop they never reach.
 
 ### An `Error:` prose result can also be framed as an MCP error
 

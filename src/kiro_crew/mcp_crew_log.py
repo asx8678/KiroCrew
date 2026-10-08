@@ -81,7 +81,7 @@ from urllib.parse import quote, urlencode
 from kiro_crew.mcp_core import _get, _resolve_session_key, require_strict_session_key
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.platform import redact_via_context as redact
-from kiro_crew.validation import MCP_CREW_LOG_SCHEMAS, validate_tool_args
+from kiro_crew.validation import MAX_RESPONSE_LEN, MCP_CREW_LOG_SCHEMAS, validate_tool_args
 
 logger = logging.getLogger(__name__)
 
@@ -112,8 +112,10 @@ MAX_READ_LIMIT = 200
 #: Bytes one ``crew_log_read`` result may occupy. A crew log holds message bodies,
 #: so a whole file is megabytes and a tool result is context: past this the rows
 #: are cut at a ROW boundary and ``next_from`` carries the rest, because half a
-#: JSON row is not a shorter answer, it is an unparseable one.
-MAX_READ_BYTES = 64 * 1024
+#: JSON row is not a shorter answer, it is an unparseable one. Held 4 KiB under the
+#: transport's tool-result budget (``MAX_RESPONSE_LEN``, 48 KiB), whose own cut
+#: would otherwise land mid-document; the margin covers redaction growth.
+MAX_READ_BYTES = MAX_RESPONSE_LEN - 4 * 1024
 
 #: Characters of one entry's ``data`` a page keeps. A caller wanting one row whole
 #: asks for it by seq with ``full=True``, which is cheap and explicit; trimming by
@@ -476,7 +478,7 @@ def _one_row_within_budget(body: dict[str, Any], kept: list[dict[str, Any]]) -> 
     Converges by SHRINKING the character budget and re-rendering, never by slicing
     the rendered bytes: a byte slice through a JSON string produces a body no
     caller can parse, which is the failure this whole cap exists to avoid. Halving
-    terminates in at most ~17 passes from a 64 KiB budget, and a budget that
+    terminates in at most ~17 passes from a 44 KiB budget, and a budget that
     reaches zero drops the data to the marker alone, which is bounded by
     construction.
     """

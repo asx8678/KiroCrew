@@ -1,21 +1,22 @@
 """Spill-to-file for oversized MCP tool responses.
 
-When a tool/call result exceeds ``response_spill_threshold_bytes``, the full
-text payload is written to a sidecar file under ``<config_dir>/mcp_spill/`` and
-the in-band response is truncated to the first 16 KiB plus a marker telling
-the agent where to find the full content. Non-tool-result frames, errors, and
-small responses pass through untouched.
+When a tool/call result exceeds ``response_spill_threshold_bytes`` (by default
+the one tool-result budget, ``tool_result_cap.MAX_TOOL_RESULT_CHARS``), the full
+frame is written to a sidecar file under ``<config_dir>/mcp_spill/`` and each
+text item is cut in the middle -- head and tail kept, the same cut first-party
+results get -- with a marker telling the agent where the full content is, until
+the whole frame fits the threshold. Non-tool-result frames, errors, and small
+responses pass through untouched.
 
-Any failure in the spill path (disk full, permission denied, parse error) is
-swallowed and the original unmodified response forwarded — the happy path is
-never broken.
+A failed sidecar write (disk full, permission denied, a linked spill dir) still
+caps the frame, with a marker saying the full copy was not saved. A frame that
+does not parse, or a rewrite that itself fails, is forwarded unmodified.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import stat as stat_mod
 import time
@@ -24,15 +25,22 @@ from pathlib import Path
 from kiro_crew import platform_compat
 from kiro_crew.config.paths import config_dir
 from kiro_crew.json_line import parse_json_object_line
+from kiro_crew.tool_result_cap import (
+    SPILL_DIR_NAME,
+    cut_head_tail,
+    spill_filename,
+    write_spill_file,
+)
 
 logger = logging.getLogger(__name__)
 
-# Truncation prefix size — first 16 KiB of the original text content kept
-# inline so the agent has enough context to decide whether to read the file.
-_INLINE_PREFIX_BYTES = 16 * 1024
+# The smallest per-text-item budget the frame rewrite shrinks to. Below this the
+# kept head and tail would be too small to tell the agent whether to read the file.
+_MIN_TEXT_BUDGET = 1024
 
-# Spill directory (created mode 0700 on first use).
-_SPILL_DIR_NAME = "mcp_spill"
+# Spill directory (created mode 0700 on first use) -- shared with the
+# first-party tool-result spill in ``validation.build_tool_response``.
+_SPILL_DIR_NAME = SPILL_DIR_NAME
 
 # Max age (seconds) for spill files — older ones are cleaned on startup.
 _SPILL_MAX_AGE_SECS = 24 * 60 * 60  # 24 hours
@@ -93,12 +101,14 @@ def maybe_spill_response(
     server_name: str,
     threshold_bytes: int,
 ) -> bytes:
-    """If ``line`` is an oversized tool/call result, spill and truncate.
+    """If ``line`` is an oversized tool/call result, spill it and cut it to fit.
 
-    Returns the (possibly rewritten) line to forward. On any failure
-    returns the original ``line`` unmodified.
+    Returns the (possibly rewritten) line to forward: at most *threshold_bytes*
+    for a text result. A threshold of 0 (or less) disables the layer. A failed
+    sidecar write still caps; only an unparseable frame or a failed rewrite is
+    forwarded unmodified.
     """
-    if len(line) <= threshold_bytes:
+    if threshold_bytes <= 0 or len(line) <= threshold_bytes:
         return line
 
     msg = parse_json_object_line(line)
@@ -121,76 +131,96 @@ def maybe_spill_response(
     if not has_text_items:
         return line
 
-    # Spill the full text to file
+    msg_id = msg.get("id", "unknown")
+    total_bytes = len(line)
+    abs_path: str | None = None
     try:
-        msg_id = msg.get("id", "unknown")
-        request_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", str(msg_id))[:64]
-        timestamp = int(time.time())
-        safe_server = _sanitize_server_name(server_name)
-        filename = f"{safe_server}-{request_id}-{timestamp}.json"
+        # Named after the call (server, request id) plus a random token, so two
+        # results of one request id can never collide on the O_EXCL create.
+        label = f"{_sanitize_server_name(server_name)}-{_sanitize_server_name(str(msg_id))}"
+        filename = spill_filename(label, ".json")
+        abs_path = write_spill_file(_spill_dir(), filename, line)
+    except Exception:
+        # The full copy could not be kept (disk full, permissions, a linked
+        # spill dir). The frame is STILL cut to the budget -- an over-budget
+        # result must not reach the model whole because a sidecar failed -- and
+        # the note says the rest was not saved.
+        logger.warning(
+            "spill: failed to write oversized response for %s; capping without a copy",
+            server_name,
+            exc_info=True,
+        )
 
-        spill_dir = _spill_dir()
-        # Never operate through a linked spill dir (agent-swappable): an
-        # attacker-planted link would redirect the write outside the data home.
-        # ``is_link_or_junction``, not ``Path.is_symlink()``: a Windows directory
-        # JUNCTION is a reparse point ``is_symlink()`` answers False for, and it
-        # is the only directory link an unprivileged Windows writer can plant.
-        if platform_compat.is_link_or_junction(spill_dir):
-            logger.warning("spill dir is a link — refusing to spill")
-            return line
-        # Not a bare mkdir(mode=0o700): that is umask-masked, is ignored for
-        # an already-existing directory, and is inert on Windows -- yet this
-        # directory holds spilled tool responses, which are exactly the
-        # payloads that may carry secrets.
-        platform_compat.make_owner_only_dir(spill_dir)
-        spill_path = spill_dir / filename
-
-        # Exclusive, no-follow write: O_EXCL refuses ANY pre-existing entry
-        # at the path (including a pre-planted symlink, so nothing can make
-        # this write land on another file), and O_NOFOLLOW backstops it.
-        open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            open_flags |= os.O_NOFOLLOW
-        fd = os.open(str(spill_path), open_flags, 0o600)
-        try:
-            os.write(fd, line)
-        finally:
-            os.close(fd)
-        abs_path = str(spill_path.resolve())
-
-        # Truncate each text item's content to first 16 KiB + marker
-        total_bytes = len(line)
-        rewritten_content = []
-        for item in content_list:
-            if isinstance(item, dict) and item.get("type") == "text" and "text" in item:
-                text = item["text"]
-                if len(text.encode("utf-8")) > _INLINE_PREFIX_BYTES:
-                    truncated = text.encode("utf-8")[:_INLINE_PREFIX_BYTES].decode("utf-8", errors="ignore")
-                    marker = (
-                        f"\n\n[KiroCrew: response truncated -- full {total_bytes} bytes "
-                        f"at {abs_path}. Read with bash: head/grep/jq.]"
-                    )
-                    rewritten_content.append({**item, "text": truncated + marker})
-                else:
-                    rewritten_content.append(item)
-            else:
-                rewritten_content.append(item)
-
-        # Rebuild the response with truncated content
-        rewritten_msg = dict(msg)
-        rewritten_msg["result"] = {**result, "content": rewritten_content}
-        rewritten_line = json.dumps(rewritten_msg, separators=(",", ":")).encode("utf-8") + b"\n"
-
+    try:
+        rewritten_line = _cap_frame(
+            msg, result, content_list, threshold_bytes, total_bytes, abs_path
+        )
         logger.info(
-            "spill: %s response %s spilled to %s (%d bytes -> %d inline)",
-            server_name, msg_id, abs_path, total_bytes, len(rewritten_line),
+            "spill: %s response %s capped (%d bytes -> %d inline, full copy %s)",
+            server_name,
+            msg_id,
+            total_bytes,
+            len(rewritten_line),
+            abs_path or "not saved",
         )
         return rewritten_line
 
     except Exception:
-        # Any failure in spill path -> forward original unmodified
+        # A rewrite failure (not a spill failure) forwards the original line,
+        # so the happy path is never broken by this layer's own bug.
         logger.warning(
-            "spill: failed to write oversized response for %s; forwarding original",
-            server_name, exc_info=True,
+            "spill: failed to rewrite oversized response for %s; forwarding original",
+            server_name,
+            exc_info=True,
         )
         return line
+
+
+def _cap_frame(
+    msg: dict,
+    result: dict,
+    content_list: list,
+    threshold_bytes: int,
+    total_bytes: int,
+    abs_path: str | None,
+) -> bytes:
+    """The frame re-serialized with each text item cut head+tail to fit the threshold.
+
+    The text budget starts at the threshold and shrinks by the measured overshoot
+    until the WHOLE re-serialized line fits (JSON escaping makes a character cost
+    up to six bytes, and other items take their share). A frame whose non-text
+    items alone exceed the threshold is returned at the floor budget.
+    """
+
+    def note(omitted: int) -> str:
+        where = (
+            f"full {total_bytes}-byte response at {abs_path}. Read with bash: head/grep/jq."
+            if abs_path
+            else "the full response could not be saved."
+        )
+        return f"\n\n[KiroCrew: response truncated -- {omitted} chars omitted from the middle; {where}]\n\n"
+
+    budget = threshold_bytes
+    while True:
+        rewritten_content = []
+        for item in content_list:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "text"
+                and isinstance(item.get("text"), str)
+            ):
+                rewritten_content.append(
+                    {**item, "text": cut_head_tail(item["text"], budget, note)}
+                )
+            else:
+                rewritten_content.append(item)
+        rewritten_msg = dict(msg)
+        rewritten_msg["result"] = {**result, "content": rewritten_content}
+        rewritten_line = json.dumps(rewritten_msg, separators=(",", ":")).encode("utf-8") + b"\n"
+        over = len(rewritten_line) - threshold_bytes
+        if over <= 0 or budget <= _MIN_TEXT_BUDGET:
+            return rewritten_line
+        # Shrink in proportion to the overshoot, and always by at least the
+        # overshoot itself, so the loop converges in a few passes.
+        shrink = max(over, budget * over // max(len(rewritten_line), 1))
+        budget = max(_MIN_TEXT_BUDGET, budget - shrink - 64)

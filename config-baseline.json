@@ -3567,7 +3567,7 @@
         "pool_identity_env": [],
         "prewarm_count": 0,
         "read_buffer_limit_bytes": 67108864,
-        "response_spill_threshold_bytes": 262144
+        "response_spill_threshold_bytes": 49152
       }
     },
     {
@@ -3962,10 +3962,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Response Spill Threshold",
-      "help": "Tool-call responses larger than this (bytes) have their text content written to ~/.kiro/crew/mcp_spill/ and truncated inline to 16 KiB + a file path marker. Default 256 KiB. Set 0 to disable spilling. Env override: KIROCREW_MCP_SPILL_THRESHOLD. Read by the MCP broker when it starts, like every other field of this section.",
+      "help": "Tool-call responses larger than this (bytes) are written to ~/.kiro/crew/mcp_spill/ and their text cut head+tail to fit, with a file path marker. Default 48 KiB, the same budget every first-party tool result is held to. Set 0 to disable spilling. Env override: KIROCREW_MCP_SPILL_THRESHOLD. Read by the MCP broker when it starts, like every other field of this section.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 262144,
+      "defaultValue": 49152,
       "requiresRestart": true
     },
     {

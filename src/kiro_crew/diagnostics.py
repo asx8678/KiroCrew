@@ -329,12 +329,10 @@ _MAX_LOG_READ_BYTES = 64 * 1024
 #: above is divided among the sources rather than applied to each in full.
 #:
 #: The MCP transport has its own ceiling: every tool response leaves through
-#: ``validation.build_tool_response``, which calls ``sanitize_response`` -- and
-#: that truncation drops the TAIL (``text[:max_len]``). For a LOG TAIL that is
-#: the worst possible end to lose: the newest lines are the entire reason the
-#: tool was called, and its ``[response truncated]`` marker reads like the tool
-#: cut the OLDEST content, which is the normal convention for a tail. So the
-#: agent would be misled about which end it lost, not merely short-changed.
+#: ``validation.build_tool_response``, which cuts a result over its 48 KiB
+#: budget in the MIDDLE (head and tail kept). For a LOG TAIL that still loses
+#: lines the caller asked for, from the middle of the window, behind a generic
+#: marker -- not the oldest lines, which is the normal convention for a tail.
 #:
 #: This reader therefore does its own trimming, from the FRONT, so the newest
 #: output always survives and the drop is labelled for what it is. Kept a round
@@ -344,7 +342,7 @@ _MAX_LOG_READ_BYTES = 64 * 1024
 #: pins the relationship, so the invariant is enforced without the coupling.
 #: (``mcp_tools/skills.py`` bounds its own fields against the same ceiling for
 #: the same reason, so this is an existing contract, not a new one.)
-_MAX_LOG_RESPONSE_CHARS = 80_000
+_MAX_LOG_RESPONSE_CHARS = 40_000
 
 #: Default-response budget (TOOL-11): a call that names no ``tail`` answers in
 #: ~20k chars, not the full ceiling — the old default returned 65-80k chars per
@@ -689,12 +687,11 @@ def read_kiro_cli_logs(
     tail is the shape that deadlocks a pipe, so that bound is by BYTES; ``tail``
     narrows lines within it but can never raise it), and
     :data:`_MAX_LOG_RESPONSE_CHARS` caps the whole assembled response. Every MCP
-    response leaves through ``validation.build_tool_response``, whose
-    ``sanitize_response`` truncates the TAIL -- so left alone it would drop the
-    NEWEST log lines, the entire reason a tail was requested, behind a marker
-    that reads like the oldest were cut. This function therefore trims its own
-    output from the FRONT and labels the drop, so the newest lines always
-    survive.
+    response leaves through ``validation.build_tool_response``, which cuts an
+    over-budget result in the MIDDLE -- so left alone it would drop log lines
+    from inside the requested window behind a generic marker. This function
+    therefore trims its own output from the FRONT and labels the drop, so the
+    newest lines always survive and the oldest are what is lost.
 
     The read goes through :func:`_read_log_tail`, which opens each source and
     (where the platform offers ``O_NOFOLLOW``) refuses a symlinked final
@@ -718,7 +715,7 @@ def read_kiro_cli_logs(
         # The default view answers "what just happened" in ONE bounded read:
         # ~50 newest lines MERGED across sources (divided between them) under a
         # 20,000-char response budget. A caller who asks for more gets the full
-        # per-source tail and the 80,000-char ceiling.
+        # per-source tail and the 40,000-char ceiling.
         tail = max(1, _DEFAULT_LOG_TAIL_LINES_TOTAL // max(len(sources), 1))
     response_budget = _MAX_LOG_RESPONSE_CHARS if tail_given else _DEFAULT_LOG_RESPONSE_CHARS
 
@@ -786,7 +783,7 @@ def read_kiro_cli_logs(
         + (f", since={since}" if since else "")
         + f", {total_redactions} secret(s) redacted, capped at {max_bytes // 1024} KiB/source"
         + (
-            "; default view - ask for more with tail=N (up to 2000, 80,000-char ceiling)"
+            "; default view - ask for more with tail=N (up to 2000, 40,000-char ceiling)"
             if not tail_given
             else ""
         )

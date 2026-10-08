@@ -36,6 +36,7 @@ from kiro_crew.instances.constants import (
     RECOVER_BACKOFF_MAX_CEILING_SECS as _RECOVER_BACKOFF_CEILING,
 )
 from kiro_crew.instances.constants import WARM_SET_CAP_AUTO as _WARM_SET_CAP_AUTO
+from kiro_crew.tool_result_cap import MAX_TOOL_RESULT_CHARS
 
 logger = logging.getLogger("kiro_crew.config.loader")
 
@@ -639,12 +640,13 @@ class McpGatewayConfig:
         ),
     )
     response_spill_threshold_bytes: int = field(
-        default=256 * 1024,
+        default=MAX_TOOL_RESULT_CHARS,
         metadata=_meta(
             "Response Spill Threshold",
-            "Tool-call responses larger than this (bytes) have their text content "
-            "written to ~/.kiro/crew/mcp_spill/ and truncated inline to 16 KiB + "
-            "a file path marker. Default 256 KiB. Set 0 to disable spilling. "
+            "Tool-call responses larger than this (bytes) are written to "
+            "~/.kiro/crew/mcp_spill/ and their text cut head+tail to fit, with a "
+            "file path marker. Default 48 KiB, the same budget every first-party "
+            "tool result is held to. Set 0 to disable spilling. "
             "Env override: KIROCREW_MCP_SPILL_THRESHOLD. Read by the MCP broker "
             "when it starts, like every other field of this section.",
             restart=True,

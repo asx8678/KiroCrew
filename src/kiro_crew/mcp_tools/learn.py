@@ -513,9 +513,9 @@ def learn_list(name: str, args: dict[str, Any]) -> str:
         )
     text = "\n".join(lines)
     if len(text) > _LIST_RENDER_BUDGET:
-        # ``sanitize_response`` cuts the TAIL of a response over the cap, and
-        # the header above is the head -- so a page that renders past the cap
-        # would say "Showing N" and then lose rows the model never sees. Refuse
+        # ``build_tool_response`` cuts the MIDDLE of a response over the cap,
+        # and the header above is the head -- so a page that renders past the
+        # cap would say "Showing N" and then lose rows the model never sees. Refuse
         # the page and name a limit that fits instead of shipping that claim.
         shown = len(lessons)
         fits = max(1, min(shown - 1, shown * _LIST_RENDER_BUDGET // len(text)))

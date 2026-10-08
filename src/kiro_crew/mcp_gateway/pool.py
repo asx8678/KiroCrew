@@ -128,6 +128,7 @@ from kiro_crew import platform_compat
 from kiro_crew.mcp_gateway import read_limits
 from kiro_crew.mcp_gateway.breaker import CircuitBreaker
 from kiro_crew.mcp_gateway.hashing import format_pool_label
+from kiro_crew.tool_result_cap import MAX_TOOL_RESULT_CHARS
 
 if TYPE_CHECKING:
     from kiro_crew.mcp_gateway.backend import Backend
@@ -148,10 +149,14 @@ READ_BUFFER_LIMIT_BYTES: int = read_limits.resolve_read_buffer_limit()
 
 
 # Default spill threshold — responses larger than this (but under the read
-# limit) get their text content spilled to file and truncated inline.
+# limit) are spilled to file and cut head+tail to fit it. EQUAL to the one
+# tool-result budget first-party servers are held to, so a stubbed server's
+# result fits the same 48 KiB: a higher threshold left a band (the old 256 KiB)
+# where a result reached the model whole, and a cliff right past it where it
+# dropped to a 16 KiB prefix.
 # Config-driven via ``mcp_gateway.response_spill_threshold_bytes`` / env var
 # ``KIROCREW_MCP_SPILL_THRESHOLD``.
-_DEFAULT_SPILL_THRESHOLD = 256 * 1024  # 256 KiB
+_DEFAULT_SPILL_THRESHOLD = MAX_TOOL_RESULT_CHARS
 
 
 def _resolve_spill_threshold() -> int:

@@ -86,7 +86,7 @@ from urllib.parse import urlencode
 from kiro_crew.mcp_core import _get, _resolve_session_key, require_strict_session_key
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.platform import redact_via_context as redact
-from kiro_crew.validation import MCP_DEBUG_SCHEMAS, validate_tool_args
+from kiro_crew.validation import MAX_RESPONSE_LEN, MCP_DEBUG_SCHEMAS, validate_tool_args
 
 logger = logging.getLogger(__name__)
 
@@ -113,8 +113,9 @@ ROUTE_PREFIX = "/api/debug"
 #: Bytes one tool result may occupy. A process roster or a thread ledger on a busy
 #: host is large, and a tool result is context: past this the payload is cut and a
 #: cursor carries the rest, because half a JSON document is not a shorter answer,
-#: it is an unparseable one.
-MAX_OUTPUT_BYTES = 64 * 1024
+#: it is an unparseable one. Held 4 KiB under the transport's tool-result budget
+#: (``MAX_RESPONSE_LEN``, 48 KiB), whose own cut would otherwise land mid-document.
+MAX_OUTPUT_BYTES = MAX_RESPONSE_LEN - 4 * 1024
 
 #: The refusal the three diag-dependent routes answer with until the recorder and
 #: the process-tree modules land. Spelled here as the exact contract so the ratchet
@@ -456,7 +457,7 @@ def _fit(payload: dict[str, Any]) -> str:
     keep = dict(payload)
     keep["truncated_to_fit"] = True
     keep["truncated_hint"] = (
-        "this result exceeded the 64 KB budget and was cut; narrow it with a "
+        "this result exceeded the 44 KB budget and was cut; narrow it with a "
         "shorter window, a 'fields' list, or a filter"
     )
     for large in ("series", "events", "nodes", "threads", "refusals", "stacks"):

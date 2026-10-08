@@ -384,8 +384,8 @@ range checks, unknown-field rejection, tiered length caps (`MAX_TOOL_NAME_LEN` 2
 the field-specific `MAX_CRON_MESSAGE` 50 000 for the cron `message` — a task
 prompt, enforced on the MCP schemas, both REST cron endpoints, and the
 `CronService` persistence chokepoint), and
-response truncation at `MAX_RESPONSE_LEN` (100 000 chars) so unbounded tool output
-cannot be a DoS vector.
+a head+tail cut at `MAX_RESPONSE_LEN` (48 KiB of chars, full text spilled to
+`<data home>/mcp_spill/`) so unbounded tool output cannot be a DoS vector.
 
 The schema count is a runtime-derived posture value (`tool_schemas` in
 `security_posture.py`), surfaced in Settings; it is not stated here.
