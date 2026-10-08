@@ -62,6 +62,7 @@ from kiro_crew.config.loader import (
     update_config_locked,
 )
 from kiro_crew.config.sections import (
+    AUTOCOMPACT_MAX_TOKENS_MAX,
     DECISION_BUCKET_MAX,
     DECISION_BUCKET_MIN,
     DECISION_MODEL_ROUTE_TIERS,
@@ -2750,6 +2751,16 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "type": "float",
         "min": AUTOCOMPACT_PCT_MIN,
         "max": AUTOCOMPACT_PCT_MAX,
+    },
+    # The ABSOLUTE arm of the same trigger. Range shared with the load-time
+    # clamp in config/loader.py — one constant pair, so the write gate and the
+    # load path cannot drift. 0 is the writable "off" sentinel; positive
+    # values are floored at load exactly as the percentage's 5-point minimum
+    # floors its arm.
+    "session.autocompact_max_tokens": {
+        "type": "int",
+        "min": 0,
+        "max": AUTOCOMPACT_MAX_TOKENS_MAX,
     },
     "session.pool_size": {"type": "int", "min": 0, "max": 10},
     "session.pool_agent": {"type": "str", "values_fn": _agent_values},

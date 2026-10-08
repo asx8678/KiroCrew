@@ -145,6 +145,7 @@ from kiro_crew.config.loader import (
     build_provider_factory,
     default_project_dir,
     normalize_agent_model,
+    published_autocompact_max_tokens,
     published_autocompact_pct,
 )
 from kiro_crew.config.paths import config_dir
@@ -637,11 +638,14 @@ HEARTBEAT_KEY = "_hb"
 
 # Context usage thresholds.
 #
-# The compaction threshold itself is NOT here — it is per-install config
-# (``cfg.session.autocompact_pct``, default ``DEFAULT_AUTOCOMPACT_PCT``), read
-# at ``check_context_usage``. The warning fires one
-# ``CONTEXT_WARN_MARGIN_PCT`` below whatever that threshold is; see that
-# constant in ``config.loader`` for why it is relative rather than absolute.
+# The compaction threshold itself is NOT here — it is per-install config with
+# two arms, read at ``check_context_usage``: the percentage of the window
+# (``cfg.session.autocompact_pct``, default ``DEFAULT_AUTOCOMPACT_PCT``) and
+# the absolute cap (``cfg.session.autocompact_max_tokens``, default
+# ``DEFAULT_AUTOCOMPACT_MAX_TOKENS``; 0 = off). Whichever arm is reached first
+# fires. The warning fires one ``CONTEXT_WARN_MARGIN_PCT`` below whichever
+# arm binds; see that constant in ``config.loader`` for why it is relative
+# rather than absolute.
 #
 # Cost is why the compaction default sits below the 90.0 validation ceiling.
 # Measured on a 7-day sample (808 turns), credits scale ~linearly with context
@@ -1966,6 +1970,9 @@ class SessionManager:
         # a LOAD publishes a different one, rather than having it replaced by
         # whatever the last load in this process happened to publish.
         self._adopted_autocompact_pct = published_autocompact_pct()
+        # The absolute arm's baseline: the same adopt-on-change contract, one
+        # branch inside `_sync_autocompact_pct`.
+        self._adopted_autocompact_max_tokens = published_autocompact_max_tokens()
         self._provider_factory = provider_factory
         # Installed by the dashboard once its state exists (set_subagent_probe);
         # None means "no dashboard, so no children can be attached".
@@ -2183,29 +2190,34 @@ class SessionManager:
         await self._lifecycle_boundary().refresh_defaults(cfg)
 
     def _sync_autocompact_pct(self) -> None:
-        """Adopt a newly published compaction threshold, if one arrived.
+        """Adopt newly published compaction thresholds — the percentage and the
+        absolute token cap — if either arrived.
 
-        The threshold is captured on ``_cfg`` when the gateway starts, so on its
-        own a config write would reach disk and stop there. Every successful
-        ``KiroCrewConfig.load`` publishes it, and prompt assembly loads
-        config once per turn, so a write from ANY writer -- the dashboard PATCH
-        handler or ``kirocrew config set`` -- is in force by the next context
-        reading without a restart.
+            The threshold is captured on ``_cfg`` when the gateway starts, so on its
+            own a config write would reach disk and stop there. Every successful
+            ``KiroCrewConfig.load`` publishes it, and prompt assembly loads
+            config once per turn, so a write from ANY writer -- the dashboard PATCH
+            handler or ``kirocrew config set`` -- is in force by the next context
+            reading without a restart.
 
-        Adopt-on-CHANGE rather than unconditional assignment: a manager
-        constructed with a config that carries its own threshold must keep it, so
-        only a value that differs from the last one this manager adopted wins.
-        That also makes the sync idempotent, which matters because the gate calls
-        it on every reading.
+            Adopt-on-CHANGE rather than unconditional assignment: a manager
+            constructed with a config that carries its own threshold must keep it, so
+            only a value that differs from the last one this manager adopted wins.
+            That also makes the sync idempotent, which matters because the gate calls
+            it on every reading.
 
-        Reads a module-level snapshot, never config.json -- this runs on the
-        event loop, where a stat/read/validate is exactly what the publish idiom
-        exists to avoid.
+            Reads a module-level snapshot, never config.json -- this runs on the
+            event loop, where a stat/read/validate is exactly what the publish idiom
+            exists to avoid.
         """
         published = published_autocompact_pct()
         if published != self._adopted_autocompact_pct:
             self._adopted_autocompact_pct = published
             self._cfg.session.autocompact_pct = published
+        published_cap = published_autocompact_max_tokens()
+        if published_cap != self._adopted_autocompact_max_tokens:
+            self._adopted_autocompact_max_tokens = published_cap
+            self._cfg.session.autocompact_max_tokens = published_cap
 
     async def reload_provider_factory(self, cfg: KiroCrewConfig | None = None) -> None:
         """Rebuild the provider factory and retire sessions created by the old one.

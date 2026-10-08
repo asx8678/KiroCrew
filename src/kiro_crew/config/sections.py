@@ -183,6 +183,18 @@ DEFAULT_SESSION_TIMEOUT = 3600  # 60 min
 # with nothing on disk to show it, which is why ``pool_size`` is named the same
 # way (``DEFAULT_POOL_SIZE``) rather than written twice.
 DEFAULT_AUTOCOMPACT_PCT = 70.0
+# The ABSOLUTE arm of the same trigger (``session.autocompact_max_tokens``):
+# compaction also fires once a session's used tokens reach this many, whichever
+# arm is reached first. 200k because the default deployment runs provider=acp +
+# model="auto" on a 1M-token window, where a percentage-only trigger lets a chat
+# grow to ~700k tokens before anything is summarized and every turn near that
+# size is the most expensive one the session ever runs (credits scale
+# ~linearly with context; see the cost note by ``SessionManager`` in
+# ``session.py``). On a 200k window the percentage arm fires first and this cap
+# never binds. 0 disables the absolute arm. Named for the same two-path reason
+# as ``DEFAULT_AUTOCOMPACT_PCT``: the dataclass field default and the
+# dict-load fallback in ``load()`` share one constant.
+DEFAULT_AUTOCOMPACT_MAX_TOKENS = 200_000
 # Margin BELOW the configured compaction threshold at which the "context is
 # getting large" warning fires. A margin rather than an absolute percentage
 # because both consumers test compaction FIRST in an if/elif chain
@@ -2013,6 +2025,18 @@ class SessionConfig:
             "Context usage percentage at which auto-compaction triggers (5-90).",
         ),
     )
+    autocompact_max_tokens: int = field(
+        default=DEFAULT_AUTOCOMPACT_MAX_TOKENS,
+        metadata=_meta(
+            "Auto-Compact Token Cap",
+            "Absolute context size in tokens that also triggers auto-compaction, "
+            "whichever arm is reached first: this cap or the percentage threshold "
+            "(default 200000). Compacting earlier keeps turns on a large window "
+            "cheap, at the cost of older detail being summarized away sooner; "
+            "the summary keeps open tasks. 0 disables the cap and leaves only "
+            "the percentage.",
+        ),
+    )
     compact_wait_secs: float = field(
         default=0.0,
         metadata=_meta(
@@ -3789,6 +3813,19 @@ MAX_SUBAGENTS_FIXED_FLOOR = 3
 # read instead.
 AUTOCOMPACT_PCT_MIN = 5.0
 AUTOCOMPACT_PCT_MAX = 90.0
+
+# ``session.autocompact_max_tokens`` — the ABSOLUTE arm of the same trigger.
+# SINGLE SOURCE OF TRUTH for the same reason the percentage pair above is: the
+# dashboard config API validates writes against these constants and the load
+# read clamps a hand-edited config.json value into them, so the two ranges
+# cannot drift as separate literals. ``0`` is the "off" sentinel (the
+# percentage arm alone decides); any other value must sit at or above the MIN
+# floor, which keeps a hand-edited near-zero value from firing a compaction on
+# every turn — the same outcome ``AUTOCOMPACT_PCT_MIN`` guards the percentage
+# arm against — and at or below the MAX, above which the percentage arm fires
+# first on every window the model registry can report anyway.
+AUTOCOMPACT_MAX_TOKENS_MIN = 10_000
+AUTOCOMPACT_MAX_TOKENS_MAX = 5_000_000
 
 # ``session.compact_wait_secs``: 0 is the sentinel for "use the built-in
 # budget"; any positive value is lifted to at least ``COMPACT_WAIT_SECS_MIN``

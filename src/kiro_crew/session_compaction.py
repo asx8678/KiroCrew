@@ -288,6 +288,61 @@ def _compaction_harness_managed(provider: LLMProvider) -> bool:
     return claimed is not False
 
 
+def _provider_used_tokens(provider: Any) -> int:
+    """The provider's used-context token reading, or 0 when it reports none.
+
+    Optional on doubles the way ``context_usage_unknown`` is: the gate is
+    driven with bare ``object()`` and ``MagicMock`` providers (see
+    ``_compact_unsupported_backend``), so the read is a guarded getattr and
+    anything that is not a positive int reads as 0 — the absolute arm cannot
+    bind on a double, which keeps it as fail-quiet as the percentage arm.
+    """
+    fn = getattr(provider, "context_used_tokens", None)
+    if not callable(fn):
+        return 0
+    try:
+        value = fn()
+    except Exception:
+        return 0
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _provider_window_tokens(provider: Any) -> int:
+    """The provider's context-window token reading, or 0 when unknown.
+
+    Same guarded shape as :func:`_provider_used_tokens`; 0 leaves the warning
+    on the percentage arm — the trigger itself compares used tokens against
+    the cap directly, so an unknown window disarms only the warn conversion.
+    """
+    fn = getattr(provider, "context_window_tokens", None)
+    if not callable(fn):
+        return 0
+    try:
+        value = fn()
+    except Exception:
+        return 0
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def effective_compaction_threshold_pct(
+    pct_threshold: float, max_tokens: int, window_tokens: int
+) -> float:
+    """The compaction threshold as a window percentage, absolute cap included.
+
+    The shared statement of the trigger's pct face: whichever arm is reached
+    first wins, so on a large window an absolute cap below the percentage
+    threshold moves the whole threshold down with it. The ``cli_chat`` REPL,
+    which compacts outside the manager, renders its warn level from this too
+    rather than restating the rule. The cap joins as a percentage of the
+    reported window only when both are known and positive; the gate compares
+    used tokens against the cap directly, so an unknown window never disarms
+    the trigger, only this conversion.
+    """
+    if max_tokens > 0 and window_tokens > 0:
+        return min(pct_threshold, 100.0 * max_tokens / window_tokens)
+    return pct_threshold
+
+
 class CompactionCoordinator:
     """Coordinate context compaction while ``SessionManager`` remains facade."""
 
@@ -322,7 +377,19 @@ class CompactionCoordinator:
             if pct > 0:
                 self._deps.logger.info("Session %s context at %.0f%% (CC-managed)", key, pct)
         elif decline == "below_threshold":
-            warn_at = self.effective_autocompact_pct(key) - self._deps.context_warn_margin_pct
+            # The warning tracks whichever arm binds first: on a large window
+            # an absolute cap sits far below the percentage, and a warn level
+            # left on the percentage would sit ABOVE the compaction point —
+            # the dead early signal ``CONTEXT_WARN_MARGIN_PCT`` exists to
+            # prevent.
+            warn_at = (
+                effective_compaction_threshold_pct(
+                    self.effective_autocompact_pct(key),
+                    self._absolute_cap_tokens(),
+                    _provider_window_tokens(provider),
+                )
+                - self._deps.context_warn_margin_pct
+            )
             if warn_at > 0 and pct >= warn_at:
                 self._deps.logger.warning("Session %s context at %.0f%%", key, pct)
             elif pct > 0:
@@ -490,6 +557,33 @@ class CompactionCoordinator:
             self._owner._fold_key(key), self._owner._cfg.session.autocompact_pct
         )
 
+    def _absolute_cap_tokens(self) -> int:
+        """The configured absolute compaction cap in tokens; 0 = the arm is off.
+
+        Read off ``owner._cfg`` after the manager's sync, so a published change
+        binds on the next reading exactly as the percentage does. Guarded like
+        the provider reads below: the coordinator is driven with partial
+        doubles, and a cfg that does not carry the field reads as "off"
+        rather than raising.
+        """
+        try:
+            value = int(getattr(self._owner._cfg.session, "autocompact_max_tokens", 0))
+        except (TypeError, ValueError):
+            return 0
+        return value if value > 0 else 0
+
+    def _over_absolute_cap(self, provider: LLMProvider) -> bool:
+        """True when the used-token reading has reached the absolute cap.
+
+        The compare is direct rather than window-relative so the arm still
+        triggers when the window is unknown; 0 (off) or an unreported reading
+        (0 tokens) never binds.
+        """
+        cap = self._absolute_cap_tokens()
+        if cap <= 0:
+            return False
+        return _provider_used_tokens(provider) >= cap
+
     def _compaction_gate_decision(self, key: str, provider: LLMProvider, pct: float) -> str | None:
         """Return the first compaction gate decline, in lifecycle order.
 
@@ -538,7 +632,15 @@ class CompactionCoordinator:
 
         if self._deps.is_cc_managed(provider):
             return "cc_managed"
-        if pct < self.effective_autocompact_pct(key):
+        # The trigger is whichever arm is reached first: the percentage of the
+        # window, or the absolute ``session.autocompact_max_tokens`` cap
+        # (0 = off). An over-cap reading declines exactly the way an
+        # over-threshold percentage does — it falls through to the SAME rungs
+        # below (unsupported → unconfirmed → in_progress → …), so nothing
+        # about the harness-managed paths changes: ``cc_managed`` has already
+        # returned above, and a KAS member still declines at the unsupported
+        # rung for its own summarizer to answer.
+        if pct < self.effective_autocompact_pct(key) and not self._over_absolute_cap(provider):
             return "below_threshold"
         unsupported = _compact_unsupported_backend(provider)
         if unsupported is not None and _compaction_unmanaged_backend(provider) is None:

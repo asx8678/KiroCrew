@@ -919,7 +919,7 @@ against sweep completeness, and are torn down at `close_all`.
   normal Stop, user-follow-up, pending-steer, approval/refusal,
   and one-shot gates remain unchanged; trusted or global auto-approve sessions
   retain the existing notice-only downgrade.
-- **Context compaction**: at ≥ configured threshold (`session.autocompact_pct`, default 70%, valid 5–90), compacts **in place** on a member of
+- **Context compaction**: at ≥ whichever trigger arm is reached first — the configured percentage (`session.autocompact_pct`, default 70%, valid 5–90) or the absolute used-token cap (`session.autocompact_max_tokens`, default 200,000; 0 = off) — compacts **in place** on a member of
   `ACP_BACKENDS_COMPACT` — kiro-cli, claude, codex, opencode and goose. They divide by WHERE
   the
   done signal lands, which is `ACP_BACKENDS_INLINE_COMPACTION`: kiro-cli sends a

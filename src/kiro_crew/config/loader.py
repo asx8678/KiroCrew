@@ -2789,6 +2789,23 @@ def _clamp_compact_wait_secs(raw: object, default: float) -> float:
     return value if value == 0 else max(_sections.COMPACT_WAIT_SECS_MIN, value)
 
 
+def _clamp_autocompact_max_tokens(raw: object, default: int) -> int:
+    """Coerce ``session.autocompact_max_tokens``, preserving its ``0`` sentinel.
+
+    ``0`` means "the absolute arm is off" and the percentage threshold alone
+    decides, so it must survive coercion. A positive value is lifted to at
+    least ``_sections.AUTOCOMPACT_MAX_TOKENS_MIN`` and capped at
+    ``_sections.AUTOCOMPACT_MAX_TOKENS_MAX``: a hand-edited near-zero value
+    would otherwise fire a compaction on every turn, the same outcome the
+    percentage arm's ``AUTOCOMPACT_PCT_MIN`` floor exists to prevent. Bounds
+    are referenced via the module handle, not imported: this module's
+    top-level names are a frozen compatibility facade. A value it cannot
+    read takes *default*, the field's.
+    """
+    value = _safe_int(raw, default, 0, _sections.AUTOCOMPACT_MAX_TOKENS_MAX)
+    return value if value == 0 else max(_sections.AUTOCOMPACT_MAX_TOKENS_MIN, value)
+
+
 _DEFAULT_MEMORY_MODES = frozenset({"persistent", "incognito", "temporary"})
 
 
@@ -3314,6 +3331,14 @@ def _build_session_config(session_data: dict) -> SessionConfig:
         ),
         autocompact_pct=section.read(
             "autocompact_pct", _safe_float, lo=AUTOCOMPACT_PCT_MIN, hi=AUTOCOMPACT_PCT_MAX
+        ),
+        # The ABSOLUTE arm of the same trigger, clamped on the read like its
+        # percentage sibling: 0 is the "off" sentinel and any positive value is
+        # floored and capped, so a hand-edited typo can neither arm a
+        # compaction-every-turn cap nor set an unreachable one. Bounds via the
+        # module handle (frozen facade).
+        autocompact_max_tokens=section.read(
+            "autocompact_max_tokens", _clamp_autocompact_max_tokens
         ),
         # Clamped on the read, like the sibling floats: 0 is the sentinel for
         # "use the built-in budget" and any positive value is the wait, so a
@@ -6657,6 +6682,12 @@ def agent_alias_snapshot() -> tuple[frozenset[str], str, bool]:
 # independent of the filesystem, so a deletion and a timestamp-preserving restore
 # both order as what they are: the newest read.
 _CONFIG_AUTOCOMPACT_PCT: float = DEFAULT_AUTOCOMPACT_PCT
+#: The ABSOLUTE arm of the same trigger (``session.autocompact_max_tokens``;
+#: 0 = off), snapshotted and ticket-ordered WITH the percentage above so the
+#: pair a running gate adopts always comes from ONE load. A second, separate
+#: ticket for it would let two concurrent loads interleave a new percentage
+#: with a stale cap.
+_CONFIG_AUTOCOMPACT_MAX_TOKENS: int = _sections.DEFAULT_AUTOCOMPACT_MAX_TOKENS
 _CONFIG_AUTOCOMPACT_TICKET: int = 0
 
 #: Highest ticket handed out by :func:`next_config_load_ticket`. Distinct from the
@@ -6698,7 +6729,8 @@ def next_config_load_ticket() -> int:
 
 
 def publish_autocompact_pct(config: "KiroCrewConfig", ticket: int | None = None) -> None:
-    """Publish *config*'s compaction threshold for the filesystem-free read path.
+    """Publish *config*'s compaction thresholds — the percentage and the
+    absolute token cap — for the filesystem-free read path.
 
     Pure in-memory rebind -- safe from anywhere, including the event loop, and a
     reader sees either the whole previous value or the whole new one. Called from
@@ -6720,7 +6752,7 @@ def publish_autocompact_pct(config: "KiroCrewConfig", ticket: int | None = None)
     ticket is independent of the files: an ordering read off their mtime drops to
     a lower value when a file is removed, and so cannot express it.
     """
-    global _CONFIG_AUTOCOMPACT_PCT, _CONFIG_AUTOCOMPACT_TICKET
+    global _CONFIG_AUTOCOMPACT_PCT, _CONFIG_AUTOCOMPACT_MAX_TOKENS, _CONFIG_AUTOCOMPACT_TICKET
     # Drawn OUTSIDE the lock: next_config_load_ticket acquires the same
     # non-reentrant lock, so drawing it inside the block below would deadlock.
     if ticket is None:
@@ -6733,11 +6765,17 @@ def publish_autocompact_pct(config: "KiroCrewConfig", ticket: int | None = None)
             return
         _CONFIG_AUTOCOMPACT_TICKET = ticket
         _CONFIG_AUTOCOMPACT_PCT = config.session.autocompact_pct
+        _CONFIG_AUTOCOMPACT_MAX_TOKENS = config.session.autocompact_max_tokens
 
 
 def published_autocompact_pct() -> float:
     """The published compaction threshold."""
     return _CONFIG_AUTOCOMPACT_PCT
+
+
+def published_autocompact_max_tokens() -> int:
+    """The published absolute compaction cap in tokens (0 = the arm is off)."""
+    return _CONFIG_AUTOCOMPACT_MAX_TOKENS
 
 
 # Snapshot of the global default timezone, refreshed by every successful

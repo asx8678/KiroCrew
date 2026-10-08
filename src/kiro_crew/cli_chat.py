@@ -44,6 +44,7 @@ from kiro_crew.providers.base import (
 from kiro_crew.sandbox import SandboxCeilingUnsealable
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.session_compaction import effective_compaction_threshold_pct
 from kiro_crew.shell_audit_log import rotate_shell_audit_log
 from kiro_crew.start_priority import StartPriority
 from kiro_crew.terminal_safe import safe_terminal_line
@@ -1124,11 +1125,24 @@ async def _interactive(
 
         # Check context usage — compact and restart if needed
         pct = provider.context_usage_pct()
-        needs_compact = pct >= cfg.session.autocompact_pct
-        # Warn one margin BELOW the compaction point. An absolute warn level
-        # would be dead code here: the compact arm is tested first and claims
-        # the whole range above the configured threshold.
-        warn_at = cfg.session.autocompact_pct - CONTEXT_WARN_MARGIN_PCT
+        # Whichever arm is reached first wins: the percentage of the window, or
+        # the absolute token cap (0 = off) — the same rule the session
+        # manager's gate applies (``session_compaction``), restated here
+        # because the REPL compacts outside the manager.
+        cap_tokens = cfg.session.autocompact_max_tokens
+        threshold_pct = effective_compaction_threshold_pct(
+            cfg.session.autocompact_pct,
+            cap_tokens,
+            provider.context_window_tokens(),
+        )
+        needs_compact = pct >= threshold_pct or (
+            cap_tokens > 0 and provider.context_used_tokens() >= cap_tokens
+        )
+        # Warn one margin BELOW the compaction point, whichever arm sets it.
+        # An absolute warn level would be dead code here: the compact arm is
+        # tested first and claims the whole range above the configured
+        # threshold.
+        warn_at = threshold_pct - CONTEXT_WARN_MARGIN_PCT
 
         if needs_compact:
             reason = f"context at {pct:.0f}%"

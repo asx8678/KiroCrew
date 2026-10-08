@@ -15,6 +15,10 @@ Three things are pinned, because the number alone is not the invariant:
 - that the warning arm fires strictly before the compaction arm, since the two
   are consecutive arms of one if/elif chain and an equal warn level makes the
   warning unreachable.
+
+The absolute token cap (``session.autocompact_max_tokens``) is the second arm
+of the same trigger, reached first on a large window, and is pinned by the
+same relationships below: whichever arm is reached first fires.
 """
 
 from __future__ import annotations
@@ -87,8 +91,10 @@ def _reset_published_threshold() -> None:
     once enough loads had run in the same worker.
     """
     from kiro_crew.config import loader as _loader
+    from kiro_crew.config.sections import DEFAULT_AUTOCOMPACT_MAX_TOKENS
 
     _loader._CONFIG_AUTOCOMPACT_PCT = DEFAULT_AUTOCOMPACT_PCT
+    _loader._CONFIG_AUTOCOMPACT_MAX_TOKENS = DEFAULT_AUTOCOMPACT_MAX_TOKENS
     _loader._CONFIG_AUTOCOMPACT_TICKET = 0
     _loader._CONFIG_AUTOCOMPACT_ISSUED = 0
 
@@ -498,4 +504,195 @@ def test_load_publishes_without_a_second_stat_pass(tmp_path, monkeypatch) -> Non
         assert passes["n"] == 1, f"cache-hit load took {passes['n']} stat passes, want 1"
     finally:
         _loader._invalidate_config_cache()
+        _reset_published_threshold()
+
+
+# ---------------------------------------------------------------------------
+# The absolute token cap — the second arm of the same trigger. On the default
+# 1M-token window the 200k cap fires long before the 70% percentage does.
+# ---------------------------------------------------------------------------
+
+
+class _ContextMeter:
+    """A provider double reporting the three context readings and nothing else.
+
+    The gate is driven with bare ``object()`` doubles elsewhere; this one
+    adds exactly the readings the absolute arm consults, so the tests stay
+    about the arm and not the double.
+    """
+
+    def __init__(self, *, pct: float = 0.0, used: int = 0, window: int = 0) -> None:
+        self._pct = pct
+        self._used = used
+        self._window = window
+
+    def context_usage_pct(self) -> float:
+        return self._pct
+
+    def context_used_tokens(self) -> int:
+        return self._used
+
+    def context_window_tokens(self) -> int:
+        return self._window
+
+
+def test_the_absolute_cap_default_sits_inside_its_validated_range() -> None:
+    """The shipped cap is 200k: on for the default window, off-able via 0.
+
+    The cap default sits strictly inside its validated range for the same
+    reason the percentage default does, and 0 (the off sentinel) stays
+    writable so an operator can return the trigger to the percentage arm
+    alone.
+    """
+    from kiro_crew.config.sections import DEFAULT_AUTOCOMPACT_MAX_TOKENS
+
+    assert DEFAULT_AUTOCOMPACT_MAX_TOKENS == 200_000
+    assert SessionConfig().autocompact_max_tokens == DEFAULT_AUTOCOMPACT_MAX_TOKENS
+    spec = _EDITABLE_CONFIG["session.autocompact_max_tokens"]
+    assert spec["min"] == 0
+    assert spec["max"] > DEFAULT_AUTOCOMPACT_MAX_TOKENS
+
+
+def test_the_absolute_cap_compacts_a_large_window_before_the_percentage() -> None:
+    """Window 1M, used 210k: over the 200k cap, far under the 70% line.
+
+    This is the reason the cap exists: on the default deployment's 1M window
+    the percentage arm alone would let the chat grow to ~700k tokens before
+    anything is summarized. Asserting 'not below_threshold' keeps this
+    pinned to the threshold and indifferent to the later gates in the ladder.
+    """
+    from kiro_crew.session import SessionManager
+
+    mgr = SessionManager(KiroCrewConfig(), provider_factory=lambda *a, **k: object())
+    meter = _ContextMeter(used=210_000, window=1_000_000)
+
+    # 21% of the window: far below the 70% percentage, over the 200k cap.
+    assert mgr._compaction_gate_decision("k", meter, 21.0) != "below_threshold"
+
+
+def test_the_absolute_cap_stays_quiet_below_the_cap() -> None:
+    """Window 1M, used 150k: below both arms, so the gate declines."""
+    from kiro_crew.session import SessionManager
+
+    mgr = SessionManager(KiroCrewConfig(), provider_factory=lambda *a, **k: object())
+    meter = _ContextMeter(used=150_000, window=1_000_000)
+
+    assert mgr._compaction_gate_decision("k", meter, 15.0) == "below_threshold"
+
+
+def test_the_percentage_arm_still_binds_on_a_small_window() -> None:
+    """Window 200k, used 141k (70.5%): the percentage fires, the cap does not."""
+    from kiro_crew.session import SessionManager
+
+    mgr = SessionManager(KiroCrewConfig(), provider_factory=lambda *a, **k: object())
+    meter = _ContextMeter(used=141_000, window=200_000)
+
+    assert mgr._compaction_gate_decision("k", meter, 70.5) != "below_threshold"
+
+
+def test_zero_disables_the_absolute_arm() -> None:
+    """cap=0 returns the trigger to the percentage arm alone."""
+    from kiro_crew.session import SessionManager
+
+    cfg = KiroCrewConfig()
+    cfg.session.autocompact_max_tokens = 0
+    mgr = SessionManager(cfg, provider_factory=lambda *a, **k: object())
+    meter = _ContextMeter(used=210_000, window=1_000_000)
+
+    assert mgr._compaction_gate_decision("k", meter, 21.0) == "below_threshold"
+
+
+def test_the_warning_tracks_whichever_arm_binds(caplog) -> None:
+    """With the cap binding at 20% of a 1M window, the warn level is 10%.
+
+    A warn level left on the percentage arm would sit at 60% — ABOVE the
+    compaction point — and go dead, the exact failure the relative margin
+    exists to prevent. The reading (15%) is below both arms' thresholds, so
+    the gate declines below_threshold and the warn arm decides.
+    """
+    import logging
+
+    from kiro_crew.session import SessionManager
+
+    mgr = SessionManager(KiroCrewConfig(), provider_factory=lambda *a, **k: object())
+
+    with caplog.at_level(logging.WARNING):
+        mgr.check_context_usage("k", _ContextMeter(pct=15.0, used=150_000, window=1_000_000))
+    assert any(
+        "context at" in record.getMessage() and record.levelno == logging.WARNING
+        for record in caplog.records
+    )
+
+    caplog.clear()
+    cfg = KiroCrewConfig()
+    cfg.session.autocompact_max_tokens = 0
+    mgr_off = SessionManager(cfg, provider_factory=lambda *a, **k: object())
+    with caplog.at_level(logging.WARNING):
+        mgr_off.check_context_usage("k", _ContextMeter(pct=15.0, used=150_000, window=1_000_000))
+    assert not any("context at" in record.getMessage() for record in caplog.records)
+
+
+def test_an_absolute_cap_change_reaches_an_already_live_manager() -> None:
+    """A published cap moves the gate for sessions already open.
+
+    The cap rides the same ticket-ordered publish as the percentage, so a
+    write from any writer — the dashboard PATCH handler or ``kirocrew config
+    set`` — is in force by the next reading without a restart.
+    """
+    from kiro_crew.config.loader import publish_autocompact_pct
+    from kiro_crew.session import SessionManager
+
+    _reset_published_threshold()
+
+    cfg = KiroCrewConfig()
+    mgr = SessionManager(cfg, provider_factory=lambda *a, **k: object())
+    meter = _ContextMeter(used=160_000, window=1_000_000)
+
+    # 16% of the window: below the 70% percentage and below the 200k cap.
+    assert mgr._compaction_gate_decision("k", meter, 16.0) == "below_threshold"
+
+    lowered = KiroCrewConfig()
+    lowered.session.autocompact_max_tokens = 150_000
+    try:
+        publish_autocompact_pct(lowered, 1000)
+
+        # Same reading, same manager, no restart: 160k is now over the 150k cap.
+        assert mgr._compaction_gate_decision("k", meter, 16.0) != "below_threshold"
+        assert mgr._cfg.session.autocompact_max_tokens == 150_000
+    finally:
+        _reset_published_threshold()
+
+
+def test_a_hand_edited_cap_is_floored_and_capped_on_load() -> None:
+    """The load path clamps a hand-edited cap into its validated range.
+
+    A near-zero value floors at the minimum — a cap that would fire a
+    compaction on every turn is not a cap — an absurd value caps at the
+    maximum, and the 0 'off' sentinel survives the read.
+    """
+    from kiro_crew.config.sections import (
+        AUTOCOMPACT_MAX_TOKENS_MAX,
+        AUTOCOMPACT_MAX_TOKENS_MIN,
+    )
+
+    assert (
+        _load_with_session({"autocompact_max_tokens": 500}).session.autocompact_max_tokens
+        == AUTOCOMPACT_MAX_TOKENS_MIN
+    )
+    assert (
+        _load_with_session({"autocompact_max_tokens": 999_999_999}).session.autocompact_max_tokens
+        == AUTOCOMPACT_MAX_TOKENS_MAX
+    )
+    assert _load_with_session({"autocompact_max_tokens": 0}).session.autocompact_max_tokens == 0
+    assert _load_with_session({}).session.autocompact_max_tokens == 200_000
+
+
+def test_load_publishes_the_cap_it_resolved() -> None:
+    """Every ``load()`` refreshes the cap snapshot the gate adopts."""
+    from kiro_crew.config.loader import published_autocompact_max_tokens
+
+    try:
+        _load_with_session({"autocompact_max_tokens": 150_000})
+        assert published_autocompact_max_tokens() == 150_000
+    finally:
         _reset_published_threshold()

@@ -1180,12 +1180,19 @@ class TestTheFitReadingSizesTheAssembledPrompt:
         from kiro_crew.session import SessionManager
 
         monkeypatch.setattr(session_mod, "published_autocompact_pct", lambda: 55.0)
+        # The absolute arm's published value, pinned for the same reason: the
+        # real accessor reads a process-global another test may publish, and
+        # the sync under test adopts it into the double's cfg.
+        monkeypatch.setattr(session_mod, "published_autocompact_max_tokens", lambda: 200_000)
 
         def _owner():
             """A manager holding a STALE threshold, and a delegate that reports it."""
             held = SimpleNamespace(
                 _adopted_autocompact_pct=70.0,
-                _cfg=SimpleNamespace(session=SimpleNamespace(autocompact_pct=70.0)),
+                _adopted_autocompact_max_tokens=200_000,
+                _cfg=SimpleNamespace(
+                    session=SimpleNamespace(autocompact_pct=70.0, autocompact_max_tokens=200_000)
+                ),
             )
             held._compaction = SimpleNamespace(
                 effective_autocompact_pct=lambda _key: held._cfg.session.autocompact_pct,
