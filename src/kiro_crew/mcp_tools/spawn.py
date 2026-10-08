@@ -266,12 +266,14 @@ def schemas() -> list[dict[str, Any]]:
         "include_memory": {
             "type": "boolean",
             "description": (
-                "Default true. Set false when the task is FULLY specified by the text "
-                "you wrote — read these files, run this command, validate this finding, "
-                "summarize this log. This is the normal case for parallel fan-out. If "
-                "the sub-agent needs one fact from your memory, put that fact in the "
-                "task text instead of turning this back on. Keep true when the task is "
-                "open-ended about the user's own work or history."
+                "Default FALSE for a sub-agent spawned with no `agent` (it runs as the "
+                "slim kirocrew-step agent), true when you name an `agent` or `crew`. "
+                "Leave it off when the task is FULLY specified by the text you wrote — "
+                "read these files, run this command, validate this finding, summarize "
+                "this log. This is the normal case for parallel fan-out. If the "
+                "sub-agent needs one fact from your memory, put that fact in the task "
+                "text. Set true when the task is open-ended about the user's own work "
+                "or history."
             ),
         },
         "include_lessons": {
@@ -732,8 +734,10 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     reasoning_effort = args.get("reasoning_effort") or ""
     keep = bool(args.get("keep"))
     # Context scope: absent ⇒ true, so a parent that passes nothing gets the
-    # same context a normal session would.
-    inc_memory = args.get("include_memory", True) is not False
+    # same context a normal session would -- except memory, which an UNNAMED
+    # spawn (no agent, no crew) leaves out unless asked (CTX-7): it runs as the
+    # slim step agent, whose first turn is the task, not the user's history.
+    inc_memory_arg = args.get("include_memory")
     inc_lessons = args.get("include_lessons", True) is not False
     inc_project = args.get("include_project", True) is not False
     if agents_list and len(agents_list) != len(task_list):
@@ -827,6 +831,9 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             body["reasoning_effort"] = reasoning_effort
         if keep:
             body["keep"] = True
+        inc_memory = (
+            inc_memory_arg if isinstance(inc_memory_arg, bool) else bool(a or crew or target_member)
+        )
         if not inc_memory:
             body["include_memory"] = False
         if not inc_lessons:
@@ -1363,12 +1370,12 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
     if not agents_input or not isinstance(agents_input, list):
         return "Error: 'agents' array is required"
     cwd = args.get("cwd") or ""
-    # Context scope: batch-wide, absent ⇒ true (same rule as spawn_run).
+    # Context scope: batch-wide, absent ⇒ true (same rule as spawn_run), and
+    # memory absent ⇒ false for an entry naming no agent (CTX-7).
     sa_groups = {
-        k: False
-        for k in ("include_memory", "include_lessons", "include_project")
-        if args.get(k, True) is False
+        k: False for k in ("include_lessons", "include_project") if args.get(k, True) is False
     }
+    sa_memory_arg = args.get("include_memory")
     parent_session = mcp_core._resolve_session_key()
 
     def _redact_sa(text: str) -> str:
@@ -1417,6 +1424,11 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
             "agent": sa_agent,
             "parent_session": parent_session,
             **sa_groups,
+            **(
+                {}
+                if (sa_memory_arg if isinstance(sa_memory_arg, bool) else bool(sa_agent))
+                else {"include_memory": False}
+            ),
         }
         if cwd:
             sa_body["cwd"] = cwd

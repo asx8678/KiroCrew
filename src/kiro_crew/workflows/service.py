@@ -70,6 +70,10 @@ from .validate import validate
 
 logger = logging.getLogger(__name__)
 
+#: The agent a ``ctx.agent()`` step with no ``agent=`` runs as (CTX-7): the slim
+#: step spec, not the default agent's full contract and tool set.
+WORKFLOW_STEP_AGENT = "kirocrew-step"
+
 # Bounded attempts to coax a valid script out of the model (mirrors schema retry).
 _AUTHOR_RETRIES = 2
 # A failed run's error is stored and served verbatim (runner joins ``errors``),
@@ -794,6 +798,7 @@ class WorkflowService:
                 agent_fn, pool = build_pooled_agent_fn(
                     self._sessions,
                     run_id=run_id,
+                    default_agent=WORKFLOW_STEP_AGENT,
                     max_workers=workers,
                     max_starting=min(workers, 2),
                     memory_scope=memory_scope,
@@ -814,6 +819,7 @@ class WorkflowService:
             agent_fn = build_agent_fn(
                 self._sessions,
                 run_id=run_id,
+                default_agent=WORKFLOW_STEP_AGENT,
                 memory_scope=memory_scope,
                 context_builder=self._context_builder,
                 session_key=session_key,

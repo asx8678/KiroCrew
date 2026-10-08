@@ -9,6 +9,7 @@ import time as _time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
+from ..agent_files import AGENT_FILENAME, STEP_AGENT_FILENAME
 from ..constants import DENY_CAUSE_SURFACE_POLICY
 from ..hooks import permission_pre_tool_block
 from ..metrics import events as metric_events
@@ -131,6 +132,37 @@ if TYPE_CHECKING:
         write_finished_result,
         write_result_chunk,
     )
+
+#: The managed default agent (the ``kirocrew`` contract) and the slim step agent an
+#: unnamed spawn of it runs as (CTX-7).
+DEFAULT_AGENT = AGENT_FILENAME.removesuffix(".json")
+STEP_AGENT = STEP_AGENT_FILENAME.removesuffix(".json")
+
+
+def _runs_as_step(
+    info: SubagentInfo, kind: str, inherited: str | None, *, member_bound: bool
+) -> bool:
+    """Whether this run, as admitted, executes as :data:`STEP_AGENT` (CTX-7).
+
+    True only for a FRESH template spawn that named no agent, delegates to no
+    crew, comes from no app, and whose inherited template IS the default
+    contract: :data:`DEFAULT_AGENT` itself, or the empty template a default chat
+    records (the template-less selection the runtime resolves to that same
+    agent). Identity is positive: a parent on a custom agent, a member or a
+    crew keeps inheriting what it has, which keeps the documented
+    session-control inheritance rule intact; an app's spawn keeps its own
+    ownership rules; and a continuation resumes whatever its run recorded.
+    """
+    return (
+        not info.agent
+        and not info.crew
+        and not info.app
+        and not info.conversation_key
+        and kind == "template"
+        and not member_bound
+        and (inherited or "") in ("", DEFAULT_AGENT)
+    )
+
 
 #: Delayed re-reads armed, one after another, while the store cannot answer the
 #: queue depth; the last one that still fails says so at WARNING.
@@ -2127,6 +2159,20 @@ class RunEventCoordinator(ManagerComponent):
             if error:
                 info.error_code = code
                 raise RuntimeError(error)
+        if _runs_as_step(info, kind, agent, member_bound=execution.member_id is not None):
+            # CTX-7: an unnamed spawn of a default-contract parent runs as the
+            # slim step agent, and records it as its durable template so a
+            # ``spawn_continue`` resumes it as the step too (a run started before
+            # this change recorded the default and keeps resuming as it).
+            agent = STEP_AGENT
+            durable_selection = ("template", STEP_AGENT)
+            sel().log_api_access(
+                caller=f"subagent:{info.id}",
+                operation="subagent.unnamed_spawn_step",
+                outcome="ok",
+                source="subagent",
+                resources=f"subagent_id={info.id},agent={STEP_AGENT}",
+            )
         await self._await_identity_write(
             info,
             asyncio.ensure_future(

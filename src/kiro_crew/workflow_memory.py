@@ -357,7 +357,32 @@ class WorkflowScope:
             modes[key] = stricter_memory_mode(execution.memory_mode, modes.get(key, "persistent"))
         return self.store
 
-    async def prompt(self, context, key, text, *, is_new, agent, cwd, provider, resumed=False):
+    def step_memory(self, requested: object) -> bool:
+        """Whether a step's prompt carries the memory context group (CTX-7).
+
+        ``ctx.agent(memory=True/False)`` decides when given. Absent, it is off --
+        a step's first turn is its task, not the user's history -- except on a
+        member-bound run, whose memory group carries the member's briefing layer
+        and manual anchors: its identity, not optional recall.
+        """
+        if isinstance(requested, bool):
+            return requested
+        execution = self.execution_context
+        return execution is not None and execution.member_id is not None
+
+    async def prompt(
+        self,
+        context,
+        key,
+        text,
+        *,
+        is_new,
+        agent,
+        cwd,
+        provider,
+        resumed=False,
+        include_memory=False,
+    ):
         await self.prepare(context, key)
         from kiro_crew.executors import run_in_embed_pool
 
@@ -389,8 +414,24 @@ class WorkflowScope:
             blocks_reads=self.memory_mode == "temporary",
             context_provider=provider,
             resumed=resumed,
+            context_groups=_step_context_groups(include_memory),
         )
         return full
+
+
+def _step_context_groups(include_memory: bool) -> frozenset[str]:
+    """The switchable groups a workflow step keeps: lessons and project always,
+    memory only when the step opted in (CTX-7)."""
+    from kiro_crew.context_assembly.inclusion import (
+        CONTEXT_GROUP_LESSONS,
+        CONTEXT_GROUP_MEMORY,
+        CONTEXT_GROUP_PROJECT,
+    )
+
+    groups = {CONTEXT_GROUP_LESSONS, CONTEXT_GROUP_PROJECT}
+    if include_memory:
+        groups.add(CONTEXT_GROUP_MEMORY)
+    return frozenset(groups)
 
 
 async def authorize_run(

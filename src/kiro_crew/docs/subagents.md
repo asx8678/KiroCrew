@@ -31,7 +31,7 @@ The `spawn_run` tool accepts:
 - `task` — single task description
 - `tasks` — array of tasks for parallel execution
 - `agent` / `agents` — optional agent name(s) for each task
-- `include_memory` / `include_lessons` / `include_project` — booleans (default `true`) switching off a context group the sub-agent would otherwise inherit
+- `include_memory` / `include_lessons` / `include_project` — booleans (default `true`; `include_memory` defaults to `false` when you name no `agent` or `crew`, because such a sub-agent runs as the slim `kirocrew-step` agent) switching off a context group the sub-agent would otherwise inherit
 - `max_turns` — per-spawn tool-call budget override (0 = unset, max 1000)
 - `model` — model override for this spawn (e.g. `deepseek-3.2`)
 - `reasoning_effort` — `low` / `medium` / `high` / `xhigh` / `max`, batch-wide

@@ -56,6 +56,7 @@ from kiro_crew.taskq.model import KIND_WORKFLOW_AGENT, SIDE_EFFECT_UNKNOWN
 from kiro_crew.workflows.agent_exec import (
     _MAX_TURNS_PER_STEP,
     WorkflowSpawnRefused,
+    step_memory,
     vet_step_spawn,
 )
 
@@ -117,8 +118,10 @@ class _WorkflowSessionWorker:
         memory_scope: Any = None,
         context_builder: Any = None,
         effort: str = "",
+        include_memory: bool = False,
     ) -> None:
         self._sessions = sessions
+        self._include_memory = include_memory
         self._key = key
         self._agent = agent
         self._model = model
@@ -170,6 +173,7 @@ class _WorkflowSessionWorker:
                 resumed=self._resumed,
                 agent=self._agent,
                 cwd=self._cwd,
+                include_memory=self._include_memory,
             )
         result = await _run_step(self._provider, prompt, timeout=timeout)
         if self._memory_scope is not None:
@@ -319,7 +323,11 @@ def build_pooled_agent_fn(
         return effort
 
     def _make_pool(
-        agent: Optional[str], model: Optional[str], work_dir: Optional[str], effort: Optional[str]
+        agent: Optional[str],
+        model: Optional[str],
+        work_dir: Optional[str],
+        effort: Optional[str],
+        include_memory: bool = False,
     ) -> WorkerPool:
         def _factory() -> _WorkflowSessionWorker:
             wid = next(worker_ids)
@@ -333,6 +341,7 @@ def build_pooled_agent_fn(
                 memory_scope=memory_scope,
                 context_builder=context_builder,
                 effort=effort or "",
+                include_memory=include_memory,
             )
 
         return WorkerPool(
@@ -345,21 +354,34 @@ def build_pooled_agent_fn(
     # Default sub-pool (no per-call override) + a registry of identity-keyed
     # sub-pools created on demand. ``pool`` (the default) is returned to the
     # caller for shutdown; it delegates to every sub-pool via _AggregatePool.
-    default_pool = _make_pool(default_agent, default_model, cwd, "")
+    default_memory = step_memory(memory_scope, None)
+    default_pool = _make_pool(default_agent, default_model, cwd, "", default_memory)
     subpools: dict[
-        tuple[Optional[str], Optional[str], Optional[str], Optional[str]], WorkerPool
+        tuple[Optional[str], Optional[str], Optional[str], Optional[str], bool], WorkerPool
     ] = {}
 
     def _pool_for(
-        agent: Optional[str], model: Optional[str], work_dir: Optional[str], effort: Optional[str]
+        agent: Optional[str],
+        model: Optional[str],
+        work_dir: Optional[str],
+        effort: Optional[str],
+        include_memory: bool,
     ) -> Optional[WorkerPool]:
         # ``agent=None`` on the call means "use the run default" — identical to
         # build_agent_fn's ``opts.get("agent") or default_agent``. Resolve first
         # so a call that explicitly asks for the default reuses the default pool.
         # WF-5: effort joins the identity key — a warm worker built at one
         # effort must not serve a call that asked for another.
-        key = (agent or default_agent, model or default_model, work_dir or cwd, effort or "")
-        if key == (default_agent, default_model, cwd, ""):
+        # CTX-7: the memory group joins the key too -- a warm worker built
+        # without the user's memory never serves a step that asked for it.
+        key = (
+            agent or default_agent,
+            model or default_model,
+            work_dir or cwd,
+            effort or "",
+            include_memory,
+        )
+        if key == (default_agent, default_model, cwd, "", default_memory):
             return default_pool
         sp = subpools.get(key)
         if sp is not None:
@@ -412,6 +434,7 @@ def build_pooled_agent_fn(
                     resumed=_resumed,
                     agent=opts.get("agent") or default_agent,
                     cwd=opts.get("cwd") or cwd,
+                    include_memory=step_memory(memory_scope, opts.get("memory")),
                 )
             result = await _run_step(provider, prompt)
             if memory_scope is not None:
@@ -445,9 +468,12 @@ def build_pooled_agent_fn(
             await memory_scope.validate()
         # The same two gates the cold path runs, at the single entry: the pooled
         # leg and the unpooled leg both allocate a child session.
+        # The governance gate vets what the SCRIPT named: an unnamed step's
+        # run default (``kirocrew-step``) is Crew's narrowing of the default
+        # agent, vetted as the unnamed spawn it replaces.
         step_cwd = await vet_step_spawn(
             session_key=session_key,
-            agent=opts.get("agent") or default_agent,
+            agent=opts.get("agent"),
             cwd=opts.get("cwd"),
             app=app,
         )
@@ -458,7 +484,10 @@ def build_pooled_agent_fn(
             opts = {**opts, "cwd": step_cwd}
         if opts.get("session") is not None:
             return await _run_unpooled(prompt, opts)
-        target = _pool_for(opts.get("agent"), opts.get("model"), opts.get("cwd"), _step_effort)
+        _step_memory = step_memory(memory_scope, opts.get("memory"))
+        target = _pool_for(
+            opts.get("agent"), opts.get("model"), opts.get("cwd"), _step_effort, _step_memory
+        )
         if target is None:
             return await _run_unpooled(prompt, opts)
         return await target.send(prompt)

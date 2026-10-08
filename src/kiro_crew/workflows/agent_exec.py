@@ -51,6 +51,17 @@ class WorkflowSpawnRefused(Exception):
     """A ``ctx.agent()`` step the spawn policy or the cwd allowlist refuses."""
 
 
+def step_memory(memory_scope: Any, requested: object) -> bool:
+    """Whether a ``ctx.agent()`` step's prompt carries the memory group (CTX-7).
+
+    The scope decides (``WorkflowScope.step_memory``): ``memory=`` when the script
+    gave one, else off except on a member-bound run. A scope without the method
+    (no scope, a test double) answers off, the CTX-7 default.
+    """
+    decide = getattr(memory_scope, "step_memory", None)
+    return bool(decide(requested)) if callable(decide) else requested is True
+
+
 async def vet_step_spawn(
     *, session_key: str, agent: Optional[str], cwd: Optional[str], app: str = ""
 ) -> Optional[str]:
@@ -159,9 +170,10 @@ def build_agent_fn(
     async def agent_fn(prompt: str, opts: dict) -> Any:
         # Spawn gates FIRST: a refused step must allocate no session, touch no
         # memory scope and consume no session index.
+        # Vets what the SCRIPT named (see agent_pool.build_pooled_agent_fn).
         step_cwd = await vet_step_spawn(
             session_key=session_key,
-            agent=opts.get("agent") or default_agent,
+            agent=opts.get("agent"),
             cwd=opts.get("cwd"),
             app=app,
         )
@@ -214,6 +226,7 @@ def build_agent_fn(
                     resumed=_resumed,
                     agent=opts.get("agent") or default_agent,
                     cwd=step_cwd or cwd,
+                    include_memory=step_memory(memory_scope, opts.get("memory")),
                 )
             text = await stream_and_collect(
                 provider,
