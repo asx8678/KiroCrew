@@ -9,9 +9,6 @@ are supplied through :class:`AllocationDeps`.
 
 from __future__ import annotations
 
-#: One busy session does not accumulate an unbounded deque (MSG-1).
-_MAX_SESSION_QUEUE = 32
-
 import asyncio
 import contextlib
 import logging
@@ -47,6 +44,9 @@ from kiro_crew.start_priority import (
     notify_start_queue,
 )
 from kiro_crew.validation import bounded_session_id
+
+#: One busy session does not accumulate an unbounded deque (MSG-1).
+_MAX_SESSION_QUEUE = 32
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
