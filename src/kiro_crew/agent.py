@@ -1192,6 +1192,16 @@ _MANAGED_MCP_SERVERS: dict[str, dict] = {
         "invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-panel"),
         "opt_in": True,
     },
+    # The workflow, knowledge, browser and log tools that TOOL-2 took off the
+    # default ``kirocrew-core`` list. ``opt_in`` for the same reason as the sets
+    # above: a default session must not spend context on schemas it rarely calls.
+    # An agent that runs workflows or searches the knowledge base is granted the
+    # set in its own spec. No ``autoApprove`` key, for the reason given on the
+    # servers above: an autoApproved MCP tool never reaches ``hooks.on_tool_call``.
+    "kirocrew-ops": {
+        "invocation_fn": lambda: _kirocrew_mcp_invocation("mcp-ops"),
+        "opt_in": True,
+    },
 }
 
 

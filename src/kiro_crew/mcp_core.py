@@ -65,7 +65,7 @@ from kiro_crew.mcp_shared import (
     spawned_without_gateway_identity,
 )
 from kiro_crew.mcp_tool_titles import with_titles
-from kiro_crew.mcp_tools import build_tool_list, dispatch
+from kiro_crew.mcp_tools import OPS_TOOL_NAMES, build_tool_list, dispatch
 from kiro_crew.members import record_activity
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.link import is_legacy_slack_key, legacy_key
@@ -2737,7 +2737,25 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
     chan_err = _deny_channel_agent_dispatch(name, args)
     if chan_err:
         return chan_err
+    if not _tool_is_served(name):
+        # Not this server's set: the default core process does not run the opt-in
+        # kirocrew-ops tools even when a caller names one (TOOL-2).
+        return f"Unknown tool: {name}"
     return dispatch(name, args)
+
+
+#: The tool names this process serves, set once at process start. ``None`` is the
+#: default ``kirocrew-core`` process, which serves everything except the opt-in
+#: set; ``kirocrew-ops`` sets it to :data:`OPS_TOOL_NAMES` before its loop starts.
+#: Process-wide and fixed for the process's life, so it holds no per-caller data.
+_SERVED_TOOL_NAMES: frozenset[str] | None = None
+
+
+def _tool_is_served(name: str) -> bool:
+    """Whether this process serves *name* (see :data:`_SERVED_TOOL_NAMES`)."""
+    if _SERVED_TOOL_NAMES is None:
+        return name not in OPS_TOOL_NAMES
+    return name in _SERVED_TOOL_NAMES
 
 
 #: Whether this server advertises ``kirocrew.caller-identity`` — i.e. whether it
