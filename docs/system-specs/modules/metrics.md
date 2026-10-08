@@ -954,6 +954,13 @@ inside `background_turn`/`metered_turn`, or appear in the script's `ALLOWED`
 list with the reason its row is written elsewhere (the Slack heartbeat and
 autonudge, and the cron callback).
 
+**Per-surface daily total (USE-1 follow-up).** `dashboard/handlers/usage.py`
+`surface_daily_credits(day)` sums a local day's `tokens` rows by canonical surface,
+and `surfaces_over_daily_credits(day, threshold)` returns the surfaces above a
+threshold. A threshold of `0` or less is off and returns nothing. Nothing calls
+these yet: the threshold's config key and where its alert surfaces are the
+maintainer's decision, and the usage page does not show the per-surface day total.
+
 Labels in use: `workflow` (cold and pooled stages), `workflow_author`, `bg:judge`,
 `side`, `thread`, `subagent_completion` (the Slack gateway's completion injection,
 filed under the parent key), `taskrunner_lesson`, `issue_radar`, `meetings`,
