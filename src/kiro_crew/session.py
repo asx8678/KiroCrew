@@ -3398,6 +3398,10 @@ class SessionManager:
         """Pop the next non-cancelled queued message."""
         return self._allocation_boundary().dequeue(key)
 
+    def requeue_front(self, key: str, msg_ts: str, text: str, **kwargs: object) -> bool:
+        """Put one entry back at the head of the session queue."""
+        return self._allocation_boundary().requeue_front(key, msg_ts, text, **kwargs)
+
     def cancel_queued(self, key: str, msg_ts: str) -> bool:
         """Remove or mark one queued message as cancelled."""
         return self._allocation_boundary().cancel_queued(key, msg_ts)

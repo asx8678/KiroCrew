@@ -9,6 +9,9 @@ are supplied through :class:`AllocationDeps`.
 
 from __future__ import annotations
 
+#: One busy session does not accumulate an unbounded deque (MSG-1).
+_MAX_SESSION_QUEUE = 32
+
 import asyncio
 import contextlib
 import logging
@@ -1715,9 +1718,26 @@ class SessionAllocationService:
         if not session:
             return False
         if force or session.semaphore.locked():
+            if len(session.queue) >= _MAX_SESSION_QUEUE:
+                return False
             session.queue.append((msg_ts, text, kwargs))
             return True
         return False
+
+    def requeue_front(
+        self,
+        key: str,
+        msg_ts: str,
+        text: str,
+        **kwargs: object,
+    ) -> bool:
+        """Put one entry back at the head. Used when a drain stops at another sender."""
+        key = self._owner._fold_key(key)
+        session = self._sessions.get(key)
+        if session is None:
+            return False
+        session.queue.appendleft((msg_ts, text, kwargs))
+        return True
 
     def dequeue(self, key: str) -> tuple[str, str, dict[str, Any]] | None:
         key = self._owner._fold_key(key)

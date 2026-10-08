@@ -1281,21 +1281,16 @@ async def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
 
 
 async def _drain_slack_queue(orch: GatewayOrchestrator, session_key: str) -> None:
-    """Start the next queued message when no turn's own tail will drain it.
+    """Start the next queued burst when no turn's own tail will drain it.
 
-    One message per call; each dispatched turn calls this again when it ends.
+    Same-sender messages collapse into one turn. Each dispatched turn calls
+    this again when it ends.
     """
     if _key_busy(orch, session_key) or not orch.sessions:
         return
-    _next = orch.sessions.dequeue(session_key)
+    _next = take_queued_burst(orch, session_key)
     if not _next:
-        # The pre-session stash, as the turn-end drains read it.
-        _pq = orch._pending_queue.get(session_key)
-        if not _pq:
-            return
-        _next = _pq.pop(0)
-        if not _pq:
-            del orch._pending_queue[session_key]
+        return
     task = asyncio.ensure_future(_dispatch_queued(orch, session_key, *_next))
     orch._session_tasks[session_key] = task
     orch._handler_tasks.add(task)
@@ -2020,6 +2015,66 @@ def _resolve_approval_mode(orch: "GatewayOrchestrator") -> str:
     return APPROVAL_AUTO if mode == APPROVAL_AUTO else APPROVAL_INTERACTIVE
 
 
+_SLACK_PENDING_CAP = 32
+_SLACK_COLLAPSE_MAX = 8
+
+
+def _queue_sender_key(kwargs: dict) -> tuple[str, str, str]:
+    return (
+        str(kwargs.get("sender_id") or ""),
+        str(kwargs.get("channel") or ""),
+        str(kwargs.get("thread_ts") or ""),
+    )
+
+
+def _pop_queued(orch: GatewayOrchestrator, session_key: str):
+    if orch.sessions:
+        item = orch.sessions.dequeue(session_key)
+        if item is not None:
+            return item
+    pending = orch._pending_queue.get(session_key)
+    if not pending:
+        return None
+    item = pending.pop(0)
+    if not pending:
+        del orch._pending_queue[session_key]
+    return item
+
+
+def _put_back(orch: GatewayOrchestrator, session_key: str, item) -> None:
+    ts, text, kwargs = item
+    if orch.sessions and orch.sessions.requeue_front(session_key, ts, text, **kwargs):
+        return
+    orch._pending_queue.setdefault(session_key, []).insert(0, item)
+
+
+def take_queued_burst(orch: GatewayOrchestrator, session_key: str):
+    """The next queued message plus later ones from the same sender and thread.
+
+    A different sender stays at the head. At most ``_SLACK_COLLAPSE_MAX`` texts
+    join one turn.
+    """
+    first = _pop_queued(orch, session_key)
+    if first is None:
+        return None
+    ts, text, kwargs = first
+    texts = [text]
+    stamps = [ts]
+    key = _queue_sender_key(kwargs)
+    while len(texts) < _SLACK_COLLAPSE_MAX:
+        nxt = _pop_queued(orch, session_key)
+        if nxt is None:
+            break
+        if _queue_sender_key(nxt[2]) != key:
+            _put_back(orch, session_key, nxt)
+            break
+        texts.append(nxt[1])
+        stamps.append(nxt[0])
+    merged = dict(kwargs)
+    merged["_collapsed_ts"] = stamps[1:]
+    return ts, "\n".join(part for part in texts if part), merged
+
+
 async def _dispatch_queued(
     orch: GatewayOrchestrator,
     session_key: str,
@@ -2032,10 +2087,11 @@ async def _dispatch_queued(
     thread_ts = kwargs.get("thread_ts")
     from_trusted_bot = bool(kwargs.get("from_trusted_bot", False))
     if orch.slack:
-        try:
-            await orch.slack.remove_reaction(channel, msg_ts, "hourglass_flowing_sand")
-        except Exception:
-            pass
+        for stamp in [msg_ts, *list(kwargs.get("_collapsed_ts") or [])]:
+            try:
+                await orch.slack.remove_reaction(channel, stamp, "hourglass_flowing_sand")
+            except Exception:
+                pass
     # Route the queued follow-up through the SAME gate as the initial message so
     # behavior is consistent mid-conversation: a thread that took the transport
     # path must keep taking it for its queued follow-ups (not silently fall back
@@ -3196,7 +3252,16 @@ async def _route_message(
             # Session object not created yet — stash on orch._pending_queue,
             # tagged like a session entry so a caller-scoped !stop can tell
             # this sender's entries from the rest here too.
-            orch._pending_queue.setdefault(session_key, []).append(
+            pending = orch._pending_queue.setdefault(session_key, [])
+            if len(pending) >= _SLACK_PENDING_CAP:
+                logger.warning(
+                    "Message %s dropped: session %s queue is full",
+                    msg_ts,
+                    session_key,
+                )
+                _cleanup_attachment_temps()
+                return
+            pending.append(
                 (
                     msg_ts,
                     clean_text,
@@ -3331,14 +3396,7 @@ async def _route_message(
             # busy aren't stranded when the transport path is the active route.
             try:
                 if not _key_busy(orch, session_key) and orch.sessions:
-                    _next = orch.sessions.dequeue(session_key)
-                    # Fall back to orchestrator-level pending queue (pre-session).
-                    if not _next:
-                        _pq = orch._pending_queue.get(session_key)
-                        if _pq:
-                            _next = _pq.pop(0)
-                            if not _pq:
-                                del orch._pending_queue[session_key]
+                    _next = take_queued_burst(orch, session_key)
                     if _next:
                         _q_ts, _q_text, _q_kw = _next
                         _q_t = asyncio.ensure_future(
@@ -3395,14 +3453,7 @@ async def _route_message(
         # Drain queue: only if no other task took over this session
         try:
             if not _key_busy(orch, session_key) and orch.sessions:
-                _next = orch.sessions.dequeue(session_key)
-                # Fall back to orchestrator-level pending queue (pre-session messages)
-                if not _next:
-                    _pq = orch._pending_queue.get(session_key)
-                    if _pq:
-                        _next = _pq.pop(0)
-                        if not _pq:
-                            del orch._pending_queue[session_key]
+                _next = take_queued_burst(orch, session_key)
                 if _next:
                     _q_ts, _q_text, _q_kw = _next
                     _q_t = asyncio.ensure_future(
