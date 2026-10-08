@@ -3136,24 +3136,33 @@ class GatewayOrchestrator:
                                 inject_cls,
                                 meta={"injectKind": "cron", "cronLabel": label},
                             )
-                            task = spawn_guarded_turn(
-                                self.dashboard_state,
-                                slot,
-                                _run_chat(
+                            # A Report is context for the next turn, not a wake.
+                            # Done (remove=True) still starts a turn.
+                            if not remove:
+                                self.dashboard_state.notify(
+                                    "cron",
+                                    f"Cron: {label}",
+                                    message,
+                                    meta={"job_id": job.id},
+                                )
+                                self.dashboard_state.push_slots_update()
+                                self._record_cron_delivery(job, rh)
+                                delivered = True
+                            else:
+                                task = spawn_guarded_turn(
                                     self.dashboard_state,
                                     slot,
-                                    wrapped,
-                                    _directive_user_origin=False,
-                                    # Structural provenance for the session
-                                    # crew log: the queued twin above carries
-                                    # CRON_NOTIFICATION_KIND, and this branch is
-                                    # the same injector dispatching directly.
-                                    _turn_actor="cron",
-                                ),
-                            )
-                            slot.task = task
-                        self.dashboard_state.push_slots_update()
-                        self._record_cron_delivery(job, rh)
+                                    _run_chat(
+                                        self.dashboard_state,
+                                        slot,
+                                        wrapped,
+                                        _directive_user_origin=False,
+                                        _turn_actor="cron",
+                                    ),
+                                )
+                                slot.task = task
+                                self.dashboard_state.push_slots_update()
+                                self._record_cron_delivery(job, rh)
                     else:
                         self.dashboard_state.notify(
                             "cron", f"⚡ {label}", message, meta={"job_id": job.id}
