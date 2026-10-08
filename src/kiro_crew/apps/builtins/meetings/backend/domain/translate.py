@@ -114,7 +114,11 @@ async def run_oneshot_translation(sessions: Any, prompt: str) -> str:
     provider, _is_new, _resumed = await sessions.get_or_create(key, agent="kirocrew-lite")
     try:
         return await stream_and_collect(
-            provider, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
+            provider,
+            prompt,
+            approval_policy=ToolApprovalPolicy.REJECT_ALL,
+            usage_surface="meetings_translate",
+            usage_session_key=key,
         )
     finally:
         try:

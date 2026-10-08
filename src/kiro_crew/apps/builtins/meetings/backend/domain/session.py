@@ -235,6 +235,7 @@ async def dispatch_to_agent(
             session_key=key,
             agent=agent,
             app=k.APP_NAME,
+            usage_surface="meetings",
         )
 
     turn_task = asyncio.create_task(_run_turn())

@@ -2751,7 +2751,12 @@ class TaskRunner:
                     session_key,
                     agent=self._agent or None,
                 )
-            return await stream_and_collect_json(client, prompt)
+            return await stream_and_collect_json(
+                client,
+                prompt,
+                usage_surface="taskrunner_lesson",
+                usage_session_key=session_key,
+            )
         except Exception:
             logger.debug("LLM lesson extraction call failed", exc_info=True)
             return None

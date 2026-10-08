@@ -1096,10 +1096,13 @@ never spawns `kiro-cli` in tests. Two production adapters:
   history. Each step runs through `llm_helpers.stream_and_collect` with
   `AUTO_APPROVE` and `max_turns=_MAX_TURNS_PER_STEP`, then the output passes
   through `redact_credentials` and `redact_exfiltration_urls` before it can reach a
-  run record, history, or parent chat. A per-turn usage row is persisted with
-  `surface="workflow"` on a best-effort basis, with deliberately **narrow** guards:
-  one wide try around import plus context read plus persist would let a single
-  import failure silently drop every row from the workflow surface.
+  run record, history, or parent chat. The per-turn usage row (`surface="workflow"`,
+  filed under the stage's key, the step's agent as the fallback attribution) is
+  written by `stream_and_collect(..., usage_surface="workflow")` itself, so a stage
+  that raises or is cancelled still records what it spent (USE-1); the context
+  read is guarded on its own inside `record_turn_usage`, so an enrichment failure
+  cannot drop the row. The pooled path below writes the same row from
+  `agent_pool._run_step`, its per-task timeout included.
 - **`agent_pool.build_pooled_agent_fn`** (warm sessions; the service default,
   `pool_agents=True`). Per-call sessions make every call pay a full cold start
   (subprocess spawn plus ACP `initialize` plus `session/new`, which loads the MCP

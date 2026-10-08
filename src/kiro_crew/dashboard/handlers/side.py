@@ -638,6 +638,7 @@ async def _run_side_turn(
                 app=slot._app or "",
                 on_chunk=_on_chunk,
                 on_steer_consumed=_on_steer_consumed,
+                usage_surface="side",
             )
             # Redact the assembled text before it is stored/broadcast as the
             # terminal frame (which replaces the streamed deltas). Never trust

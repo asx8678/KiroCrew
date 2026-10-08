@@ -922,6 +922,34 @@ monitor/heartbeat/webhook/taskrunner/workflow) retain their canonical source;
 `taskrunner` when rows are read. Zero-token surfaces (cron `script=`/`command=`
 modes, heartbeat maintenance ticks) never call a model and must not write a row.
 
+**Every model call writes exactly one row (USE-1).** `llm_helpers.record_turn_usage`
+is the one persist behind every row a non-dashboard path writes: it reads the
+turn's billing (or takes the usage a caller already snapshotted), skips an
+unbilled turn (`usage_has_billing`), names the SERVED model (`provider.served_model`,
+with the provider as `model_source` fallback), the agent that served the turn
+(else the caller's fallback), guarded context occupancy, the caller's measured
+`elapsed_ms`, and the caller's surface label; a caller with no key files under
+`_bg`. It never raises into the turn. Two ways in:
+
+- `stream_and_collect(..., usage_surface=..., usage_session_key=..., usage_agent=...)`
+  (and `stream_and_collect_json`, which forwards them) writes the row in the
+  terminal attempt's `finally` — reached on a return, a raise, and a
+  `CancelledError` (including one landing in a retry's backoff sleep) — from the
+  billing summed over every attempt. A labelled call does NOT publish the total
+  for `provider_last_turn_usage`, so nothing is left for a second writer. Unlabelled
+  calls are unchanged: the caller owns the row.
+- A path that drives `provider.stream` itself calls `record_turn_usage` from its own
+  `finally`, with `since=` the stats object observed before the turn.
+
+Labels in use: `workflow` (cold and pooled stages), `workflow_author`, `bg:judge`,
+`side`, `thread`, `subagent_completion` (the Slack gateway's completion injection,
+filed under the parent key), `taskrunner_lesson`, `issue_radar`, `meetings`,
+`meetings_translate`, and `bg:<source>` / `bg:<task>` from the two background
+helpers, which share the same persist. A caller that ALSO reads the turn's usage for
+something else (cron's turn-stats footer, the monitor controller, the task runner's
+step, subagents, hooks, heartbeat) keeps writing its own row and passes no label —
+passing both would write two rows for one turn.
+
 **Per-turn injection breakdown (`context/composed`).** Recorded in the crew log
 rather than on this row (see above). Its `sources` are
 produced by `context_blocks.split_blocks(prompt, user_chars=…)`, which attributes

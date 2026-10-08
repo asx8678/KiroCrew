@@ -33,7 +33,9 @@ Each `daily_history` row also carries `credits`: the plan credits billed on that
 local calendar day, summed from the per-turn usage shards with the same row
 guard the Spend tab applies (a `tokens` row inside the per-row epoch cutoff with
 a finite numeric `credits`) and no slot filter, so background slots count too.
-It is the rolling 30-day local shard spend the table already covers, not a
+The figure is only as complete as the shards: every model-calling path writes its
+one row through `llm_helpers.record_turn_usage` (USE-1; the rule and the surface
+labels are in `metrics.md` § Per-turn token usage row store). It is the rolling 30-day local shard spend the table already covers, not a
 billing-cycle figure: the Billing card's total comes from the account, over the
 account's period, and the two are not expected to sum to each other. A day with
 credits but no transcript (a background slot, a refused file) still gets a row,

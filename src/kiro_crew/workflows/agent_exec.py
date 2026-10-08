@@ -30,11 +30,10 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
-import time
 from typing import Any, Callable, Optional
 
 from kiro_crew.effort import is_valid_effort
-from kiro_crew.llm_helpers import ToolApprovalPolicy, provider_last_turn_usage, stream_and_collect
+from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect
 from kiro_crew.security import redact
 
 logger = logging.getLogger(__name__)
@@ -195,11 +194,6 @@ def build_agent_fn(
             extra_env=extra_env,
             reasoning_effort_override=_effort,
         )
-        # Wall clock for THIS agent turn only (not the whole workflow run):
-        # acp leaves TurnUsage.duration_ms at 0, so without this the row's
-        # duration_ms is a literal 0. Started after get_or_create so session
-        # setup is not charged to the turn.
-        _turn_t0 = time.monotonic()
         try:
             from kiro_crew.messaging.identity import publish_turn_identity
 
@@ -215,66 +209,19 @@ def build_agent_fn(
                     agent=opts.get("agent") or default_agent,
                     cwd=step_cwd or cwd,
                 )
+            # USE-1: the stage's one usage row (surface ``workflow``) is written
+            # inside stream_and_collect on every exit -- success, a raise, a
+            # timeout's cancellation -- not after it returns, where a failed stage
+            # used to write nothing.
             text = await stream_and_collect(
                 provider,
                 prompt,
                 approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
                 max_turns=_MAX_TURNS_PER_STEP,
+                usage_surface="workflow",
+                usage_session_key=key,
+                usage_agent=opts.get("agent") or default_agent or "",
             )
-            # ── Per-turn usage row: attribute workflow spend. ──
-            # Best-effort analytics that must never break the workflow run — but
-            # the guards are deliberately NARROW. A single wide try around the
-            # import + context read + persist would swallow ANY of them at
-            # debug, so one import failure or a context-read failure would
-            # silently drop the ENTIRE row (the workflow surface writing zero
-            # rows).
-            #
-            # The import stays function-local on purpose: kiro_crew.dashboard.
-            # handlers.usage pulls in the slack handler chain, so a module-scope
-            # import can raise ImportError under some import orders. A genuine
-            # failure here is a real wiring bug, so surface it (warning) instead
-            # of hiding it — while still not aborting the run.
-            try:
-                from kiro_crew.dashboard.handlers.usage import (
-                    persist_token_record_async,
-                    read_context_tokens,
-                    read_effective_agent,
-                )
-            except ImportError:
-                logger.warning(
-                    "workflow usage row skipped: usage handlers unimportable",
-                    exc_info=True,
-                )
-            else:
-                # Context occupancy is enrichment only. Guard it on its OWN so a
-                # read failure degrades to (0, 0) instead of taking the row down.
-                try:
-                    _used, _window = read_context_tokens(provider)
-                except Exception:
-                    logger.debug("workflow context-token read failed", exc_info=True)
-                    _used, _window = 0, 0
-                # Only the persist stays in a best-effort try: a write failure
-                # must not break the workflow run, but nothing else hides here.
-                try:
-                    await persist_token_record_async(
-                        key,
-                        opts.get("model") or default_model or "",
-                        provider_last_turn_usage(provider),
-                        provider="acp",
-                        surface="workflow",
-                        agent=(
-                            read_effective_agent(provider)
-                            or opts.get("agent")
-                            or default_agent
-                            or ""
-                        ),
-                        context_used=_used,
-                        context_window=_window,
-                        elapsed_ms=int((time.monotonic() - _turn_t0) * 1000),
-                        model_source=provider,
-                    )
-                except Exception:
-                    logger.debug("workflow usage row persist failed", exc_info=True)
             # Apply canonical output redaction to prevent credential or
             # exfiltration-URL leakage into workflow results stored in history
             # or injected into parent chat.
