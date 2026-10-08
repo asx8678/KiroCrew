@@ -942,6 +942,17 @@ with the provider as `model_source` fallback), the agent that served the turn
   `async with llm_helpers.metered_turn(provider, surface=..., slot_key=...)`, which
   pins the stats object on entry and calls `record_turn_usage` on every exit;
   `TurnDriver(usage_surface=...)` does the same around `run()`.
+- The knowledge CLI's Claude worker (`knowledge/llm_pool.py` `CCWorker`) is not a
+  provider, so it reads the billing off its own `result` event (`usage`,
+  `total_cost_usd`, `modelUsage`) and writes the row (surface `knowledge`, under
+  `_bg`) in a `finally` in `send_message`: a timed-out, cancelled or error reply
+  still records what its result reported.
+
+Enforced by `scripts/check_usage_surface.py` (AST, no test run): every
+`stream_and_collect(` call site must pass a non-empty `usage_surface=`, sit
+inside `background_turn`/`metered_turn`, or appear in the script's `ALLOWED`
+list with the reason its row is written elsewhere (the Slack heartbeat and
+autonudge, and the cron callback).
 
 Labels in use: `workflow` (cold and pooled stages), `workflow_author`, `bg:judge`,
 `side`, `thread`, `subagent_completion` (the Slack gateway's completion injection,
@@ -952,9 +963,10 @@ for its monitor wakes, `channel`, `cli`, `optimizer`, `taskrunner_decompose`,
 `taskrunner_refine`, `compaction` (native `/compact` through the provider and the
 compaction coordinator), `code_review_sage`, `knowledge` (the knowledge pool's ACP
 workers), and `bg:<source>` / `bg:<task>` from the two background helpers, which
-share the same persist. Not metered: the offline eval harness (`eval/`), and the
-knowledge pool's external-CLI worker (`CCWorker`), which has no billing-stats seam
-to read. A caller that ALSO reads the turn's usage for
+share the same persist. The offline eval harness is metered too: `eval/runner.py`
+writes one `eval` row per scenario turn and `eval/judge.py` one `eval_judge` row
+per judge call, both through `metered_turn`. The knowledge pool's external-CLI
+worker (`CCWorker`) is metered as well, from its own result event (see above). A caller that ALSO reads the turn's usage for
 something else (cron's turn-stats footer, the monitor controller, the task runner's
 step, subagents, hooks, heartbeat) keeps writing its own row and passes no label —
 passing both would write two rows for one turn.

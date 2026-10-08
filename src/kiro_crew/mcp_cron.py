@@ -2105,7 +2105,10 @@ def _list_tools() -> list[dict[str, Any]]:
                     "timezone": {"type": "string", "description": "New IANA timezone"},
                     "strict_schedule": {"type": "boolean"},
                     "persistent_session": {"type": "boolean"},
-                    "auto_pause_after": {"type": "number", "description": "Failures before auto-pause; 0 = never."},
+                    "auto_pause_after": {
+                        "type": "number",
+                        "description": "Failures before auto-pause; 0 = never.",
+                    },
                     "minimal_context": {"type": "boolean"},
                     "hide_in_chat": {"type": "boolean"},
                     "model": {
