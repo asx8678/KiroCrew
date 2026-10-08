@@ -1,8 +1,9 @@
 """The conductor agent specs: one shape, four charters.
 
 Four specs share one shape -- derived from the default template, no file-writing tool,
-``execute_bash`` mounted but never auto-approved, and every MCP server mounted whole
-but auto-approved verb by verb -- and differ in charter: the goal conductor (and its
+``execute_bash`` mounted but never auto-approved, and every MCP verb mounted by name
+(its grants plus the verbs its prompt names) and auto-approved only for the grants --
+and differ in charter: the goal conductor (and its
 deprecated ledger alias, which emits the same spec under the old name), the pipeline
 conductor and the security conductor. Their prompts and the grant tuples each may
 auto-approve are spec bytes and stay in :mod:`kiro_crew.agent`, beside the invariant
@@ -71,6 +72,72 @@ def _conductor_mcp_servers(config: dict[str, Any], *, work: bool = False) -> dic
     if work:
         narrowed["kirocrew-work"] = managed_mcp._managed_opt_in_entry("mcp-work")
     return narrowed
+
+
+# -- What each conductor MOUNTS -------------------------------------------------
+#
+# SPEC-1 (human-approved): a conductor mounts the verbs its charter grants plus the
+# verbs its prompt and skill tell it to call, never a managed server whole. Every
+# request resends the definitions of every mounted tool, and the whole
+# ``@kirocrew-core`` + ``@kirocrew-dashboard`` (+ ``@kirocrew-work``) set cost
+# ~150 KB of them on every patrol cycle, where the verbs below cost ~45 KB. Tool
+# Search deferral would hide the cost only above ``tool_search_min_tokens``, which a
+# 1M-window session does not cross.
+#
+# A MOUNTED verb is not an auto-approved one. The grants (``agent._*_GRANTS``) stay
+# the auto-approve list exactly as before; the verbs below are mounted and PROMPT,
+# which is what the prompt already tells the conductor to expect for each of them.
+# A verb a prompt names only to forbid it (``spawn_sub_agents``, ``workflow_run``,
+# ``task_run``, and ``spawn_run`` on the goal conductor) is deliberately not mounted:
+# the charter says a work item never goes there, and an unmounted tool is that rule
+# held by the spec instead of the prose.
+
+#: Prompt-named verbs beyond the goal conductor's grants: the inspect that confirms
+#: an arm, the three child-session writes it is told to expect one approval for, and
+#: ``work_report`` for its OWN item when a parent conductor dispatched it.
+_CONDUCTOR_PROMPTED_VERBS: tuple[str, ...] = (
+    "@kirocrew-core/monitor_inspect",
+    "@kirocrew-dashboard/session_send",
+    "@kirocrew-dashboard/session_stop",
+    "@kirocrew-dashboard/session_close",
+    "@kirocrew-work/work_report",
+)
+
+#: The pipeline and security conductors' prompt-named verbs beyond their grants: the
+#: same inspect and child-session writes, and ``spawn_run`` for the ONE purpose both
+#: prompts give it -- a bounded, read-only inspector of a suspect child.
+_FLEET_CONDUCTOR_PROMPTED_VERBS: tuple[str, ...] = (
+    "@kirocrew-core/monitor_inspect",
+    "@kirocrew-core/spawn_run",
+    "@kirocrew-dashboard/session_send",
+    "@kirocrew-dashboard/session_stop",
+    "@kirocrew-dashboard/session_close",
+)
+
+#: The managed servers a conductor's per-verb mounts may name.
+_CONDUCTOR_MOUNTABLE_SERVERS = ("@kirocrew-core", "@kirocrew-dashboard", "@kirocrew-work")
+
+
+def _conductor_tool_mounts(
+    shipped: tuple[str, ...], prompted: tuple[str, ...], granted: list[str]
+) -> list[str]:
+    """The ``@server/verb`` refs a conductor's ``tools`` mounts, in a stable order.
+
+    The SHIPPED grants rather than the governed ones: a grant the governance ceiling
+    strips stays mounted and prompts, as it did when the whole server was mounted.
+    A user's own carried-forward entry on one of the conductor's servers is mounted
+    too -- the user approved a tool by name, and dropping its mount would turn that
+    approval into a missing tool. Any other entry (a builtin, another server) is not
+    a mount this helper decides.
+    """
+    mounts: list[str] = []
+    for ref in (*shipped, *prompted, *granted):
+        if not isinstance(ref, str) or ref in mounts:
+            continue
+        server = ref.split("/", 1)[0]
+        if server in _CONDUCTOR_MOUNTABLE_SERVERS:
+            mounts.append(ref)
+    return mounts
 
 
 # -- Every grant any release has shipped on the four conductor specs -------------
@@ -608,8 +675,9 @@ def _conductor_spec(
     work item's work itself" true against the tool list and not just against
     the prose.
 
-    ``@kirocrew-core``, ``@kirocrew-dashboard`` and ``@kirocrew-work`` are all
-    MOUNTED whole but auto-approved only verb by verb, via
+    ``@kirocrew-core``, ``@kirocrew-dashboard`` and ``@kirocrew-work`` are
+    MOUNTED verb by verb -- the grants plus the prompt-named verbs
+    (``_conductor_tool_mounts``) -- and auto-approved only for the grants, via
     ``_CONDUCTOR_CORE_GRANTS``, ``_CONDUCTOR_DASHBOARD_GRANTS`` and
     ``_LEDGER_CONDUCTOR_WORK_GRANTS`` (see their comments for the per-verb
     reasoning). Both backends honour a per-tool reference, so the narrowing is
@@ -665,12 +733,9 @@ def _conductor_spec(
         # it loads them by id. Named in the prompt's tool inventory for that
         # reason, and auto-approved below so the load itself never prompts.
         "tool_search",
-        "@kirocrew-core",
-        "@kirocrew-dashboard",
-        # Mounted whole, auto-approved verb by verb below: the worker half lives
-        # on this server too, and a conductor has no reason to auto-approve a
-        # tool whose only answer to it is a refusal.
-        "@kirocrew-work",
+        # The ``@kirocrew-core`` / ``@kirocrew-dashboard`` / ``@kirocrew-work``
+        # verbs are appended below, once the grants are known: charter plus
+        # prompt-named verbs, never a server whole (``_conductor_tool_mounts``).
     ]
     # ``allowedTools`` is the ONE path that never reaches the PreToolUse gate, so
     # every grant is filtered through the governance ceiling first — the same
@@ -691,12 +756,12 @@ def _conductor_spec(
     # What the user approved on the spec on disk is carried forward beside them,
     # through the same ceiling (``_governed_grants``) -- or, when that spec is
     # theirs and cannot be read, left exactly where it is.
-    granted = _governed_grants(
-        _conductor_shipped_grants(), name=name, filename=filename, source=source, clean=clean
-    )
+    shipped = _conductor_shipped_grants()
+    granted = _governed_grants(shipped, name=name, filename=filename, source=source, clean=clean)
     if granted is None:
         return None
     config["allowedTools"] = granted
+    config["tools"] += _conductor_tool_mounts(shipped, _CONDUCTOR_PROMPTED_VERBS, granted)
     config["mcpServers"] = _conductor_mcp_servers(config, work=True)
     # Derive the KAS policy from the FILTERED grant list instead of restating it
     # as a literal: the rules come out byte-identical, a later edit to
@@ -722,8 +787,8 @@ def _install_conductor_agent(*, clean: bool = False) -> bool:
 
     Every property ``_conductor_spec`` argues for holds here, and the swap did
     not relax one of them: no file-writing tool at all, ``@kirocrew-core`` /
-    ``@kirocrew-dashboard`` / ``@kirocrew-work`` mounted whole and auto-approved
-    verb by verb, ``execute_bash`` mounted and never auto-approved BY CREW, and
+    ``@kirocrew-dashboard`` / ``@kirocrew-work`` mounted and auto-approved verb by
+    verb, ``execute_bash`` mounted and never auto-approved BY CREW, and
     the KAS policy derived from the FILTERED grant list rather than restated.
     The user's own auto-approve entries on the installed file are carried
     forward under the ceiling (``_governed_grants``); ``clean`` is the rebuild's
@@ -816,8 +881,8 @@ def _install_pipeline_conductor_agent(*, clean: bool = False) -> bool:
     installer per generated agent is the file's established pattern — and
     keeps every property that installer's docstring argues for: derived from
     the kirocrew agent, **no dedicated file-writing tool** (neither ``fs_write``
-    nor ``code``), ``@kirocrew-dashboard`` mounted whole but auto-approved only
-    verb by verb, ``execute_bash`` mounted but never auto-approved
+    nor ``code``), ``@kirocrew-core`` and ``@kirocrew-dashboard`` mounted and
+    auto-approved verb by verb, ``execute_bash`` mounted but never auto-approved
     (``allowedTools`` has no argument matching, so trusting the two bundled
     skill scripts cannot be told apart from trusting arbitrary shell), and the
     KAS policy derived from the FILTERED grant list. Where the two agents
@@ -843,8 +908,7 @@ def _install_pipeline_conductor_agent(*, clean: bool = False) -> bool:
         "session",
         "report",
         "tool_search",
-        "@kirocrew-core",
-        "@kirocrew-dashboard",
+        # Per-verb mounts appended once the grants are known (``_conductor_tool_mounts``).
     ]
     shipped = (
         "session",
@@ -863,6 +927,7 @@ def _install_pipeline_conductor_agent(*, clean: bool = False) -> bool:
     if granted is None:
         return False
     config["allowedTools"] = granted
+    config["tools"] += _conductor_tool_mounts(shipped, _FLEET_CONDUCTOR_PROMPTED_VERBS, granted)
     config["mcpServers"] = _conductor_mcp_servers(config)
     # Same derive-don't-restate rationale as the conductor above; the shared
     # writer version-gates it.
@@ -885,7 +950,7 @@ def _install_security_conductor_agent(*, clean: bool = False) -> bool:
     keeping every property those docstrings argue for: derived from the kirocrew
     agent, **no dedicated file-writing tool** (neither ``fs_write`` nor ``code``,
     which governance classes under ``filesystem.write``), ``@kirocrew-core`` and
-    ``@kirocrew-dashboard`` mounted whole but auto-approved only verb by verb,
+    ``@kirocrew-dashboard`` mounted and auto-approved verb by verb,
     ``execute_bash`` mounted but never auto-approved (``allowedTools`` has no
     argument matching, so trusting the skill's bundled scripts cannot be told
     apart from trusting arbitrary shell), and the KAS policy derived from the
@@ -934,8 +999,7 @@ def _install_security_conductor_agent(*, clean: bool = False) -> bool:
         "session",
         "report",
         "tool_search",
-        "@kirocrew-core",
-        "@kirocrew-dashboard",
+        # Per-verb mounts appended once the grants are known (``_conductor_tool_mounts``).
     ]
     shipped = (
         "session",
@@ -954,6 +1018,7 @@ def _install_security_conductor_agent(*, clean: bool = False) -> bool:
     if granted is None:
         return False
     config["allowedTools"] = granted
+    config["tools"] += _conductor_tool_mounts(shipped, _FLEET_CONDUCTOR_PROMPTED_VERBS, granted)
     config["mcpServers"] = _conductor_mcp_servers(config)
     # Derived from the FILTERED grant list rather than restated, so a ceiling
     # that strips a grant strips its KAS rule with it; the shared writer
