@@ -911,6 +911,7 @@ def get_lessons_context(
     hard_cap: int = 0,
     directive_budget: int = 0,
     experience_budget: int = 0,
+    tier: str = "all",
 ) -> str:
     """Format lessons for prompt injection, most relevant first.
 
@@ -1006,6 +1007,8 @@ def get_lessons_context(
                 untagged.append(entry)
             else:
                 authored.append(entry)
+        authored.sort(key=lambda entry: str(entry[0].get("key") or ""))
+        untagged.sort(key=lambda entry: str(entry[0].get("key") or ""))
         directives = authored + untagged
         unclassified = len(untagged)
         # The model-safety ceiling bounds the two blocks TOGETHER, and the
@@ -1118,6 +1121,10 @@ def get_lessons_context(
             len(experiences),
             len(experience_block),
         )
+        if tier == "directives":
+            return directive_block
+        if tier == "experiences":
+            return experience_block
         return directive_block + experience_block
     total = len(entries)
     ranked = (

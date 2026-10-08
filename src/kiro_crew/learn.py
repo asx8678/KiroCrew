@@ -647,6 +647,7 @@ class LessonStore:
         directive_budget: int = 0,
         experience_budget: int = 0,
         query_text: str = "",
+        tier: str = "all",
     ) -> str:
         """Format lessons as context for injection into prompts.
 
@@ -713,8 +714,13 @@ class LessonStore:
         # that tier unordered lost a match the vector store kept, which ranks its
         # whole eligible set. Ordering is not admission: it decides which rows
         # survive a truncation that is going to happen anyway.
-        ranked_directives = order_by_request_relevance(entries(authored), query_text)
-        ranked_directives += order_by_request_relevance(entries(unclassified), query_text)
+        # Standing rules are ordered by timestamp, not by this request (CTX-4).
+        # A query-ranked rule tier split the shared prefix whenever the question
+        # changed. Findings stay query-ranked, and the session path renders them
+        # after that prefix.
+        ranked_directives = sorted(
+            entries(authored) + entries(unclassified), key=lambda e: (e[0].ts, e[0].rule)
+        )
         directive_room = tighter_lesson_budget(directive_budget, cap)
         directive_block, _ = render_lesson_tier(
             ranked_directives,
@@ -791,4 +797,8 @@ class LessonStore:
                     "learn_list for the rest.]"
                 ),
             )
+        if tier == "directives":
+            return directive_block
+        if tier == "experiences":
+            return experience_block
         return directive_block + experience_block

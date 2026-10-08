@@ -326,6 +326,7 @@ def session_lessons_part(
     caps: _budgets._ResolvedCaps,
     essentials: str,
     query_text: str,
+    findings_out: list[str] | None = None,
 ) -> tuple[Callable[[int], str] | None, int | None]:
     """Admit the session-start lessons block from the store that answers for it.
 
@@ -354,6 +355,7 @@ def session_lessons_part(
     # exists to prevent.
     lessons_ctx = ""
     lessons_renderer: Callable[[int], str] | None = None
+    findings_fn: Callable[[int], str] | None = None
     lessons_part_index: int | None = None
     if (memory is not None or member_vectors is not None) and _inclusion._group_included(
         effective_groups, _inclusion.CONTEXT_GROUP_LESSONS
@@ -382,9 +384,24 @@ def session_lessons_part(
                     hard_cap=hard_cap,
                     directive_budget=caps.lessons_startup,
                     experience_budget=caps.lesson_experience,
+                    tier="directives",
                 )
 
             lessons_renderer = _render_member_lessons
+
+            def _member_findings(hard_cap: int) -> str:
+                return member_store.get_lessons_context(
+                    query_text=query_text,
+                    cap=caps.lessons,
+                    project_dir=project,
+                    background=True,
+                    hard_cap=hard_cap,
+                    directive_budget=caps.lessons_startup,
+                    experience_budget=caps.lesson_experience,
+                    tier="experiences",
+                )
+
+            findings_fn = _member_findings
         elif memory is not None and memory.vector_store and memory.vector_store.has_any_lesson():
             vector_store = memory.vector_store
             # Only after the activity block ranked against the first message:
@@ -406,9 +423,25 @@ def session_lessons_part(
                     hard_cap=hard_cap,
                     directive_budget=caps.lessons_startup,
                     experience_budget=caps.lesson_experience,
+                    tier="directives",
                 )
 
             lessons_renderer = _render_vector_lessons
+
+            def _vector_findings(hard_cap: int) -> str:
+                return vector_store.get_lessons_context(
+                    query_text=query_text,
+                    cap=caps.lessons,
+                    project_dir=project,
+                    recall_query=vector_query,
+                    background=True,
+                    hard_cap=hard_cap,
+                    directive_budget=caps.lessons_startup,
+                    experience_budget=caps.lesson_experience,
+                    tier="experiences",
+                )
+
+            findings_fn = _vector_findings
         elif ctx._resolved_store_name(memory_store):
             lesson_store = builder.get_lessons_for(workspace, memory_store)
 
@@ -419,9 +452,22 @@ def session_lessons_part(
                     directive_budget=caps.lessons_startup,
                     experience_budget=caps.lesson_experience,
                     query_text=query_text,
+                    tier="directives",
                 )
 
             lessons_renderer = _render_named_jsonl_lessons
+
+            def _named_findings(hard_cap: int) -> str:
+                return lesson_store.get_context(
+                    project_dir=project,
+                    cap=hard_cap,
+                    directive_budget=caps.lessons_startup,
+                    experience_budget=caps.lesson_experience,
+                    query_text=query_text,
+                    tier="experiences",
+                )
+
+            findings_fn = _named_findings
         else:
 
             def _render_default_jsonl_lessons(hard_cap: int) -> str:
@@ -431,9 +477,22 @@ def session_lessons_part(
                     directive_budget=caps.lessons_startup,
                     experience_budget=caps.lesson_experience,
                     query_text=query_text,
+                    tier="directives",
                 )
 
             lessons_renderer = _render_default_jsonl_lessons
+
+            def _default_findings(hard_cap: int) -> str:
+                return builder.lessons.get_context(
+                    project_dir=project,
+                    cap=hard_cap,
+                    directive_budget=caps.lessons_startup,
+                    experience_budget=caps.lesson_experience,
+                    query_text=query_text,
+                    tier="experiences",
+                )
+
+            findings_fn = _default_findings
 
         protected_before_lessons = len(essentials) + sum(
             len(parts[index]) for index in protected_parts
@@ -456,6 +515,10 @@ def session_lessons_part(
         if lessons_ctx:
             lessons_part_index = len(parts)
             append_required(lessons_ctx)
+        if findings_out is not None and findings_fn is not None:
+            findings_out.append(
+                findings_fn(max(1, caps.protected_context - protected_before_lessons))
+            )
     return lessons_renderer, lessons_part_index
 
 

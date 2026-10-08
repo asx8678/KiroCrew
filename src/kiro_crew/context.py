@@ -3280,6 +3280,7 @@ class ContextBuilder:
         # Lessons: injected for ALL agents (skipped for temporary sessions), gated
         # by the same project scope the skill loader applies; the store that
         # answers is chosen by population, not by what a render returned.
+        _findings_tail: list[str] = []
         lessons_renderer, lessons_part_index = _store_admission.session_lessons_part(
             self,
             blocks,
@@ -3293,8 +3294,9 @@ class ContextBuilder:
             caps=caps,
             essentials=essentials,
             query_text=query_text,
+            findings_out=_findings_tail,
         )
-        # V2 essential rules are query-free; V1 retains its query-ranked lessons.
+        # Standing rules stay in the prefix. Findings ride the volatile tail.
         _mark("lessons")
 
         # Source snippets may exist only in this conversation's log, not in the
@@ -3366,6 +3368,8 @@ class ContextBuilder:
             is_custom,
             len(context),
         )
+        if _findings_tail:
+            _volatile_tail += "".join(part for part in _findings_tail if part)
         if _volatile_tail:
             context = context + _volatile_tail
         _mark("finalize")

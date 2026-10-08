@@ -4011,6 +4011,7 @@ class VectorMemoryStore:
         hard_cap: int = 0,
         directive_budget: int = 0,
         experience_budget: int = 0,
+        tier: str = "all",
     ) -> str:
         """Format lessons for prompt injection, most relevant first."""
         return _lessons.get_lessons_context(
@@ -4023,6 +4024,7 @@ class VectorMemoryStore:
             hard_cap=hard_cap,
             directive_budget=directive_budget,
             experience_budget=experience_budget,
+            tier=tier,
         )
 
     def turn_lessons(
