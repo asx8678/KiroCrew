@@ -490,17 +490,13 @@ def schemas() -> list[dict[str, Any]]:
                     if prefer_structured
                     else _ARMING_STEER_STRUCTURED_ON_CONDITION
                 )
-                + "Every interval_secs `message` is re-injected as your next turn; user "
-                "turns defer a due fire without restarting the deadline. Works from "
-                "dashboard, Slack, Discord and Webex. Put the checks and exit condition in "
-                "`message`, END YOUR TURN, and call autonudge_stop when done: max_cycles is "
-                "a runaway backstop, NOT success. Create-only while an ACTIVE automation "
-                "exists; revise with monitor_update. On Webex, stop the loop and create a "
-                "new finite one instead. Naming ONE GitHub pull request by full URL gates "
-                "the loop, re-injecting only when the tick needs you: "
-                f"{screen_phrase()}; one lane of many finishing raises no wake, and a "
-                "raised wake lands up to about one interval after the tick that observed "
-                f"it. {_ending_clause()} ends the watch. Read the `babysit` skill first."
+                + "Put the checks and exit condition in `message`, END YOUR TURN, and call "
+                "autonudge_stop when done: max_cycles is a runaway backstop, NOT success. "
+                "Create-only while an ACTIVE automation exists; revise with monitor_update. "
+                "On Webex, stop the loop and create a new finite one instead. Naming ONE "
+                "GitHub pull request by full URL gates the loop, re-injecting only when the "
+                f"tick needs you: {screen_phrase()}; one lane of many finishing raises no "
+                f"wake. {_ending_clause()} ends the watch. Read the `babysit` skill first."
             ),
             "inputSchema": {
                 "type": "object",

@@ -2019,10 +2019,8 @@ def _list_tools() -> list[dict[str, Any]]:
                     },
                     "auto_pause_after": {
                         "type": "number",
-                        "description": "Consecutive failed runs before this job "
-                        "auto-pauses. 0 = never auto-pause; omit or null = the "
-                        "global default (5). Failures caused by an expired "
-                        "sign-in never count toward auto-pause in any case.",
+                        "description": "Failed runs before auto-pause; 0 = never; omit "
+                        "for the default (5). Expired sign-ins never count.",
                     },
                     "minimal_context": {
                         "type": "boolean",
