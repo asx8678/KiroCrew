@@ -274,9 +274,11 @@ retry within that turn; confirm activation from the gateway arm notice or a
 later `monitor_inspect`. A refusal means no new loop was armed.
 
 
-The conductor patrols with `monitor_start`, never `wait`, at roughly a 90-second
-interval, and arms the loop with both the full cycle instructions and the exit
-condition. Two cycle-order rules are structural rather than stylistic:
+The conductor patrols with `monitor_start`, never `wait`, and arms the loop
+with `watch="work-ledger"` plus the full cycle instructions and the exit
+condition. A worker report wakes that watch. The interval is the liveness
+fallback, 900 to 1800 seconds, not a model turn on every quiet cycle. Two
+cycle-order rules are structural rather than stylistic:
 
 **The ledger is read at the top of every cycle, before the probe.** The
 `[work ledger]` block prefixed onto a nudge turn is a teaser: `render_snapshot`
@@ -339,11 +341,11 @@ invisible unless it keeps its own list.
 - **An absent script reads as `UNKNOWN`, never as permission.** Presence is
   checked at first use rather than assumed, so an install that does not carry a
   script loses that script's answers instead of gaining a default yes.
-- **The patrol expires silently.** `monitor_start` defaults to 24 cycles, so a
-  90-second patrol runs out in well under an hour, long before a fleet drains,
-  and the loop simply stops with no symptom. `max_cycles` is passed explicitly
-  and raised mid-run with `monitor_update`. Coasting into the cap is a failure,
-  not a finish, so `autonudge_stop` is called deliberately.
+- **The patrol expires silently.** `monitor_start` defaults to 24 cycles, so an
+  ungated patrol runs out long before a fleet drains, and the loop simply stops
+  with no symptom. `max_cycles=960` and `max_runtime_secs=259200` are passed
+  explicitly and raised mid-run with `monitor_update`. Coasting into the cap is
+  a failure, not a finish, so `autonudge_stop` is called deliberately.
 - **The conductor cannot detect its own loop's death from the inside.** The
   procedure bounds what recovery it can and says so.
 - **Credit metering covers dashboard-session turns only.** Inspector `spawn_run`

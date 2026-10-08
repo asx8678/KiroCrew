@@ -1122,6 +1122,16 @@ class TestPatrolLoopEnumeratesTheTags:
         assert "diff each fired line's `i=`" not in loop
 
 
+class TestPatrolIsGated:
+    """LOOP-2: the armed example must not be an ungated interval loop."""
+
+    def test_startup_arms_a_work_ledger_watch(self):
+        text = (SKILL_DIR / "references" / "startup.md").read_text(encoding="utf-8")
+        assert 'watch="work-ledger"' in text
+        assert "900 to" in text and "1800 seconds" in text
+        assert len((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")) < 99000
+
+
 class TestConductorOwnedState:
     HEADING = "## Conductor-owned state: `conductor-status/v1`"
 
