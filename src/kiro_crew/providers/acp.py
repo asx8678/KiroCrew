@@ -2568,15 +2568,22 @@ class AcpProvider(LLMProvider):
         # subsequent wait_for_compaction() (task_executor, wecom, cli_chat)
         # until timeout even though the compact succeeded.
         self._compact_result = None
-        async for event in self._client.stream_events(message):
-            if event.kind == EVENT_COMPACTION_STATUS and event.text in (
-                "completed",
-                "failed",
-            ):
-                self._compact_result = {
-                    "type": event.text,
-                    "summary": event.title or "",
-                }
+        # Function-local: llm_helpers imports this package's types.
+        from kiro_crew.llm_helpers import metered_turn
+
+        # USE-1: a native /compact is a billed turn every channel's !compact,
+        # the CLI and the task runner reach through here; one usage row, on
+        # every exit, filed under the session it compacted.
+        async with metered_turn(self, surface="compaction", slot_key=self._owning_session_key()):
+            async for event in self._client.stream_events(message):
+                if event.kind == EVENT_COMPACTION_STATUS and event.text in (
+                    "completed",
+                    "failed",
+                ):
+                    self._compact_result = {
+                        "type": event.text,
+                        "summary": event.title or "",
+                    }
 
     async def cancel(self, *, wait_ack_timeout: float = 0.0) -> CancelOutcome:
         """Cancel in-flight operation via ACP session/cancel."""

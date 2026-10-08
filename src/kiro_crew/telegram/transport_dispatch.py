@@ -1218,6 +1218,9 @@ class TelegramDispatcher:
                 closing_gate=turn_ceiling.gate(
                     session_key, lambda: self.sessions.begin_turn(session_key)
                 ),
+                # USE-1: the channel turn's one usage row, on every exit.
+                usage_surface="telegram",
+                usage_session_key=session_key,
             )
             accumulated = await driver.run(full_message)
 

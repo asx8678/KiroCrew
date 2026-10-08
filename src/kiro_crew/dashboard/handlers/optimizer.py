@@ -13,7 +13,7 @@ from aiohttp import web
 from kiro_crew.constants import DENY_CAUSE_SURFACE_POLICY
 from kiro_crew.dashboard.request_priority import owner_start_priority
 from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.llm_helpers import _steer_host_deny
+from kiro_crew.llm_helpers import _steer_host_deny, metered_turn
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, EVENT_TEXT_CHUNK
 from kiro_crew.security import (
     contains_injection,
@@ -318,32 +318,39 @@ async def handle_optimize(request: web.Request) -> web.Response:
             logger.debug("Optimizer: session acquired, streaming")
             try:
                 text = ""
-                async for event in client.stream(full_prompt):
-                    if event.kind == EVENT_TEXT_CHUNK:
-                        text += event.text
-                    elif event.kind == EVENT_PERMISSION_REQUEST:
-                        # Audit FIRST (backend-security-controls: every denied
-                        # tool attempt is a Security Event Log row, and the
-                        # steer and the reject both await the ACP pipe, so a
-                        # row sequenced after them can be cancelled away), then
-                        # tell the model in-band that the HOST refused this (a
-                        # rejected permission reaches it as kiro-cli's "User
-                        # denied tool execution"), then answer the wire. The
-                        # SURFACE refuses every call, so the notice says what the
-                        # optimizer permits, not a sanctioned alternative.
-                        sel().log_tool_invocation(
-                            session_key=optimizer_session_key,
-                            tool_name=getattr(event, "title", "") or "unknown",
-                            outcome="denied",
-                            source="optimizer",
-                            request_id=str(event.request_id),
-                        )
-                        await _steer_host_deny(
-                            client, event, _OPTIMIZER_DENY_REASON, cause=DENY_CAUSE_SURFACE_POLICY
-                        )
-                        await client.reject_tool(event.request_id)
-                    elif event.kind == EVENT_COMPLETE:
-                        break
+                # USE-1: the optimizer turn's one usage row, on every exit.
+                async with metered_turn(
+                    client, surface="optimizer", slot_key=optimizer_session_key
+                ):
+                    async for event in client.stream(full_prompt):
+                        if event.kind == EVENT_TEXT_CHUNK:
+                            text += event.text
+                        elif event.kind == EVENT_PERMISSION_REQUEST:
+                            # Audit FIRST (backend-security-controls: every denied
+                            # tool attempt is a Security Event Log row, and the
+                            # steer and the reject both await the ACP pipe, so a
+                            # row sequenced after them can be cancelled away), then
+                            # tell the model in-band that the HOST refused this (a
+                            # rejected permission reaches it as kiro-cli's "User
+                            # denied tool execution"), then answer the wire. The
+                            # SURFACE refuses every call, so the notice says what the
+                            # optimizer permits, not a sanctioned alternative.
+                            sel().log_tool_invocation(
+                                session_key=optimizer_session_key,
+                                tool_name=getattr(event, "title", "") or "unknown",
+                                outcome="denied",
+                                source="optimizer",
+                                request_id=str(event.request_id),
+                            )
+                            await _steer_host_deny(
+                                client,
+                                event,
+                                _OPTIMIZER_DENY_REASON,
+                                cause=DENY_CAUSE_SURFACE_POLICY,
+                            )
+                            await client.reject_tool(event.request_id)
+                        elif event.kind == EVENT_COMPLETE:
+                            break
                 return text
             finally:
                 logger.debug("Optimizer: releasing dedicated session")

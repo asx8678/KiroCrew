@@ -76,7 +76,13 @@ def _log_unpooled_teardown_failure(action: str, exc: BaseException) -> None:
     )
 
 
-async def _run_step(provider: Any, prompt: str, *, timeout: Optional[float] = None) -> str:
+async def _run_step(
+    provider: Any,
+    prompt: str,
+    *,
+    timeout: Optional[float] = None,
+    usage_session_key: str = "",
+) -> str:
     """Stream one workflow agent step through ``provider`` and redact its output.
 
     Single source of truth for the per-step contract shared by the pooled worker
@@ -86,13 +92,17 @@ async def _run_step(provider: Any, prompt: str, *, timeout: Optional[float] = No
     wedged turn is terminated instead of holding a permit until the run ceiling),
     and canonical output redaction (parity with ``agent_exec`` — prevents
     credential or exfiltration-URL leakage into workflow results stored in
-    history / injected into parent chat).
+    history / injected into parent chat). USE-1: the step writes its one usage
+    row (surface ``workflow``) on success, a raise, and the per-task timeout's
+    cancellation alike, filed under ``usage_session_key``.
     """
     coro = stream_and_collect(
         provider,
         prompt,
         approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
         max_turns=_MAX_TURNS_PER_STEP,
+        usage_surface="workflow",
+        usage_session_key=usage_session_key,
     )
     text = await (asyncio.wait_for(coro, timeout) if timeout is not None else coro)
     return redact(text)
@@ -171,7 +181,9 @@ class _WorkflowSessionWorker:
                 agent=self._agent,
                 cwd=self._cwd,
             )
-        result = await _run_step(self._provider, prompt, timeout=timeout)
+        result = await _run_step(
+            self._provider, prompt, timeout=timeout, usage_session_key=self._key
+        )
         if self._memory_scope is not None:
             await self._memory_scope.validate()
         self._is_new = False
@@ -413,7 +425,7 @@ def build_pooled_agent_fn(
                     agent=opts.get("agent") or default_agent,
                     cwd=opts.get("cwd") or cwd,
                 )
-            result = await _run_step(provider, prompt)
+            result = await _run_step(provider, prompt, usage_session_key=key)
             if memory_scope is not None:
                 await memory_scope.validate()
             return result

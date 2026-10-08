@@ -969,6 +969,7 @@ async def _run_thread_turn(
                     agent=slot_agent or "kirocrew",
                     app=slot._app or "",
                     on_chunk=_on_chunk,
+                    usage_surface="thread",
                 )
             )
         except PromptBusyExhaustedError:

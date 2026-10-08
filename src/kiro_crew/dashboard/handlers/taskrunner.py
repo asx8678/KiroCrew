@@ -22,7 +22,7 @@ from kiro_crew.dashboard.slot_ownership import TASK_REVIEW_SLOT_PREFIX, task_rev
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.execution_context import ExecutionContext, bind_session_execution
 from kiro_crew.hooks import FileTooLargeError, validate_file_path
-from kiro_crew.llm_helpers import _steer_host_deny
+from kiro_crew.llm_helpers import _steer_host_deny, metered_turn
 from kiro_crew.security import (
     is_sensitive_path,
     is_sensitive_resolved_path,
@@ -1186,35 +1186,37 @@ async def _run_refine(
             session_key, start_priority=start_priority
         )
 
-        async for event in client.stream(prompt):
-            if event.kind == EVENT_TEXT_CHUNK:
-                state._refine_text += event.text
-                now = _time.monotonic()
-                if now - _last_push > 0.25:
-                    _last_push = now
-                    _push()
-            elif event.kind == EVENT_PERMISSION_REQUEST:
-                # Audit FIRST (backend-security-controls: every denied tool
-                # attempt is a Security Event Log row, and the steer and the
-                # reject both await the ACP pipe, so a row sequenced after them
-                # can be cancelled away), then tell the model in-band that the
-                # HOST refused this (a rejected permission reaches it as
-                # kiro-cli's "User denied tool execution"), then answer the
-                # wire. The SURFACE refuses every call, so the notice says what
-                # the refine turn permits, not a sanctioned alternative.
-                _sel().log_tool_invocation(
-                    session_key=session_key,
-                    tool_name=getattr(event, "title", "") or "unknown",
-                    outcome="denied",
-                    source="taskrunner_refine",
-                    request_id=str(event.request_id),
-                )
-                await _steer_host_deny(
-                    client, event, _REFINE_DENY_REASON, cause=DENY_CAUSE_SURFACE_POLICY
-                )
-                await client.reject_tool(event.request_id)
-            elif event.kind == EVENT_COMPLETE:
-                break
+        # USE-1: the refine turn's one usage row, on every exit.
+        async with metered_turn(client, surface="taskrunner_refine", slot_key=session_key):
+            async for event in client.stream(prompt):
+                if event.kind == EVENT_TEXT_CHUNK:
+                    state._refine_text += event.text
+                    now = _time.monotonic()
+                    if now - _last_push > 0.25:
+                        _last_push = now
+                        _push()
+                elif event.kind == EVENT_PERMISSION_REQUEST:
+                    # Audit FIRST (backend-security-controls: every denied tool
+                    # attempt is a Security Event Log row, and the steer and the
+                    # reject both await the ACP pipe, so a row sequenced after them
+                    # can be cancelled away), then tell the model in-band that the
+                    # HOST refused this (a rejected permission reaches it as
+                    # kiro-cli's "User denied tool execution"), then answer the
+                    # wire. The SURFACE refuses every call, so the notice says what
+                    # the refine turn permits, not a sanctioned alternative.
+                    _sel().log_tool_invocation(
+                        session_key=session_key,
+                        tool_name=getattr(event, "title", "") or "unknown",
+                        outcome="denied",
+                        source="taskrunner_refine",
+                        request_id=str(event.request_id),
+                    )
+                    await _steer_host_deny(
+                        client, event, _REFINE_DENY_REASON, cause=DENY_CAUSE_SURFACE_POLICY
+                    )
+                    await client.reject_tool(event.request_id)
+                elif event.kind == EVENT_COMPLETE:
+                    break
 
         _push()
         state._refine_status = "done"

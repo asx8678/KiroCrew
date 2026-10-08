@@ -1069,16 +1069,20 @@ async def _send_and_print(
     request pays nothing for it.
     """
     try:
-        async for event in provider.stream(message):
-            if event.kind == EVENT_TEXT_CHUNK:
-                print(event.text, end="", flush=True)
-            elif event.kind == EVENT_PERMISSION_REQUEST:
-                # The backend holds the turn open until this is answered, so an
-                # unhandled request is not a missed prompt -- it is a turn that
-                # never ends.
-                await _answer_permission(provider, event, interactive=interactive, gate=gate)
-            elif event.kind == EVENT_COMPLETE:
-                break
+        from kiro_crew.llm_helpers import metered_turn
+
+        # USE-1: the CLI turn's one usage row, on every exit.
+        async with metered_turn(provider, surface="cli", slot_key="cli_chat"):
+            async for event in provider.stream(message):
+                if event.kind == EVENT_TEXT_CHUNK:
+                    print(event.text, end="", flush=True)
+                elif event.kind == EVENT_PERMISSION_REQUEST:
+                    # The backend holds the turn open until this is answered, so an
+                    # unhandled request is not a missed prompt -- it is a turn that
+                    # never ends.
+                    await _answer_permission(provider, event, interactive=interactive, gate=gate)
+                elif event.kind == EVENT_COMPLETE:
+                    break
         print()  # final newline
     except AcpTimeoutError as e:
         if e.partial_output:

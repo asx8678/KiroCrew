@@ -9074,7 +9074,15 @@ class GatewayOrchestrator:
                 """
                 for attempt in range(3):
                     try:
-                        return await stream_and_collect(client, msg, retry_transient=False)
+                        # USE-1: the completion turn is real spend on the parent
+                        # session; one row per attempt, filed under the parent.
+                        return await stream_and_collect(
+                            client,
+                            msg,
+                            retry_transient=False,
+                            usage_surface="subagent_completion",
+                            usage_session_key=parent_key,
+                        )
                     except PromptBusyExhaustedError:
                         # Provider is dead after exhausting prompt-busy retries.
                         # Reset session + notify, same as TimeoutError path.

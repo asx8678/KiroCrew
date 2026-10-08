@@ -99,6 +99,7 @@ from kiro_crew.hooks import (
     safe_read_file_bytes,
 )
 from kiro_crew.llm_helpers import (
+    metered_turn,
     record_interaction_event,
     save_conversation_turn_off_loop,
 )
@@ -1740,294 +1741,300 @@ async def handle_message(
             await slack.set_thread_status(channel, reply_ts, "")
             return
 
-        async for event in client.stream(full_message):
-            if event.kind == EVENT_TEXT_CHUNK:
-                await answer.on_text(event)
+        # USE-1: this native Slack turn's one usage row, on every exit.
+        async with metered_turn(client, surface="slack", slot_key=session_key):
+            async for event in client.stream(full_message):
+                if event.kind == EVENT_TEXT_CHUNK:
+                    await answer.on_text(event)
 
-            elif event.kind == EVENT_THINKING_CHUNK:
-                await answer.on_thinking(event)
+                elif event.kind == EVENT_THINKING_CHUNK:
+                    await answer.on_thinking(event)
 
-            elif event.kind == EVENT_TOOL_CALL:
-                answer.tool_gap = True
-                # Check tool hooks. NOTE: EVENT_TOOL_CALL is informational —
-                # the tool has already been auto-approved by the provider and
-                # is executing; this branch cannot reject_tool(). The real
-                # enforceable gate is EVENT_PERMISSION_REQUEST below. So we do
-                # NOT arm deny-by-default here (is_shell omitted): a shell tool
-                # with an unrecoverable command would otherwise render a
-                # misleading "blocked" message while the tool actually runs.
-                # For the same reason this site deliberately does NOT use
-                # ``hook_gate_kwargs`` (the shared extraction every enforcing
-                # permission-request site threads): the params/diff-path tiers
-                # it would arm can also deny a call that is already executing,
-                # and this warning must never claim to have blocked one. The
-                # structural test in test_hooks.py names this site as the one
-                # informational exception. A genuine deny-list / sensitive-path
-                # match still surfaces a (best-effort, non-enforcing) warning +
-                # audit.
-                if context_builder:
-                    tool_result = context_builder.hooks.on_tool_call(
-                        event.title,
-                        session_key=session_key,
-                        agent=_agent or "",
-                        command=event.shell_command,
-                        mcp_server_name=event.mcp_server_name,
-                        mcp_tool_name=event.tool_name,
-                        mcp_identity_trusted=event.mcp_identity_trusted,
-                    )
-                    if tool_result.action == TOOL_DENY:
-                        # event.title is LLM-authored (select_tool_title prefers
-                        # the model's description) — never post it to Slack raw.
-                        _flagged_title, _ = redact_exfiltration_urls(event.title)
-                        _flagged_title, _ = redact_credentials(_flagged_title)
-                        answer.accumulated += (
-                            f"\n⚠️ _Tool `{_flagged_title}` flagged by security "
-                            f"hooks (already executing; cannot be stopped here)._"
-                        )
-                        sel().log_tool_invocation(
+                elif event.kind == EVENT_TOOL_CALL:
+                    answer.tool_gap = True
+                    # Check tool hooks. NOTE: EVENT_TOOL_CALL is informational —
+                    # the tool has already been auto-approved by the provider and
+                    # is executing; this branch cannot reject_tool(). The real
+                    # enforceable gate is EVENT_PERMISSION_REQUEST below. So we do
+                    # NOT arm deny-by-default here (is_shell omitted): a shell tool
+                    # with an unrecoverable command would otherwise render a
+                    # misleading "blocked" message while the tool actually runs.
+                    # For the same reason this site deliberately does NOT use
+                    # ``hook_gate_kwargs`` (the shared extraction every enforcing
+                    # permission-request site threads): the params/diff-path tiers
+                    # it would arm can also deny a call that is already executing,
+                    # and this warning must never claim to have blocked one. The
+                    # structural test in test_hooks.py names this site as the one
+                    # informational exception. A genuine deny-list / sensitive-path
+                    # match still surfaces a (best-effort, non-enforcing) warning +
+                    # audit.
+                    if context_builder:
+                        tool_result = context_builder.hooks.on_tool_call(
+                            event.title,
                             session_key=session_key,
-                            source="slack",
-                            tool_name=event.title,
-                            tool_kind=event.tool_kind,
-                            outcome="flagged_unenforceable",
-                            error="hook_deny",
+                            agent=_agent or "",
+                            command=event.shell_command,
+                            mcp_server_name=event.mcp_server_name,
+                            mcp_tool_name=event.tool_name,
+                            mcp_identity_trusted=event.mcp_identity_trusted,
                         )
-                        continue
-
-                sel().log_tool_invocation(
-                    session_key=session_key,
-                    source="slack",
-                    tool_name=event.title,
-                    tool_kind=event.tool_kind,
-                    outcome="invoked",
-                )
-                await answer.on_tool_call(event)
-
-            elif event.kind == EVENT_PERMISSION_REQUEST:
-                # Check tool hooks for auto-approve
-                if context_builder:
-                    tool_result = context_builder.hooks.on_tool_call(
-                        event.title,
-                        session_key=session_key,
-                        agent=_agent or "",
-                        **hook_gate_kwargs(event),
-                    )
-                    if tool_result.action == TOOL_AUTO_APPROVE:
-                        # The hook granted this by NAME (its `auto_approve_tools`
-                        # globs, or the read-only allowlist). Honour it only
-                        # while each program name in the command still resolves
-                        # to the program it appears to name; a shadowed,
-                        # agent-tree or unidentified resolution DOWNGRADES to
-                        # the remaining rungs below (spawn hook, approval mode,
-                        # trust/YOLO, the interactive buttons) — never a hard
-                        # block.
-                        _ng_refusal = await name_grant.refusal_for_event(event)
-                        if _ng_refusal is None:
-                            approval_sent = await client.approve_tool(event.request_id)
-                            if approval_sent is False:
-                                sel().log_tool_invocation(
-                                    session_key=session_key,
-                                    source="slack",
-                                    tool_name=event.title,
-                                    tool_kind=event.tool_kind,
-                                    outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
-                                    request_id=event.request_id,
-                                )
-                                continue
-                            Stats().inc_tool_auto_approved()
+                        if tool_result.action == TOOL_DENY:
+                            # event.title is LLM-authored (select_tool_title prefers
+                            # the model's description) — never post it to Slack raw.
+                            _flagged_title, _ = redact_exfiltration_urls(event.title)
+                            _flagged_title, _ = redact_credentials(_flagged_title)
+                            answer.accumulated += (
+                                f"\n⚠️ _Tool `{_flagged_title}` flagged by security "
+                                f"hooks (already executing; cannot be stopped here)._"
+                            )
                             sel().log_tool_invocation(
                                 session_key=session_key,
                                 source="slack",
                                 tool_name=event.title,
                                 tool_kind=event.tool_kind,
-                                outcome="auto_approved",
-                                request_id=event.request_id,
-                                metadata={"reason": "hook_auto_approve"},
+                                outcome="flagged_unenforceable",
+                                error="hook_deny",
                             )
                             continue
-                        logger.warning(
-                            "declining a hook auto-approve: %s; the request "
-                            "falls through to the Slack handler's normal "
-                            "approval ladder",
-                            _ng_refusal.log_text,
-                        )
-                        name_grant.log_decline(
-                            source="slack",
-                            session_key=session_key,
-                            event=event,
-                            refusal=_ng_refusal,
-                            tier="hook_auto_approve",
-                            sel_factory=sel,
-                        )
-                    if tool_result.action == TOOL_DENY:
-                        # Audit FIRST, then steer, then reject: the steer and
-                        # the reject both await the ACP pipe, and a backend that
-                        # stops reading stdin cancels this coroutine at the
-                        # turn deadline -- an SEL row sequenced after them
-                        # never runs (the chat runner's audit-first rule).
-                        sel().log_tool_invocation(
-                            session_key=session_key,
-                            source="slack",
-                            tool_name=event.title,
-                            tool_kind=event.tool_kind,
-                            outcome="denied",
-                            request_id=event.request_id,
-                            error="hook_deny",
-                        )
-                        # A hook deny is a HOST verdict on the call, not the
-                        # person's: tell the model so in-band before the reject
-                        # hands it kiro-cli's "User denied tool execution".
-                        await _steer_host_deny(
-                            client,
-                            event,
-                            tool_result.reason,
-                            cause=DENY_CAUSE_POLICY,
-                            audited=True,
-                        )
-                        await client.reject_tool(event.request_id)
-                        Stats().inc_tool_denial()
-                        # event.title is LLM-authored — redact before posting.
-                        _blocked_title, _ = redact_exfiltration_urls(event.title)
-                        _blocked_title, _ = redact_credentials(_blocked_title)
-                        answer.accumulated += f"\n🚫 _Tool `{_blocked_title}` blocked by hooks._"
-                        continue
 
-                # auto_approve_subagent_spawn → auto-approve spawn_run tool calls
-                if _should_auto_approve_spawn(context_builder, event):
-                    approval_sent = await client.approve_tool(event.request_id)
-                    if approval_sent is False:
-                        sel().log_tool_invocation(
-                            session_key=session_key,
-                            source="slack",
-                            tool_name=event.title,
-                            tool_kind=event.tool_kind,
-                            outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
-                            request_id=event.request_id,
-                        )
-                        continue
-                    Stats().inc_tool_auto_approved()
                     sel().log_tool_invocation(
                         session_key=session_key,
                         source="slack",
                         tool_name=event.title,
                         tool_kind=event.tool_kind,
-                        outcome="auto_approved",
-                        request_id=event.request_id,
-                        metadata={"reason": "auto_approve_subagent_spawn"},
+                        outcome="invoked",
                     )
-                    continue
+                    await answer.on_tool_call(event)
 
-                if approval_mode == APPROVAL_AUTO:
-                    approval_sent = await client.approve_tool(event.request_id)
-                    if approval_sent is False:
+                elif event.kind == EVENT_PERMISSION_REQUEST:
+                    # Check tool hooks for auto-approve
+                    if context_builder:
+                        tool_result = context_builder.hooks.on_tool_call(
+                            event.title,
+                            session_key=session_key,
+                            agent=_agent or "",
+                            **hook_gate_kwargs(event),
+                        )
+                        if tool_result.action == TOOL_AUTO_APPROVE:
+                            # The hook granted this by NAME (its `auto_approve_tools`
+                            # globs, or the read-only allowlist). Honour it only
+                            # while each program name in the command still resolves
+                            # to the program it appears to name; a shadowed,
+                            # agent-tree or unidentified resolution DOWNGRADES to
+                            # the remaining rungs below (spawn hook, approval mode,
+                            # trust/YOLO, the interactive buttons) — never a hard
+                            # block.
+                            _ng_refusal = await name_grant.refusal_for_event(event)
+                            if _ng_refusal is None:
+                                approval_sent = await client.approve_tool(event.request_id)
+                                if approval_sent is False:
+                                    sel().log_tool_invocation(
+                                        session_key=session_key,
+                                        source="slack",
+                                        tool_name=event.title,
+                                        tool_kind=event.tool_kind,
+                                        outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                                        request_id=event.request_id,
+                                    )
+                                    continue
+                                Stats().inc_tool_auto_approved()
+                                sel().log_tool_invocation(
+                                    session_key=session_key,
+                                    source="slack",
+                                    tool_name=event.title,
+                                    tool_kind=event.tool_kind,
+                                    outcome="auto_approved",
+                                    request_id=event.request_id,
+                                    metadata={"reason": "hook_auto_approve"},
+                                )
+                                continue
+                            logger.warning(
+                                "declining a hook auto-approve: %s; the request "
+                                "falls through to the Slack handler's normal "
+                                "approval ladder",
+                                _ng_refusal.log_text,
+                            )
+                            name_grant.log_decline(
+                                source="slack",
+                                session_key=session_key,
+                                event=event,
+                                refusal=_ng_refusal,
+                                tier="hook_auto_approve",
+                                sel_factory=sel,
+                            )
+                        if tool_result.action == TOOL_DENY:
+                            # Audit FIRST, then steer, then reject: the steer and
+                            # the reject both await the ACP pipe, and a backend that
+                            # stops reading stdin cancels this coroutine at the
+                            # turn deadline -- an SEL row sequenced after them
+                            # never runs (the chat runner's audit-first rule).
+                            sel().log_tool_invocation(
+                                session_key=session_key,
+                                source="slack",
+                                tool_name=event.title,
+                                tool_kind=event.tool_kind,
+                                outcome="denied",
+                                request_id=event.request_id,
+                                error="hook_deny",
+                            )
+                            # A hook deny is a HOST verdict on the call, not the
+                            # person's: tell the model so in-band before the reject
+                            # hands it kiro-cli's "User denied tool execution".
+                            await _steer_host_deny(
+                                client,
+                                event,
+                                tool_result.reason,
+                                cause=DENY_CAUSE_POLICY,
+                                audited=True,
+                            )
+                            await client.reject_tool(event.request_id)
+                            Stats().inc_tool_denial()
+                            # event.title is LLM-authored — redact before posting.
+                            _blocked_title, _ = redact_exfiltration_urls(event.title)
+                            _blocked_title, _ = redact_credentials(_blocked_title)
+                            answer.accumulated += (
+                                f"\n🚫 _Tool `{_blocked_title}` blocked by hooks._"
+                            )
+                            continue
+
+                    # auto_approve_subagent_spawn → auto-approve spawn_run tool calls
+                    if _should_auto_approve_spawn(context_builder, event):
+                        approval_sent = await client.approve_tool(event.request_id)
+                        if approval_sent is False:
+                            sel().log_tool_invocation(
+                                session_key=session_key,
+                                source="slack",
+                                tool_name=event.title,
+                                tool_kind=event.tool_kind,
+                                outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                                request_id=event.request_id,
+                            )
+                            continue
+                        Stats().inc_tool_auto_approved()
                         sel().log_tool_invocation(
                             session_key=session_key,
                             source="slack",
                             tool_name=event.title,
                             tool_kind=event.tool_kind,
-                            outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                            outcome="auto_approved",
                             request_id=event.request_id,
+                            metadata={"reason": "auto_approve_subagent_spawn"},
                         )
                         continue
-                    Stats().inc_tool_auto_approved()
-                    sel().log_tool_invocation(
-                        session_key=session_key,
-                        source="slack",
-                        tool_name=event.title,
-                        tool_kind=event.tool_kind,
-                        outcome="auto_approved",
-                        request_id=event.request_id,
-                        metadata={"reason": "approval_mode_auto"},
-                    )
-                    continue
 
-                # Trust mode (per-session) or YOLO mode (owner-only global) → auto-approve
-                _yolo_now = is_yolo_mode()
-                if _yolo_now or session_key in _trusted_sessions:
-                    approval_sent = await client.approve_tool(event.request_id)
-                    if approval_sent is False:
+                    if approval_mode == APPROVAL_AUTO:
+                        approval_sent = await client.approve_tool(event.request_id)
+                        if approval_sent is False:
+                            sel().log_tool_invocation(
+                                session_key=session_key,
+                                source="slack",
+                                tool_name=event.title,
+                                tool_kind=event.tool_kind,
+                                outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                                request_id=event.request_id,
+                            )
+                            continue
+                        Stats().inc_tool_auto_approved()
                         sel().log_tool_invocation(
                             session_key=session_key,
                             source="slack",
                             tool_name=event.title,
                             tool_kind=event.tool_kind,
-                            outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                            outcome="auto_approved",
                             request_id=event.request_id,
+                            metadata={"reason": "approval_mode_auto"},
                         )
                         continue
-                    Stats().inc_tool_auto_approved()
+
+                    # Trust mode (per-session) or YOLO mode (owner-only global) → auto-approve
+                    _yolo_now = is_yolo_mode()
+                    if _yolo_now or session_key in _trusted_sessions:
+                        approval_sent = await client.approve_tool(event.request_id)
+                        if approval_sent is False:
+                            sel().log_tool_invocation(
+                                session_key=session_key,
+                                source="slack",
+                                tool_name=event.title,
+                                tool_kind=event.tool_kind,
+                                outcome=OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                                request_id=event.request_id,
+                            )
+                            continue
+                        Stats().inc_tool_auto_approved()
+                        logger.info(
+                            "Auto-approved %s (%s)",
+                            event.title,
+                            "yolo" if _yolo_now else "trust",
+                        )
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            source="slack",
+                            tool_name=event.title,
+                            tool_kind=event.tool_kind,
+                            outcome="auto_approved",
+                            request_id=event.request_id,
+                            metadata={"reason": "yolo" if _yolo_now else "trust"},
+                        )
+                        continue
+
                     logger.info(
-                        "Auto-approved %s (%s)",
-                        event.title,
-                        "yolo" if _yolo_now else "trust",
+                        "Permission request: tool=%s req_id=%s", event.title, event.request_id
                     )
+                    status_ctrl.pause_stall_watchdog()
+                    task.await_approval()
+                    # The stream-prep Slack calls below run BEFORE _request_approval
+                    # answers the permission. If any raises (rate-limit, network),
+                    # the ACP permission request would be orphaned and the
+                    # subprocess would wedge — reject it before propagating so the
+                    # turn unblocks. _request_approval guards its own post failure.
+                    try:
+                        await answer.prepare_for_approval()
+                    except Exception:
+                        await _reject_orphaned_tool(client, event.request_id)
+                        raise
+
+                    outcome = await _request_approval(
+                        slack,
+                        client,
+                        channel,
+                        reply_ts,
+                        event,
+                        session_key,
+                        is_dm=channel.startswith("D"),
+                    )
+                    task.resume()
+                    status_ctrl.resume_stall_watchdog()
                     sel().log_tool_invocation(
                         session_key=session_key,
                         source="slack",
                         tool_name=event.title,
                         tool_kind=event.tool_kind,
-                        outcome="auto_approved",
+                        outcome="approved" if outcome != _OUTCOME_REJECTED else "rejected",
                         request_id=event.request_id,
-                        metadata={"reason": "yolo" if _yolo_now else "trust"},
+                        metadata={"reason": "interactive"},
                     )
-                    continue
+                    if outcome == _OUTCOME_REJECTED:
+                        await answer.on_tool_rejected()
+                        break
 
-                logger.info("Permission request: tool=%s req_id=%s", event.title, event.request_id)
-                status_ctrl.pause_stall_watchdog()
-                task.await_approval()
-                # The stream-prep Slack calls below run BEFORE _request_approval
-                # answers the permission. If any raises (rate-limit, network),
-                # the ACP permission request would be orphaned and the
-                # subprocess would wedge — reject it before propagating so the
-                # turn unblocks. _request_approval guards its own post failure.
-                try:
-                    await answer.prepare_for_approval()
-                except Exception:
-                    await _reject_orphaned_tool(client, event.request_id)
-                    raise
-
-                outcome = await _request_approval(
-                    slack,
-                    client,
-                    channel,
-                    reply_ts,
-                    event,
-                    session_key,
-                    is_dm=channel.startswith("D"),
-                )
-                task.resume()
-                status_ctrl.resume_stall_watchdog()
-                sel().log_tool_invocation(
-                    session_key=session_key,
-                    source="slack",
-                    tool_name=event.title,
-                    tool_kind=event.tool_kind,
-                    outcome="approved" if outcome != _OUTCOME_REJECTED else "rejected",
-                    request_id=event.request_id,
-                    metadata={"reason": "interactive"},
-                )
-                if outcome == _OUTCOME_REJECTED:
-                    await answer.on_tool_rejected()
+                elif event.kind == EVENT_COMPLETE:
+                    status_ctrl.on_progress()
+                    _stop_reason = event.stop_reason
+                    _completion_observed = True
+                    if (
+                        _stop_reason
+                        and _stop_reason != STOP_REASON_END_TURN
+                        and _stop_reason != STOP_REASON_CANCELLED
+                        # Expected terminal state after a failed auto-compaction;
+                        # handled below with a session reset, so not "unexpected".
+                        and _stop_reason != STOP_REASON_COMPACTION_FAILED
+                    ):
+                        logger.warning(
+                            "Unexpected stop_reason %r for %s — treating as normal completion",
+                            _stop_reason,
+                            session_key,
+                        )
                     break
-
-            elif event.kind == EVENT_COMPLETE:
-                status_ctrl.on_progress()
-                _stop_reason = event.stop_reason
-                _completion_observed = True
-                if (
-                    _stop_reason
-                    and _stop_reason != STOP_REASON_END_TURN
-                    and _stop_reason != STOP_REASON_CANCELLED
-                    # Expected terminal state after a failed auto-compaction;
-                    # handled below with a session reset, so not "unexpected".
-                    and _stop_reason != STOP_REASON_COMPACTION_FAILED
-                ):
-                    logger.warning(
-                        "Unexpected stop_reason %r for %s — treating as normal completion",
-                        _stop_reason,
-                        session_key,
-                    )
-                break
 
         if _stop_reason == STOP_REASON_CANCELLED:
             logger.info("Turn cancelled by user for %s", session_key)

@@ -233,7 +233,11 @@ async def _run_oneshot_model(request: web.Request, key: str, prompt: str) -> str
     )
     try:
         return await stream_and_collect(
-            provider, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
+            provider,
+            prompt,
+            approval_policy=ToolApprovalPolicy.REJECT_ALL,
+            usage_surface="issue_radar",
+            usage_session_key=key,
         )
     finally:
         try:

@@ -1004,6 +1004,8 @@ class WorkflowService:
                     prompt,
                     approval_policy=ToolApprovalPolicy.REJECT_ALL,
                     on_complete=_record_stop,
+                    usage_surface="workflow_author",
+                    usage_session_key=key,
                 )
                 await memory_scope.validate()
                 author_is_new = False

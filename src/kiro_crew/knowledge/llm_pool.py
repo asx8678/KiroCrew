@@ -602,8 +602,15 @@ class AcpWorker(Worker):
         if self._client is None or not self._client.is_ready:
             await self.start()
         assert self._client is not None
+        # Function-local, like the rest of this module's host imports: the pool
+        # is reached from the knowledge CLI without the gateway's import chain.
+        from kiro_crew.llm_helpers import metered_turn
+
         try:
-            return await self._client.send_message(prompt, timeout=timeout)
+            # USE-1: each knowledge prompt (extraction, agent fetch) is a billed
+            # turn; one usage row, on every exit, before a failed client is shut.
+            async with metered_turn(self._client, surface="knowledge"):
+                return await self._client.send_message(prompt, timeout=timeout)
         except Exception:
             # A timed-out turn is still running in the child, so a reused client
             # answers "Prompt already in progress". Prompts are self-contained,

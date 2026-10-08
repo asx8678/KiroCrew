@@ -1128,7 +1128,12 @@ class AcpSessionProvider(LLMProvider):
     async def compact(self, context: str = "") -> None:
         """Trigger context compaction."""
         self.essential_delivery.invalidate()
-        await self._guarded(self._handle.compact(context))
+        # Function-local: llm_helpers imports this package's types.
+        from kiro_crew.llm_helpers import metered_turn
+
+        # USE-1: a native /compact is a billed turn; one usage row, on every exit.
+        async with metered_turn(self, surface="compaction", slot_key=self._session_key):
+            await self._guarded(self._handle.compact(context))
 
     async def wait_for_compaction(
         self, timeout: float = COMPACT_WAIT_TIMEOUT_SECS

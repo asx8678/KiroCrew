@@ -1852,15 +1852,6 @@ async def run_bg_oneliner(
         # destroy() and leak the session's runtime.
         try:
             try:
-                # Imported here rather than at module scope because the usage
-                # module's own import chain reaches back into this one -- history
-                # and several dashboard handlers import ToolApprovalPolicy /
-                # run_bg_oneliner from here -- so a module-scope import raises
-                # ImportError against a partially initialized llm_helpers. It
-                # also pulls ~600 modules that every consumer of this low-level
-                # module would otherwise pay for at boot.
-                from kiro_crew.dashboard.handlers.usage import persist_token_record_async
-
                 usage = provider_last_turn_usage(session, since=stats_before)
                 # One shared predicate across every persist gate: a claude-seam
                 # turn recovered through the live-stats path can bill cost or
@@ -1882,19 +1873,16 @@ async def run_bg_oneliner(
                         provider=_provider_label(session),
                         elapsed_ms=_elapsed_ms,
                     )
-                    await persist_token_record_async(
-                        sel_session_key,
-                        # The model the session SERVED, never the one requested: a
-                        # rejected preference is replaced by the reactive fallback
-                        # above, so recording the request would bill the spend to a
-                        # model that did not run. An unreadable served model falls
-                        # through to model_source rather than naming a guess.
-                        _served,
-                        usage,
-                        _provider_label(session),
+                    # The row names the model the session SERVED, never the one
+                    # requested: a rejected preference is replaced by the reactive
+                    # fallback above, so recording the request would bill the spend
+                    # to a model that did not run (record_turn_usage reads it).
+                    await record_turn_usage(
+                        session,
                         surface=f"bg:{sel_source}",
+                        usage=usage,
+                        slot_key=sel_session_key,
                         elapsed_ms=_elapsed_ms,
-                        model_source=session,
                     )
             except Exception:
                 logger.debug("bg oneliner accounting failed source=%s", sel_source, exc_info=True)
@@ -2158,6 +2146,112 @@ def provider_last_turn_usage(provider: Any, *, since: Any = _NO_PRIOR_STATS) -> 
     return _attempt_usage(provider, since=since)
 
 
+async def record_turn_usage(
+    provider: Any,
+    *,
+    surface: str,
+    usage: TurnUsage | None = None,
+    since: Any = _NO_PRIOR_STATS,
+    slot_key: str = "",
+    agent: str = "",
+    app: str = "",
+    elapsed_ms: int = 0,
+) -> TurnUsage:
+    """Write the ONE usage row for a model turn just driven on *provider*.
+
+    USE-1: the single persist every model-calling path goes through, so a new
+    path cannot forget the row and two paths cannot disagree about its shape.
+    :func:`stream_and_collect` calls it when given ``usage_surface``; a caller
+    that drives ``provider.stream`` itself calls it from a ``finally``, so the
+    row is written on success, on an exception and on cancellation alike.
+
+    *usage* is the turn's billing when the caller already read it (the
+    background helpers snapshot it before releasing the shared session); else it
+    is read here through :func:`provider_last_turn_usage` against *since*. A turn
+    with no billing writes nothing -- an acquire-time failure is not spend.
+
+    The row names the SERVED model (``"auto"`` or the concrete id, never the
+    request), with *provider* as the resolver fallback; the agent is the one that
+    served the turn, else *agent*. ``slot_key`` groups the row; a
+    caller with no session key of its own files under ``_bg`` (the shared
+    background session's key, classified ``background``) rather than an empty
+    key the dashboard reads as ``unknown``. Returns the usage it read. Never raises
+    an ``Exception``: the row is analytics and must not fail the turn it
+    measures.
+    """
+    if usage is None:
+        usage = provider_last_turn_usage(provider, since=since)
+    try:
+        if not usage_has_billing(usage):
+            return usage
+        # Function-local: the usage module's import chain reaches back into this
+        # one (see run_bg_oneliner's teardown), and it pulls ~600 modules.
+        from kiro_crew.dashboard.handlers.usage import (
+            persist_token_record_async,
+            read_context_tokens,
+            read_effective_agent,
+        )
+
+        # Enrichment only, guarded on its own: a failed read degrades to (0, 0)
+        # rather than taking the whole row down with it.
+        try:
+            used, window = read_context_tokens(provider)
+        except Exception:
+            logger.debug("usage row context read failed surface=%s", surface, exc_info=True)
+            used, window = 0, 0
+        await persist_token_record_async(
+            slot_key or "_bg",
+            str(getattr(provider, "served_model", "") or "").strip(),
+            usage,
+            _provider_label(provider),
+            surface=surface,
+            agent=read_effective_agent(provider) or agent,
+            context_used=used,
+            context_window=window,
+            elapsed_ms=elapsed_ms,
+            app=app,
+            model_source=provider,
+        )
+    except Exception:
+        logger.debug("usage row persist failed surface=%s", surface, exc_info=True)
+    return usage
+
+
+@asynccontextmanager
+async def metered_turn(
+    provider: Any,
+    *,
+    surface: str,
+    slot_key: str = "",
+    agent: str = "",
+    app: str = "",
+) -> "AsyncIterator[None]":
+    """Write the ONE usage row for a turn a caller drives on *provider* itself.
+
+    USE-1: wrap the ``async for event in provider.stream(...)`` loop (or any other
+    direct drive) in this, and the row is written on every exit -- a completed
+    turn, a raise, a ``break``, and a cancellation -- through
+    :func:`record_turn_usage`. The stats object is pinned on entry so a turn that
+    never dispatched (and so left the previous turn's already-recorded stats in
+    place) writes nothing. Enter it AFTER acquiring the session, so the acquire
+    wait is not charged as turn time.
+    """
+    since = _billing_stats(provider)
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        await record_turn_usage(
+            provider,
+            surface=surface,
+            since=since,
+            slot_key=slot_key,
+            agent=agent,
+            app=app,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+
+
 def _billing_stat_holders(provider: Any) -> "list[Any]":
     """Objects that may carry ``last_prompt_stats``, nearest wrapper first.
 
@@ -2360,14 +2454,6 @@ async def background_turn(
         # accounting because it may replace the provider entirely.
         try:
             try:
-                # Same cycle as the oneliner's teardown: the usage module's import
-                # chain reaches back into this one (history and several dashboard
-                # handlers import ToolApprovalPolicy / run_bg_oneliner from here),
-                # so a module-scope import raises ImportError against a partially
-                # initialized llm_helpers, and it would pull ~600 modules into
-                # every consumer's boot.
-                from kiro_crew.dashboard.handlers.usage import persist_token_record_async
-
                 # A turn that never reached the provider bills nothing and has no
                 # row to write; the same guard the chat path applies keeps
                 # acquire-time failures from landing as zero-credit noise. The
@@ -2390,15 +2476,13 @@ async def background_turn(
                         provider=_provider_label(client),
                         elapsed_ms=turn_elapsed_ms,
                     )
-                    await persist_token_record_async(
-                        key,
-                        _served_model,
-                        usage,
-                        _provider_label(client),
+                    await record_turn_usage(
+                        client,
                         surface=f"bg:{task}",
+                        usage=usage,
+                        slot_key=key,
                         agent=agent or BACKGROUND_AGENT,
                         elapsed_ms=turn_elapsed_ms,
-                        model_source=client,
                     )
             except Exception:
                 logger.debug("background turn accounting failed task=%s", task, exc_info=True)
@@ -2432,6 +2516,9 @@ async def stream_and_collect(
     model_fallback: bool = False,
     fallback_models: Sequence[str] = (),
     allow_image: bool = True,
+    usage_surface: str = "",
+    usage_session_key: str = "",
+    usage_agent: str = "",
 ) -> str:
     """Stream a message through an LLM provider and collect the full response.
 
@@ -2505,10 +2592,24 @@ async def stream_and_collect(
             a later call on the same provider probes one primary restore.
         allow_image: ``False`` sends every attempt text-only (see
             ``LLMProvider.stream``), for a prompt that is text ABOUT a session.
+        usage_surface: USE-1. When set, this call writes the turn's ONE usage
+            row itself (:func:`record_turn_usage`), tagged with this surface
+            label, on every terminal exit -- success, an exception, or a
+            cancellation -- summing every billed attempt. The total is then NOT
+            published for :func:`provider_last_turn_usage`, so a caller that
+            passes a surface cannot write a second row from it. Empty (the
+            default) leaves the row to the caller; ``test_usage_every_model_call``
+            requires every call site to pass one or be a listed owner of its row.
+        usage_session_key: The row's slot key; defaults to ``session_key``.
+        usage_agent: The row's agent when the provider cannot name the one that
+            served the turn; defaults to ``agent``. Row-only: unlike ``agent`` it
+            never reaches the PreToolUse gate.
 
     Returns:
         The complete response text.
     """
+    # USE-1: the row's duration covers every attempt, retries included.
+    _usage_t0 = time.monotonic()
     transient_attempts = 0
     # SES-9: when the current connection-class retry window opened. None until
     # the first connection-class failure; a live monotonic reading, closure-local
@@ -2865,7 +2966,9 @@ async def stream_and_collect(
             turn_billed = _sum_usage(
                 turn_billed, _attempt_usage(provider, since=attempt_stats_before)
             )
-            if not retrying:
+            # A caller that passed ``usage_surface`` gets its row written below
+            # instead, so nothing is left behind for a second reader to persist.
+            if not retrying and not usage_surface:
                 try:
                     setattr(
                         provider,
@@ -2898,6 +3001,21 @@ async def stream_and_collect(
                         on_tool_gate(_exec_title, True, False)
                     except Exception:
                         logger.debug("on_tool_gate callback failed", exc_info=True)
+            if not retrying and usage_surface:
+                # USE-1: the terminal attempt -- reached on a return, a raise and a
+                # CancelledError alike (a cancel landing in a retry's backoff sleep
+                # raises before ``retrying`` is set) -- writes the one row. Last in
+                # this block, after the synchronous callbacks, so the only await
+                # the finally makes cannot cost them a delivery.
+                await record_turn_usage(
+                    provider,
+                    surface=usage_surface,
+                    usage=turn_billed,
+                    slot_key=usage_session_key or session_key,
+                    agent=usage_agent or agent,
+                    app=app,
+                    elapsed_ms=int((time.monotonic() - _usage_t0) * 1000),
+                )
 
 
 async def stream_and_collect_json(
@@ -2908,11 +3026,14 @@ async def stream_and_collect_json(
     hooks: HookManager | None = None,
     model_fallback: bool = False,
     allow_image: bool = True,
+    usage_surface: str = "",
+    usage_session_key: str = "",
 ) -> dict | None:
     """Stream a message and parse the response as JSON.
 
     Combines ``stream_and_collect`` with ``parse_llm_json``.
-    Returns parsed dict or None on failure.
+    Returns parsed dict or None on failure. ``usage_surface`` /
+    ``usage_session_key`` are forwarded (see :func:`stream_and_collect`).
     """
     text = await stream_and_collect(
         provider,
@@ -2921,6 +3042,8 @@ async def stream_and_collect_json(
         hooks=hooks,
         model_fallback=model_fallback,
         allow_image=allow_image,
+        usage_surface=usage_surface,
+        usage_session_key=usage_session_key,
     )
     return parse_llm_json(text)
 

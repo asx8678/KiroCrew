@@ -47,7 +47,6 @@ import json
 import logging
 import math
 import re
-import time
 import uuid
 from typing import Any, Awaitable, Callable
 
@@ -190,14 +189,7 @@ def build_session_runner(sessions: Any, *, model: str = "") -> Runner:
         # The session layer stays off this package's import graph, for the reason
         # `gate._oracle` documents: the package is reached from hot paths, and a
         # machine that decides without ever running a judge should not pay for it.
-        from kiro_crew.llm_helpers import (
-            ToolApprovalPolicy,
-            _billing_stats,
-            _provider_label,
-            provider_last_turn_usage,
-            stream_and_collect,
-            usage_has_billing,
-        )
+        from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect
 
         # The ceiling has to bound what is RETAINED, so it is counted per chunk as
         # the response arrives rather than once it is whole: a runaway generation
@@ -215,10 +207,6 @@ def build_session_runner(sessions: Any, *, model: str = "") -> Runner:
         provider, _is_new, _resumed = await sessions.get_or_create(
             key, agent=JUDGE_AGENT_NAME, model=resolved or None
         )
-        # LOOP-9: snapshot BEFORE the stream, the same anchor background_turn uses,
-        # so only THIS ask's spend is attributed to it.
-        stats_before = _billing_stats(provider)
-        turn_started = time.monotonic()
         try:
             text = await stream_and_collect(
                 provider,
@@ -230,25 +218,13 @@ def build_session_runner(sessions: Any, *, model: str = "") -> Runner:
                 # 8 s budget are hidden retries — one prompt, one answer, one
                 # failure, all visible to the caller that owns the budget.
                 retry_transient=False,
+                # LOOP-9 / USE-1: one usage row per ask, surface bg:judge, under
+                # the ephemeral judge key — written by stream_and_collect on every
+                # exit, so an ask the gate's 8 s wait_for cancels still records
+                # what it spent.
+                usage_surface="bg:judge",
+                usage_session_key=key,
             )
-            # LOOP-9: this runner is not run_bg_oneliner, and stream_and_collect
-            # persists nothing, so the judge's spend used to be invisible. Record
-            # it the way background_turn does — one usage row per ask, surface
-            # bg:judge — under the ephemeral judge key (the row's surface names
-            # what spent it; the key only groups it).
-            usage = provider_last_turn_usage(provider, since=stats_before)
-            if usage_has_billing(usage):
-                from kiro_crew.dashboard.handlers.usage import persist_token_record_async
-
-                await persist_token_record_async(
-                    key,
-                    str(getattr(provider, "served_model", "") or "").strip(),
-                    usage,
-                    _provider_label(provider),
-                    surface="bg:judge",
-                    elapsed_ms=int((time.monotonic() - turn_started) * 1000),
-                    model_source=provider,
-                )
             return text
         finally:
             try:
