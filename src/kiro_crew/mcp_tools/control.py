@@ -64,6 +64,7 @@ from kiro_crew.security import (
     redact_exfiltration_urls,
 )
 from kiro_crew.session_surface import has_dashboard_surface
+from kiro_crew.tool_result_cap import tool_json
 from kiro_crew.validation import (
     ASK_QUESTION_SCHEMA,
     AUTONUDGE_STOP_SCHEMA,
@@ -1887,12 +1888,7 @@ def monitor_inspect(name: str, args: dict[str, Any]) -> str:
     result = mcp_core._get("/api/autonudge/session-monitor", session_key=sk)
     if result.get("error"):
         return f"Error: Monitor inspection failed: {result['error']}"
-    return json.dumps(
-        _compact_monitor_inspection(result),
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
+    return tool_json(_compact_monitor_inspection(result), sort_keys=True)
 
 
 def _compact_monitor_inspection(result: dict[str, Any]) -> dict[str, Any]:

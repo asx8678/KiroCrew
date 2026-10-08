@@ -49,6 +49,7 @@ from kiro_crew import mcp_core
 from kiro_crew.browser_cli import install
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.security import canonicalize_ip, redact_credentials, redact_exfiltration_urls
+from kiro_crew.tool_result_cap import tool_json
 
 logger = logging.getLogger(__name__)
 
@@ -315,7 +316,7 @@ def _result_text(op: str, result: Any) -> str:
         )
     if result in (None, "", {}, []):
         return f"Browser {op}: ok"
-    rendered = result if isinstance(result, str) else json.dumps(result, default=str)
+    rendered = result if isinstance(result, str) else tool_json(result)
     rendered, _ = redact_exfiltration_urls(rendered)
     rendered, _ = redact_credentials(rendered)
     budget = _SNAPSHOT_RESULT_BUDGET if op == "snapshot" else _DEFAULT_RESULT_BUDGET

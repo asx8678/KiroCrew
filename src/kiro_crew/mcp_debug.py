@@ -78,7 +78,6 @@ result would read as the second.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 from urllib.parse import urlencode
@@ -86,6 +85,7 @@ from urllib.parse import urlencode
 from kiro_crew.mcp_core import _get, _resolve_session_key, require_strict_session_key
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.platform import redact_via_context as redact
+from kiro_crew.tool_result_cap import tool_json
 from kiro_crew.validation import MAX_RESPONSE_LEN, MCP_DEBUG_SCHEMAS, validate_tool_args
 
 logger = logging.getLogger(__name__)
@@ -385,7 +385,7 @@ def _error(code: str, message: str) -> str:
     ``diag_unavailable`` means this build cannot answer yet, ``unavailable`` means
     nothing answered. Prose alone makes every failure look like the same dead end.
     """
-    return redact(json.dumps({"error": {"code": code, "message": message}}, indent=2))
+    return redact(tool_json({"error": {"code": code, "message": message}}))
 
 
 def _proxy_error(payload: dict[str, Any], *, fallback: str) -> str:
@@ -451,7 +451,7 @@ def _fit(payload: dict[str, Any]) -> str:
     the caller is told to narrow the question instead, because this server cannot
     mint a cursor into a series it did not page.
     """
-    rendered = json.dumps(payload, indent=2, ensure_ascii=False)
+    rendered = tool_json(payload)
     if len(rendered.encode("utf-8")) <= MAX_OUTPUT_BYTES:
         return redact(rendered)
     keep = dict(payload)
@@ -464,15 +464,13 @@ def _fit(payload: dict[str, Any]) -> str:
         rows = keep.get(large)
         if not isinstance(rows, list) or not rows:
             continue
-        while rows and len(json.dumps(keep, indent=2, ensure_ascii=False).encode("utf-8")) > (
-            MAX_OUTPUT_BYTES
-        ):
+        while rows and len(tool_json(keep).encode("utf-8")) > MAX_OUTPUT_BYTES:
             # Halve rather than step: one serialization per row would make the
             # loop's cost proportional to the very size it is bounding.
             rows = rows[: max(0, len(rows) // 2)]
             keep[large] = rows
             keep[f"{large}_returned"] = len(rows)
-    rendered = json.dumps(keep, indent=2, ensure_ascii=False)
+    rendered = tool_json(keep)
     if len(rendered.encode("utf-8")) <= MAX_OUTPUT_BYTES:
         logger.debug("debug result cut to fit the %d byte budget", MAX_OUTPUT_BYTES)
         return redact(rendered)
@@ -480,7 +478,7 @@ def _fit(payload: dict[str, Any]) -> str:
     # envelope alone rather than an unbounded body. A caller gets a parseable
     # result that says it was cut, which is the one thing it can act on.
     return redact(
-        json.dumps(
+        tool_json(
             {
                 "truncated_to_fit": True,
                 "truncated_hint": keep["truncated_hint"],
@@ -488,8 +486,7 @@ def _fit(payload: dict[str, Any]) -> str:
                     "code": "too_large",
                     "message": "the answer does not fit in one result; narrow the question",
                 },
-            },
-            indent=2,
+            }
         )
     )
 

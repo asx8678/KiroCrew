@@ -23,6 +23,7 @@ from urllib.parse import quote
 
 from kiro_crew import mcp_core
 from kiro_crew.platform import redact_via_context as redact
+from kiro_crew.tool_result_cap import tool_json
 from kiro_crew.validation import (
     _ISSUE_RADAR_CREW_CLEARABLE_FIELDS,
     _ISSUE_RADAR_CREW_EVENT_KINDS,
@@ -580,7 +581,7 @@ def _pod_failure(payload: dict[str, Any], verb: str) -> str | None:
         _suffix = f" [{_code}]" if _code else ""
         return f"Error: {verb} failed{_suffix}: {redact(str(payload['error']))}"
     if not payload.get("ok"):
-        return f"Error: {verb} returned no result: {redact(json.dumps(payload, default=str))}"
+        return f"Error: {verb} returned no result: {redact(tool_json(payload))}"
     return None
 
 
@@ -681,7 +682,7 @@ def issue_radar_crew_read(name: str, args: dict[str, Any]) -> str:
     # untrusted issue text, and a resume re-reads it into context. Paths in
     # `worktree` survive this pass (it removes credentials and exfil URLs,
     # not paths) — which is required, since the resume needs them.
-    return redact(json.dumps(_cr_view, indent=2, ensure_ascii=False))
+    return redact(tool_json(_cr_view))
 
 
 def issue_radar_crew_record(name: str, args: dict[str, Any]) -> str:

@@ -25,6 +25,7 @@ from typing import Any, Callable
 from kiro_crew.json_line import parse_json_object_line, recover_line_id
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
+from kiro_crew.tool_result_cap import tool_json
 from kiro_crew.validation import build_tool_response
 
 from . import deps, progress, runner
@@ -374,7 +375,7 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
         # the one tool-result budget with head and tail kept and the full redacted text
         # spilled to a file the note names — so an agent asking for a finding cannot
         # pull an unbounded diff into its context, and loses no part of it either.
-        text = _redact_result(json.dumps(payload, default=str))
+        text = _redact_result(tool_json(payload))
         return _result(req_id, build_tool_response(text, spill_label=f"auto-improvement-{req_id}"))
     return _error(req_id, _METHOD_NOT_FOUND, f"unknown method: {method}")
 
