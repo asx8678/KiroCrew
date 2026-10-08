@@ -64,6 +64,9 @@ class BudgetCaps:
     max_cycles: int = 1000
     max_hours: float = 10.0
     max_cost_usd: float = 50.0
+    # USE-3: a cap on the backend's reported credits (kiro bills credits, not USD).
+    # 0 = no credits cap, so an existing run is unchanged.
+    max_credits: float = 0.0
     quiesce_after: int = 3  # consecutive cycles with no keep (M) → mined out, stop
     cycle_gap_s: float = 0.0  # gentle spacing so a transient failure doesn't hot-spin
     # Optional fan-out overrides — caps takes precedence over env defaults so a caller
@@ -385,6 +388,13 @@ class Driver:
             self.cost_meter = agent_runner.total_cost_usd
         else:
             self.cost_meter = lambda: 0.0
+        # USE-3: the credits source the ``max_credits`` cap reads. Zero when the
+        # runner has none (a USD-only backend), which never trips the cap.
+        if agent_runner is not None and hasattr(agent_runner, "total_credits"):
+            self.credit_meter = agent_runner.total_credits
+        else:
+            self.credit_meter = lambda: 0.0
+        self._meter_silent_cycles = 0
         # The measurement-runtime BOOT callable the Phase-1 do-not-pollute test drives
         # (boot the runtime once + tear down; the spine measures the host-state delta it
         # leaves; 08_safety §2.2; preflight §7.3). Profile/driver-supplied + opaque to the
@@ -2900,6 +2910,21 @@ class Driver:
                 if self.stats.cost_usd > self.caps.max_cost_usd:
                     self.log.info("cost budget reached ($%.2f)", self.stats.cost_usd)
                     break
+                credits_spent = self.credit_meter()
+                if self.caps.max_credits > 0 and credits_spent > self.caps.max_credits:
+                    self.log.info("credits budget reached (%.2f)", credits_spent)
+                    break
+                # USE-3: a meter still at zero after several cycles means the cap
+                # cannot trip at all, so say so rather than run uncapped in silence.
+                if self.stats.cost_usd == 0 and credits_spent == 0:
+                    self._meter_silent_cycles += 1
+                    if self._meter_silent_cycles == 5:
+                        self.log.warning(
+                            "spend meter still 0 after 5 cycles; the cost and credits caps "
+                            "cannot trip while the backend reports no spend"
+                        )
+                else:
+                    self._meter_silent_cycles = 0
 
                 self.stats.cycles += 1
                 kept_before = self.stats.kept
