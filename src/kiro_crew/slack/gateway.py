@@ -186,6 +186,7 @@ from kiro_crew.dashboard.stale_asset_watchdog import (
 from kiro_crew.dashboard.state import (
     SUBAGENT_BATCH_COMPLETION_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
+    SUBAGENT_SYNTHESIS_INLINE_SUFFIX,
     DashboardState,
 )
 from kiro_crew.dashboard.token_auth import MAX_SESSION_TTL_SECS, generate_token
@@ -9780,9 +9781,12 @@ class GatewayOrchestrator:
                     # anything is queued; the other completions re-arm.
                     try:
                         _mgr = self.subagent_mgr
-                        _arm_synthesis = (
+                        # The LAST-child test: everything the in-memory view
+                        # knows about is done except this delivery. The store
+                        # half (a sibling the gate still holds) stays the fire
+                        # gate's job — see the comment above.
+                        _last_child = (
                             _mgr is not None
-                            and not _injection_slot._pending_synthesis
                             and not _flush_only
                             and info.id not in _injection_slot._subagents_inline_collected
                             and _mgr.running_agents_for(parent_key) == []
@@ -9790,9 +9794,37 @@ class GatewayOrchestrator:
                                 parent_key, exclude_id=info.id
                             )
                         )
+                        _prior_turns = getattr(_injection_slot, "_synthesis_completion_turns", 0)
+                        # EVT-6: when this is the batch's last child AND at
+                        # least one earlier completion turn already ran, the
+                        # synthesis RIDES this envelope — one consolidated
+                        # instruction on the turn the results arrive on,
+                        # instead of a separate full-context turn restating
+                        # them. A batch whose whole delivery is one turn (no
+                        # prior turns) keeps the arm, which
+                        # `_drop_single_turn_synthesis` then consumes.
+                        _inline_synthesis = bool(
+                            _last_child and isinstance(_prior_turns, int) and _prior_turns >= 1
+                        )
+                        _arm_synthesis = bool(
+                            _last_child
+                            and not _inline_synthesis
+                            and not _injection_slot._pending_synthesis
+                        )
                     except Exception:
                         _arm_synthesis = False  # error → don't arm (fail safe)
-                    if _arm_synthesis:
+                        _inline_synthesis = False
+                    if _inline_synthesis:
+                        announce = announce + SUBAGENT_SYNTHESIS_INLINE_SUFFIX
+                        # The batch is DONE: an arm some earlier delivery set
+                        # would fire a turn that only restates what this
+                        # envelope now asks for, so consume it. The count is
+                        # pre-paid at -1 so THIS delivery's own +1 lands at 0
+                        # and the next batch starts with no prior turns.
+                        _injection_slot._pending_synthesis = False
+                        _injection_slot._synthesis_rechecks = 0
+                        _injection_slot._synthesis_completion_turns = -1
+                    elif _arm_synthesis:
                         _injection_slot._pending_synthesis = True
 
                     # ── Skip injection for blocking-tool-collected results ──

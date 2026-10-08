@@ -1850,11 +1850,15 @@ SUBAGENT_COMPLETION_PREFIXES = (
     SUBAGENT_COMPLETION_PREFIX,
     SUBAGENT_BATCH_COMPLETION_PREFIX,
 )
-# One-shot synthesis turn fired after ALL sub-agents in a fan-out complete and
-# every completion turn has run (see gateway._subagent_done arm + chat_runner
+# One-shot synthesis turn fired after ALL sub-agents in a fan-out complete
+# and every completion turn has run (see gateway._subagent_done arm + chat_runner
 # drain/idle branch). Consecutive completions drain as ONE merged turn (EVT-1)
-# and count once, so this fires only over what the parent has not already
-# seen. Its visible reply is the consolidated,
+# and count once. When the batch's last child delivers with at least one
+# earlier completion turn behind it, the synthesis instead RIDES that envelope
+# inline (EVT-6, SUBAGENT_SYNTHESIS_INLINE_SUFFIX below) and this separate
+# turn never fires; the arm remains the fallback for a batch whose whole
+# delivery is one turn (consumed by _drop_single_turn_synthesis) or for a
+# straggler the in-memory view missed. Its visible reply is the consolidated,
 # user-facing summary. Rendered as an "inject" message (not a user bubble); the
 # prefix marks it as a synthetic continuation so it is NOT mirrored to linked
 # surfaces (Slack/Telegram) as though the user typed it.
@@ -1866,6 +1870,22 @@ SUBAGENT_SYNTHESIS_PROMPT = (
     "findings across all of them (do not just repeat each result in turn), and (3) give concrete "
     "recommended next actions or decisions. This is the user-facing deliverable — keep it clear "
     "and actionable."
+)
+#: EVT-6: the synthesis instruction, INLINED. When the in-memory view says a
+#: completion is the batch's last outstanding child and at least one earlier
+#: completion turn already ran, this is appended to that envelope so the
+#: synthesis rides the turn the results arrive on instead of firing as its
+#: own full-context request afterwards. Deliberately SHORTER than
+#: SUBAGENT_SYNTHESIS_PROMPT — the results sit directly above it in the same
+#: prompt, so it only asks for the consolidated deliverable — and deliberately
+#: free of a totality claim ("all sub-agents have completed"): a child the
+#: in-memory view missed still delivers as its own later turn, and the inline
+#: wording must not have promised there were no more.
+SUBAGENT_SYNTHESIS_INLINE_SUFFIX = (
+    f"\n\n{SUBAGENT_SYNTHESIS_PREFIX} the sub-agent results above are ready. End "
+    "THIS reply with one consolidated synthesis for the user: what was "
+    "achieved across them, what failed or is still open, and the recommended "
+    "next actions. Do not restate individual results verbatim."
 )
 # Synthetic continuation injected after a recoverable tool refusal (host-gate
 # policy deny or the read-only bash gate) ended a turn early. Carries the

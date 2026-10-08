@@ -3006,3 +3006,110 @@ class TestInjectionSettleWindow:
             await task
         drain.assert_awaited_once_with(state, slot)
         assert "dashboard:main" not in timers, "the window closed"
+
+
+class TestSynthesisRidesTheLastCompletion:
+    """EVT-6: the synthesis rides the LAST completion's envelope — the batch's
+    closing delivery asks for the consolidated summary in the same turn, and
+    no separate full-context synthesis turn fires after it."""
+
+    _capture_on_done = TestWaveDigest._capture_on_done
+
+    @staticmethod
+    def _plain_member(i: int) -> SubagentInfo:
+        info = SubagentInfo(
+            id=f"p{i}",
+            task=f"plain task {i}",
+            parent_session_key="dashboard:main",
+        )
+        info.done = True
+        info.result = f"result {i}"
+        info.result_path = f"/tmp/p{i}/result.txt"
+        info.elapsed = 1.0
+        info.credits = 0.1
+        return info
+
+    def _orch_with_slot(self):
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = MagicMock()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        slot = MagicMock()
+        slot.mode = "chat"
+        slot.running = False
+        slot.task = None
+        slot._subagent_deliveries_inflight = 0
+        slot._pending_synthesis = False
+        slot._synthesis_rechecks = 0
+        slot._synthesis_completion_turns = 0
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        return orch, slot
+
+    @pytest.mark.asyncio
+    async def test_the_last_completion_carries_the_synthesis_inline(self):
+        from kiro_crew.dashboard.state import SUBAGENT_SYNTHESIS_INLINE_SUFFIX
+
+        orch, slot = self._orch_with_slot()
+        mgr, on_done = self._capture_on_done(orch)
+        # Siblings still out for the first two deliveries; the third is the
+        # batch's last child, with two earlier completion turns behind it.
+        # `running_agents_for` is read more than once per delivery, so the
+        # sibling-out answer is driven per DELIVERY, not per call.
+        delivery = {"n": -1}
+
+        def _running(_key):
+            return ["sib"] if delivery["n"] < 2 else []
+
+        mgr.running_agents_for = MagicMock(side_effect=_running)
+        mgr.has_in_memory_pending_work_for = MagicMock(return_value=False)
+
+        delivered: list[str] = []
+
+        async def _cap_run_chat(_state, _slot, text, **_kw):
+            delivered.append(text)
+
+        with patch("kiro_crew.slack.gateway._run_chat", _cap_run_chat):
+            for i, prior in enumerate((0, 1, 2)):
+                delivery["n"] = i
+                slot._synthesis_completion_turns = prior
+                await on_done(self._plain_member(i))
+                await _settle(lambda n=i: len(delivered) == n + 1, what=f"delivery {i} injected")
+
+        assert len(delivered) == 3
+        assert SUBAGENT_SYNTHESIS_INLINE_SUFFIX not in delivered[0]
+        assert SUBAGENT_SYNTHESIS_INLINE_SUFFIX not in delivered[1]
+        assert SUBAGENT_SYNTHESIS_INLINE_SUFFIX in delivered[2], (
+            "the batch's closing delivery must carry the synthesis inline "
+            f"(last announce tail: {delivered[2][-120:]!r})"
+        )
+        # No separate synthesis is armed, and the pre-paid count leaves the
+        # slot at zero once this delivery's own increment lands.
+        assert slot._pending_synthesis is False
+        assert slot._synthesis_completion_turns == 0
+
+    @pytest.mark.asyncio
+    async def test_a_lone_completion_takes_the_arm_not_the_inline(self):
+        """A batch whose whole delivery is one turn (no prior turns) keeps the
+        arm — `_drop_single_turn_synthesis` consumes it at the turn's end, and
+        the envelope carries no restating instruction."""
+        from kiro_crew.dashboard.state import SUBAGENT_SYNTHESIS_INLINE_SUFFIX
+
+        orch, slot = self._orch_with_slot()
+        mgr, on_done = self._capture_on_done(orch)
+        mgr.running_agents_for = MagicMock(return_value=[])
+        mgr.has_in_memory_pending_work_for = MagicMock(return_value=False)
+
+        delivered: list[str] = []
+
+        async def _cap_run_chat(_state, _slot, text, **_kw):
+            delivered.append(text)
+
+        with patch("kiro_crew.slack.gateway._run_chat", _cap_run_chat):
+            slot._synthesis_completion_turns = 0
+            await on_done(self._plain_member(0))
+            await _settle(lambda: len(delivered) == 1, what="the lone delivery injected")
+
+        assert len(delivered) == 1
+        assert SUBAGENT_SYNTHESIS_INLINE_SUFFIX not in delivered[0]
+        assert slot._pending_synthesis is True, "the lone-completion arm must stand"

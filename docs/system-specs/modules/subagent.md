@@ -2270,8 +2270,12 @@ per-sub-agent completion note. Dashboard chat only.
   through the merged turn; a pre-consumption retry re-queues the ORIGINAL
   entries, never the merged string. A merged drain counts ONE completion turn
   for the synthesis fire gate, so a whole batch that reached the slot in a
-  single turn drops its synthesis (`_drop_single_turn_synthesis`). The
-  synthesis then works over the already-condensed merged turns.
+  single turn drops its synthesis (`_drop_single_turn_synthesis`). When the
+  batch's last child delivers with at least one earlier completion turn behind
+  it, the synthesis instead RIDES that envelope inline
+  (`SUBAGENT_SYNTHESIS_INLINE_SUFFIX`, EVT-6) and the separate synthesis turn
+  never fires; the arm remains only for a one-turn batch (dropped) or a
+  straggler the in-memory view missed.
 - **Delivery-race guard** — `_subagent_deliveries_inflight` is incremented in
   `_subagent_done` from entry until the completion is queued/launched
   (try/finally). Because a concurrently-finishing sibling holds this count while
