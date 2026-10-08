@@ -942,6 +942,17 @@ with the provider as `model_source` fallback), the agent that served the turn
   `async with llm_helpers.metered_turn(provider, surface=..., slot_key=...)`, which
   pins the stats object on entry and calls `record_turn_usage` on every exit;
   `TurnDriver(usage_surface=...)` does the same around `run()`.
+- The knowledge CLI's Claude worker (`knowledge/llm_pool.py` `CCWorker`) is not a
+  provider, so it reads the billing off its own `result` event (`usage`,
+  `total_cost_usd`, `modelUsage`) and writes the row (surface `knowledge`, under
+  `_bg`) in a `finally` in `send_message`: a timed-out, cancelled or error reply
+  still records what its result reported.
+
+Enforced by `scripts/check_usage_surface.py` (AST, no test run): every
+`stream_and_collect(` call site must pass a non-empty `usage_surface=`, sit
+inside `background_turn`/`metered_turn`, or appear in the script's `ALLOWED`
+list with the reason its row is written elsewhere (the Slack heartbeat and
+autonudge, and the cron callback).
 
 Labels in use: `workflow` (cold and pooled stages), `workflow_author`, `bg:judge`,
 `side`, `thread`, `subagent_completion` (the Slack gateway's completion injection,

@@ -680,6 +680,31 @@ def _text_blocks(container: Any) -> list[str]:
     ]
 
 
+def _claude_result_billing(event: dict) -> tuple[Any, str]:
+    """The billing a Claude CLI ``result`` event reports, and the model it served.
+
+    USE-1: the CLI's ``usage`` object carries the token counts and
+    ``total_cost_usd`` the cost; ``modelUsage`` names the served model(s). Absent
+    fields read as zero, so an event without billing yields a usage that
+    :func:`~kiro_crew.llm_helpers.usage_has_billing` rejects.
+    """
+    from kiro_crew.acp.types import TurnUsage
+
+    usage = event.get("usage") or {}
+    model_usage = event.get("modelUsage") or {}
+    model = next(iter(model_usage), "") if isinstance(model_usage, dict) else ""
+    turn = TurnUsage(
+        input_tokens=int(usage.get("input_tokens", 0) or 0),
+        output_tokens=int(usage.get("output_tokens", 0) or 0),
+        cache_creation_tokens=int(usage.get("cache_creation_input_tokens", 0) or 0),
+        cache_read_tokens=int(usage.get("cache_read_input_tokens", 0) or 0),
+        cost_usd=float(event.get("total_cost_usd", 0.0) or 0.0),
+        num_turns=int(event.get("num_turns", 0) or 0),
+        duration_ms=int(event.get("duration_ms", 0) or 0),
+    )
+    return turn, str(model)
+
+
 class CCWorker(Worker):
     """Long-lived external agent CLI subprocess using stream-json I/O."""
 
@@ -695,6 +720,10 @@ class CCWorker(Worker):
         # rather than take ``wrap_argv``'s own default. ``None`` -> resolve
         # lazily in ``_spawn`` (direct construction outside the pool / tests).
         self._sandbox_mode = sandbox_mode
+        # USE-1: the billing of the reply being collected, read off its result
+        # event (``(TurnUsage, served model)``), so ``send_message`` can write
+        # the turn's one usage row on every exit.
+        self._turn_billing: Optional[tuple[Any, str]] = None
 
     async def start(self) -> None:
         self._claude_bin = shutil.which("claude")
@@ -842,6 +871,7 @@ class CCWorker(Worker):
             await stdin.drain()
             return await self._collect_response()
 
+        self._turn_billing = None
         # The queue may hold only this prompt's events, so the worker survives
         # a message only when its result event was consumed. Anything else (a
         # timeout, a dead reader, a reply that broke off, a cancelled caller)
@@ -859,8 +889,32 @@ class CCWorker(Worker):
             settled = True  # the error result is the result event
             raise
         finally:
+            # USE-1: a timed-out, cancelled or failed reply still spent what its
+            # result event reported, so the row is written before the shutdown.
+            await self._record_turn_usage()
             if not settled:
                 await self.shutdown()
+
+    async def _record_turn_usage(self) -> None:
+        """Write this reply's one usage row (surface ``knowledge``), if it billed.
+
+        Never raises: the row is analytics and must not fail the turn it measures.
+        """
+        billing, self._turn_billing = self._turn_billing, None
+        if billing is None:
+            return
+        usage, model = billing
+        # Function-local, like the rest of this module's host imports.
+        from kiro_crew.dashboard.handlers.usage import persist_token_record_async
+        from kiro_crew.llm_helpers import usage_has_billing
+
+        try:
+            if usage_has_billing(usage):
+                await persist_token_record_async(
+                    "_bg", model, usage, "claude_code", surface="knowledge"
+                )
+        except Exception:
+            logger.debug("CCWorker: knowledge usage row failed", exc_info=True)
 
     async def _collect_response(self) -> str:
         """Collect text from events until a result event arrives.
@@ -885,6 +939,8 @@ class CCWorker(Worker):
 
             elif event_type == "result":
                 result = event.get("result")
+                # Read before the error check: an error result is still a turn.
+                self._turn_billing = _claude_result_billing(event)
                 if event.get("is_error") is True:
                     detail = result if isinstance(result, str) else event.get("subtype", "")
                     raise CCWorkerReplyError(f"CLI reported an error result: {str(detail)[:500]}")
