@@ -1139,6 +1139,21 @@ def spawn_status(name: str, args: dict[str, Any]) -> str:
         error = f"Error: {d['error']}"
         return f"[usage: {usage}]\n{error}" if usage else error
 
+    # EVT-5: a FINISHED run read through this tool counts as collected. The
+    # model just received the result inline, so the queued completion turn
+    # would re-deliver it — the extra turn that fired right after every poll.
+    # Best-effort exactly like spawn_sub_agents' own mark: a failed POST keeps
+    # the pre-existing completion turn.
+    if d.get("done") is True:
+        try:
+            mcp_core._post(
+                "/api/spawn/mark-collected",
+                {"ids": [agent_id], "parent_session": mcp_core._resolve_session_key()},
+                timeout=5,
+            )
+        except Exception:
+            pass
+
     meta = d.get("result_meta")
     if isinstance(meta, dict) and meta.get("grep_error"):
         return f"Error: {meta['grep_error']}"

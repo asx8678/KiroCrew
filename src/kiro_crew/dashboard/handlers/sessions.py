@@ -4348,7 +4348,7 @@ async def api_session_keepalive(request: web.Request) -> web.Response:
 def _wait_end_reason(slot, wait_id: str, provider: Any) -> str | None:
     """Why this sleep should return early, or None to keep sleeping.
 
-    Exactly two reasons, and the narrowness is the design:
+    Three reasons, and the narrowness is the design:
 
     ``"user"``
         The End-wait button parked an explicit request naming this ``wait_id``,
@@ -4361,6 +4361,16 @@ def _wait_end_reason(slot, wait_id: str, provider: Any) -> str | None:
         tool call is the absence of one, so without this the user's correction
         sits in the backend's steer queue until the sleep elapses — up to the
         tool's 1800s ceiling — while the agent sleeps through it.
+
+    ``"event"`` (EVT-5)
+        One of the session's OWN events is waiting behind this sleep: a
+        queued system injection (a sub-agent completion, a cron report) or a
+        delivery still in flight. That event is the thing the model is
+        sleeping toward; without this arm it sits behind the deadline while
+        the model polls `spawn_status`, and each poll costs a full-context
+        request the pushed event would have made unnecessary. Reading a
+        finished run with `spawn_status` now marks it collected, so the
+        pushed turn and the poll never BOTH deliver.
 
     "After this sleep began" is decided by comparing the provider's steer stamp
     against the reading taken when this sleep was minted, so the handler reads
@@ -4389,7 +4399,29 @@ def _wait_end_reason(slot, wait_id: str, provider: Any) -> str | None:
         # Not the sleep this slot is tracking (contested identity, stale ping).
         return None
     steered_at = _provider_steer_stamp(provider)
-    return "steer" if steered_at > slot._wait_steer_baseline else None
+    if steered_at > slot._wait_steer_baseline:
+        return "steer"
+    # EVT-5: one of the session's OWN events is waiting behind this sleep. A
+    # queued system injection — a sub-agent completion, a cron report — or a
+    # delivery still in flight IS the thing the model is sleeping toward;
+    # without this arm it sits behind the deadline while the model polls
+    # spawn_status, and each poll costs a full-context request the pushed
+    # event would have made unnecessary. Reads are guarded the same way the
+    # steer stamp is: a double that lacks the attr keeps sleeping, never
+    # raises on the keepalive that stops the watchdog killing the session.
+    from kiro_crew.dashboard.chat_utils import is_system_injection_item
+
+    _queue = getattr(slot, "_queue", None)
+    if isinstance(_queue, list) and any(
+        isinstance(item, dict) and is_system_injection_item(item) for item in _queue
+    ):
+        return "event"
+    try:
+        if int(getattr(slot, "_subagent_deliveries_inflight", 0) or 0) > 0:
+            return "event"
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 def _provider_steer_stamp(provider: Any) -> float:
@@ -4536,6 +4568,7 @@ def _service_wait_ping(
         reply["end_wait"] = wait_id
         # Advisory, for the tool's result text only: a tool that predates this
         # field honours ``end_wait`` alone exactly as before.
+        reply["end_wait_reason"] = reason
         if ended_by:
             reply["end_wait_by"] = ended_by
         logger.info("wait ending early for %s (reason=%s)", session_key, reason)

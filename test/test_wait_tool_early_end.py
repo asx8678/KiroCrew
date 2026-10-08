@@ -143,6 +143,26 @@ class TestWaitLoopEarlyEnd:
         assert result.endswith("Resuming: test")
         assert len(_countdown_posts(posts)) == 3
 
+    def test_a_queued_completion_ends_the_wait_within_one_ping(self):
+        """EVT-5's done-when: a completion queued 30s into wait(600) ends the
+        sleep within 5s — the ping cadence — and the result text tells the
+        model its own work reported, so it never polls for it."""
+
+        def replies(n, body):
+            # The completion lands at t=30s; the ping at that boundary is the
+            # 7th (pings at t=0, 5, 10, ... ), and it carries the early end.
+            if n == 7:
+                return {"ok": True, "end_wait": body["wait_id"], "end_wait_reason": "event"}
+            return {"ok": True}
+
+        result, posts, clock = _run_wait(replies, seconds=600)
+
+        assert "one of your own sub-agents or jobs just reported" in result
+        assert "do not poll for it" in result
+        assert "600s" in result
+        assert clock.t == 30.0, "the sleep must end at the first ping after the event"
+        assert len(_countdown_posts(posts)) == 7
+
     def test_an_end_by_another_session_names_that_session(self):
         """session_end_wait: the result tells the woken agent a peer ended it,
         not the person, so it can go and read that peer's instruction."""
@@ -296,6 +316,51 @@ class TestWaitLoopEarlyEnd:
         assert clock.t == 0.0
         # The impostor saw the unadvanced clock too.
         assert leaked == [0.0]
+
+
+class TestWaitEndReasonEvents:
+    """EVT-5: the `event` arm — a queued system injection or an in-flight
+    delivery ends the sleep the model is waiting toward. Exactly two reasons
+    became three; the arm stays as narrow as the original pair."""
+
+    @staticmethod
+    def _slot(queue=None, inflight=0):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            _end_wait_request=None,
+            _wait_state={"wait_id": "w1"},
+            _wait_steer_baseline=0.0,
+            _queue=queue or [],
+            _subagent_deliveries_inflight=inflight,
+        )
+
+    def test_a_queued_completion_ends_the_sleep(self):
+        from kiro_crew.dashboard.chat_utils import SUBAGENT_COMPLETION_KIND
+        from kiro_crew.dashboard.handlers.sessions import _wait_end_reason
+
+        slot = self._slot(queue=[{"kind": SUBAGENT_COMPLETION_KIND, "content": "done"}])
+        assert _wait_end_reason(slot, "w1", None) == "event"
+
+    def test_a_held_user_message_does_not_end_the_sleep(self):
+        from kiro_crew.dashboard.handlers.sessions import _wait_end_reason
+
+        slot = self._slot(queue=[{"content": "plain user text"}])
+        assert _wait_end_reason(slot, "w1", None) is None
+
+    def test_an_in_flight_delivery_ends_the_sleep(self):
+        from kiro_crew.dashboard.handlers.sessions import _wait_end_reason
+
+        slot = self._slot(inflight=1)
+        assert _wait_end_reason(slot, "w1", None) == "event"
+
+    def test_a_contested_identity_still_ignores_events(self):
+        from kiro_crew.dashboard.chat_utils import SUBAGENT_COMPLETION_KIND
+        from kiro_crew.dashboard.handlers.sessions import _wait_end_reason
+
+        slot = self._slot(queue=[{"kind": SUBAGENT_COMPLETION_KIND, "content": "done"}])
+        slot._wait_state = {"wait_id": "somebody-else"}
+        assert _wait_end_reason(slot, "w1", None) is None
 
 
 class TestUnauthoritativeIdentityGate:

@@ -205,3 +205,48 @@ class TestSpawnStatusMcpDefault:
         assert "tail=" not in seen["path"]
         assert "offset=1" in seen["path"] and "limit=1" in seen["path"]
         assert "more available — call again with offset=" in out
+
+
+class TestSpawnStatusMarksCollected:
+    """EVT-5: reading a FINISHED run with spawn_status counts as receiving
+    it — the queued completion turn must not re-deliver what the poll just
+    showed, so the tool marks the run collected exactly like the blocking
+    tool does."""
+
+    @staticmethod
+    def _run_tool(done: bool) -> list[tuple[str, dict]]:
+        posts: list[tuple[str, dict]] = []
+
+        def _fake_post(path, body=None, **kwargs):
+            posts.append((path, dict(body or {})))
+
+        report = {
+            "done": done,
+            "result": "the answer" if done else "",
+            "credits": 0.2,
+            "elapsed": 1.0,
+        }
+
+        with (
+            patch("kiro_crew.mcp_core._post", side_effect=_fake_post),
+            patch("kiro_crew.mcp_core._get", return_value=report),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key",
+                return_value="dashboard:chat-1",
+            ),
+        ):
+            spawn_tools.spawn_status("spawn_status", {"agent_id": "a1"})
+        return posts
+
+    def test_a_finished_run_is_marked_collected(self):
+        posts = self._run_tool(done=True)
+        mc = [(p, b) for p, b in posts if p == "/api/spawn/mark-collected"]
+        assert mc, "a finished run read through spawn_status must POST mark-collected"
+        assert mc[0][1]["ids"] == ["a1"]
+        assert mc[0][1]["parent_session"] == "dashboard:chat-1"
+
+    def test_a_running_run_is_not_marked_collected(self):
+        """Still-running work completes later; suppressing its real result
+        would strand it, so only a finished run is marked."""
+        posts = self._run_tool(done=False)
+        assert not [p for p, _ in posts if p == "/api/spawn/mark-collected"]

@@ -854,6 +854,9 @@ def wait(name: str, args: dict[str, Any]) -> str:
     # staleness watchdog alone would need.
     _next_ping = mcp_core.time.monotonic()
     ended_early = False
+    # Which early-end reason the gateway named (EVT-5: "event" gets its own
+    # result wording; "user"/"steer" share the pre-existing one).
+    ended_reason = ""
     # Slot key of the session that ended this sleep through session_end_wait,
     # or "" for the End-wait button / a steer. Only read from a reply that named
     # this wait, so it cannot describe someone else's sleep.
@@ -924,6 +927,7 @@ def wait(name: str, args: dict[str, Any]) -> str:
             if _identified and isinstance(reply, dict) and reply.get("end_wait") == wait_id:
                 ended_early = True
                 ended_by = str(reply.get("end_wait_by") or "")[:128]
+                ended_reason = str(reply.get("end_wait_reason") or "")[:32]
                 break
             _next_ping = now + _ping_secs
         mcp_core.time.sleep(min(_ping_secs, remaining))
@@ -951,6 +955,15 @@ def wait(name: str, args: dict[str, Any]) -> str:
     # the response of a cancelled call, so raising here would leave kiro-cli
     # waiting on a tool result that never arrives until the 600s stall
     # watchdog kills the session. Ending a wait early continues the turn.
+    if ended_early and ended_reason == "event":
+        # EVT-5: the model must know the sleep ended because its OWN work
+        # reported — the result is the next turn, and polling for it would
+        # spend a request the push already made unnecessary.
+        return (
+            f"Wait ended early after {waited}s of {seconds}s: one of your own "
+            f"sub-agents or jobs just reported — its result arrives as the "
+            f"next turn; do not poll for it. Resuming: {reason_safe}"
+        )
     if ended_early and ended_by:
         return (
             f"Wait ended early by session `{ended_by}` (session_end_wait) after "
