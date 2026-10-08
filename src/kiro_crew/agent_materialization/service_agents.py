@@ -4,7 +4,9 @@
 agent a non-operator channel sender talks to, a trust boundary that mounts nothing;
 ``kirocrew-knowledge`` runs the Knowledge Library's extraction; ``kirocrew-research``
 is the Research Lab's per-cycle worker, derived from the default template so it
-inherits the governance ceiling. Each is rewritten on every rebuild.
+inherits the governance ceiling; ``kirocrew-step`` is the slim agent an unnamed
+subagent spawn or workflow step runs as (builtins plus a small ``kirocrew-core``
+base). Each is rewritten on every rebuild.
 """
 
 from __future__ import annotations
@@ -15,6 +17,8 @@ from kiro_crew.agent_files import GUEST_AGENT_FILENAME as _GUEST_AGENT_FILENAME
 from kiro_crew.agent_files import KNOWLEDGE_AGENT_FILENAME as _KNOWLEDGE_AGENT_FILENAME
 from kiro_crew.agent_files import LITE_AGENT_FILENAME as _LITE_AGENT_FILENAME
 from kiro_crew.agent_files import RESEARCH_AGENT_FILENAME as _RESEARCH_AGENT_FILENAME
+from kiro_crew.agent_files import STEP_AGENT_FILENAME as _STEP_AGENT_FILENAME
+from kiro_crew.agent_materialization import auto_approve
 
 
 def _install_guest_agent() -> None:
@@ -127,3 +131,98 @@ def _install_research_agent() -> None:
     path = agent_mod.kiro_agents_dir_path() / _RESEARCH_AGENT_FILENAME
     agent_mod._atomic_json_write(path, config)
     agent_mod.logger.info("Installed research agent config: %s", path)
+
+
+#: The ``kirocrew-core`` verbs a step mounts, and the ONLY Crew MCP surface it has
+#: (SPEC-3). Chosen for what one delegated task needs: check on spawned work
+#: (``spawn_status``/``spawn_list``), find and read a procedure (the three skill
+#: verbs), read and record what is learned (``memory_recall``, the knowledge
+#: search, ``learn_add``/``learn_list``), reach a person (``ask_question``,
+#: ``send_message``, ``send_notification``) and ``wait``. Deliberately absent:
+#: ``@kirocrew-cron`` (a recurring job outlives the step), every ``workflow_*``
+#: and ``monitor_*``/``autonudge_*`` verb (a step does not orchestrate), spawning
+#: (``spawn_run`` and friends), artifacts, app/dev tools and session control.
+#: Their mounted compact schemas total ~22 KB, against ~120 KB for the default
+#: agent's whole-server mounts; the budget is 25,000 bytes.
+STEP_CORE_VERBS: tuple[str, ...] = (
+    "spawn_status",
+    "spawn_list",
+    "skill_search",
+    "skill_discover",
+    "skill_fetch",
+    "memory_recall",
+    "local_knowledge_search",
+    "learn_add",
+    "learn_list",
+    "ask_question",
+    "send_message",
+    "send_notification",
+    "wait",
+)
+
+#: The step contract. Short on purpose: a step's first turn is the task, not the
+#: default agent's ~40 KB operating contract.
+STEP_SYSTEM_PROMPT = """# Kiro Crew Step
+
+You are `kirocrew-step`: you run ONE delegated task -- a subagent spawn or a
+workflow step -- and end with its result.
+
+- Do the task with the tools you have: read and write files, run commands, search.
+  Stay inside the task; do not widen it to problems you notice along the way.
+- Your Crew tools are a small base: check spawned work, search and fetch skills
+  (`skill_search`, then `skill_fetch` when a procedure applies), recall memory,
+  record a durable lesson with `learn_add`, ask a person with `ask_question`, and
+  `wait`. You have no scheduling, workflow, monitor or spawning tools; if the
+  task needs one, say so in your result rather than working around it.
+- When you are blocked on something only a person can supply, say exactly what
+  and stop; do not guess at credentials or decisions.
+- End with a concise final message: what you did, what came out, and where it
+  is (absolute paths, commit, branch, URLs). That message IS your result.
+"""
+
+
+def _install_step_agent() -> None:
+    """Generate and install the ``kirocrew-step`` agent config (SPEC-3).
+
+    The slim agent an unnamed subagent spawn or workflow step runs as: the
+    default template's builtin tools, hooks and model, a short step contract, and
+    ONLY the :data:`STEP_CORE_VERBS` of ``kirocrew-core`` -- mounted verb by verb
+    as ``@kirocrew-core/<verb>``, so the whole-server ``@kirocrew-core`` mount,
+    ``@kirocrew-cron`` and every other Crew server stay off it. Derived from
+    ``build_agent_config`` (template + user override), so the governance ceiling
+    and the security hooks it carries apply here too; a server or grant the user
+    added only to ``kirocrew.json`` is deliberately not mirrored (a step is the
+    narrow base, ``kirocrew-worker`` is the default-mirroring superset).
+    """
+    config = agent_mod.build_agent_config()
+    config["name"] = "kirocrew-step"
+    config["description"] = (
+        "Runs one delegated task (an unnamed subagent spawn or a workflow step) "
+        "with the builtin tools and a small Crew base, and ends with its result."
+    )
+    config["prompt"] = STEP_SYSTEM_PROMPT
+    verbs = [f"@kirocrew-core/{verb}" for verb in STEP_CORE_VERBS]
+    builtins = [ref for ref in (config.get("tools") or []) if isinstance(ref, str)]
+    config["tools"] = [ref for ref in builtins if not ref.startswith("@")] + verbs
+    # Only the core server's entry: a mounted verb needs its server, and no other
+    # Crew server is referenced. Absent (a broken template), the verbs resolve to
+    # nothing and the step still runs on its builtins.
+    servers = config.get("mcpServers") or {}
+    core = servers.get("kirocrew-core") if isinstance(servers, dict) else None
+    config["mcpServers"] = {"kirocrew-core": core} if isinstance(core, dict) else {}
+    # A grant is kept when it names a builtin, the core server whole (it reaches
+    # only the mounted verbs) or one of those verbs; the cron grants and anything
+    # naming an unmounted server go.
+    allowed_refs = {"@kirocrew-core", *verbs}
+    config["allowedTools"] = [
+        ref
+        for ref in (config.get("allowedTools") or [])
+        if isinstance(ref, str) and (not ref.startswith("@") or ref in allowed_refs)
+    ]
+    auto_approve._apply_allowed_tools_ceiling(config, source="_install_step_agent")
+    config["mcpServers"] = auto_approve._strip_ungoverned_auto_approve(config["mcpServers"])
+    auto_approve._write_derived_permissions(config, config["allowedTools"], _STEP_AGENT_FILENAME)
+    agent_mod.kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
+    path = agent_mod.kiro_agents_dir_path() / _STEP_AGENT_FILENAME
+    agent_mod._atomic_json_write(path, config)
+    agent_mod.logger.info("Installed step agent config: %s", path)

@@ -47,6 +47,9 @@ DASHBOARD_AUTHOR_AGENT_FILENAME = "kirocrew-dashboard-author.json"
 KNOWLEDGE_AGENT_FILENAME = "kirocrew-knowledge.json"
 RESEARCH_AGENT_FILENAME = "kirocrew-research.json"
 HEARTBEAT_AGENT_FILENAME = "kirocrew-heartbeat.json"
+# The slim agent an unnamed subagent spawn or workflow step runs as: builtins plus
+# a small ``kirocrew-core`` verb base, no cron/workflow/monitor surface.
+STEP_AGENT_FILENAME = "kirocrew-step.json"
 
 # Collective allowlists — the EXACT filenames KiroCrew owns in each dir. Used by
 # the Playwright convergence sweep (browser/setup.py) so it rewrites only files
@@ -65,6 +68,7 @@ OWNED_KIRO_AGENT_FILES = (
     KNOWLEDGE_AGENT_FILENAME,
     RESEARCH_AGENT_FILENAME,
     HEARTBEAT_AGENT_FILENAME,
+    STEP_AGENT_FILENAME,
 )
 
 # The specs that MUST exist for the product to work at all. kiro-cli resolves an

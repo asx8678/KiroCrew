@@ -1190,6 +1190,21 @@ its agents before then refuses the mode. So:
 The match is on the owner marker, never the name alone: a hand-authored agent
 that merely ends in `--readonly` stays listed and spawnable.
 
+### The step spec (`kirocrew-step`)
+
+`agent_materialization/service_agents._install_step_agent` writes
+`kirocrew-step.json` on every rebuild: the default template's builtin tools,
+hooks and model, a short step contract (`STEP_SYSTEM_PROMPT`, under 1 KB), and
+ONLY the `STEP_CORE_VERBS` of `kirocrew-core`, each mounted as
+`@kirocrew-core/<verb>` — spawn status/list, the skill verbs, memory recall and
+knowledge search, `learn_add`/`learn_list`, `ask_question`, `send_message`,
+`send_notification` and `wait`. It mounts no `@kirocrew-cron`, no `workflow_*`,
+`monitor_*`/`autonudge_*` or spawning verb, and no other Crew server: ~22 KB of
+mounted schemas (budget 25,000 bytes) against ~120 KB for `kirocrew`. It is the
+narrow base, not a mirror: servers and grants a user adds to `kirocrew.json`
+reach `kirocrew-worker` (the default-mirroring superset), not the step.
+`kirocrew-worker` is unchanged.
+
 Spawn flow:
 1. **YOLO mode**: skips approval, runs immediately
 2. **Parent trusted**: parent session has `approval_policy="auto"` (set by

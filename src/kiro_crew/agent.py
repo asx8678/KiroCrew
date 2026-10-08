@@ -256,10 +256,12 @@ if TYPE_CHECKING:  # served by ``__getattr__`` at runtime; named here for mypy
         _KNOWLEDGE_AGENT_FILENAME,
         _LITE_AGENT_FILENAME,
         _RESEARCH_AGENT_FILENAME,
+        _STEP_AGENT_FILENAME,
         _install_guest_agent,
         _install_knowledge_agent,
         _install_lite_agent_fallback,
         _install_research_agent,
+        _install_step_agent,
     )
     from kiro_crew.agent_materialization.worker_agent import (  # noqa: F401
         _DEFAULT_SPEC_OBSERVATION_ATTEMPTS,
@@ -1920,10 +1922,12 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "_install_lite_agent_fallback",
         "_install_knowledge_agent",
         "_install_research_agent",
+        "_install_step_agent",
         "_GUEST_AGENT_FILENAME",
         "_KNOWLEDGE_AGENT_FILENAME",
         "_LITE_AGENT_FILENAME",
         "_RESEARCH_AGENT_FILENAME",
+        "_STEP_AGENT_FILENAME",
     ),
     "kiro_crew.agent_materialization.conductor_agents": (
         "_conductor_mcp_servers",
@@ -3774,6 +3778,12 @@ def rebuild_agent_config(
         service_agents._install_research_agent()
     except Exception:
         logger.debug("kirocrew-research agent install failed", exc_info=True)
+
+    # Install kirocrew-step agent (unnamed subagent spawns and workflow steps)
+    try:
+        service_agents._install_step_agent()
+    except Exception:
+        logger.debug("kirocrew-step agent install failed", exc_info=True)
 
     # Install kirocrew-heartbeat agent (used by HeartbeatService for unattended polling)
     try:

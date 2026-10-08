@@ -647,6 +647,7 @@ would otherwise clobber your pin.
 | `kirocrew-security-conductor.json` | generated; your `allowedTools` entries are carried forward | every gateway start |
 | `kirocrew-knowledge.json` | generated | every gateway start |
 | `kirocrew-research.json` | generated | every gateway start |
+| `kirocrew-step.json` | generated from the template (`service_agents._install_step_agent`): its builtins, hooks and model, a short step contract, and only the `STEP_CORE_VERBS` of `kirocrew-core` mounted as `@kirocrew-core/<verb>` — no `@kirocrew-cron`, no `workflow_*`, `monitor_*` or spawning verb (~22 KB of mounted schemas against ~120 KB for `kirocrew`). Servers and grants you add to `kirocrew.json` are not mirrored | every gateway start |
 | `kirocrew-heartbeat.json` | generated | every gateway start |
 | an app's generated agent | the App Kit | regenerated on app refresh; containment fields are framework-owned |
 | your own `<name>.json` / `<name>.md` | yours | `model` / `skills` via the Template pane and `toolAliases` on rebuild; nothing else. `.md` is read-only to Crew entirely |
