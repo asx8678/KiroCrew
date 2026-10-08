@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
+import json
 import logging
 import os
 import re
 import threading
+import time
 from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Coroutine
@@ -39,6 +42,14 @@ _KEEP_SENTINEL = "HEARTBEAT_KEEP"
 _KEEP_RE = re.compile(_KEEP_SENTINEL, re.IGNORECASE)
 
 _DEFAULT_INTERVAL = 60
+# A kept task waits this long at most between model calls. The service tick
+# stays at the maintenance interval; this cap is per task, not per beat.
+_KEEP_BACKOFF_CAP_SECS = 3600
+# Twelve keeps is the 24h bound: a task that always answers HEARTBEAT_KEEP
+# is retired on the twelfth call, with one notice. Seven days covers a task
+# that keeps slowly enough to never hit the count.
+_KEEP_RETIRE_AFTER = 12
+_KEEP_MAX_AGE_SECS = 7 * 24 * 3600
 _FTS_REBUILD_TICKS = 15  # rebuild every 15 ticks (15 min at 60s interval)
 _PRUNE_TICKS = 1440  # prune old history once per day (1440 min at 60s interval)
 # Memory backup runs on its OWN counter, offset from _PRUNE_TICKS rather than sharing
@@ -53,6 +64,7 @@ _MEMORY_BACKUP_OFFSET = 30
 # approval blocks the whole heartbeat subsystem indefinitely.
 HEARTBEAT_TASK_TIMEOUT_SECS = 1800  # 30 min per heartbeat task
 HEARTBEAT_FILE = "HEARTBEAT.md"
+HEARTBEAT_STATE_FILE = "HEARTBEAT.state.json"
 _HEADER = (
     "# Heartbeat Tasks\n\n<!-- Add tasks below (one per line). "
     "KiroCrew picks them up on next heartbeat. -->\n"
@@ -61,6 +73,80 @@ _HEADER = (
 
 def heartbeat_path() -> Path:
     return workspace_dir() / HEARTBEAT_FILE
+
+
+def heartbeat_state_path(path: Path | None = None) -> Path:
+    target = path or heartbeat_path()
+    return target.with_name(HEARTBEAT_STATE_FILE)
+
+
+def _task_state_key(task_text: str) -> str:
+    return hashlib.sha256(task_text.encode("utf-8")).hexdigest()[:16]
+
+
+def _task_interval_secs() -> int:
+    """Base gap for a kept task. The service tick is not this value."""
+    try:
+        raw = int(KiroCrewConfig.load().heartbeat.interval_secs)
+    except Exception:
+        return _DEFAULT_INTERVAL
+    if raw < 15 or raw > _KEEP_BACKOFF_CAP_SECS:
+        return _DEFAULT_INTERVAL
+    return raw
+
+
+def _backoff_secs(streak: int, base: int) -> int:
+    shift = min(max(streak, 1) - 1, 16)
+    return min(_KEEP_BACKOFF_CAP_SECS, max(1, base) * (2**shift))
+
+
+def _load_task_state(path: Path) -> dict[str, dict]:
+    try:
+        raw = json.loads(heartbeat_state_path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return {}
+    tasks = raw.get("tasks") if isinstance(raw, dict) else None
+    if not isinstance(tasks, dict):
+        return {}
+    return {str(k): v for k, v in tasks.items() if isinstance(v, dict)}
+
+
+def _due(entry: dict | None, now: float) -> bool:
+    if not entry:
+        return True
+    try:
+        return now >= float(entry.get("next_due") or 0)
+    except (TypeError, ValueError):
+        return True
+
+
+def _after_incomplete(
+    entry: dict | None, now: float, base: int, *, failed: bool
+) -> tuple[dict, bool]:
+    """Next sidecar row, and whether a keep has retired the task."""
+    prev = entry or {}
+    first = float(prev.get("first_keep_ts") or now)
+    keep_streak = int(prev.get("keep_streak") or 0)
+    fail_streak = int(prev.get("fail_streak") or 0)
+    if failed:
+        fail_streak += 1
+        streak_for_wait = fail_streak
+        retired = False
+    else:
+        keep_streak += 1
+        streak_for_wait = keep_streak
+        if not prev.get("first_keep_ts"):
+            first = now
+        retired = keep_streak >= _KEEP_RETIRE_AFTER or (now - first) >= _KEEP_MAX_AGE_SECS
+    return (
+        {
+            "keep_streak": keep_streak,
+            "fail_streak": fail_streak,
+            "first_keep_ts": first,
+            "next_due": now + _backoff_secs(streak_for_wait, base),
+        },
+        retired,
+    )
 
 
 def heartbeat_lock_path(path: Path | None = None) -> Path:
@@ -93,8 +179,13 @@ def _rewrite_heartbeat_locked(
     path: Path,
     original_tasks: list[tuple[str, str]],
     keep: list[tuple[str, str]],
+    state: dict[str, dict] | None = None,
 ) -> int:
-    """Re-read, merge, and atomically replace HEARTBEAT.md under an OS lock."""
+    """Re-read, merge, and atomically replace HEARTBEAT.md under an OS lock.
+
+    ``state`` is the per-task backoff sidecar. It is written in the same lock
+    as the markdown so a keep cannot lose its next_due to a concurrent append.
+    """
     lock_path = heartbeat_lock_path(path)
     with open(lock_path, "a+b") as lock_file:
         with platform_compat.file_lock(lock_file.fileno(), exclusive=True):
@@ -116,6 +207,12 @@ def _rewrite_heartbeat_locked(
                 suffix = f"  <!-- deliver:{deliver} -->" if deliver else ""
                 lines += f"- {task_text}{suffix}\n"
             atomic_write(path, lines, fsync=True)
+            if state is not None:
+                atomic_write(
+                    heartbeat_state_path(path),
+                    json.dumps({"tasks": state}, indent=2) + "\n",
+                    fsync=True,
+                )
             return len(appended)
 
 
@@ -149,11 +246,13 @@ class HeartbeatService:
         interval: int = _DEFAULT_INTERVAL,
         consolidator: HistoryConsolidator | None = None,
         on_cycle_end: Callable[[], Coroutine] | None = None,
+        on_retire: Callable[[str], Coroutine] | None = None,
     ) -> None:
         self._memory = memory
         self._on_task = on_task
         self._interval = interval
         self._consolidator = consolidator
+        self._on_retire = on_retire
         # Called once after every cycle's tasks finish (regardless of
         # individual task success/fail).  Owner uses this to recycle the
         # shared heartbeat session at cycle boundaries — the per-task
@@ -355,14 +454,36 @@ class HeartbeatService:
                 return
 
             self._processing = True
+            retired: list[str] = []
             try:
-                logger.info("Heartbeat: %d task(s) found", len(tasks))
-                keep: list[tuple[str, str]] = []
+                state = await asyncio.to_thread(_load_task_state, path)
+                now = time.time()
+                base = _task_interval_secs()
+                runnable: list[tuple[str, str]] = []
+                parked: list[tuple[str, str]] = []
+                for task in tasks:
+                    entry = state.get(_task_state_key(task[0]))
+                    if _due(entry, now):
+                        runnable.append(task)
+                    else:
+                        parked.append(task)
+                logger.info(
+                    "Heartbeat: %d task(s) found, %d due",
+                    len(tasks),
+                    len(runnable),
+                )
+                keep: list[tuple[str, str]] = list(parked)
+                new_state: dict[str, dict] = {
+                    _task_state_key(text): state[_task_state_key(text)]
+                    for text, _deliver in parked
+                    if _task_state_key(text) in state
+                }
                 results = await asyncio.gather(
-                    *[self._run_one_task(t, d) for t, d in tasks],
+                    *[self._run_one_task(t, d) for t, d in runnable],
                     return_exceptions=True,
                 )
-                for (task_text, deliver), result in zip(tasks, results):
+                for (task_text, deliver), result in zip(runnable, results):
+                    key = _task_state_key(task_text)
                     if isinstance(result, BaseException):
                         # A chain-exhaustion failure carries the fallback story
                         # on the exception; this log line is the heartbeat's
@@ -374,10 +495,26 @@ class HeartbeatService:
                             append_fallback_story(task_text[:80], result),
                             exc_info=result,
                         )
+                        row, _retired = _after_incomplete(state.get(key), now, base, failed=True)
+                        new_state[key] = row
                         keep.append((task_text, deliver))
                     elif _should_keep(result):
-                        logger.info("Heartbeat task incomplete, keeping: %s", task_text[:80])
-                        keep.append((task_text, deliver))
+                        row, is_retired = _after_incomplete(state.get(key), now, base, failed=False)
+                        if is_retired:
+                            logger.info(
+                                "Heartbeat task retired after %s keeps: %s",
+                                row["keep_streak"],
+                                task_text[:80],
+                            )
+                            retired.append(task_text)
+                        else:
+                            logger.info(
+                                "Heartbeat task incomplete, next due in %ss: %s",
+                                int(row["next_due"] - now),
+                                task_text[:80],
+                            )
+                            new_state[key] = row
+                            keep.append((task_text, deliver))
 
                 # Re-read, merge mid-cycle appends, and replace atomically while
                 # holding the sibling OS lock. Every internal writer uses the
@@ -389,6 +526,7 @@ class HeartbeatService:
                     path,
                     tasks,
                     keep,
+                    new_state,
                 )
                 if appended_count:
                     logger.info(
@@ -407,6 +545,12 @@ class HeartbeatService:
                         await self._on_cycle_end()
                     except Exception:
                         logger.warning("Heartbeat: on_cycle_end callback failed", exc_info=True)
+                if self._on_retire is not None:
+                    for task_text in retired:
+                        try:
+                            await self._on_retire(task_text)
+                        except Exception:
+                            logger.warning("Heartbeat: retire notice failed", exc_info=True)
 
 
 def _should_keep(result: str | None) -> bool:

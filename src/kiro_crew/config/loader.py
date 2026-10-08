@@ -5329,6 +5329,7 @@ def build_config(
     heartbeat_default_deliver = str(heartbeat.get("default_deliver")).strip().lower()
     if heartbeat_default_deliver not in ("slack", "dashboard"):
         heartbeat_default_deliver = heartbeat.default("default_deliver")
+    heartbeat_interval = heartbeat.read("interval_secs", _safe_int, 15, 3600)
     # A stored document written before this key existed has no "monitoring"
     # object at all, and that is the case that must keep working: the miss
     # resolves to the dataclass default, which is the off position. So an
@@ -5587,7 +5588,10 @@ def build_config(
         mcp_gateway=_build_mcp_gateway_config(mcp_gateway_data),
         mcp=_build_mcp_config(mcp_data),
         instances=_build_instances_config(connect_timeout_raw, instances_data, mint_timeout_raw),
-        heartbeat=HeartbeatConfig(default_deliver=heartbeat_default_deliver),
+        heartbeat=HeartbeatConfig(
+            default_deliver=heartbeat_default_deliver,
+            interval_secs=heartbeat_interval,
+        ),
         monitoring=_build_monitoring_config(monitoring_data, monitoring_prefer_structured_arming),
         decisions=DecisionsConfig.from_raw(decisions_data),
         skills=_build_skills_config(skills_data),

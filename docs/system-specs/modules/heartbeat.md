@@ -31,9 +31,15 @@ The heartbeat service (`kiro_crew/heartbeat.py`) runs periodic background tasks 
 1. Tick fires → read file → extract tasks
 2. For each task: call `on_task` callback (gateway sends through ACP, posts result)
 3. Callback returns response text; heartbeat checks for `HEARTBEAT_KEEP` sentinel
-4. Tasks with `HEARTBEAT_KEEP` in response are retained for next tick (incomplete)
-5. Tasks without the sentinel are removed (complete)
-6. Tasks that raise exceptions are retained automatically (retry)
+4. Tasks with `HEARTBEAT_KEEP` in response are retained, but not re-sent until
+   `next_due`. The first keep waits `heartbeat.interval_secs` (default 60); each
+   further keep doubles that, capped at 1 hour. The count and the due time live
+   in `HEARTBEAT.state.json`, written in the same lock as the markdown rewrite.
+5. A task retires on the 12th keep, or when the first keep is 7 days old, and
+   the gateway posts one dashboard notice. It is removed from `HEARTBEAT.md`.
+6. Tasks without the sentinel are removed (complete) and their sidecar row is dropped.
+7. Tasks that raise are retained and use the same backoff on `fail_streak`. They
+   are not retired: a crash is not "the condition is still false".
 
 ### Task Retention (`HEARTBEAT_KEEP`)
 
@@ -137,7 +143,11 @@ When a legitimate new read tool needs to run in heartbeat, operators observe SEL
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `_DEFAULT_INTERVAL` | 60 | `heartbeat.py` |
+| `_DEFAULT_INTERVAL` | 60 | `heartbeat.py` (maintenance tick; not the keep gap) |
+| `heartbeat.interval_secs` | 60 (15–3600) | `HeartbeatConfig`; base keep gap |
+| `_KEEP_BACKOFF_CAP_SECS` | 3600 | `heartbeat.py` |
+| `_KEEP_RETIRE_AFTER` | 12 | `heartbeat.py` |
+| `_KEEP_MAX_AGE_SECS` | 7 days | `heartbeat.py` |
 | `_FTS_REBUILD_TICKS` | 15 | `heartbeat.py` |
 | `_PRUNE_TICKS` | 1440 | `heartbeat.py` |
 | `_KEEP_SENTINEL` | `HEARTBEAT_KEEP` | `heartbeat.py` |
@@ -153,7 +163,7 @@ When a legitimate new read tool needs to run in heartbeat, operators observe SEL
 
 - No multiline tasks — each line is a separate task
 - If user edits file while tasks are processing, new additions may be lost
-- Exception-retried tasks have no max retry count
+- Exception-retried tasks back off but are not retired
 
 ## Delivery Modes
 

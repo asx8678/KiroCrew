@@ -166,9 +166,7 @@ class TestHeartbeatRetention:
 
         svc = HeartbeatService(memory=MagicMock(), on_task=on_task)
         hb_path = tmp_path / "HEARTBEAT.md"
-        hb_path.write_text(
-            _HEADER + "- Check ticket  <!-- deliver:C08HZAWV4TP -->\n"
-        )
+        hb_path.write_text(_HEADER + "- Check ticket  <!-- deliver:C08HZAWV4TP -->\n")
 
         original = hb_mod.heartbeat_path
         hb_mod.heartbeat_path = lambda: hb_path
@@ -207,3 +205,60 @@ class TestDeliverySuppression:
     def test_case_insensitive(self) -> None:
         """Lowercase variant also suppresses."""
         assert is_keep_response("Still checking. heartbeat_keep")
+
+
+class TestKeepBackoff:
+    """A task that keeps answering HEARTBEAT_KEEP must not call the model every tick."""
+
+    @pytest.mark.asyncio
+    async def test_second_tick_skips_until_due(self, tmp_path: Path, monkeypatch) -> None:
+        calls = {"n": 0}
+
+        async def on_task(text: str, deliver: str) -> str:
+            calls["n"] += 1
+            return "not yet HEARTBEAT_KEEP"
+
+        now = {"t": 1_000_000.0}
+        monkeypatch.setattr(hb_mod.time, "time", lambda: now["t"])
+        monkeypatch.setattr(hb_mod, "_task_interval_secs", lambda: 60)
+        monkeypatch.setattr(hb_mod, "heartbeat_path", lambda: tmp_path / "HEARTBEAT.md")
+        (tmp_path / "HEARTBEAT.md").write_text(_HEADER + "- watch the build\n")
+        svc = HeartbeatService(memory=MagicMock(), on_task=on_task)
+
+        await svc._process_heartbeat_file()
+        await svc._process_heartbeat_file()
+        assert calls["n"] == 1
+
+        now["t"] += 60
+        await svc._process_heartbeat_file()
+        assert calls["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_always_keep_retires_at_twelve_with_one_notice(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        calls = {"n": 0}
+        notices: list[str] = []
+
+        async def on_task(text: str, deliver: str) -> str:
+            calls["n"] += 1
+            return "still false HEARTBEAT_KEEP"
+
+        async def on_retire(text: str) -> None:
+            notices.append(text)
+
+        now = {"t": 1_000_000.0}
+        monkeypatch.setattr(hb_mod.time, "time", lambda: now["t"])
+        monkeypatch.setattr(hb_mod, "_task_interval_secs", lambda: 60)
+        monkeypatch.setattr(hb_mod, "heartbeat_path", lambda: tmp_path / "HEARTBEAT.md")
+        (tmp_path / "HEARTBEAT.md").write_text(_HEADER + "- watch the build\n")
+        svc = HeartbeatService(memory=MagicMock(), on_task=on_task, on_retire=on_retire)
+
+        for _ in range(20):
+            await svc._process_heartbeat_file()
+            now["t"] += hb_mod._KEEP_BACKOFF_CAP_SECS
+
+        assert calls["n"] == hb_mod._KEEP_RETIRE_AFTER
+        assert calls["n"] <= 12
+        assert notices == ["watch the build"]
+        assert "watch the build" not in (tmp_path / "HEARTBEAT.md").read_text()

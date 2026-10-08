@@ -200,6 +200,16 @@ class HeartbeatConfig:
             "override this.",
         ),
     )
+    interval_secs: int = field(
+        default=60,
+        metadata=_meta(
+            "Task interval (s)",
+            "Base gap before a HEARTBEAT_KEEP task is sent to the model again. "
+            "Each further keep doubles it, up to 1 hour. The maintenance tick "
+            "(index rebuild, prune, idle consolidation) stays on its own 60s "
+            "clock. Clamped to 15–3600.",
+        ),
+    )
 
 
 @dataclass

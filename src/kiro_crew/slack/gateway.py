@@ -6517,11 +6517,23 @@ class GatewayOrchestrator:
             except Exception:
                 logger.warning("Heartbeat: cycle-end recycle failed", exc_info=True)
 
+        async def _on_retire(task_text: str) -> None:
+            if self.dashboard_state is None:
+                return
+            self.dashboard_state.notify(
+                "heartbeat",
+                "Heartbeat task retired",
+                "Stopped after repeated incomplete runs: "
+                + redact_and_truncate(task_text, 200)
+                + ". Use a script or irq cron if it should keep watching.",
+            )
+
         self.heartbeat_svc = HeartbeatService(
             memory=memory,
             on_task=_heartbeat_task,
             consolidator=self.consolidator,
             on_cycle_end=_on_cycle_end,
+            on_retire=_on_retire,
         )
         await self.heartbeat_svc.start()
 

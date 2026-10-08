@@ -4665,6 +4665,17 @@ def test_heartbeat_default_deliver_invalid_falls_back_to_slack():
     assert cfg.heartbeat.default_deliver == "slack"
 
 
+def test_heartbeat_interval_secs_defaults_and_clamps():
+    cfg = _load_from_dict({})
+    assert cfg.heartbeat.interval_secs == 60
+    widened = _load_from_dict({"heartbeat": {"interval_secs": 120}})
+    assert widened.heartbeat.interval_secs == 120
+    clamped = _load_from_dict({"heartbeat": {"interval_secs": 1}})
+    assert clamped.heartbeat.interval_secs == 15
+    capped = _load_from_dict({"heartbeat": {"interval_secs": 99999}})
+    assert capped.heartbeat.interval_secs == 3600
+
+
 class TestKnowledgeAutoIngest:
     """The auto-add / project-docs / budget / dedup-cadence keys."""
 
