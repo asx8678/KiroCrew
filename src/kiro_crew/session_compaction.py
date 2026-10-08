@@ -1107,12 +1107,16 @@ class CompactionCoordinator:
                 from kiro_crew.acp.types import EVENT_COMPACTION_STATUS
 
                 status: str | None = None
-                async for event in session.provider.stream_command("/compact"):
-                    if event.kind == EVENT_COMPACTION_STATUS and event.text in (
-                        "completed",
-                        "failed",
-                    ):
-                        status = event.text
+                from kiro_crew.llm_helpers import metered_turn
+
+                # USE-1: a native /compact is a billed turn; one usage row, on every exit.
+                async with metered_turn(session.provider, surface="compaction", slot_key=key):
+                    async for event in session.provider.stream_command("/compact"):
+                        if event.kind == EVENT_COMPACTION_STATUS and event.text in (
+                            "completed",
+                            "failed",
+                        ):
+                            status = event.text
                 if status is None:
                     # No special case for an inline harness HERE. This loop
                     # drives the harness through ``stream_command`` rather than

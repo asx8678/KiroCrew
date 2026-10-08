@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
@@ -214,6 +215,29 @@ def sandbox_unavailable_message(exc: BaseException | None = None) -> str:
             "~/.kiro/crew/config.json to allow it explicitly."
         )
     return f"{base} (sandbox: {detail})" if detail else base
+
+
+async def _record_review_usage(handle: Any, keep_session_key: Optional[str],
+                               elapsed_s: float) -> None:
+    """Write the review turn's ONE usage row (USE-1), surface ``code_review_sage``.
+
+    The review drives ``handle.prompt`` on a fresh session itself, so nothing
+    else records its spend. Best-effort and import-guarded like this module's
+    other host imports: a host without the usage helper simply writes no row.
+    """
+    if handle is None:
+        return
+    try:
+        from kiro_crew.llm_helpers import record_turn_usage
+    except ImportError:  # pragma: no cover - standalone import without the host
+        return
+    await record_turn_usage(
+        handle,
+        surface="code_review_sage",
+        slot_key=keep_session_key or "",
+        app="code-review-sage",
+        elapsed_ms=int(elapsed_s * 1000),
+    )
 
 
 def _is_abnormal_stop(reason: str) -> bool:
@@ -620,6 +644,7 @@ class ReviewPool:
                 # agent=None -> inherit the runtime's agent (spawned with --agent);
                 # cwd=app root so relative prompt paths + the effort overlay resolve.
                 handle = await runtime.create_session(cwd=self._work_dir, agent=None)
+                started = time.monotonic()
                 gen = handle.prompt(task, timeout=timeout)
                 parts: list[str] = []
                 stop_reason = ""
@@ -677,13 +702,20 @@ class ReviewPool:
                             stop_reason = getattr(ev, "stop_reason", "") or ""
                             break
                 finally:
-                    # Deterministically close the async generator instead of leaving
-                    # it suspended-until-GC after the EVENT_COMPLETE break. prompt()
-                    # is typed AsyncIterator (no aclose in the protocol) but is an
-                    # async generator at runtime — close it if it supports it.
-                    aclose = getattr(gen, "aclose", None)
-                    if aclose is not None:
-                        await aclose()
+                    try:
+                        # Deterministically close the async generator instead of
+                        # leaving it suspended-until-GC after the EVENT_COMPLETE
+                        # break. prompt() is typed AsyncIterator (no aclose in the
+                        # protocol) but is an async generator at runtime — close it
+                        # if it supports it.
+                        aclose = getattr(gen, "aclose", None)
+                        if aclose is not None:
+                            await aclose()
+                    finally:
+                        # USE-1: the review's one usage row, on every exit.
+                        await _record_review_usage(
+                            handle, keep_session_key, time.monotonic() - started
+                        )
                 # An abnormal completion (timeout / tool-stall / stale-recovery /
                 # error:*) means the review did NOT finish — surface it as a failure
                 # so make_sync_dispatch reports ok=False and the driver never marks

@@ -938,14 +938,23 @@ with the provider as `model_source` fallback), the agent that served the turn
   billing summed over every attempt. A labelled call does NOT publish the total
   for `provider_last_turn_usage`, so nothing is left for a second writer. Unlabelled
   calls are unchanged: the caller owns the row.
-- A path that drives `provider.stream` itself calls `record_turn_usage` from its own
-  `finally`, with `since=` the stats object observed before the turn.
+- A path that drives `provider.stream` itself wraps the drive in
+  `async with llm_helpers.metered_turn(provider, surface=..., slot_key=...)`, which
+  pins the stats object on entry and calls `record_turn_usage` on every exit;
+  `TurnDriver(usage_surface=...)` does the same around `run()`.
 
 Labels in use: `workflow` (cold and pooled stages), `workflow_author`, `bg:judge`,
 `side`, `thread`, `subagent_completion` (the Slack gateway's completion injection,
 filed under the parent key), `taskrunner_lesson`, `issue_radar`, `meetings`,
-`meetings_translate`, and `bg:<source>` / `bg:<task>` from the two background
-helpers, which share the same persist. A caller that ALSO reads the turn's usage for
+`meetings_translate`, `slack` (native handler and Slack transport), `telegram`,
+the transport label for the generic channel dispatcher (`discord`, …), `monitor`
+for its monitor wakes, `channel`, `cli`, `optimizer`, `taskrunner_decompose`,
+`taskrunner_refine`, `compaction` (native `/compact` through the provider and the
+compaction coordinator), `code_review_sage`, `knowledge` (the knowledge pool's ACP
+workers), and `bg:<source>` / `bg:<task>` from the two background helpers, which
+share the same persist. Not metered: the offline eval harness (`eval/`), and the
+knowledge pool's external-CLI worker (`CCWorker`), which has no billing-stats seam
+to read. A caller that ALSO reads the turn's usage for
 something else (cron's turn-stats footer, the monitor controller, the task runner's
 step, subagents, hooks, heartbeat) keeps writing its own row and passes no label —
 passing both would write two rows for one turn.

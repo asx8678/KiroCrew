@@ -462,6 +462,13 @@ class TurnDriver:
         transports. Injected by the caller with its own session key bound, so
         the driver stays channel-neutral. When omitted, directive markers are
         ignored exactly as before.
+    usage_surface:
+        USE-1. When set, :meth:`run` writes the turn's ONE usage row
+        (``llm_helpers.record_turn_usage``) under this surface label and
+        ``usage_session_key`` on every exit -- a completed turn, a raise, and a
+        cancellation (a caller's ``wait_for`` timeout or Stop). Empty leaves the
+        row to the caller, which is how a caller that persists its own (the Slack
+        gateway's monitor nudge) avoids a second row for the same turn.
     closing_gate:
         Optional synchronous gate invoked immediately before the provider stream
         starts. Callers use it to reject a lease that shutdown cannot
@@ -486,6 +493,8 @@ class TurnDriver:
         audit_agent: str = "kirocrew",
         closing_gate: Callable[[], None] | None = None,
         monitor_completion: MonitorCompletionHook | None = None,
+        usage_surface: str = "",
+        usage_session_key: str = "",
     ) -> None:
         self.provider = provider
         self.renderer = renderer
@@ -547,9 +556,32 @@ class TurnDriver:
         # prompt is registered. A driver built without one keeps the old ungated
         # behaviour, so a stand-in predating the parameter still works.
         self.closing_gate = closing_gate
+        self.usage_surface = usage_surface
+        self.usage_session_key = usage_session_key
 
     async def run(self, message: str) -> str:
-        """Drive one turn; return the accumulated channel-safe assistant text."""
+        """Drive one turn; return the accumulated channel-safe assistant text.
+
+        With ``usage_surface`` set, the turn's usage row is written in a
+        ``finally`` around the whole drive (USE-1); an unbilled turn -- one the
+        closing gate refused before any prompt -- writes nothing.
+        """
+        if not self.usage_surface:
+            return await self._drive(message)
+        # Function-local: llm_helpers' import chain is heavy, and the driver is
+        # imported on every channel's boot path.
+        from kiro_crew.llm_helpers import metered_turn
+
+        async with metered_turn(
+            self.provider,
+            surface=self.usage_surface,
+            slot_key=self.usage_session_key or self.audit_session_key,
+            agent=self.audit_agent,
+        ):
+            return await self._drive(message)
+
+    async def _drive(self, message: str) -> str:
+        """The turn itself; :meth:`run` wraps it with the usage row."""
         accumulated = ""
         self.empty_turn_notice = ""
         self.partial_text = ""

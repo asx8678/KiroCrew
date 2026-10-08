@@ -72,6 +72,7 @@ from kiro_crew.messaging.link import (
     channel_namespace_of,
     is_channel_session_key,
     split_dm_session_key,
+    telemetry_channel_of,
 )
 from kiro_crew.messaging.renderer import (
     DONE,
@@ -2230,12 +2231,19 @@ class ChannelTurns:
                     # for a generated turn is ``turn_ceiling.generated_turn``, set by
                     # the nudge dispatcher, and is not what this branch decides.
                     closing_gate: Callable[[], None] = _begin_monitor_turn
-                    driver_extra: dict[str, Any] = {"monitor_completion": monitor.hook}
+                    # USE-1: a monitor wake is monitor spend, as the Slack
+                    # gateway files its own wakes.
+                    driver_extra: dict[str, Any] = {
+                        "monitor_completion": monitor.hook,
+                        "usage_surface": "monitor",
+                    }
                 else:
                     closing_gate = turn_ceiling.gate(
                         session_key, lambda: sessions.begin_turn(session_key)
                     )
-                    driver_extra = {}
+                    # USE-1: a channel turn files under its transport (discord,
+                    # telegram, ...), the bounded label the telemetry uses.
+                    driver_extra = {"usage_surface": telemetry_channel_of(session_key)}
                 driver = TurnDriver(
                     provider,
                     retry_guard if retry_guard is not None else renderer,
@@ -2249,6 +2257,7 @@ class ChannelTurns:
                     audit_session_key=session_key,
                     audit_agent=agent or "kirocrew",
                     closing_gate=closing_gate,
+                    usage_session_key=session_key,
                     **driver_extra,
                 )
                 if replaying and retry_guard is not None:

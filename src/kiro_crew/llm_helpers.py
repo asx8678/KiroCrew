@@ -2217,6 +2217,41 @@ async def record_turn_usage(
     return usage
 
 
+@asynccontextmanager
+async def metered_turn(
+    provider: Any,
+    *,
+    surface: str,
+    slot_key: str = "",
+    agent: str = "",
+    app: str = "",
+) -> "AsyncIterator[None]":
+    """Write the ONE usage row for a turn a caller drives on *provider* itself.
+
+    USE-1: wrap the ``async for event in provider.stream(...)`` loop (or any other
+    direct drive) in this, and the row is written on every exit -- a completed
+    turn, a raise, a ``break``, and a cancellation -- through
+    :func:`record_turn_usage`. The stats object is pinned on entry so a turn that
+    never dispatched (and so left the previous turn's already-recorded stats in
+    place) writes nothing. Enter it AFTER acquiring the session, so the acquire
+    wait is not charged as turn time.
+    """
+    since = _billing_stats(provider)
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        await record_turn_usage(
+            provider,
+            surface=surface,
+            since=since,
+            slot_key=slot_key,
+            agent=agent,
+            app=app,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+
+
 def _billing_stat_holders(provider: Any) -> "list[Any]":
     """Objects that may carry ``last_prompt_stats``, nearest wrapper first.
 
