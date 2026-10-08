@@ -2919,6 +2919,7 @@ class ContextBuilder:
         blocks = _budgets.ContextParts()
         parts = blocks.parts
         append_required = blocks.append_required
+        _volatile_tail = ""
 
         essentials = _v2_essentials
         if essentials is None:
@@ -3008,22 +3009,16 @@ class ContextBuilder:
         # the user's local time instead of the gateway host's system TZ, which
         # is often UTC on Cloud Desktops and makes "today" ambiguous.
 
+        # Date, agent, and runtime are volatile. They are appended after the
+        # admitted prefix (CTX-4) so two new sessions share every byte up to
+        # that tail. The values are built here and joined after admission.
         _, tz = get_local_tz()
         now = datetime.now(tz)
-        append_required(f"[CURRENT DATE] {now.strftime('%A, %Y-%m-%d %H:%M %Z')}\n\n")
-
-        # Agent identity and runtime — inject for ALL agents so the LLM
-        # knows which agent it is and where it's running.  Without this,
-        # the LLM cannot distinguish dashboard from kiro-cli and may
-        # incorrectly tell the user to "go to the dashboard" when it IS
-        # the dashboard.
-        #
-        # Prefer the trusted per-turn source supplied by the dispatcher. The
-        # session-key fallback preserves callers that do not carry one.
         agent_label = agent or "kirocrew"
+        _volatile_tail = f"[CURRENT DATE] {now.strftime('%A, %Y-%m-%d %H:%M %Z')}\n\n"
         if session_key:
             runtime = _runtime_display_name(session_key, runtime_source)
-            append_required(_sections.runtime_identity_block(agent_label, runtime))
+            _volatile_tail += _sections.runtime_identity_block(agent_label, runtime)
 
         # Crew-member operating mode — injected only for a member's pinned DM
         # session (mode carries the slot's mode; "member" slots are born only
@@ -3368,6 +3363,8 @@ class ContextBuilder:
             is_custom,
             len(context),
         )
+        if _volatile_tail:
+            context = context + _volatile_tail
         _mark("finalize")
         _emit_context_section_timings(
             _marks,

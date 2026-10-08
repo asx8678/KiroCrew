@@ -1610,6 +1610,12 @@ class TestCurrentDateTimezone:
         date_line = [ln for ln in ctx.splitlines() if ln.startswith("[CURRENT DATE]")][0]
         assert "UTC" in date_line
 
+    def test_current_date_comes_after_the_stable_prefix(self, tmp_path):
+        builder = self._make_builder(tmp_path)
+        ctx = builder.build_session_context()
+        assert ctx.rfind("[CURRENT DATE]") > ctx.find("[CRITICAL RULES]")
+        assert ctx.rfind("[CURRENT DATE]") > ctx.find("[END") if "[END" in ctx else True
+
 
 class TestLoadSteeringResources:
     """Tests for _load_steering_resources."""

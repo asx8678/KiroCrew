@@ -195,10 +195,9 @@ class TestUserProfileSection:
         ctx = _builder(tmp_path).build_session_context(minimal_context=True)
         assert "[USER PROFILE]" not in ctx
 
-    def test_ordering_after_agent_identity(self, tmp_path):
-        """Block lands with identity context (after CURRENT DATE, before
-        workspace identity) so the model reads who it's talking to early."""
+    def test_profile_stays_in_the_stable_prefix(self, tmp_path):
+        """The profile is stable. Date and agent identity are the volatile tail."""
         _seed_profile("developer", "codes")
         ctx = _builder(tmp_path).build_session_context(session_key="dashboard:main")
-        assert ctx.index("[CURRENT AGENT]") < ctx.index("[USER PROFILE]")
         assert ctx.index("[USER PROFILE]") < ctx.index("[WORKSPACE IDENTITY]")
+        assert ctx.index("[USER PROFILE]") < ctx.index("[CURRENT DATE]")
