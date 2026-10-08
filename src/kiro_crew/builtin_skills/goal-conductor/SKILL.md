@@ -636,8 +636,9 @@ what the composer renders:
   `autonudge_stop`, `wait`, `resource_status`, `list_sessions`,
   `session_ledger_read`, `session_ledger_record`, `skill_search`, `skill_fetch`,
   `select_crew`, `send_message`, `send_notification`, `ask_question`. That covers
-  every core call this procedure asks you to make; **any other core tool is
-  mounted but prompts**, including `task_run`, `workflow_run` and the `spawn_*`
+  every core call this procedure asks you to make. Besides those, only
+  `monitor_inspect` is mounted (it prompts); **every other core tool is not
+  mounted at all**, including `task_run`, `workflow_run` and the `spawn_*`
   family, which this charter forbids you to route a work item to in the first
   place. **`session_send` and `session_stop` are deliberately NOT
   auto-approved**, because each writes to a session that is not yours: a seed

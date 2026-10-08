@@ -89,6 +89,6 @@ cancels the workflow run and resume starts a new one that appends to the same fi
 
 ## Scope and permissions
 
-Research Lab writes campaign state, findings, and reports in its campaign directory. Its `kirocrew-research` worker derives from the main Kiro Crew agent configuration rather than a research-only tool allowlist. Treat Research Lab as an orchestration feature, not a permission boundary; review the tools enabled for the generated agent before running an unattended campaign.
+Research Lab writes campaign state, findings, and reports in its campaign directory. Its `kirocrew-research` worker derives from the main Kiro Crew agent configuration rather than a research-only tool allowlist, except for Kiro Crew's own tools: it mounts only `autonudge_stop`, `spawn_run` and `spawn_status` from `@kirocrew-core`, and no `@kirocrew-cron`, since a research cycle calls nothing else of them. Treat Research Lab as an orchestration feature, not a permission boundary; review the tools enabled for the generated agent before running an unattended campaign.
 
 Actions surfaced by a campaign still require the normal tool-approval flow when the configured tool requires approval.

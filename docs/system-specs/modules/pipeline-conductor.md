@@ -53,9 +53,17 @@ into the kiro agents directory. It derives from `build_agent_config` and then
 narrows, and each narrowing is a permission decision:
 
 - **Tools:** `execute_bash`, `fs_read`, `web_fetch`, `session`, `report`,
-  `tool_search`, plus the `@kirocrew-core` and `@kirocrew-dashboard` servers.
-  Neither `fs_write` nor `code` is mounted, which is what makes "never does the
-  work" structural.
+  `tool_search`, plus `@kirocrew-core` and `@kirocrew-dashboard` verbs mounted
+  BY NAME, never a server whole (SPEC-1): the auto-approved grants, and the
+  verbs the prompt tells the conductor to call that prompt for approval
+  (`monitor_inspect`, `spawn_run` for the bounded inspector, `session_send`,
+  `session_stop`, `session_close`; `conductor_agents._FLEET_CONDUCTOR_PROMPTED_VERBS`).
+  A verb the prompt names only to forbid (`spawn_sub_agents`, `workflow_run`,
+  `task_run`) is not mounted. Every request resends each mounted tool's
+  definition, so the narrowing cut ~141 KB of them to ~30 KB. Neither `fs_write`
+  nor `code` is mounted, which is what makes "never does the work" structural.
+  On a mirrored harness a per-verb ref still mounts its whole server
+  ([agent-spec-fields](../../../src/kiro_crew/docs/agent-spec-fields.md)).
 - **`allowedTools` is verb by verb, never a whole server.** The conductor ingests
   untrusted content by design (issue text, PR bodies) on unattended cycles, so a
   server-wide grant would let that content start persistent work or spawn

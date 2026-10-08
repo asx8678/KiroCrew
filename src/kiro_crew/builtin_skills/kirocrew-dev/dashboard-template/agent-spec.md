@@ -6,7 +6,10 @@ tools:
   - fs_read
   - fs_write
   - tool_search
-  - "@kirocrew-core"
+  - "@kirocrew-core/skill_search"
+  - "@kirocrew-core/skill_discover"
+  - "@kirocrew-core/memory_recall"
+  - "@kirocrew-core/resource_status"
 allowedTools:
   - fs_read
   - tool_search
@@ -103,6 +106,10 @@ cannot be called.
   four files, drive the scaffold, the type checker, the tests, `git` and `gh`.
 - `tool_search` is load-bearing rather than decoration. With MCP tool search active the
   core specs are deferred, so the grants below are unreachable until they are loaded by id.
+- Four `@kirocrew-core` verbs, mounted by name rather than the whole server: the skill
+  reads and memory recall this charter names, and the resource check before a test run.
+  Every request resends each mounted tool's definition, so the other core tools would be
+  paid on every turn for calls this charter forbids or never makes.
 - No `session` verb. This agent authors one template; it dispatches nobody, and a session
   verb is how an authoring agent grows into a conductor by accident.
 - No work-ledger mount and no `work_report`. It is not a dispatched worker reporting

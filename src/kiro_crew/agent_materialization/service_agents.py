@@ -109,6 +109,17 @@ def _install_knowledge_agent() -> None:
     agent_mod.logger.info("Installed knowledge agent config: %s (model=%s)", path, model)
 
 
+#: The managed servers ``kirocrew-research`` mounts per verb instead of whole.
+_RESEARCH_NARROWED_SERVERS = ("@kirocrew-core", "@kirocrew-cron")
+
+#: The Kiro Crew verbs a research cycle calls (see ``_install_research_agent``).
+_RESEARCH_CREW_VERBS: tuple[str, ...] = (
+    "@kirocrew-core/autonudge_stop",
+    "@kirocrew-core/spawn_run",
+    "@kirocrew-core/spawn_status",
+)
+
+
 def _install_research_agent() -> None:
     """Generate and install the kirocrew-research agent config.
 
@@ -123,6 +134,26 @@ def _install_research_agent() -> None:
         "in a Research Lab campaign loop."
     )
     config["prompt"] = agent_mod._RESEARCH_SYSTEM_PROMPT
+    # SPEC-1: mount only the Kiro Crew verbs a research cycle is told to call, not
+    # the default's whole ``@kirocrew-core`` + ``@kirocrew-cron`` (~70 KB of tool
+    # definitions resent on every cycle). The campaign brief
+    # (``auto_research/campaign/publication.py``) ends a run with ``autonudge_stop``
+    # and fans sub-questions out with ``spawn_run``; ``spawn_status`` reads a child's
+    # transcript, which its completion event points at. The research prompt itself
+    # names no Kiro Crew tool. Builtins and any non-Crew server stay as derived.
+    config["tools"] = [
+        t
+        for t in config.get("tools", [])
+        if not (isinstance(t, str) and t.split("/", 1)[0] in _RESEARCH_NARROWED_SERVERS)
+    ] + list(_RESEARCH_CREW_VERBS)
+    config["allowedTools"] = [
+        t
+        for t in config.get("allowedTools", [])
+        if not (isinstance(t, str) and t.split("/", 1)[0] == "@kirocrew-cron")
+    ]
+    mcp = config.get("mcpServers")
+    if isinstance(mcp, dict):
+        mcp.pop("kirocrew-cron", None)
     agent_mod.kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
     path = agent_mod.kiro_agents_dir_path() / _RESEARCH_AGENT_FILENAME
     agent_mod._atomic_json_write(path, config)
