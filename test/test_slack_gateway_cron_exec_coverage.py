@@ -1152,7 +1152,43 @@ class TestDeliverScriptResult:
                 assert await cb(job) == "green again"
         spawn.assert_called_once()
         assert slot.append.call_args[0][0] == "inject"
+        assert slot.append.call_args[0][1].startswith('[Cron notification from "')
         assert slot.task is turn
+
+    @pytest.mark.asyncio
+    async def test_identical_reports_wake_once(self):
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        slot = _mock_slot(running=False)
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        job = _job(script="probes.py:check", session_key="dashboard:chat-1-2")
+        result = {"status": "report", "message": "still red"}
+        spawn = MagicMock(return_value=MagicMock())
+        with (
+            patch.object(gw, "spawn_guarded_turn", spawn),
+            patch.object(gw, "_run_chat", MagicMock(return_value=MagicMock())),
+        ):
+            async with _cron_cb(orch, script_result=result) as cb:
+                for _ in range(10):
+                    await cb(job)
+        assert spawn.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_long_report_is_capped(self):
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        slot = _mock_slot(running=False)
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        job = _job(script="probes.py:check", session_key="dashboard:chat-1-2")
+        result = {"status": "report", "message": "x" * 228_890}
+        with (
+            patch.object(gw, "spawn_guarded_turn", MagicMock(return_value=MagicMock())),
+            patch.object(gw, "_run_chat", MagicMock(return_value=MagicMock())),
+        ):
+            async with _cron_cb(orch, script_result=result) as cb:
+                await cb(job)
+        body = slot.append.call_args[0][1]
+        assert len(body) <= 5000 + 200
 
     @pytest.mark.asyncio
     async def test_report_falls_back_to_notification_when_no_slot(self):

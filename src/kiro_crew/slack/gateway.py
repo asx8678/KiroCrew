@@ -183,6 +183,8 @@ from kiro_crew.dashboard.stale_asset_watchdog import (
     shutdown_exit_code,
 )
 from kiro_crew.dashboard.state import (
+    CRON_NOTIFY_END,
+    CRON_NOTIFY_PREFIX,
     SUBAGENT_BATCH_COMPLETION_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
     SUBAGENT_SYNTHESIS_INLINE_SUFFIX,
@@ -3087,7 +3089,25 @@ class GatewayOrchestrator:
             """Deliver a script cron result to the originating session. Optionally remove the job."""
             delivered = False
             try:
-                if message and not job.silent and self.dashboard_state and job.session_key:
+                if message:
+                    message = message[:5000]
+                rh = _result_hash(message) if message else ""
+                duplicate = bool(
+                    message
+                    and rh == job.last_posted_hash
+                    and time.time() - job.last_posted_at < _SUCCESS_REMINDER_SECS
+                )
+                if duplicate:
+                    job.consecutive_dupes += 1
+                    if self.dashboard_state and not job.silent:
+                        self.dashboard_state.notify(
+                            "cron",
+                            f"Cron: {redact(job.name)} (repeat)",
+                            message,
+                            meta={"job_id": job.id},
+                        )
+                    delivered = True
+                elif message and not job.silent and self.dashboard_state and job.session_key:
                     slot_key = job.session_key.removeprefix("dashboard:")
                     slot = self.dashboard_state.get_slot(slot_key)
                     if slot is None:
@@ -3099,7 +3119,7 @@ class GatewayOrchestrator:
                         )
                     label = redact(job.name)
                     if slot:
-                        wrapped = f'[Cron notification: "{label}"]\n{message}\n[/Cron notification]'
+                        wrapped = f'{CRON_NOTIFY_PREFIX}"{label}"]\n{message}\n{CRON_NOTIFY_END}'
                         inject_cls = json.dumps({"cronLabel": label})
                         if slot.running:
                             qid = slot.queue_append(wrapped, kind=CRON_NOTIFICATION_KIND)
@@ -3133,6 +3153,7 @@ class GatewayOrchestrator:
                             )
                             slot.task = task
                         self.dashboard_state.push_slots_update()
+                        self._record_cron_delivery(job, rh)
                     else:
                         self.dashboard_state.notify(
                             "cron", f"⚡ {label}", message, meta={"job_id": job.id}

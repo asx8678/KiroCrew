@@ -25,6 +25,10 @@ was reachable. `dashboard/handlers/messaging.py` wraps the text:
 [End of cron notification]
 ```
 
+A script cron `Report` or `Done` uses the same wrapper, capped at 5,000
+characters. An identical report inside the success-reminder window is a bell,
+not another model turn.
+
 - Prefix `CRON_NOTIFY_PREFIX = '[Cron notification from '`, terminator
   `CRON_NOTIFY_END = '[End of cron notification]'`. The job label sits between a
   literal `"` pair and the closing `]`; `CRON_NOTIFY_RE` extracts it, falling back
