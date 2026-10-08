@@ -164,6 +164,25 @@ def _runs_as_step(
     )
 
 
+def _step_spec_on_disk(run_id: str) -> bool:
+    """Whether the step spec exists; WARNING and keep the default when it does not.
+
+    A spawn onto a mode kiro-cli does not have fails every turn, so a missing
+    ``kirocrew-step.json`` (its install failed and was logged) leaves the run on
+    the inherited default agent rather than on a dead mode. Blocking; off-loop.
+    """
+    from kiro_crew.agent_materialization.service_agents import step_spec_present
+
+    if step_spec_present():
+        return True
+    _logging.getLogger(__name__).warning(
+        "subagent %s: %s spec missing; running on the inherited default agent",
+        run_id,
+        STEP_AGENT,
+    )
+    return False
+
+
 #: Delayed re-reads armed, one after another, while the store cannot answer the
 #: queue depth; the last one that still fails says so at WARNING.
 _QUEUE_DEPTH_RETRIES = 3
@@ -2159,7 +2178,13 @@ class RunEventCoordinator(ManagerComponent):
             if error:
                 info.error_code = code
                 raise RuntimeError(error)
-        if _runs_as_step(info, kind, agent, member_bound=execution.member_id is not None):
+        # Local import: run.py's ``*_impl`` bodies resolve globals through
+        # ``kiro_crew.subagent``, which does not export these names.
+        from kiro_crew.subagent_manager.run import STEP_AGENT, _runs_as_step, _step_spec_on_disk
+
+        if _runs_as_step(
+            info, kind, agent, member_bound=execution.member_id is not None
+        ) and await asyncio.to_thread(_step_spec_on_disk, info.id):
             # CTX-7: an unnamed spawn of a default-contract parent runs as the
             # slim step agent, and records it as its durable template so a
             # ``spawn_continue`` resumes it as the step too (a run started before

@@ -3779,11 +3779,18 @@ def rebuild_agent_config(
     except Exception:
         logger.debug("kirocrew-research agent install failed", exc_info=True)
 
-    # Install kirocrew-step agent (unnamed subagent spawns and workflow steps)
+    # Install kirocrew-step agent (unnamed subagent spawns and workflow steps).
+    # WARNING, not debug: those paths fall back to the inherited default agent
+    # when the spec is absent (``step_spec_present``), and this line is the only
+    # record of why they did.
     try:
         service_agents._install_step_agent()
     except Exception:
-        logger.debug("kirocrew-step agent install failed", exc_info=True)
+        logger.warning(
+            "kirocrew-step agent install failed; unnamed subagent spawns and workflow "
+            "steps keep running on the default agent",
+            exc_info=True,
+        )
 
     # Install kirocrew-heartbeat agent (used by HeartbeatService for unattended polling)
     try:

@@ -266,8 +266,9 @@ def schemas() -> list[dict[str, Any]]:
         "include_memory": {
             "type": "boolean",
             "description": (
-                "Default FALSE for a sub-agent spawned with no `agent` (it runs as the "
-                "slim kirocrew-step agent), true when you name an `agent` or `crew`. "
+                "Default FALSE for a sub-agent spawned with no `agent` (`agent_or_mode` "
+                "in spawn_sub_agents), which runs as the slim kirocrew-step agent; "
+                "true when you name an `agent` or `crew`. "
                 "Leave it off when the task is FULLY specified by the text you wrote — "
                 "read these files, run this command, validate this finding, summarize "
                 "this log. This is the normal case for parallel fan-out. If the "

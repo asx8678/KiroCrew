@@ -74,6 +74,26 @@ logger = logging.getLogger(__name__)
 #: step spec, not the default agent's full contract and tool set.
 WORKFLOW_STEP_AGENT = "kirocrew-step"
 
+
+def _workflow_step_agent(run_id: str) -> Optional[str]:
+    """The run's default step agent: the step spec, or ``None`` (the default
+    agent) when ``kirocrew-step.json`` is missing -- a step dispatched onto a mode
+    kiro-cli does not have fails every call. One local ``stat`` per run start,
+    taken once here rather than per step so the pooled fan-out's scheduling (no
+    ``await`` before the pool, see ``vet_step_spawn``) is unchanged.
+    """
+    from kiro_crew.agent_materialization.service_agents import step_spec_present
+
+    if step_spec_present():
+        return WORKFLOW_STEP_AGENT
+    logger.warning(
+        "workflow %s: %s spec missing; unnamed steps run on the default agent",
+        run_id,
+        WORKFLOW_STEP_AGENT,
+    )
+    return None
+
+
 # Bounded attempts to coax a valid script out of the model (mirrors schema retry).
 _AUTHOR_RETRIES = 2
 # A failed run's error is stored and served verbatim (runner joins ``errors``),
@@ -788,6 +808,7 @@ class WorkflowService:
         # admission gate threads. It rides the run's execution context; a run
         # with no app carries "", which is what a non-app spawn passes.
         app = getattr(getattr(memory_scope, "execution_context", None), "app", "") or ""
+        step_agent = _workflow_step_agent(run_id)
         agent_fn: Optional[Callable[[str, dict], Any]] = None
         pool: Any = None
         if self._pool_agents:
@@ -798,7 +819,7 @@ class WorkflowService:
                 agent_fn, pool = build_pooled_agent_fn(
                     self._sessions,
                     run_id=run_id,
-                    default_agent=WORKFLOW_STEP_AGENT,
+                    default_agent=step_agent,
                     max_workers=workers,
                     max_starting=min(workers, 2),
                     memory_scope=memory_scope,
@@ -819,7 +840,7 @@ class WorkflowService:
             agent_fn = build_agent_fn(
                 self._sessions,
                 run_id=run_id,
-                default_agent=WORKFLOW_STEP_AGENT,
+                default_agent=step_agent,
                 memory_scope=memory_scope,
                 context_builder=self._context_builder,
                 session_key=session_key,
