@@ -86,15 +86,13 @@ def schemas() -> list[dict[str, Any]]:
                 "durable. The tool rejects recognized runtime identity assertions "
                 "and model-selection imperatives whose selected object is a "
                 "concrete model ID at the end of its clause in the rule or negative "
-                "clause. Clause endings are the field end, a newline, punctuation, or "
-                "the documented closed connector class. A following plain noun makes "
-                "the ID a durable tooling qualifier. "
+                "clause. "
                 "The check covers only the registry families pinned by the trusted review "
                 "workflow; other backend IDs are not lesson-refused. A model version "
-                "mentioned by itself is allowed. Free-form wording remains a best-effort "
-                "check. Future phrasing misses are handled by this instruction, not new "
-                "regex branches, so do not disguise either refused class. Include "
-                "both the rule (what to do) and negative (what not to do)."
+                "mentioned by itself is allowed. Future phrasing misses are handled by "
+                "this instruction, not new regex branches, so do not disguise either "
+                "refused class. Include both the rule (what to do) and negative (what not "
+                "to do)."
             ),
             "inputSchema": {
                 "type": "object",

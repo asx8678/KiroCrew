@@ -266,22 +266,15 @@ def schemas() -> list[dict[str, Any]]:
         "include_memory": {
             "type": "boolean",
             "description": (
-                "Default true. Set false when the task is FULLY specified by the text "
-                "you wrote — read these files, run this command, validate this finding, "
-                "summarize this log. This is the normal case for parallel fan-out. If "
-                "the sub-agent needs one fact from your memory, put that fact in the "
-                "task text instead of turning this back on. Keep true when the task is "
-                "open-ended about the user's own work or history."
+                "Default true. Set false for a fully specified task; put any fact it "
+                "needs in the task text. See Subagent Orchestration."
             ),
         },
         "include_lessons": {
             "type": "boolean",
             "description": (
-                "Default true. Set false ONLY when the sub-agent purely reads and "
-                "reports (search, summarize, analyze, review). Keep true whenever it "
-                "writes code, edits files, runs git, or pushes — the user's learned "
-                "corrections live here and a sub-agent without them repeats mistakes "
-                "the user already corrected."
+                "Default true. Set false only for a read-only task; keep true when it "
+                "writes, runs git or pushes."
             ),
         },
         "include_project": {
@@ -301,8 +294,7 @@ def schemas() -> list[dict[str, Any]]:
                 "as [Subagent completion event] messages. "
                 "Use 'tasks' for parallel work."
                 + _cap_hint
-                + " Validate results before declaring done, follow the returned parent-work"
-                " boundary, and do not spawn again while a previous batch is arriving."
+                + " Validate results before declaring done."
             ),
             "inputSchema": {
                 "type": "object",
