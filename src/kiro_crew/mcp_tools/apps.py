@@ -17,6 +17,7 @@ every existing patch site.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
@@ -31,6 +32,59 @@ from kiro_crew.validation import (
     OPS_MISSION_CONTROL_ALLOWED_CALLS,
     sanitize_json_values,
 )
+
+logger = logging.getLogger(__name__)
+
+#: The app each tool belongs to, by its installed name. A tool is advertised
+#: only while that app is installed AND enabled (TOOL-2): the eight descriptors
+#: cost ~11 KB of every request's tool definitions, and without the app every
+#: one of them can only answer that the app is missing.
+APP_OF_TOOL: dict[str, str] = {
+    "issue_radar_record_investigation": "issue-radar",
+    "issue_radar_crew_read": "issue-radar",
+    "issue_radar_crew_record": "issue-radar",
+    "ops_mission_control_api": "ops-mission-control",
+    "pod_up": "dev-fleet",
+    "pod_down": "dev-fleet",
+    "pod_status": "dev-fleet",
+    "pod_ls": "dev-fleet",
+}
+
+
+def _app_enabled(app: str) -> bool:
+    """Whether *app* is installed and enabled; an unreadable answer reads as no.
+
+    Function-local import: the apps manager pulls in the app graph, which this
+    descriptor module must not load at import time. Closed on failure because
+    the cost of the wrong answer is one tool missing until the next session,
+    while the open answer would advertise tools that cannot work.
+    """
+    try:
+        from kiro_crew.apps.manager import is_app_enabled
+
+        return bool(is_app_enabled(app))
+    except Exception:
+        logger.debug("app enablement unreadable for %s; withholding its tools", app, exc_info=True)
+        return False
+
+
+def advertised_schemas() -> list[dict[str, Any]]:
+    """:func:`schemas` minus the tools whose app is not installed and enabled.
+
+    ``build_tool_list`` advertises from here, while ``schemas()`` stays the full
+    declaration ``HANDLERS`` is checked against. Read on every build, like the
+    rest of the descriptors, so a session opened after the app is enabled sees
+    its tools; an already-open session keeps the list kiro-cli cached for it.
+    """
+    verdicts: dict[str, bool] = {}
+    out: list[dict[str, Any]] = []
+    for spec in schemas():
+        app = APP_OF_TOOL[spec["name"]]
+        if app not in verdicts:
+            verdicts[app] = _app_enabled(app)
+        if verdicts[app]:
+            out.append(spec)
+    return out
 
 
 def schemas() -> list[dict[str, Any]]:

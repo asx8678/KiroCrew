@@ -281,222 +281,68 @@ def schemas() -> list[dict[str, Any]]:
             },
         },
         {
-            "name": "artifact_get_comments",
+            "name": "artifact_comment",
             "description": (
-                "Get all comments on an artifact (local + provider-synced). "
-                "Use to read feedback, review comments, or discussion threads "
-                "on an artifact before addressing them. Pass "
-                "exclude_resolved=true to skip threads that are already "
-                "resolved, so a mid-review read does not hand you back feedback "
-                "you have addressed."
+                "Work an artifact's comment threads (local + provider-synced), one action "
+                "per call: list (exclude_resolved skips resolved threads), post (scope "
+                "private or shared; agent comments are flagged and audited), reply, "
+                "mark_review (addressed, awaiting a human: you may NEVER resolve) and "
+                "delete (only a thread you demonstrably applied, with a reason; "
+                "provider-synced ones are refused, mark those REVIEW). The `artifacts` "
+                "skill says which to use when."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "slug": {
-                        "type": "string",
-                        "description": "Artifact slug to get comments for.",
-                    },
-                    "exclude_resolved": {
-                        "type": "boolean",
-                        "description": "Omit threads whose root is resolved (default false).",
-                    },
-                },
-                "required": ["slug"],
-            },
-        },
-        {
-            "name": "artifact_post_comment",
-            "description": (
-                "Post a comment on an artifact. Agent comments are flagged "
-                "(is_agent) and SEL-audited. Use scope='shared' to sync to the "
-                "provider."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "slug": {
-                        "type": "string",
-                        "description": "Artifact slug.",
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "Comment body text.",
-                    },
-                    "scope": {
-                        "type": "string",
-                        "description": "private (local only) or shared (syncs to provider).",
-                    },
-                },
-                "required": ["slug", "text"],
-            },
-        },
-        {
-            "name": "artifact_reply_comment",
-            "description": (
-                "Reply to an existing comment thread on an artifact. "
-                "If the parent is provider-origin, the reply posts back."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "slug": {
-                        "type": "string",
-                        "description": "Artifact slug.",
-                    },
-                    "parent_id": {
-                        "type": "string",
-                        "description": "ID of the comment to reply to.",
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "Reply body text.",
-                    },
-                },
-                "required": ["slug", "parent_id", "text"],
-            },
-        },
-        {
-            "name": "artifact_mark_review",
-            "description": (
-                "Advance a comment thread to REVIEW status, signaling "
-                "the issue is addressed and awaiting human verification. "
-                "Agent can mark_review but NEVER resolve."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "slug": {
-                        "type": "string",
-                        "description": "Artifact slug.",
-                    },
+                    "action": {"type": "string", "enum": list(_COMMENT_ACTIONS)},
+                    "slug": {"type": "string", "description": "Artifact slug."},
+                    "exclude_resolved": {"type": "boolean", "description": "list only."},
+                    "text": {"type": "string", "description": "post / reply: body text."},
+                    "scope": {"type": "string", "description": "post: private or shared."},
+                    "parent_id": {"type": "string", "description": "reply: comment to reply to."},
                     "comment_id": {
                         "type": "string",
-                        "description": "ID of the root comment to advance.",
-                    },
-                },
-                "required": ["slug", "comment_id"],
-            },
-        },
-        {
-            "name": "artifact_delete_comment",
-            "description": (
-                "Delete a comment thread you have demonstrably applied — an "
-                "unambiguous directive ('delete this', 'fix typo') that was "
-                "fully executed. Root deletes cascade to replies. For "
-                "judgment calls the human may want to verify, use "
-                "artifact_mark_review instead. Provider-synced comments "
-                "cannot be deleted by agents (the tool refuses) — mark those "
-                "REVIEW. Deletion is SEL-audited and recorded in the "
-                "artifact's activity feed with your reason."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "slug": {
-                        "type": "string",
-                        "description": "Artifact slug.",
-                    },
-                    "comment_id": {
-                        "type": "string",
-                        "description": "ID of the comment to delete (root deletes its replies too).",
+                        "description": "mark_review / delete: root comment id.",
                     },
                     "reason": {
                         "type": "string",
-                        "description": (
-                            "One-line justification recorded in the audit log and "
-                            "activity feed, e.g. 'applied in v12: deleted the "
-                            "flagged paragraph'."
-                        ),
+                        "description": "delete: one-line justification, recorded in the audit log.",
                     },
                 },
-                "required": ["slug", "comment_id", "reason"],
+                "required": ["action", "slug"],
             },
         },
         {
-            "name": "artifact_folder_list",
+            "name": "artifact_folder",
             "description": (
-                "List the artifact-library folder tree. Returns each folder's id, "
-                "name, parent_id, human path, and direct item_count. Use to "
-                "discover folder ids/paths before moving or organizing artifacts."
-            ),
-            "inputSchema": {"type": "object", "properties": {}},
-        },
-        {
-            "name": "artifact_folder_create",
-            "description": (
-                "Create an artifact-library folder. ``parent`` accepts a folder id "
-                "OR a '/'-separated human path; missing segments are auto-created "
-                "(mkdir -p). Omit ``parent`` (or pass 'root') to create at the top "
-                "level. Returns the new folder id and canonical path."
+                "Manage the artifact-library folder tree, one action per call: list "
+                "(ids, paths, item counts), create (name under parent; missing path "
+                "segments are created), rename, move (reparent; cycle-guarded) and "
+                "delete. `folder`, `parent` and `new_parent` take an id or a '/' path; "
+                "omit a parent or pass 'root' for the top level. delete is SAFE by "
+                "default (children move up); delete_contents=true permanently deletes "
+                "the subtree with every artifact in it: state the count and get consent."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Folder name (max 100 chars)."},
-                    "parent": {
+                    "action": {"type": "string", "enum": list(_FOLDER_ACTIONS)},
+                    "folder": {
                         "type": "string",
-                        "description": "Parent folder id or human path. Omit / 'root' for top level.",
+                        "description": "rename / move / delete: the folder.",
                     },
-                },
-                "required": ["name"],
-            },
-        },
-        {
-            "name": "artifact_folder_rename",
-            "description": "Rename an artifact-library folder. ``folder`` = folder id or human path.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "folder": {"type": "string", "description": "Folder id or human path."},
-                    "name": {"type": "string", "description": "New name (max 100 chars)."},
-                },
-                "required": ["folder", "name"],
-            },
-        },
-        {
-            "name": "artifact_folder_move",
-            "description": (
-                "Reparent an artifact-library folder (nest it under another, or move "
-                "to the top level). Cycle-guarded — a folder cannot become its own "
-                "descendant. ``folder`` and ``new_parent`` are each a folder id or "
-                "human path; omit ``new_parent`` (or pass 'root') to move to top level."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "folder": {"type": "string", "description": "Folder to move (id or path)."},
-                    "new_parent": {
+                    "name": {
                         "type": "string",
-                        "description": "Destination parent folder (id or path). Omit / 'root' for top level.",
+                        "description": "create / rename: name (max 100 chars).",
                     },
-                },
-                "required": ["folder"],
-            },
-        },
-        {
-            "name": "artifact_folder_delete",
-            "description": (
-                "Delete an artifact-library folder. By default (delete_contents=false) "
-                "this is SAFE: the folder's direct child folders and artifacts are "
-                "re-parented up to the folder's parent, and only the folder itself is "
-                "removed. Pass delete_contents=true to permanently delete the entire "
-                "subtree, INCLUDING every descendant artifact — echo the affected "
-                "count to the user before doing so. ``folder`` = folder id or human path."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "folder": {"type": "string", "description": "Folder id or human path."},
+                    "parent": {"type": "string", "description": "create: parent folder."},
+                    "new_parent": {"type": "string", "description": "move: destination parent."},
                     "delete_contents": {
                         "type": "boolean",
-                        "description": (
-                            "false (default) = keep artifacts, re-parent to the folder's "
-                            "parent. true = permanently delete the whole subtree."
-                        ),
+                        "description": "delete: true removes the whole subtree permanently.",
                     },
                 },
-                "required": ["folder"],
+                "required": ["action"],
             },
         },
         {
@@ -1268,6 +1114,56 @@ def deploy_artifact(name: str, args: dict[str, Any]) -> str:
     )
 
 
+#: ``artifact_comment``'s actions, each the verb it used to be its own tool for.
+#: The verb's handler -- and the per-verb schema it validates against -- is
+#: unchanged; only the advertisement collapsed (TOOL-2), so the ten former tools
+#: cost two descriptors of every request instead of ten.
+_COMMENT_ACTIONS: dict[str, tuple[str, Callable[[str, dict[str, Any]], str]]] = {
+    "list": ("artifact_get_comments", artifact_get_comments),
+    "post": ("artifact_post_comment", artifact_post_comment),
+    "reply": ("artifact_reply_comment", artifact_reply_comment),
+    "mark_review": ("artifact_mark_review", artifact_mark_review),
+    "delete": ("artifact_delete_comment", artifact_delete_comment),
+}
+
+#: ``artifact_folder``'s actions, on the same terms as ``_COMMENT_ACTIONS``.
+_FOLDER_ACTIONS: dict[str, tuple[str, Callable[[str, dict[str, Any]], str]]] = {
+    "list": ("artifact_folder_list", artifact_folder_list),
+    "create": ("artifact_folder_create", artifact_folder_create),
+    "rename": ("artifact_folder_rename", artifact_folder_rename),
+    "move": ("artifact_folder_move", artifact_folder_move),
+    "delete": ("artifact_folder_delete", artifact_folder_delete),
+}
+
+
+def _route_action(
+    tool: str,
+    actions: dict[str, tuple[str, Callable[[str, dict[str, Any]], str]]],
+    args: dict[str, Any],
+) -> str:
+    """Run the verb ``args["action"]`` names, with the remaining arguments.
+
+    ``action`` is removed before the verb's handler validates, so each verb is
+    held to exactly the schema it had as a tool of its own: a field another
+    action takes is an unknown field there, and refused, not ignored.
+    """
+    rest = dict(args)
+    action = rest.pop("action", None)
+    entry = actions.get(action) if isinstance(action, str) else None
+    if entry is None:
+        return f"Error: {tool} needs action, one of: {', '.join(actions)}"
+    verb, handler = entry
+    return handler(verb, rest)
+
+
+def artifact_comment(name: str, args: dict[str, Any]) -> str:
+    return _route_action(name, _COMMENT_ACTIONS, args)
+
+
+def artifact_folder(name: str, args: dict[str, Any]) -> str:
+    return _route_action(name, _FOLDER_ACTIONS, args)
+
+
 HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "artifact_save": artifact_save,
     "artifact_get": artifact_get,
@@ -1276,16 +1172,8 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "artifact_list": artifact_list,
     "artifact_versions": artifact_versions,
     "artifact_delete": artifact_delete,
-    "artifact_get_comments": artifact_get_comments,
-    "artifact_post_comment": artifact_post_comment,
-    "artifact_reply_comment": artifact_reply_comment,
-    "artifact_mark_review": artifact_mark_review,
-    "artifact_delete_comment": artifact_delete_comment,
-    "artifact_folder_list": artifact_folder_list,
-    "artifact_folder_create": artifact_folder_create,
-    "artifact_folder_rename": artifact_folder_rename,
-    "artifact_folder_move": artifact_folder_move,
-    "artifact_folder_delete": artifact_folder_delete,
+    "artifact_comment": artifact_comment,
+    "artifact_folder": artifact_folder,
     "artifact_move": artifact_move,
     "deploy_artifact": deploy_artifact,
 }

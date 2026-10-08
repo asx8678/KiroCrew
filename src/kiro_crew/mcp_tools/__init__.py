@@ -52,7 +52,10 @@ def build_tool_list() -> list[dict[str, Any]]:
         # to the top would close that loop and turn it into an import-time
         # failure on the gateway boot path. The laziness is load-bearing.
         module = importlib.import_module(f"{__name__}.{name}")
-        tools.extend(module.schemas())
+        # A domain may advertise a subset of what it declares: ``apps`` withholds
+        # a tool whose app is not installed and enabled (``advertised_schemas``).
+        advertise = getattr(module, "advertised_schemas", None) or module.schemas
+        tools.extend(advertise())
     return tools
 
 

@@ -1259,7 +1259,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
       `Companion chat for artifact \`${artifact.slug}\` ("${artifact.name}", kind=${artifact.kind}, ` +
       `v${artifact.version}, source_path=${artifact.source_path || 'none'}, ` +
       `${commentCount} open comment${commentCount === 1 ? '' : 's'}).\n` +
-      `Use artifact_get / artifact_update / artifact_get_comments with this slug. ` +
+      `Use artifact_get / artifact_update / artifact_comment(action="list") with this slug. ` +
       `Anchored comments carry the exact quoted span they refer to — treat each as ` +
       `an instruction about that span, and triage every one you act on.`
     )
@@ -1998,7 +1998,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
                     "discuss with agent" action for all kinds; for widgets it is
                     the only way to ask the agent to change the artifact.
                     Comments are durable and read by the agent via
-                    artifact_get_comments. Works in popout windows too — the
+                    artifact_comment(action="list"). Works in popout windows too — the
                     popout has its own store + WS. */}
                 <button
                   type="button"

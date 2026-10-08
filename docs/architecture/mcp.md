@@ -150,6 +150,33 @@ explicitly granted entry is refreshed on every rebuild by
 `kirocrew` binary, strips stale remote-transport fields (`url`, `headers`) left by
 older builds, and re-pins `env.KIROCREW_HOME` to the home the gateway is actually
 running under while preserving the user's own env keys.
+
+**What the always-on pair costs.** Every request resends the definitions of every
+tool a session mounts, so the two always-on servers are kept to what the default
+prompt and default skills name. Three measures hold the default spec's Kiro Crew
+tool definitions to 69,151 B of compact JSON (from 121,370 B; measured over
+`build_agent_config()` in an empty home):
+
+- **App tools are advertised only with their app.** `mcp_tools/apps.py` declares
+  the Issue Radar, Ops Mission Control and Dev Fleet tools, and
+  `advertised_schemas()` withholds each one unless `apps.manager.is_app_enabled`
+  says its app (`APP_OF_TOOL`) is installed and enabled; an unreadable answer
+  withholds. `build_tool_list` advertises from it, so the spec that mounts
+  `@kirocrew-core` needs no change when an app is turned on. A session opened
+  before the app was enabled keeps the list kiro-cli cached for it.
+- **Artifact comments and folders are two action-enum tools**, `artifact_comment`
+  and `artifact_folder`, not ten; each action runs its old handler against its old
+  schema ([artifacts](../system-specs/modules/artifacts.md)).
+- **Descriptions are short** (the new-tool checklist below), with how-to in skills.
+
+`kirocrew-cron` stays always-on: the default prompt names its verbs (`cron_add`,
+`cron_update`, `cron_trigger`, …) and scheduling is a default capability, so making
+it opt-in would leave the prompt promising tools a default session does not have.
+The ~40,000 B target is not reachable without that: the verbs `config/prompt.md`
+names come to ~60 KB on their own, most of it argument schema rather than prose.
+Lowering `tool_search_min_tokens` so these defer on a 1M window is a separate,
+unvalidated follow-up (#16059).
+
 User customizations are preserved, `autoApprove` included: a list the owner wrote
 by hand is a deliberate statement about their own tools and survives the refresh,
 which is what `mcp.honour_auto_approve` (on by default) decides. It is worth

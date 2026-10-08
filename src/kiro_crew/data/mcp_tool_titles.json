@@ -47,6 +47,8 @@
     "artifact_list": "List artifacts",
     "artifact_versions": "List artifact versions",
     "artifact_delete": "Delete artifact",
+    "artifact_comment": "Artifact comments",
+    "artifact_folder": "Artifact folders",
     "artifact_get_comments": "Read artifact comments",
     "artifact_post_comment": "Comment on artifact",
     "artifact_reply_comment": "Reply to artifact comment",
