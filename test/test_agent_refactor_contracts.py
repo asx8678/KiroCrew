@@ -61,7 +61,6 @@ BASE_SURFACE: dict[str, str] = {
     "REQUIRED_KIRO_AGENT_FILES": "value tuple d3a5d201c05d5c9b",
     "SecurityEvent": "class SecurityEvent",
     "_AppOwnership": "class _AppOwnership fields=owned,fully_read",
-    "_BACKGROUND_CC_MODEL": "value str e5710d6b1810296f",
     "_BUNDLED_CFG_DIR": "value host",
     "_CC_MCP_JSON": "value host",
     "_CONDUCTOR_AGENT_FILENAME": "value str 923f5ca0627d569f",
@@ -872,7 +871,7 @@ def test_the_lite_spec_is_the_bare_background_agent(
         "includeMcpJson": False,
         "prompt": "",
     }
-    assert agent_state.get_cc_model("kirocrew-lite") == agent._BACKGROUND_CC_MODEL
+    assert agent_state.get_cc_model("kirocrew-lite") is None
 
 
 # ── prompts and grants are spec bytes ───────────────────────────────────────

@@ -589,6 +589,10 @@ aliases. `from_provider_id` uses that index to recover a canonical key from an
 advertised adapter ID. `TestModelRegistry.test_bare_advertised_ids_fold_to_canonical_key`
 pins the bare-ID case.
 
+Background agents do not guess a Claude model id. `agent.role_models.background`
+is used when it names a concrete model; otherwise the backend default applies
+(`agent._background_cc_model`).
+
 `model_registry.available_models` and `display_list` sort default entries first
 rather than trusting JSON object order. This is load-bearing because the adapter
 uses the resulting allowlist when an automatic selection omits an explicit

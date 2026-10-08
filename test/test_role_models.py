@@ -206,8 +206,7 @@ class TestBackgroundWiring:
             classmethod(lambda cls: KiroCrewConfig(agent=AgentConfig())),
         )
         assert agent._background_agent_model() == "auto"
-        # CC seam can't use "auto" -> cheap fallback constant.
-        assert agent._background_cc_model() == agent._BACKGROUND_CC_MODEL
+        assert agent._background_cc_model() == ""
 
     def test_background_pin_flows_to_spec_and_cc(self, monkeypatch) -> None:
         from kiro_crew import agent
@@ -231,7 +230,7 @@ class TestBackgroundWiring:
 
         monkeypatch.setattr("kiro_crew.config.loader.KiroCrewConfig.load", classmethod(_boom))
         assert agent._background_agent_model() == "auto"
-        assert agent._background_cc_model() == agent._BACKGROUND_CC_MODEL
+        assert agent._background_cc_model() == ""
 
 
 # ── subagent wiring ───────────────────────────────────────────────────────────

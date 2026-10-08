@@ -399,11 +399,11 @@ unknown identity or another namespace supply no evidence, so a pin the scoped
 backend has no live catalog for is treated as unknown (allowed), never rejected
 by an unrelated harness's advertised ids.
 
-## The one allowed concrete fallback
+## No guessed Claude id
 
-The `claude_code` seam's `cc_model` (`_BACKGROUND_CC_MODEL` in `agent.py`) is the one
-allowed concrete fallback, because that backend cannot resolve `"auto"`. Keep it off
-the default path.
+The `claude_code` seam does not fall back to a hardcoded model. An unpinned
+`agent.role_models.background` leaves `cc_model` unset (`agent._background_cc_model`
+returns `""`) and warns. The backend default applies. A concrete role pin is used.
 
 ## The gate
 

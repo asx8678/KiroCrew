@@ -557,13 +557,6 @@ def present_required_agent_specs() -> list[tuple[str, Path]]:
 
 # AGENT_FILENAME imported from agent_files (single source of truth).
 _MAIN_AGENT_NAME = "kirocrew"
-# Cheap Claude Code model for KiroCrew's background agents (lite / heartbeat).
-# Last-resort fallback for the claude_code (CC) seam ONLY: that backend cannot
-# resolve the "auto" sentinel, so an unpinned background role needs a concrete
-# cheap model. The kiro-cli path uses the resolved role model (default "auto").
-_BACKGROUND_CC_MODEL = "claude-sonnet-4.6"
-
-
 def _background_agent_model() -> str:
     """Kiro-spec model for background worker agents (lite / heartbeat).
 
@@ -588,12 +581,18 @@ def _background_agent_model() -> str:
 def _background_cc_model() -> str:
     """cc_model (claude_code seam) for background agents.
 
-    The CC backend cannot resolve ``"auto"``, so an unpinned background role
-    falls back to :data:`_BACKGROUND_CC_MODEL`; an operator's explicit pin is
-    honored when it names a concrete model.
+    The CC backend cannot resolve ``"auto"``. An operator pin is used when it
+    names a concrete model. An unpinned role does not guess a model id: the
+    backend default applies, and the miss is warned once per process.
     """
     m = _background_agent_model()
-    return m if m and m != "auto" else _BACKGROUND_CC_MODEL
+    if m and m != "auto":
+        return m
+    logger.warning(
+        "agent.role_models.background is unset; Claude Code background agents "
+        "use the backend default"
+    )
+    return ""
 
 
 _KIRO_MCP_JSON = Path.home() / ".kiro" / "settings" / "mcp.json"
