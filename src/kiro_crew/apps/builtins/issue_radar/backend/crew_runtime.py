@@ -101,11 +101,16 @@ def _is_crew_slot_key(key: str) -> bool:
     return crew_store.is_crew_id(str(key)[len(_CREW_SLOT_PREFIX) :])
 
 
-#: Crews get a turn on this idle gap when the sweep has nothing to report. The
-#: watcher is the real scheduler (it fires on an actual signal); this is the
-#: fallback clock that lets an idle crew pick up NEW work, so it is deliberately
-#: slow. ``autonudge`` clamps it to [15s, 24h].
-DEFAULT_IDLE_SECS = 300
+#: Liveness gap when the sweep has nothing to report. The sweep (driven from
+#: ``watch.py``'s 60s poll) is the real scheduler: a CI or issue change wakes the
+#: crew through ``wake_crew`` on that poll, so this clock is only the fallback
+#: that lets an idle crew notice work the fingerprint missed. 30 minutes keeps a
+#: silent day at 48 turns (LOOP-3); a shorter gap re-buys a full persona turn for
+#: a snapshot that did not change. ``autonudge`` clamps it to [15s, 24h].
+#: ``max_runtime_secs`` is deliberately unset: a crew is not a bounded errand,
+#: and a runtime cap would retire it. Its brakes stay the record flags, the STOP
+#: sentinel, and the app gate.
+DEFAULT_IDLE_SECS = 1800
 
 
 # ── the brief ───────────────────────────────────────────────────────────────

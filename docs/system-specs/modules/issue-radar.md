@@ -1040,6 +1040,13 @@ issues (high-water mark in `watch-state.json`). Sends dashboard bell
 notifications via `state.notify`. Zero-LLM. Guarded by `is_app_enabled` — silent
 when disabled. Lifecycle hooks registered via `app.on_startup`/`on_cleanup`.
 
+The same poll drives the crew sweep. A fingerprint change wakes that crew once
+(`wake_crew`) inside the 60s poll; an unchanged crew does not take a model turn
+on the poll. The crew's autonudge loop is only the liveness fallback
+(`DEFAULT_IDLE_SECS`, 1800): at most 48 turns in a day with no change. It is not
+a runtime-capped errand — `max_cycles` stays 0 and `max_runtime_secs` is unset,
+because the brakes are the record flags, the STOP sentinel, and the app gate.
+
 ## First Paint (progressive open-list load)
 
 The open-issue list is **fully paginated**: `list_open_issues` follows every `Link`

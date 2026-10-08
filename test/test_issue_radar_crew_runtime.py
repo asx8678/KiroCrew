@@ -203,6 +203,7 @@ class _FakeNudge:
     def __init__(self, loops: list[_FakeLoop] | None = None) -> None:
         self.loops: list[_FakeLoop] = list(loops or [])
         self.added: list[str] = []
+        self.added_kw: list[dict[str, Any]] = []
         self.updates: list[tuple[str, dict[str, Any]]] = []
 
     def get_by_slot(self, slot_key: str) -> _FakeLoop | None:
@@ -213,6 +214,7 @@ class _FakeNudge:
 
     async def add(self, slot_key: str = "", message: str = "", **kw: Any) -> _FakeLoop:
         self.added.append(slot_key)
+        self.added_kw.append(dict(kw))
         loop = _FakeLoop(f"nl_{len(self.loops)}", slot_key)
         self.loops.append(loop)
         return loop
@@ -1048,6 +1050,13 @@ class TestSession(unittest.IsolatedAsyncioTestCase):
                 await cr.launch_crew(state, OWNER, REPO, crew, self.root)
         self._assert_off_loop(seen, loop_thread)
         self.assertEqual(svc.added, [f"crew-{crew['id']}"])
+        # LOOP-3: the idle loop is liveness only. A silent day is 48 turns,
+        # not one every 5 minutes. Change still wakes through the 60s sweep.
+        self.assertEqual(cr.DEFAULT_IDLE_SECS, 1800)
+        self.assertLessEqual(24 * 3600 / cr.DEFAULT_IDLE_SECS, 48)
+        self.assertEqual(svc.added_kw[0]["idle_secs"], 1800)
+        self.assertEqual(svc.added_kw[0]["max_cycles"], 0)
+        self.assertNotIn("max_runtime_secs", svc.added_kw[0])
 
     async def test_wake_composes_the_prompt_off_the_event_loop(self):
         crew = _crew(self.root, unattended=True)
