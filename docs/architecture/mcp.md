@@ -141,10 +141,10 @@ app agent). Plain kiro-cli agents outside Kiro Crew keep kiro-cli's own default.
 
 ### Managed servers
 
-`agent._MANAGED_MCP_SERVERS` holds the eight servers the gateway owns end to
+`agent._MANAGED_MCP_SERVERS` holds the nine servers the gateway owns end to
 end: the always-on `kirocrew-cron` and `kirocrew-core`, the gated
 `kirocrew-computer`, and the opt-in `kirocrew-dashboard`, `kirocrew-work`,
-`kirocrew-crew-log`, `kirocrew-debug` and `kirocrew-panel`. Every emitted or
+`kirocrew-crew-log`, `kirocrew-debug`, `kirocrew-panel` and `kirocrew-ops`. Every emitted or
 explicitly granted entry is refreshed on every rebuild by
 `_refresh_dynamic_fields()`, which rewrites `command`/`args` from the live
 `kirocrew` binary, strips stale remote-transport fields (`url`, `headers`) left by
@@ -1588,6 +1588,17 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 | `kirocrew-crew-log` | `kirocrew mcp-crew-log` (`mcp_crew_log.py`) | `crew_log_list`, `crew_log_read`, `crew_log_projection` |
 | `kirocrew-debug` | `kirocrew mcp-debug` (`mcp_debug.py`) | `debug_gateway`, `debug_refusals`, `debug_threads`, `debug_processes`, `debug_snapshots` |
 | `kirocrew-panel` | `kirocrew mcp-panel` (`mcp_panel.py`) | `panel_publish`, `panel_templates` |
+| `kirocrew-ops` | `kirocrew mcp-ops` (`mcp_ops.py`) | `workflow_author`, `workflow_run`, `workflow_library_list`, `workflow_status`, `workflow_result`, `workflow_list`, `workflow_cancel`, `workflow_rerun_subtree`, `local_knowledge_search`, `knowledge_list_sources`, `knowledge_add_document`, `knowledge_dedup`, `browser`, `kiro_cli_logs` |
+
+`kirocrew-ops` is opt-in (TOOL-2). Its tools were removed from the default
+`kirocrew-core` list, so a session that is not granted the set spends nothing on
+them. It calls through the same `mcp_core._call_tool` wrapper as core, so
+validation, the channel-agent deny and the audit are identical; only the
+advertised list differs (`mcp_tools.build_ops_tool_list`). Its calls send
+`X-Internal-Caller: kirocrew-ops`, which is not in `KNOWN_INTERNAL_CALLERS`, so the
+dashboard audits them as unknown-internal, the same as `kirocrew-core` today.
+Monitor tools stay on `kirocrew-core`: their directives are derived from the
+`kirocrew-core` name in the gateway.
 
 `kirocrew-panel` is opt-in and reaches a crew member's DM session the way
 `kirocrew-dashboard` does: as a session-level `mcpServers` entry carrying that
