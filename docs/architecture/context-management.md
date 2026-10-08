@@ -410,7 +410,7 @@ spawn tools cannot drift:
 
 | Flag | Drops | Advertised rule |
 |---|---|---|
-| `include_memory` | preferences, activity index, semantic, provenance — and, for a V2 member, its briefing layer and manual anchors (§5) | false when the task is fully specified by the text you wrote |
+| `include_memory` | preferences, activity index, semantic, provenance — and, for a V2 member, its briefing layer and manual anchors (§5) | false when the task is fully specified by the text you wrote; DEFAULTS to false for a spawn naming no `agent`/`crew` (it runs as `kirocrew-step`) and for a workflow step (`ctx.agent(memory=)`, off unless the run is member-bound) — CTX-7 |
 | `include_lessons` | learned corrections, user profile | false only when the child purely reads and reports |
 | `include_project` | `[PROJECT]`, `[DOCUMENTATION]`, steering | false when the work is outside the active project tree |
 

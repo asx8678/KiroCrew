@@ -6017,7 +6017,7 @@ unchanged; neither has controlled evidence supporting a change here.
 
 ### Switchable context groups (sub-agents)
 
-A spawning parent decides which of three groups its sub-agent inherits, via `include_memory` / `include_lessons` / `include_project` on `spawn_run` and `spawn_sub_agents`. All default to `true`, so a caller that passes nothing produces byte-identical context: `build_session_context(context_groups=None)` — what every non-sub-agent caller passes — and an all-on `frozenset` are equivalent by construction.
+A spawning parent decides which of three groups its sub-agent inherits, via `include_memory` / `include_lessons` / `include_project` on `spawn_run` and `spawn_sub_agents`. All default to `true` — except `include_memory` on a spawn naming no `agent`/`crew`, which defaults to `false` (CTX-7; such a spawn runs as `kirocrew-step`) — so a caller that passes nothing to a named spawn produces byte-identical context: `build_session_context(context_groups=None)` — what every non-sub-agent caller passes — and an all-on `frozenset` are equivalent by construction.
 
 | Group | Sections | Switchable |
 |---|---|---|

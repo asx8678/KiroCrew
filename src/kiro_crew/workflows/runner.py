@@ -463,6 +463,7 @@ class _RunContext:
         cwd: Optional[str] = None,
         session: Optional[str] = None,
         nudge: Optional[dict] = None,
+        memory: Optional[bool] = None,
     ) -> Any:
         # B6 cap + A4 ceiling are checked BEFORE the call so a script cannot run
         # past either limit. would_exceed lets us stop at the boundary cleanly.
@@ -495,6 +496,7 @@ class _RunContext:
             "cwd": cwd,
             "session": session,
             "nudge": nudge,
+            "memory": memory,
         }
         error = ""
         try:

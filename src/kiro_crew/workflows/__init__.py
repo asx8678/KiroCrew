@@ -140,8 +140,12 @@ class WorkflowContext(Protocol):
         cwd: Optional[str] = None,
         session: Optional[str] = None,
         nudge: Optional[dict] = None,
+        memory: Optional[bool] = None,
     ) -> AgentResult:
         """Run one agent. Subagent by default; ``session=`` for in-session.
+
+        ``memory=True`` gives the step the user's memory context (preferences,
+        activity index, semantic recall); it is off by default (CTX-7).
 
         With ``schema`` returns a validated dict (else free text). Returns
         ``None`` if skipped or the agent died; raises only ``BudgetExceeded``.

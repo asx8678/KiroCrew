@@ -212,6 +212,20 @@ workflow step -- and end with its result.
 """
 
 
+def step_spec_present() -> bool:
+    """Whether ``kirocrew-step.json`` is on disk for kiro-cli to load.
+
+    The callers that default onto the step (an unnamed spawn, an unnamed
+    workflow step) check this first and keep the default agent when it is
+    absent: a spawn onto a mode kiro-cli does not have fails every turn, which
+    is worse than the cost the step saves. Blocking stat; call off-loop.
+    """
+    try:
+        return (agent_mod.kiro_agents_dir_path() / _STEP_AGENT_FILENAME).is_file()
+    except OSError:
+        return False
+
+
 def _install_step_agent() -> None:
     """Generate and install the ``kirocrew-step`` agent config (SPEC-3).
 

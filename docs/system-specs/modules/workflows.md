@@ -124,7 +124,7 @@ run_id`.
 ```python
 async def agent(
     self, prompt: str, *, label=None, phase=None, schema=None, model=None,
-    agent=None, effort=None, cwd=None, session=None, nudge=None,
+    agent=None, effort=None, cwd=None, session=None, nudge=None, memory=None,
 ) -> AgentResult
 ```
 
@@ -154,10 +154,26 @@ Semantics, from `runner._RunContext.agent`:
   `describe_agent_error` (type + message, redacted then truncated to
   `MAX_AGENT_ERROR_CHARS` = 500, no traceback).
 
-`label`, `phase`, `schema`, `model`, `agent`, `effort`, `cwd`, `session` and
-`nudge` are all passed to the injected `agent_fn` in one `opts` dict. The shipped
-adapters read `session`, `agent`, `model` and `cwd`; `label` and `phase` are
-consumed by the runner for the event stream; `schema` is consumed by the runner.
+`label`, `phase`, `schema`, `model`, `agent`, `effort`, `cwd`, `session`,
+`nudge` and `memory` are all passed to the injected `agent_fn` in one `opts` dict.
+The shipped adapters read `session`, `agent`, `model`, `cwd` and `memory`; `label`
+and `phase` are consumed by the runner for the event stream; `schema` is consumed
+by the runner.
+
+- **A step with no `agent=` runs as `kirocrew-step`** (CTX-7): `WorkflowService`
+  passes `default_agent=WORKFLOW_STEP_AGENT` to both adapters, so an unnamed step
+  gets the slim step spec (builtins plus a small `kirocrew-core` base, no cron,
+  workflow or monitor tools; `subagent.md` § The step spec) instead of the default
+  agent's ~40 KB contract and full tool set. The governance gate (`vet_step_spawn`)
+  still vets what the SCRIPT named, as before. A reused pooled step's prompt
+  measured ~5.5K chars on an empty home.
+- **`memory=` (CTX-7)** decides whether the step's prompt carries the memory
+  context group (preferences, activity index, semantic recall). Absent, it is off
+  (`WorkflowScope.step_memory`), except on a member-bound run, whose memory group
+  carries the member's briefing layer. The step's groups reach `build_message` as
+  `context_groups` (`workflow_memory._step_context_groups`); lessons and project
+  always stay on. On the pooled adapter the flag joins the warm-worker identity
+  key `(agent, model, cwd, effort, memory)`.
 
 > Resolved (WF-5): ``effort`` is wired on both shipped ``agent_fn`` adapters —
 > validated per call with ``is_valid_effort`` (an invalid value warns and falls
