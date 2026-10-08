@@ -296,18 +296,13 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "spawn_run",
             "description": (
-                "Spawn subagent(s) to run tasks in the background. "
-                "One task is almost always faster done yourself: spawn for two or more "
-                "independent tasks, or when a step would flood your context with bulk output. "
-                "Returns immediately — results arrive as [Subagent completion event] "
-                "messages in your conversation. For parallel work, use 'tasks' array. "
-                "Tasks are automatically batched if they exceed the concurrency limit."
+                "Spawn background subagent(s). One task is almost always faster done yourself: "
+                "spawn for two or more independent tasks. Returns immediately; results arrive "
+                "as [Subagent completion event] messages. "
+                "Use 'tasks' for parallel work."
                 + _cap_hint
-                + " Validate all results before declaring the user task complete."
-                " Follow the returned parent-work boundary; do not poll or duplicate child work."
-                " If result batches from a previous spawn are still arriving,"
-                " do not start a new spawn until all of them have been"
-                " delivered and processed."
+                + " Validate results before declaring done, follow the returned parent-work"
+                " boundary, and do not spawn again while a previous batch is arriving."
             ),
             "inputSchema": {
                 "type": "object",
@@ -337,28 +332,22 @@ def schemas() -> list[dict[str, Any]]:
                     "crew": {
                         "type": "string",
                         "description": (
-                            "Crew Member name from select_crew or route_crew. "
-                            "Selects that member's memory and provider template; agent "
-                            "alone selects a template. Naming a member is enough; its "
-                            "Triggers only steer automatic selection. Omit to inherit the "
-                            "current member. Applies to every task."
+                            "Crew Member (from select_crew/route_crew): uses that member's "
+                            "memory and template; agent alone selects a template. Naming a member is "
+                            "enough."
                         ),
                     },
                     "target_member": {
                         "type": "string",
                         "description": (
-                            "Explicit target Crew Member. Uses its existing memory without "
-                            "copying the parent's learning. Omit to inherit the current member."
+                            "Explicit Crew Member whose memory is used as-is; omit to "
+                            "inherit the current member."
                         ),
                     },
                     "agents": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": (
-                            "Agent names corresponding to each task in 'tasks' array. "
-                            "Same rule as 'agent', which lists the valid names: every "
-                            "name here must already exist."
-                        ),
+                        "description": "Agent name per entry of 'tasks'; same rule as 'agent'.",
                     },
                     "max_turns": {
                         "type": "integer",
@@ -370,47 +359,29 @@ def schemas() -> list[dict[str, Any]]:
                     "cwd": {
                         "type": "string",
                         "description": (
-                            "Optional absolute path to launch the subagent subprocess in, "
-                            "instead of the default sandbox. Enables cwd-relative resource globs "
-                            "(.kiro/steering, AGENTS.md, CLAUDE.md) to resolve against this directory. "
-                            "Must be under a configured subagent_cwd_allowed_roots entry "
-                            "(default: [~/workspace, ~/workspaces, ~/workplace, "
-                            "~/workplaces]). Applies to all tasks in a batch spawn."
+                            "Absolute launch directory for every task (its steering and "
+                            "AGENTS.md apply); must be under subagent_cwd_allowed_roots."
                         ),
                     },
                     "model": {
                         "type": "string",
                         "description": (
-                            "Optional model override for the subagent (e.g. 'deepseek-3.2', "
-                            "'claude-haiku-4.5'). When set, the subagent runs on this model "
-                            "instead of the gateway default. To discover available models, "
-                            "run: kiro-cli chat --list-models --format json"
+                            "Model override; list ids with kiro-cli chat --list-models "
+                            "--format json."
                         ),
                     },
                     "reasoning_effort": {
                         "type": "string",
                         "description": (
-                            "Optional reasoning-effort override for the subagent(s): "
-                            "'low', 'medium', 'high', 'xhigh', or 'max' (empty/absent "
-                            "= unset). Batch-wide — applies to every task in this "
-                            "call and wins over the configured subagent role pin. "
-                            "Setting it forces the dedicated-process path: each "
-                            "subagent runs its own process (~3-5s start, ~400MB) "
-                            "instead of session sharing (~200ms, near-zero memory), "
-                            "so weigh it on a wide fan-out. Models that do not "
-                            "support effort ignore the level, but the process cost "
-                            "is still paid."
+                            "low/medium/high/xhigh/max for every task; forces a dedicated "
+                            "process (~3-5s, ~400MB each)."
                         ),
                     },
                     "keep": {
                         "type": "boolean",
                         "description": (
-                            "Optional. ALL runs are already continuable "
-                            "best-effort (~1h retention) via spawn_continue — "
-                            "keep=true additionally guarantees resumability "
-                            "(dedicated process) and extends retention to "
-                            "several hours upfront. Use for a run you know is "
-                            "a long-lived delegation workstream."
+                            "Guarantee resumability and retain for hours (all runs are "
+                            "continuable for ~1h anyway)."
                         ),
                     },
                     **_context_group_props,
@@ -420,18 +391,12 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "spawn_continue",
             "description": (
-                "Dispatch a follow-up task into ANY completed subagent run's "
-                "conversation — no flag needed at spawn time. The subagent "
-                "resumes with its full accumulated context (no re-explaining). "
-                "Continuing promotes the conversation: retention extends from "
-                "~1h (default) to several hours; release with spawn_release "
-                "when the workstream is done. Returns immediately; the result "
-                "arrives as a normal [Subagent completion event]. Typed "
-                "failures: conversation_busy (run in flight — use spawn_steer), "
-                "conversation_gone (files expired — re-spawn with a summary), "
-                "resume_failed (session could not be restored; never executes "
-                "context-free). Context scope is inherited from the run being "
-                "continued, so the include_* flags are not accepted here."
+                "Send a follow-up task into ANY finished subagent run's conversation, "
+                "resuming its full context; retention extends to several hours (end it "
+                "with spawn_release). Returns at once; the result is a normal completion "
+                "event. Errors: conversation_busy (running: use spawn_steer), "
+                "conversation_gone (expired: re-spawn with a summary), resume_failed. "
+                "Context scope is inherited, so include_* flags are not accepted."
             ),
             "inputSchema": {
                 "type": "object",
@@ -457,19 +422,10 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "spawn_steer",
             "description": (
-                "Inject a message into a RUNNING subagent's in-flight turn "
-                "(course-correct without restarting it) — like steering a chat "
-                "session. A steer arriving while a just-started run's session "
-                "is still registering waits briefly for it (typed "
-                "session_starting error if it still isn't up — retry then); "
-                "runs still WAITING in the spawn queue return not_found until "
-                "they start. Only works while the run is executing; for a "
-                "finished continuable run use spawn_continue instead. "
-                "mode='follow_up' queues the message instead of interrupting: "
-                "it is delivered as a continuation on the run's conversation "
-                "AFTER its current turn completes — use it when the correction "
-                "can wait and interrupting critical work mid-execution would "
-                "do more harm than good."
+                "Inject a message into a RUNNING subagent's turn to course-correct it. "
+                "mode='follow_up' instead queues it until the current turn ends. Errors: "
+                "session_starting (retry shortly), not_found (still queued). For a "
+                "finished run use spawn_continue."
             ),
             "inputSchema": {
                 "type": "object",
@@ -486,12 +442,8 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "string",
                         "enum": ["interrupt", "follow_up"],
                         "description": (
-                            "interrupt (default): inject into the running turn "
-                            "now. follow_up: wait for the current turn to "
-                            "complete, then deliver as a continuation on the "
-                            "run's conversation (its result arrives as a "
-                            "separate completion event; multiple queued "
-                            "follow-ups drain as one continuation)"
+                            "interrupt (default) injects now; follow_up delivers after "
+                            "the current turn as a continuation"
                         ),
                     },
                 },
@@ -528,18 +480,11 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "spawn_status",
             "description": (
-                "Retrieve a subagent's live status and partial transcript while it runs, "
-                "or its retained transcript after completion. With no arguments the tool "
-                "returns the transcript TAIL (last 200 lines, kept under 12k chars) — "
-                "that is where a finished run's closing answer is. Page with offset/limit "
-                "(line-based, like reading code) to read from the start, or filter with "
-                "grep (regex). The completion event gives a summary plus the transcript "
-                "path — use this tool (or the read/grep tools on the path) to read the "
-                "rest instead of re-running the subagent. While a run is still going the "
-                "partial transcript is a live view that grows (and past the manager's "
-                "bound is truncated from the front), so line offsets can shift between "
-                "polls and offset/limit paging is best-effort until completion. Terminal "
-                "responses include elapsed time and credit usage when recorded."
+                "Read a subagent's status and transcript, live or retained. With no "
+                "paging args it returns the TAIL (last 200 lines, under 12k chars), where"
+                " a finished run's answer is; page with offset/limit from the start or "
+                "filter with grep. A running transcript grows and may be trimmed at the "
+                "front, so offsets can shift. Read this instead of re-running a subagent."
             ),
             "inputSchema": {
                 "type": "object",
@@ -554,11 +499,7 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "limit": {
                         "type": "integer",
-                        "description": (
-                            "Max lines to return (1-2000). With no offset/limit/grep the "
-                            "tool returns the transcript tail (last 200 lines) instead; "
-                            "use with offset to page through a large result from the start."
-                        ),
+                        "description": "Max lines to return (1-2000)",
                     },
                     "grep": {
                         "type": "string",
@@ -574,13 +515,9 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "spawn_sub_agents",
             "description": (
-                "Spawn one or more sub-agents to run tasks in parallel. Each sub-agent "
-                "gets its own session with full tool access. BLOCKS until all sub-agents "
-                "complete, then returns their collected results; a sub-agent the spawn "
-                "gate deferred is reported with why it waits, and its result arrives "
-                "later as a completion event. Use for delegating "
-                "independent subtasks to specialist agents. Preferred over spawn_run when "
-                "you need results before continuing." + _cap_hint
+                "Spawn sub-agents in parallel and BLOCK until all finish, returning their "
+                "results; a deferred one is reported with why it waits and completes "
+                "later as an event. Use only when you need the results inline." + _cap_hint
             ),
             "inputSchema": {
                 "type": "object",
@@ -606,10 +543,7 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "cwd": {
                         "type": "string",
-                        "description": (
-                            "Optional absolute path to launch sub-agents in. "
-                            "Must be under a configured subagent_cwd_allowed_roots entry."
-                        ),
+                        "description": "Absolute launch directory under subagent_cwd_allowed_roots",
                     },
                     **_context_group_props,
                 },
@@ -619,20 +553,11 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "resource_status",
             "description": (
-                "Check current host resource headroom when a reading is needed — "
-                "when your context carries a `[RESOURCES]` line, after a heavy "
-                "step was killed, or before a full test suite, large build or big "
-                "parallel sub-agent wave in a run with no `[RESOURCES]` line. "
-                "Returns available memory, CPU load, and an "
-                "advisory posture (ample / tight / critical) plus the sub-agent "
-                "cap ACTUALLY in force right now against your configured max "
-                "(and why it is lower, when it is), so you can decide whether to "
-                "run the "
-                "heavy path now, switch to a lighter path (targeted tests, fewer "
-                "sub-agents, deferred build), or wait for memory to free. "
-                "Read-only and advisory — it does NOT reserve or enforce "
-                "anything, and headroom can change between the check and your "
-                "action, so treat it as guidance, not a guarantee."
+                "Check host headroom when a reading is needed: a [RESOURCES] line in "
+                "context, a heavy step killed, or before a full test suite, large build "
+                "or wide spawn wave in a run without that line. Returns free memory, CPU "
+                "load, a posture (ample / tight / critical) and the sub-agent cap "
+                "actually in force. Advisory only: it reserves nothing."
             ),
             "inputSchema": {"type": "object", "properties": {}},
         },

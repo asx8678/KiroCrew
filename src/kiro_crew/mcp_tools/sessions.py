@@ -37,19 +37,11 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "search_chat_history",
             "description": (
-                "Search your own past conversation transcripts (chat history) by "
-                "keyword and get back ranked, snippet-level hits. Use this to "
-                "recover the exact words of a past conversation — 'the error message "
-                "from that debugging session', a name/number/path mentioned earlier, "
-                "the verbatim evidence behind a conclusion memory_recall gave you. "
-                "For what was decided or learned, call memory_recall first: it "
-                "searches the memory store bound to this session by meaning. "
-                "Search like a human: try a query, read the snippets, then re-search "
-                "with different keywords if the first hit isn't right. Returns "
-                "metadata + a short snippet per session (NOT full transcripts) — "
-                "call get_chat_session with a returned session_key to read the full "
-                "thread once a hit looks promising. Scoped to your current workspace "
-                "by default. This is a READ — it never modifies memory or history."
+                "Keyword-search your own past transcripts for ranked snippet hits: exact "
+                "words, names, numbers or paths from an earlier conversation. For what "
+                "was decided or learned, call memory_recall first. Re-search with new "
+                "keywords if needed, then read a promising session_key with "
+                "get_chat_session. Scoped to the current workspace; read-only."
             ),
             "inputSchema": {
                 "type": "object",
@@ -114,17 +106,10 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "list_sessions",
             "description": (
-                "List your recent conversation sessions in this workspace so you "
-                "can see the work in flight and what you've been doing — titles, "
-                "owning agent, message volume, and last-activity time, newest "
-                "first. Use this when the user asks 'what are you working on?', "
-                "'what sessions are open?', 'what have we been doing?', or when you "
-                "need a bird's-eye view of your own workspace before acting. This "
-                "is a READ — it never modifies memory or history. It complements "
-                "search_chat_history (which finds a specific past thread by "
-                "keyword): list_sessions is the browse/overview, search is the "
-                "lookup. Scoped to your current workspace by default; "
-                "incognito/temporary sessions are never listed."
+                "List your recent sessions in this workspace, newest first (title, agent,"
+                " message volume, last activity): the overview for 'what are you working "
+                "on?'. search_chat_history finds one thread by keyword. "
+                "Incognito/temporary sessions are never listed; read-only."
             ),
             "inputSchema": {
                 "type": "object",
@@ -142,10 +127,8 @@ def schemas() -> list[dict[str, Any]]:
                     "summarize": {
                         "type": "boolean",
                         "description": (
-                            "When true, generate a fresh one-line LLM summary for the top "
-                            "sessions (bounded, best-effort — costs tokens + latency, so it's "
-                            "opt-in). When false (default), the existing session title is used "
-                            "with zero cost."
+                            "Opt-in fresh one-line LLM summaries for the top sessions (costs "
+                            "tokens); default uses titles."
                         ),
                         "default": False,
                     },

@@ -38,15 +38,10 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "local_knowledge_search",
             "description": (
-                "Search the user's knowledge library. Call ONLY when the user's "
-                "message contains one of these explicit signals:\n"
-                "- Asks 'what do we know about X' or 'check knowledge for X'\n"
-                "- References a specific document, wiki, or stored content by name\n"
-                "- Says 'in my docs', 'in my notes', 'according to our knowledge'\n"
-                "- Asks a factual question AND mentions a topic you know is in "
-                "their knowledge base\n\n"
-                "Do NOT call for: general coding questions, file operations, "
-                "debugging, or any task you can answer from context alone."
+                "Search the user's knowledge library. Call ONLY on an explicit signal: "
+                "'what do we know about X', a named document or wiki, 'in my docs/notes',"
+                " or a factual question on a topic you know is stored. Not for general "
+                "coding, file operations, debugging or anything answerable from context."
             ),
             "inputSchema": {
                 "type": "object",
@@ -67,21 +62,15 @@ def schemas() -> list[dict[str, Any]]:
                     "source_id": {
                         "type": "string",
                         "description": (
-                            "Optional source ID to scope keyword/vector seeding "
-                            "to one knowledge source (graph traversal still "
-                            "surfaces cross-source connections). Discover valid "
-                            "IDs with knowledge_list_sources."
+                            "Optional source ID (from knowledge_list_sources) to scope seeding "
+                            "to."
                         ),
                     },
                     "namespace": {
                         "type": "string",
                         "description": (
-                            "Optional namespace to scope keyword/vector seeding "
-                            "to documents filed under one organisational label "
-                            "(graph traversal still surfaces cross-namespace "
-                            "connections). This is a relevance filter, not a "
-                            "security boundary. Discover namespaces in the "
-                            "dashboard Knowledge panel; composes with source_id."
+                            "Optional organisational label to scope seeding to (a relevance "
+                            "filter, not a security boundary)."
                         ),
                     },
                 },
@@ -107,24 +96,12 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "knowledge_add_document",
             "description": (
-                "Add a document you have READ during this task to the user's "
-                "knowledge library, so it stays searchable later. Use it for a "
-                "document that turned out to be load-bearing -- a design doc, "
-                "spec, RFC, runbook, or wiki page that explains intent, a "
-                "decision, or how something works, and that you would want to "
-                "find again in a future session.\n\n"
-                "Pass the document TEXT you already have as `content` -- this tool "
-                "never opens files, so read the document with your own tools first, "
-                "then hand over the text. Also pass where it came from as "
-                "`source_uri` (the path or URL you read it from): that is what tells "
-                'two documents apart, so a second "README" does not silently '
-                "replace the first. Adding the same document twice is harmless: "
-                "identical content is refused, not duplicated.\n\n"
-                "Do NOT add: source code, agent instruction files (AGENTS.md, "
-                "SKILL.md), generated or machine-readable files, chat transcripts, "
-                "your own notes and summaries, or a page you only skimmed. When in "
-                "doubt, skip it -- a polluted library makes every future search "
-                "worse."
+                "Add a document you READ during this task (design doc, spec, RFC, "
+                "runbook, wiki) to the user's knowledge library so later searches find "
+                "it. Pass its text as `content` (this tool opens nothing) and where you "
+                "read it as `source_uri`, its identity. Identical content is refused, not"
+                " duplicated. Do NOT add code, agent instruction files, generated files, "
+                "transcripts, your own notes or skimmed pages: when in doubt, skip."
             ),
             "inputSchema": {
                 "type": "object",
@@ -149,14 +126,8 @@ def schemas() -> list[dict[str, Any]]:
                     "source_uri": {
                         "type": "string",
                         "description": (
-                            "Where you read this document from -- a file path, "
-                            "URL, or any stable handle. This is the document's "
-                            "identity: re-adding the same source_uri replaces that "
-                            "document, and two documents with different URIs stay "
-                            "separate even when their titles match. Nothing here "
-                            "is opened or fetched -- it is only stored as a label. "
-                            "Required: without it two documents sharing a title "
-                            "would overwrite each other."
+                            "Path or URL you read it from; the document's identity (same URI "
+                            "replaces it). Required; never opened."
                         ),
                     },
                 },

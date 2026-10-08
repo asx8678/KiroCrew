@@ -103,12 +103,8 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "string",
                         "maxLength": _rule_max,
                         "description": (
-                            f"The lesson to remember. HARD LIMIT {_rule_max} "
-                            "characters — longer rules are REJECTED (not truncated), "
-                            "so keep it concise. Put 'what not to do' in the separate "
-                            "'negative' field rather than inlining a long '-- NOT: ...' "
-                            "clause here, and split unrelated corrections into multiple "
-                            "learn_add calls instead of one oversized rule."
+                            f"The lesson. HARD LIMIT {_rule_max} chars (longer is "
+                            "REJECTED); put 'what not to do' in 'negative'."
                         ),
                     },
                     "category": {
@@ -128,14 +124,8 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "string",
                         "maxLength": _scope_max,
                         "description": (
-                            "Optional. Restrict this correction to ONE repository, "
-                            "given as a path fragment that repository contains "
-                            "(e.g. 'src/kiro_crew'). The correction then applies "
-                            "only in sessions whose project is inside that tree, "
-                            "and is withheld everywhere else. Use it for a rule "
-                            "that is only true of one codebase; omit it for a "
-                            "durable preference that should always apply. Omitted "
-                            "means it applies everywhere."
+                            "Limit to ONE repository by a path fragment it contains "
+                            "(e.g. 'src/kiro_crew'); omit to apply everywhere."
                         ),
                     },
                     "applies": {
@@ -175,9 +165,8 @@ def schemas() -> list[dict[str, Any]]:
                         "minimum": 0,
                         "maximum": LESSON_LIST_OFFSET_MAX,
                         "description": (
-                            "Optional. How many of the newest lessons to skip before "
-                            "the window starts (default 0). The 'showing N of M' line "
-                            "names the offset that reaches the next older page."
+                            "Newest lessons to skip (default 0); the 'showing N of M' "
+                            "line names the next page's offset."
                         ),
                     },
                 },
@@ -194,26 +183,16 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "string",
                         "maxLength": _scope_max,
                         "description": (
-                            "Optional. Only remove lessons carrying this repo "
-                            "scope, given as the same path fragment used to store "
-                            "them (e.g. 'src/kiro_crew'). A lesson's identity is "
-                            "the pair (rule, repo_scope), so the same rule scoped "
-                            "to a repo and stored globally are two separate "
-                            "lessons; without this the substring removes both. "
-                            "Omit to match every scope. Pass an empty string to "
-                            "remove only the unscoped (global) lessons."
+                            "Only lessons with this repo_scope; omit for every scope, "
+                            '"" for unscoped lessons only.'
                         ),
                     },
                     "scope": {
                         "type": "string",
                         "enum": ["global", "workspace"],
                         "description": (
-                            "Optional. Which lessons file to delete from, as "
-                            "learn_list reports it: a row shown with "
-                            "'(workspace: NAME)' lives in that workspace's file "
-                            "and is reached only with scope='workspace' plus "
-                            "workspace=NAME; every other row is in the global "
-                            "file, which is also the default."
+                            "'workspace' (with workspace=NAME) for rows learn_list "
+                            "marks '(workspace: NAME)'; default global."
                         ),
                     },
                     "workspace": {

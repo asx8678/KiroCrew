@@ -40,17 +40,12 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "issue_radar_record_investigation",
             "description": (
-                "Record your conclusion on an Issue Radar investigation, so the "
-                "verdict and summary appear on the issue's card instead of living "
-                "only in this chat. Call this when you finish investigating an "
-                "issue or PR opened via Issue Radar's Investigate button — the "
-                "seed prompt names the owner, repo and number to pass back. Do "
-                "NOT call it from a Review session: that prompt asks for a draft "
-                "and forbids recording anything. "
-                "This is the ONLY way to persist findings: a raw HTTP PUT to the "
-                "same endpoint has no credential and is refused with 403. Local "
-                "triage state only — nothing is written to GitHub or GitLab. "
-                "Merges into any existing record, so a partial update is fine."
+                "Record your conclusion on an Issue Radar investigation (opened via its "
+                "Investigate button) so the verdict and summary appear on the issue's "
+                "card; the seed prompt names owner, repo and number. Never from a Review "
+                "session. Local triage only, nothing is written to the forge; partial "
+                "updates merge. The ONLY way to persist findings: raw HTTP is refused "
+                "with 403."
             ),
             "inputSchema": {
                 "type": "object",
@@ -102,18 +97,11 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "ops_mission_control_api",
             "description": (
-                "Call the Ops Mission Control app's HTTP API with the gateway's "
-                "own credential. This is the ONLY way an agent session reaches "
-                "that API: raw HTTP has no credential and is refused with 403, "
-                "and no CLI or environment variable provides one. Use it for "
-                "every call an ops-mission-control SOP asks for — reading "
-                "state/signals/incidents/rotation/ledger, claiming and "
-                "transitioning incidents, arming the rotation, posting ledger "
-                "entries. Paths are rooted at the app base (pass '/state', not "
-                "the full URL) and only the SOP surface is reachable: "
-                "provider configuration, settings, webhook ingest and the "
-                "human proposal-decision routes are deliberately not callable "
-                "from here."
+                "Call the Ops Mission Control app's API with the gateway's credential: "
+                "the ONLY way to reach it (raw HTTP is refused with 403). Use it for "
+                "every call an ops-mission-control SOP asks for. Paths are relative to "
+                "the app base ('/state', not a URL); provider configuration, settings, "
+                "webhook ingest and human proposal decisions are not callable."
             ),
             "inputSchema": {
                 "type": "object",
@@ -129,11 +117,8 @@ def schemas() -> list[dict[str, Any]]:
                         # schema cannot drift from what the handler admits.
                         "enum": sorted({p for _, p in OPS_MISSION_CONTROL_ALLOWED_CALLS}),
                         "description": (
-                            "API path relative to /api/apps/ops-mission-control. "
-                            "GET: /state /signals /incidents /handover /rotation "
-                            "/ledger /ledger/contradictions. POST: /dispatch "
-                            "/incident/transition /incident/claim /incident/action "
-                            "/rotation/arm /ledger /ledger/hygiene."
+                            "API path relative to /api/apps/ops-mission-control, e.g. GET /state,"
+                            " POST /incident/transition"
                         ),
                     },
                     "query": {
@@ -147,7 +132,7 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "string",
                         "description": (
                             "JSON object for POST bodies, serialized as a string — "
-                            "e.g. '{\"id\": \"INV-42\", \"status\": \"resolved\"}' for "
+                            'e.g. \'{"id": "INV-42", "status": "resolved"}\' for '
                             "/incident/transition"
                         ),
                     },
@@ -158,27 +143,13 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "pod_up",
             "description": (
-                "Boot a Kiro Crew POD -- a complete preview gateway for one git "
-                "worktree, on its own port with its own data directory -- and get "
-                "back the {base_url, token} handle for driving it. On a host whose "
-                "sandbox denies this session the systemd user bus, this is the only "
-                "way to start a pod: a pod is a systemd --user unit, and "
-                "`kirocrew pod up` in your shell then fails with `Permission "
-                "denied`. Check with `systemctl --user is-system-running` if you "
-                "want to know which case you are in; either way this tool works, "
-                "because the gateway holds the host bus and does the systemd part "
-                "for you. Use it to test an unfinished change end to end without "
-                "touching the live gateway. Blocking: it returns once the pod "
-                "answers its own health check, a few seconds for a worktree that "
-                "is already built. A worktree with no built dist is REFUSED with "
-                "the CLI's own remedy in the message -- provisioning (venv + SPA "
-                "build) is minutes of work and is not reachable from here; run it "
-                "from the Dev Fleet page or `kirocrew pod provision <wt>`. "
-                "Requires the Dev Fleet app to be enabled. The returned token is a "
-                "2h credential scoped to that pod alone; it is not the live "
-                "gateway's, and no secret of the host is exposed by it. "
-                "Release the pod with `pod_down` when done -- a pod holds a port "
-                "and memory until it is stopped."
+                "Boot a Kiro Crew POD (a preview gateway for one git worktree, own port "
+                "and data dir) and return its {base_url, token}. Works even where the "
+                "sandbox denies your shell the systemd user bus, since the gateway starts"
+                " the unit. Blocks until healthy. A worktree with no built dist is "
+                "REFUSED with the remedy (`kirocrew pod provision <wt>` or the Dev Fleet "
+                "page). Needs the Dev Fleet app. The token is a 2h credential for that "
+                "pod only. Release it with pod_down."
             ),
             "inputSchema": {
                 "type": "object",
@@ -279,69 +250,37 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "issue_radar_crew_record",
             "description": (
-                "Record one step of Issue Radar crew work: it updates the work "
-                "item AND appends one progress line, in a single call. There is "
-                "deliberately no separate 'append event' tool — a phase must "
-                "never move without a logged reason — so `event` and "
-                "`event_kind` are REQUIRED whenever you pass `phase`. "
-                "The ledger is your memory, not your report: write what a cold "
-                "resume needs (`next` as an intent — 'add the Windows branch to "
-                "_safe_chmod, the test already fails' — plus worktree, branch, "
-                "base_sha, and any approach you tried and rejected). Fields you "
-                "omit are left as an earlier write stored them, so a partial "
-                "update is fine and is never a way to erase state. "
-                "Setting `phase` to `skipped` also writes this repository's "
-                "SHARED skip index, so every other crew sees the pass and none "
-                "of them re-investigates the issue — pass `skip_scope` to say "
-                "what kind of pass it was (architecture, new-feature, "
-                "needs-design, needs-decision, needs-investigation, duplicate, "
-                "already-fixed, not-reproducible, wrong-root-cause, "
-                "breaking-change, gate-config, other) and put "
-                "the real explanation in `why`, which is what the next crew "
-                "reads. "
-                "The crew and repo come from this session, not from arguments. "
-                "To record that you checked the queue and took NOTHING, send "
-                "`event_kind: sweep` with NO `number` — never invent an issue "
-                "number for a cycle you did no work in. That writes one "
-                "crew-level line and no work item, so it also takes none of the "
-                "work-item fields. "
-                "WARNING — `event` and `why` BECOME PUBLIC: they are rendered into "
-                "your claim comment on the forge as well as on your crew page. "
-                "Never "
-                "put an absolute path, a host name or anything else about the "
-                "machine you run on in them; worktree paths belong in "
-                "`worktree`, which stays local. "
-                "This is the ONLY write path: a raw HTTP PUT to the same "
-                "endpoint has no credential and is refused with 403."
+                "Record one step of Issue Radar crew work: update the work item AND "
+                "append one progress line in a single call. `event` + `event_kind` are "
+                "REQUIRED with `phase`. Write what a cold resume needs (`next` as an "
+                "intent, worktree, branch, base_sha, rejected approaches); omitted fields"
+                " stay as stored, and `clear` empties one. phase=skipped also writes the "
+                "repo's SHARED skip index: pass skip_scope and explain in `why`. A cycle "
+                "that took nothing is event_kind=sweep with NO number. `event` and `why` "
+                "are PUBLIC on the forge: no paths or host names. The ONLY write path; "
+                "raw HTTP is refused with 403."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "number": {
                         "type": "integer",
-                        "description": (
-                            "Issue number this step belongs to. Omit it ONLY with "
-                            "`event_kind: sweep`, to record that you checked the "
-                            "queue and took nothing — never invent a number for that"
-                        ),
+                        "description": "Issue number; omit ONLY with event_kind=sweep, never invent one",
                     },
                     "phase": {
                         "type": "string",
                         "enum": sorted(_ISSUE_RADAR_CREW_PHASES),
                         "description": (
-                            "Work-item phase. Requires `event` + `event_kind`. "
-                            "Only one item may be in `implementing` or "
-                            "`addressing-review` at a time — a second is refused"
+                            "Work-item phase; needs event + event_kind. One item at a time may be"
+                            " implementing or addressing-review"
                         ),
                     },
                     "skip_scope": {
                         "type": "string",
                         "enum": sorted(_ISSUE_RADAR_CREW_SKIP_SCOPES),
                         "description": (
-                            "Only with `phase: skipped`. What kind of pass this "
-                            "is, for the repo-wide shared skip index. Optional — "
-                            "an omitted or unrecognised value is recorded as "
-                            "`other`, and the pass is indexed either way"
+                            "With phase=skipped: the kind of pass, for the shared skip index "
+                            "(unknown values record as other)"
                         ),
                     },
                     "outcome": {
@@ -410,11 +349,8 @@ def schemas() -> list[dict[str, Any]]:
                             "enum": sorted(_ISSUE_RADAR_CREW_CLEARABLE_FIELDS),
                         },
                         "description": (
-                            "Fields to EMPTY, by name — the only way to erase one, since "
-                            "an omitted field is left as stored. `pr_number` once the "
-                            "pull request is closed, `claim_comment_id` once the claim "
-                            "comment is gone, `next` when there is no next step. A field "
-                            "both cleared and set in the same call keeps the set value"
+                            "Field names to EMPTY (the only way to erase one); a field also set "
+                            "in this call keeps the set value"
                         ),
                     },
                     "event": {
@@ -535,7 +471,9 @@ def ops_mission_control_api(name: str, args: dict[str, Any]) -> str:
     _omc_url = "/api/apps/ops-mission-control" + _omc_path
     if _omc_query:
         _omc_url += "?" + _omc_query
-    _omc_resp = mcp_core._get(_omc_url) if _omc_method == "GET" else mcp_core._post(_omc_url, _omc_body)
+    _omc_resp = (
+        mcp_core._get(_omc_url) if _omc_method == "GET" else mcp_core._post(_omc_url, _omc_body)
+    )
     # Serialize compactly and redact on the way OUT: signals, incident
     # titles and ledger entries carry text from external monitoring
     # systems and prior LLM turns, so a credential or exfil URL quoted
@@ -547,8 +485,7 @@ def ops_mission_control_api(name: str, args: dict[str, Any]) -> str:
     _omc_cap = 60_000
     if len(_omc_text) > _omc_cap:
         _omc_text = (
-            _omc_text[:_omc_cap]
-            + f"\n… truncated ({len(_omc_text)} chars total). Narrow the "
+            _omc_text[:_omc_cap] + f"\n… truncated ({len(_omc_text)} chars total). Narrow the "
             "call (e.g. query filters) to see the rest."
         )
     return _omc_text
@@ -747,16 +684,12 @@ def issue_radar_crew_record(name: str, args: dict[str, Any]) -> str:
     # mentioning labels at all, so the store kept the previous set and the
     # crew's record claimed labels it had just taken off the issue.
     if "labels_applied" in args:
-        _cw_body["labels_applied"] = [
-            redact(s) for s in (args.get("labels_applied") or []) if s
-        ]
+        _cw_body["labels_applied"] = [redact(s) for s in (args.get("labels_applied") or []) if s]
     # Names, forwarded as names: the route turns each into an explicit null in the
     # work-item patch, which is how a field is emptied. Every field above is gated
     # on truthiness, so this list is the ONLY way a clear reaches the ledger.
     if "clear" in args:
-        _cw_body["clear"] = [
-            s for s in (args.get("clear") or []) if isinstance(s, str) and s
-        ]
+        _cw_body["clear"] = [s for s in (args.get("clear") or []) if isinstance(s, str) and s]
     # The flat ci_* args are re-assembled into the store's `ci_state` dict
     # (crew_store merges it key-by-key). `ci_state` the ARG is the forge's
     # verdict word and becomes the dict's `state`; an int reading of 0 is
