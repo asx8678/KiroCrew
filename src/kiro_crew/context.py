@@ -2683,9 +2683,11 @@ class ContextBuilder:
             rule = _DIFF_RULE_POINTER if diff_rule is None else diff_rule
             prompt = prompt.replace(_DIFF_RULE_TOKEN, rule.rstrip("\n"))
         if ContextBuilder._MAX_SUBAGENTS_TOKEN in prompt:
+            # The live number sits in the volatile tail. Substituting it here
+            # would split the shared prefix whenever the cap changes.
             prompt = prompt.replace(
                 ContextBuilder._MAX_SUBAGENTS_TOKEN,
-                cap_figure or ContextBuilder._live_cap_figure(),
+                "the cap named in [SUBAGENT CAP]",
             )
 
         cfg = KiroCrewConfig.load()
@@ -3016,6 +3018,7 @@ class ContextBuilder:
         now = datetime.now(tz)
         agent_label = agent or "kirocrew"
         _volatile_tail = f"[CURRENT DATE] {now.strftime('%A, %Y-%m-%d %H:%M %Z')}\n\n"
+        _volatile_tail += f"[SUBAGENT CAP] {ContextBuilder._live_cap_figure()} active\n\n"
         if session_key:
             runtime = _runtime_display_name(session_key, runtime_source)
             _volatile_tail += _sections.runtime_identity_block(agent_label, runtime)

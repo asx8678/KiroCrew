@@ -148,8 +148,8 @@ class TestMaxSubagentsPlaceholder:
         # queues work it believes is running. The live figure is what is used,
         # with no ceiling label, and the configured number does not appear.
         result = self._resolve_cap("up to {{MAX_SUBAGENTS}} run", "dashboard:abc", cap=64, live=8)
-        assert "up to 8 run" in result
-        assert "64" not in result and "ceiling" not in result
+        assert "the cap named in [SUBAGENT CAP]" in result
+        assert "8" not in result and "64" not in result
 
     def test_token_replaced_with_labelled_ceiling_on_every_transport(self):
         # No controller in this process: the configured number is still given,
@@ -159,17 +159,18 @@ class TestMaxSubagentsPlaceholder:
         for key in ("dashboard:abc", "slack:C1:1.2", "cli:local", ""):
             result = self._resolve_cap("up to {{MAX_SUBAGENTS}} agents", key, cap=12)
             assert "{{MAX_SUBAGENTS}}" not in result
-            assert "up to 12 (configured ceiling) agents" in result
+            assert "the cap named in [SUBAGENT CAP]" in result
+            assert "12" not in result
 
     def test_zero_cap_falls_back_to_several(self):
         # cap==0 (auto-size failed / unreadable host) keeps the sentence grammatical.
         result = self._resolve_cap("up to {{MAX_SUBAGENTS}} agents", "slack:C1:1.2", cap=0)
-        assert "up to several agents" in result
+        assert "the cap named in [SUBAGENT CAP]" in result
 
     def test_resolver_error_falls_back_to_several(self):
         # A raising resolver must never break prompt assembly.
         result = self._resolve_cap("up to {{MAX_SUBAGENTS}} agents", "dashboard:abc", raises=True)
-        assert "up to several agents" in result
+        assert "the cap named in [SUBAGENT CAP]" in result
 
     def test_absent_token_skips_resolver(self):
         # No token → the (heavier) sub-agent resolver is never invoked.

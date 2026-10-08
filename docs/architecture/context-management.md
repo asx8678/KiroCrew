@@ -365,10 +365,9 @@ re-adds, once:
    block, so a compaction that drops it leaves the session with no contract.
    A custom agent's own prompt on kiro-cli or KAS is not re-injected: it is the
    native system prompt there, which the compaction keeps.
-   This one is the *session-start* copy: `{{MAX_SUBAGENTS}}` carries the reading
-   `_session_cap_figure` took when the session started, because the cap in force
-   is derived from live host conditions and a second reading would hand the
-   session a contract it never agreed to, differing in a number it never chose.
+   This one is the *session-start* copy: `{{MAX_SUBAGENTS}}` resolves to a
+   pointer at `[SUBAGENT CAP]` in the volatile tail. The live number is not
+   substituted into the shared prefix, so a cap change does not split it.
    Its capability/surface sections are gated by the same `_prompt_section_gates`
    call as session start (the caller forwards `minimal_context` and the runtime),
    and its `{{DIFF_RULE}}` is always the pointer, because item 1 re-sends the
