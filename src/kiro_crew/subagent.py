@@ -4,7 +4,13 @@ Each subagent gets its own LLM session (via SessionManager) with a
 focused system prompt.  Results are announced back to the caller via
 a callback.  Max concurrent limit prevents resource exhaustion.
 
-No spawn recursion: subagents cannot spawn other subagents.
+Spawns can nest: a subagent may spawn children of its own, which run as a
+nested tree under one root (``taskq_parent_id_for`` / ``entry_is_child``), with
+admission reserving capacity for children so a waiting parent cannot starve
+them, and a ``subagent:<id>`` parent yielding its lane slot while it waits
+(``mcp_tools.spawn._hold_for_parent_resume``). The default subagent prompt
+(``_SYSTEM_PREFIX``) still asks a focused worker not to create agents; that is
+an instruction to the model, not a structural limit.
 """
 
 from __future__ import annotations

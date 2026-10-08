@@ -31,7 +31,7 @@ import threading
 import time
 import unicodedata
 from collections import OrderedDict, defaultdict, deque  # noqa: F401 - kept bound
-from collections.abc import Awaitable, Callable, Iterator  # noqa: F401 - kept bound
+from collections.abc import Awaitable, Callable, Iterator, Mapping  # noqa: F401 - kept bound
 from collections.abc import Set as AbstractSet  # noqa: F401 - kept bound on the facade
 from contextlib import contextmanager  # noqa: F401 - kept bound on the facade
 from dataclasses import dataclass  # noqa: F401 - kept bound on the facade
@@ -1336,6 +1336,86 @@ def _critical_rules_for(session_key: str | None, runtime_source: str | None) -> 
     return _CRITICAL_RULES if source == "dashboard" else _CRITICAL_RULES_CHANNEL
 
 
+def _diff_rule_for(session_key: str | None, runtime_source: str | None) -> str:
+    """The runtime-selected file-change rule alone, by the same selection as above.
+
+    What the managed prompt's ``{{DIFF_RULE}}`` token resolves to in a build that
+    carries no ``[CRITICAL RULES]`` block (a minimal-context session start, or an
+    agent that opted out of the Crew context), so such a build still states the
+    rule exactly once and in its runtime-selected form.
+    """
+    source = _resolve_runtime_source(session_key or "", runtime_source)
+    return _DIFF_RULE_DASHBOARD if source == "dashboard" else _DIFF_RULE_CHANNEL
+
+
+# CTX-8: capability and surface sections of the managed prompt.
+#
+# ``config/prompt.md`` wraps each section that applies only to some sessions in
+# ``{{#NAME}}`` … ``{{/NAME}}``; ``ContextBuilder._resolve_prompt_templates``
+# keeps a section's body where its gate holds and drops it whole elsewhere. A
+# prompt with no markers (a custom agent's own prompt, or an operator's copy of
+# an older prompt.md) never matches either pattern and renders byte-identical.
+# A marker that pairs with nothing, or names no known gate, is stripped and its
+# body kept, so a hand-edited prompt can never leak a literal marker to the model.
+_PROMPT_SECTION_RE = re.compile(r"\{\{#([A-Z][A-Z0-9_]*)\}\}\n?(.*?)\{\{/\1\}\}\n?", re.DOTALL)
+_PROMPT_STRAY_MARKER_RE = re.compile(r"\{\{[#/][A-Z][A-Z0-9_]*\}\}\n?")
+_DIFF_RULE_TOKEN = "{{DIFF_RULE}}"
+# What ``{{DIFF_RULE}}`` resolves to when the build carries the runtime-selected
+# rule in its ``[CRITICAL RULES]`` block: one pointer, so the rule text itself
+# reaches the model once, in the form chosen for the surface.
+_DIFF_RULE_POINTER = (
+    "After ANY file change, follow the file-change rule in the `[CRITICAL RULES]` "
+    "block: the runtime selects it for the surface carrying this session."
+)
+PROMPT_SECTION_COMPUTER_USE = "COMPUTER_USE"
+PROMPT_SECTION_BROWSER = "BROWSER"
+PROMPT_SECTION_WAIT_WEBHOOK = "WAIT_WEBHOOK"
+PROMPT_SECTION_ORCHESTRATION = "ORCHESTRATION"
+
+
+def _browser_reachable(session_key: str) -> bool:
+    """Whether the ``browser`` tool can do anything for this session.
+
+    The tool is always listed (``mcp_tools.browser.schemas``); it acts through the
+    dashboard's native Browser panel, which only a dashboard-displayed session
+    has, or falls back to ``playwright-cli`` when that is installed. With neither,
+    every call returns an install hint, so the section teaching it is dead weight.
+    Fails closed, like ``mcp_tools.browser._browsing_available``.
+    """
+    if has_dashboard_surface(session_key):
+        return True
+    try:
+        from kiro_crew.browser_cli import install as _browser_install
+
+        return bool(_browser_install.available())
+    except Exception:
+        return False
+
+
+def _prompt_section_gates(
+    session_key: str, runtime_source: str | None, minimal_context: bool
+) -> dict[str, bool]:
+    """Which capability/surface sections of the managed prompt this session keeps.
+
+    Presentation only: no gate here grants or refuses a tool. ``COMPUTER_USE``
+    is the exact predicate that decides whether ``kirocrew-computer`` is in the
+    emitted spec (``agent._computer_use_spec_gate``) — computer use stays one
+    operator opt-in, with no scope of its own. ``ORCHESTRATION`` (the delegation
+    walkthrough) and ``WAIT_WEBHOOK`` (the wait/poll and webhook-session
+    patterns) are withheld from minimal-context runs, whose wake is a bounded
+    poll; ``ORCHESTRATION`` is withheld from every cron run too.
+    """
+    from kiro_crew.agent import _computer_use_spec_gate
+
+    source = _resolve_runtime_source(session_key, runtime_source)
+    return {
+        PROMPT_SECTION_COMPUTER_USE: _computer_use_spec_gate(),
+        PROMPT_SECTION_BROWSER: _browser_reachable(session_key),
+        PROMPT_SECTION_WAIT_WEBHOOK: not minimal_context,
+        PROMPT_SECTION_ORCHESTRATION: not minimal_context and source != "cron",
+    }
+
+
 # Per-agent opt-out cache for the dashboard-contract context (``_CRITICAL_RULES``
 # + the dashboard tool nudges). ``build_message`` reads the flag on EVERY turn, so
 # a cold JSON scan there would be a per-turn cost; memoize by agent name. Staleness
@@ -2509,7 +2589,40 @@ class ContextBuilder:
             return figure
 
     @staticmethod
-    def _resolve_prompt_templates(prompt: str, session_key: str, cap_figure: str = "") -> str:
+    def _resolve_prompt_sections(prompt: str, sections: Mapping[str, bool] | None) -> str:
+        """Keep or drop each ``{{#NAME}}`` … ``{{/NAME}}`` section of *prompt*.
+
+        A section whose gate in *sections* is False is dropped whole, markers
+        included; every other section keeps its body. ``None`` keeps every body.
+        Leftover markers (unpaired, or nested inside a kept body) are stripped,
+        so no literal marker reaches the model. A prompt without markers is
+        returned unchanged — the byte-identity a custom prompt relies on.
+        """
+        if "{{#" not in prompt and "{{/" not in prompt:
+            return prompt
+        gates = sections or {}
+
+        def _keep_or_drop(match: re.Match[str]) -> str:
+            return match.group(2) if gates.get(match.group(1), True) else ""
+
+        # Repeat so a section nested in a kept one is gated too; each pass
+        # removes at least one marker pair, so this terminates.
+        while True:
+            resolved = _PROMPT_SECTION_RE.sub(_keep_or_drop, prompt)
+            if resolved == prompt:
+                break
+            prompt = resolved
+        return _PROMPT_STRAY_MARKER_RE.sub("", prompt)
+
+    @staticmethod
+    def _resolve_prompt_templates(
+        prompt: str,
+        session_key: str,
+        cap_figure: str = "",
+        *,
+        sections: Mapping[str, bool] | None = None,
+        diff_rule: str | None = None,
+    ) -> str:
         """Resolve conditional template blocks in prompt text.
 
         Dashboard sessions get a short widget pointer; Slack/CLI get it stripped.
@@ -2517,7 +2630,16 @@ class ContextBuilder:
         the model can actually fan out to: ``cap_figure`` when the caller holds
         that session's reading, otherwise a live one. Resolved for every
         transport (not just dashboard), before the widget-block branch.
+
+        Capability/surface sections are kept or dropped by *sections* (see
+        :func:`_prompt_section_gates`), and ``{{DIFF_RULE}}`` becomes *diff_rule*:
+        a pointer at the ``[CRITICAL RULES]`` rule by default, the rule itself
+        when the caller knows the build carries no such block.
         """
+        prompt = ContextBuilder._resolve_prompt_sections(prompt, sections)
+        if _DIFF_RULE_TOKEN in prompt:
+            rule = _DIFF_RULE_POINTER if diff_rule is None else diff_rule
+            prompt = prompt.replace(_DIFF_RULE_TOKEN, rule.rstrip("\n"))
         if ContextBuilder._MAX_SUBAGENTS_TOKEN in prompt:
             prompt = prompt.replace(
                 ContextBuilder._MAX_SUBAGENTS_TOKEN,
@@ -3197,6 +3319,8 @@ class ContextBuilder:
         is_cc: bool,
         private_owner: bool,
         session_start: bool,
+        minimal_context: bool = False,
+        runtime_source: str | None = None,
     ) -> str:
         """Return the agent contract for the ``[AGENT SYSTEM PROMPT]`` block, or "".
 
@@ -3204,6 +3328,13 @@ class ContextBuilder:
         contract a compacted session gets back is the one it started with. Only
         a session start takes a fresh reading of the delegation cap; the call
         that restores the block reuses the session's own.
+
+        The managed prompt's capability/surface sections are gated for this
+        session (:func:`_prompt_section_gates`), and its ``{{DIFF_RULE}}`` token
+        points at the ``[CRITICAL RULES]`` rule wherever that block is delivered
+        beside it — every session start except a minimal-context one, and every
+        post-compaction reinjection — and carries the runtime-selected rule
+        itself elsewhere, so each build states the rule exactly once.
         """
         is_custom = bool(agent) and agent != "kirocrew"
         agent_prompt: str
@@ -3240,7 +3371,25 @@ class ContextBuilder:
             if self._MAX_SUBAGENTS_TOKEN in agent_prompt
             else ""
         )
-        agent_prompt = self._resolve_prompt_templates(agent_prompt, session_key or "", cap_figure)
+        sections = (
+            _prompt_section_gates(session_key or "", runtime_source, minimal_context)
+            if "{{#" in agent_prompt
+            else None
+        )
+        rules_delivered = _agent_includes_crew_context(agent) and not (
+            minimal_context and session_start
+        )
+        agent_prompt = self._resolve_prompt_templates(
+            agent_prompt,
+            session_key or "",
+            cap_figure,
+            sections=sections,
+            diff_rule=(
+                _DIFF_RULE_POINTER
+                if rules_delivered
+                else _diff_rule_for(session_key, runtime_source)
+            ),
+        )
         return self._substitute_bot_name(agent_prompt)
 
     def build_message(
@@ -3479,6 +3628,8 @@ class ContextBuilder:
                     is_cc=is_cc,
                     private_owner=bool(_private_owner),
                     session_start=True,
+                    minimal_context=minimal_context,
+                    runtime_source=runtime_source,
                 )
             )
             if agent_prompt:
@@ -3690,6 +3841,7 @@ class ContextBuilder:
                     essentials=_essentials,
                     provider_type=provider_type,
                     context_provider=context_provider,
+                    minimal_context=minimal_context,
                 )
             )
             # Member identity is session-start context too, so a compaction

@@ -47,7 +47,7 @@ begin on its own line; the assembly newline-terminates the caller's
 
 | # | Block | Fed by | Condition |
 |--:|---|---|---|
-| 1 | `[AGENT SYSTEM PROMPT]` | `config/prompt.md`; `_load_agent_prompt` for a custom agent | skipped on a slim resume. The operator's `prompt.md` override is read whole under the 50 MiB safe-read guard with a 100K-character warn budget: past it the text is still used untruncated but one WARNING per process names its measured size (CTX-16) |
+| 1 | `[AGENT SYSTEM PROMPT]` | `config/prompt.md`; `_load_agent_prompt` for a custom agent | skipped on a slim resume. The operator's `prompt.md` override is read whole under the 50 MiB safe-read guard with a 100K-character warn budget: past it the text is still used untruncated but one WARNING per process names its measured size (CTX-16). Sections are per session (CTX-8): `_resolve_prompt_templates` keeps or drops each `{{#NAME}}`…`{{/NAME}}` block by `_prompt_section_gates` — `COMPUTER_USE` where `agent._computer_use_spec_gate` mounts `kirocrew-computer` (presentation only, no scope), `BROWSER` where the `browser` tool can act (dashboard surface or `playwright-cli` installed), `WAIT_WEBHOOK` off on minimal-context runs, `ORCHESTRATION` off on minimal-context and cron runs — and strips stray markers; `{{DIFF_RULE}}` is a pointer at the row-2 rule wherever row 2 is sent, and the runtime-selected rule itself (`_diff_rule_for`) on a minimal-context start, so each build states it once. A prompt with no markers (custom agent, older override) renders byte-identical |
 | 2 | `[CRITICAL RULES]` | `_critical_rules_for` (runtime-conditional) | unless the agent sets `includeCrewContext: false` |
 | 3 | `[CURRENT DATE]` | `get_local_tz` + `KiroCrewConfig.timezone` | always |
 | 4 | `[CURRENT AGENT]` / `[RUNTIME]` | `_runtime_display_name`, trusted `runtime_source` from the dispatcher | when a session key exists |
@@ -367,6 +367,10 @@ re-adds, once:
    `_session_cap_figure` took when the session started, because the cap in force
    is derived from live host conditions and a second reading would hand the
    session a contract it never agreed to, differing in a number it never chose.
+   Its capability/surface sections are gated by the same `_prompt_section_gates`
+   call as session start (the caller forwards `minimal_context` and the runtime),
+   and its `{{DIFF_RULE}}` is always the pointer, because item 1 re-sends the
+   critical rules here even for a minimal-context session.
 
 Member sessions skip items 2 and 3: their essentials envelope is re-injected by
 the caller, through the member lifecycle chokepoint, so the member's own store
