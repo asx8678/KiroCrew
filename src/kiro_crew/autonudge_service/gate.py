@@ -37,6 +37,20 @@ if TYPE_CHECKING:
 # The service's own logger: callers and tests filter on it by name.
 logger = logging.getLogger("kiro_crew.autonudge")
 
+# The first fallbacks still fire. After this many in a row the re-arm gap
+# doubles from idle_secs, capped at irq.DEFAULT_REALERT_SECS (LOOP-7).
+_BLIND_BACKOFF_AFTER = 3
+
+
+def blind_rearm_secs(loop: NudgeLoop) -> float:
+    """How long to wait after this tick when the probe has been blind."""
+    idle = float(loop.idle_secs)
+    monitor = loop.monitor
+    if monitor is None or monitor.gate_fallbacks < _BLIND_BACKOFF_AFTER:
+        return idle
+    shift = min(monitor.gate_fallbacks - 2, 16)
+    return min(float(irq.DEFAULT_REALERT_SECS), idle * (2**shift))
+
 
 #: Ticks the gate is bypassed for after each wake, so a woken agent gets a
 #: second turn to finish. One, because the cost is paid per wake and a second
@@ -954,6 +968,7 @@ async def _monitor_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> boo
                 # Only the streak reset has to reach the store.
                 self._persist_soon()
             return False
+        monitor.gate_fallbacks = 0
         self._persist_soon()
         logger.debug("AutoNudge: loop %s quiet tick (%s)", loop.id, verdict.body)
         return True
@@ -963,6 +978,8 @@ async def _monitor_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> boo
     # works would otherwise read as a busy, well-used watch.
     monitor.quiet_streak = 0
     if verdict.outcome is irq.Outcome.WAKE:
+        # A real reading ends a blind streak. The next failure starts at one.
+        monitor.gate_fallbacks = 0
         # NOT charged here. A wake is a DELIVERED turn, and this tick has not
         # delivered one yet -- the fire that follows can still be refused (a
         # busy slot, a callback error, a loop deactivated mid-flight). Charging
@@ -985,6 +1002,14 @@ async def _monitor_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> boo
         # A fallback is an OBSERVATION outcome, not a delivery, so it is
         # counted here where it happened.
         monitor.gate_fallbacks += 1
+        if monitor.gate_fallbacks == _BLIND_BACKOFF_AFTER:
+            logger.warning(
+                "AutoNudge: loop %s watch is blind after %d fallbacks; "
+                "backing off toward %ds",
+                loop.id,
+                monitor.gate_fallbacks,
+                int(irq.DEFAULT_REALERT_SECS),
+            )
     monitor.last_observed_at = time.time()
     self._persist_soon()
     return False

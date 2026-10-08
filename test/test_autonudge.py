@@ -2396,6 +2396,64 @@ async def test_an_interrupted_poll_fires_on_the_next_tick(tmp_path, monkeypatch)
         # The NEXT tick has no doubt to consume, so the gate works normally again.
         assert await service._monitor_tick_is_quiet(loop) is True
         assert polled == ["polled"]
+        assert loop.monitor.gate_fallbacks == 0, "a good reading resets the blind streak"
+    finally:
+        service.stop()
+
+
+def test_a_blind_hour_stays_within_eight_turns():
+    """idle_secs=60, always failing, for one hour: the gap doubles after
+    three fallbacks, so the hour cannot buy a turn a minute."""
+    from kiro_crew.autonudge_service.gate import _BLIND_BACKOFF_AFTER, blind_rearm_secs
+
+    monitor = _structured_monitor(kind="gh-pr", target="acme/widgets#42")
+    loop = NudgeLoop(
+        id="blind",
+        slot_key="chat-1",
+        message="watch",
+        idle_secs=60,
+        monitor=monitor,
+    )
+    t = 0.0
+    fires = 0
+    alerts = 0
+    while t < 3600:
+        fires += 1
+        assert loop.monitor is not None
+        loop.monitor.gate_fallbacks += 1
+        if loop.monitor.gate_fallbacks == _BLIND_BACKOFF_AFTER:
+            alerts += 1
+        t += blind_rearm_secs(loop)
+    assert fires <= 8
+    assert alerts == 1
+    loop.monitor.gate_fallbacks = 0
+    assert blind_rearm_secs(loop) == 60
+
+
+@pytest.mark.asyncio
+async def test_the_third_fallback_warns_once(tmp_path, monkeypatch, caplog):
+    import kiro_crew.autonudge as _an
+
+    monkeypatch.setattr(
+        _an.irq,
+        "poll",
+        lambda *_a, **_k: _an.irq.Verdict(_an.irq.Outcome.FALLBACK, "probe down"),
+    )
+    service = AutoNudgeService(base_dir=tmp_path, on_fire=lambda _loop: True)
+    loop = NudgeLoop(
+        id="blind-alert",
+        slot_key="chat-1-123",
+        message="watch https://github.com/acme/widgets/pull/42 until green",
+        idle_secs=60,
+        monitor=_structured_monitor(kind="gh-pr", target="acme/widgets#42"),
+        gate=True,
+    )
+    service._loops[loop.id] = loop
+    try:
+        with caplog.at_level("WARNING"):
+            for _ in range(4):
+                assert await service._monitor_tick_is_quiet(loop) is False
+        assert caplog.text.count("watch is blind") == 1
     finally:
         service.stop()
 

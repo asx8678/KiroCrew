@@ -595,9 +595,12 @@ def _arm_from_deadline(self: AutoNudgeService, loop: NudgeLoop) -> None:
             MONITOR_STATE_VERSION,
         )
         return
+    from kiro_crew.autonudge_service.gate import blind_rearm_secs
+
     now = time.time()
+    interval = blind_rearm_secs(loop)
     if loop.next_due_ts <= 0:
-        loop.next_due_ts = now + loop.idle_secs
+        loop.next_due_ts = now + interval
         if loop.monitor is not None:
             loop.monitor.next_probe_at = loop.next_due_ts
         self._persist_soon()
@@ -605,7 +608,7 @@ def _arm_from_deadline(self: AutoNudgeService, loop: NudgeLoop) -> None:
     if remaining <= 0:
         delay = float(seams._OVERDUE_REARM_SECS)
     else:
-        delay = min(remaining, float(loop.idle_secs))
+        delay = min(remaining, interval)
     # LOOP-16: a wake refused because the conductor's slot was BUSY is owed
     # (``followup_ticks``), and it must land on the FIRST tick after the
     # running turn ends. Without this the deadline arm above — with the

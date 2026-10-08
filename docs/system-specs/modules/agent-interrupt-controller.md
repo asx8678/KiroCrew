@@ -60,7 +60,10 @@ A probe implements:
   `Tick(fetch_ok=False)`. `irq.run` ignores observations in such a tick and
   uses the persisted error streak instead; treating an unreadable subject as a
   quiet subject would hide a blind watch. `test_observations_ignored_when_fetch_failed`
-  pins that distinction.
+  pins that distinction. The AutoNudge gate treats that unreadable tick as a
+  fallback. The first three still fire. After that the re-arm gap doubles from
+  idle_secs, capped at DEFAULT_REALERT_SECS, and one watch-is-blind warning is
+  logged. A later good reading resets the streak.
 * Optional `Probe.tuning()` and `Probe.wake_suffix()`. `irq.run` calls both
   after identity parsing, accepts only the exercised tuning key, validates
   numeric bounds, and drops a broken or non-string suffix. The suffix is
