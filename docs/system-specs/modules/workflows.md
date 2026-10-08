@@ -293,11 +293,18 @@ class Budget(Protocol):
 (`DEFAULT_MAX_AGENTS_PER_RUN` = 1000) is reached, so a runaway fan-out lands on the
 same terminal path.
 
-> Open question: nothing in the shipped engine calls `Budget.charge()`. The
-> ceiling is enforced (`would_exceed` before each call), but `spent()` stays 0 and
-> `remaining()` stays at `total`, so a script's `ctx.budget.remaining()`-based
-> early-stop never trips and no `budget_update` event is ever emitted. Wiring
-> per-call token cost into `charge()` is the missing half.
+**Charging (USE-2).** The runner's `_invoke` wraps every `agent_fn` call, including
+each schema re-ask and each retry, in a fresh `turn_tokens.TURN_TOKEN_SINK`. Every
+terminal `stream_and_collect` turn under the call appends its cost
+(`turn_tokens.count_turn`): input plus output tokens, or the turn's credits when the
+backend reports no token counts (kiro). That mixes units for those turns, so a
+kiro-only run's budget is in credits. `_invoke` calls `budget.would_exceed()` before
+each call, so a re-ask cannot start once the ceiling is reached. After the call,
+`_charge` calls `charge()`, ignores the `BudgetExceeded` it raises (the call
+completed, and the next call is refused), and emits `budget_update` with `spent` and
+`remaining` whenever a `budget_total` is set. A stub `agent_fn` that does not drive
+`stream_and_collect` charges nothing unless it calls `turn_tokens.count_turn`
+itself.
 
 ### ports native to Kiro Crew
 

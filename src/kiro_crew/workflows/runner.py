@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from kiro_crew.metrics.events import WORKFLOW_RUNS, emit_counter
+from kiro_crew.turn_tokens import TURN_TOKEN_SINK
 
 from . import BudgetExceeded, WorkflowEvent
 from .context import DEFAULT_MAX_AGENTS_PER_RUN, AgentCounter, Budget, build_safe_globals
@@ -409,6 +410,46 @@ class _RunContext:
                 pass
 
     # --- agent execution ---
+    async def _invoke(self, prompt: str, opts: dict) -> Any:
+        """One ``agent_fn`` call, charged to the budget (USE-2).
+
+        Every model turn the call drives is counted into a fresh sink, so a
+        schema re-ask or a retry is its own charge. The ceiling is checked before
+        the call starts, so a re-ask cannot begin once the budget is spent.
+        """
+        if self.budget.would_exceed():
+            raise BudgetExceeded("budget exhausted before agent call")
+        sink: list[int] = []
+        token = TURN_TOKEN_SINK.set(sink)
+        try:
+            return await self._agent_fn(prompt, opts)
+        finally:
+            TURN_TOKEN_SINK.reset(token)
+            self._charge(sum(sink))
+
+    def _charge(self, cost: int) -> None:
+        """Charge one completed call's spend, and report the budget (USE-2).
+
+        The call already completed, so reaching the ceiling is not an error here:
+        ``Budget.charge`` clamps at the ceiling and raises, which is caught. The
+        next call is refused by ``_invoke``'s check.
+        """
+        if cost <= 0:
+            return
+        try:
+            self.budget.charge(cost)
+        except BudgetExceeded:
+            pass
+        if self.budget.total is not None:
+            remaining = self.budget.remaining()
+            self._record(
+                self._stream.budget_update(
+                    self.now,
+                    spent=self.budget.spent(),
+                    remaining=int(remaining),
+                )
+            )
+
     async def agent(
         self,
         prompt: str,
@@ -470,7 +511,7 @@ class _RunContext:
                 # schema-valid JSON, or None after bounded retries. The producer
                 # is the same injected agent_fn (so prod/stub both flow through).
                 async def _produce(p: str) -> str:
-                    out = await self._agent_fn(p, opts)
+                    out = await self._invoke(p, opts)
                     return out if isinstance(out, str) else json.dumps(out)
 
                 async with _optional_slot(self._agent_slots):
@@ -483,7 +524,7 @@ class _RunContext:
                     error = "no schema-valid result after bounded re-asks"
             else:
                 async with _optional_slot(self._agent_slots):
-                    result = await self._agent_fn(prompt, opts)
+                    result = await self._invoke(prompt, opts)
                 ok = result is not None
                 if not ok:
                     error = "agent returned no result"
