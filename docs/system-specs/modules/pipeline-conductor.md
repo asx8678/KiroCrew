@@ -36,7 +36,8 @@ Publishing never changes permissions. See [artifacts](artifacts.md).
 | `src/kiro_crew/agent_materialization/conductor_agents.py` | `_install_pipeline_conductor_agent` |
 | `src/kiro_crew/agent_files.py` | `PIPELINE_CONDUCTOR_AGENT_FILENAME`, and its membership in `OWNED_KIRO_AGENT_FILES` |
 | `src/kiro_crew/subagent.py` | `UNADVERTISED_AGENTS` — the conductor is never offered in a rendered agent roster |
-| `src/kiro_crew/builtin_skills/pipeline-conductor/SKILL.md` | The operating procedure: pipeline spec, claim preflight, work-order brief, probe cycle and action table, intervention ladder, adjudication and override protocol, admission table, credit rules, `conductor-status/v1`, cleanup |
+| `src/kiro_crew/builtin_skills/pipeline-conductor/SKILL.md` | The operating procedure's core (SKL-4, under 24 KB): the two columns, what it decides and escalates, what it writes down, the panel, pickup, change claims, green verification, outage recovery, steering and exit, with a stub per moved section that names the reference to read at that step |
+| `.../pipeline-conductor/references/*.md` | The detail read on demand: `startup.md` (pipeline spec, startup), `ledger.md` (ledger mechanics, `conductor-status/v1`), `preflight.md` (coverage filter, claim preflight), `dispatch.md` (dispatch mechanics, partitioning, work-order brief, orders), `probe-cycle.md` (probe cycle and action table), `adjudication.md`, `admission.md` (admission table, forge budget, empty answers), `interventions.md` (intervention ladder, credit rules), `merge.md` (cleanup, reconcile), `known-limits.md` |
 | `.../pipeline-conductor/scripts/claim_preflight.py` | One claim verdict per candidate item |
 | `.../pipeline-conductor/scripts/coverage_filter.py` | The batch open-PR exclusion for the queue build |
 | `.../pipeline-conductor/scripts/fleet_probe.py` | The batch patrol probe |

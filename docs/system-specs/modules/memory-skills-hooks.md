@@ -4491,6 +4491,19 @@ the cap refuses (`size_cap`) also arrives as a pointer. Both bounds are
 decided BEFORE the per-session dedup record, so a body never delivered is
 never recorded as sent.
 
+Packaged skills keep their `SKILL.md` small instead of leaning on that cap
+(SKL-4): every packaged `SKILL.md` (`builtin_skills/`, `apps/builtins/*/skills/`)
+is at most 32 KiB, and a long procedure is a 16-24 KB core plus
+`references/*.md` the core points at from the step that needs them, each moved
+section leaving its heading in `SKILL.md` (so anchors still resolve) over a
+one-paragraph stub naming the reference. `kirocrew-prepare-pr` set the pattern;
+`pipeline-conductor`, `goal-conductor`, `writing-tests` and `kirocrew-commands`
+follow it. The read instructions match: `## Available Skills` and
+`config/prompt.md` tell the agent to read `SKILL.md` with its file-read tool
+(never `cat` the skill) and a `references/` file only when `SKILL.md` points
+there, and the prompt's computer-use and blocked-by-policy rules name the
+sections to read rather than the whole skill.
+
 That opt-out applies only to unconfined installed and provider skills. A project skill
 always goes through full-body injection even if its frontmatter says
 `inject_on_trigger: false`, and the catalog reports that effective behavior. Otherwise

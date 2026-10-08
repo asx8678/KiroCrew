@@ -229,8 +229,11 @@ Preparing that text is clerical. Typing it is the gate.
 
 `lessons.md` beside this file holds the reviewed lessons from past audits:
 how to find a defect, write a proof, grade severity, verify, scope a fix, and
-act on a policy refusal. Read it before the first dispatch, and point each
-seed at the sections that worker needs. It is reference, not scope.
+act on a policy refusal, one `##` section each. Do not read it whole before
+dispatching: point each seed at the sections that worker needs (an auditor at
+"Finding a defect" and "Writing a proof of concept", a fixer at "Scoping a
+fix"), and read a section yourself when you grade, verify, scope a fix or meet
+a refusal. It is reference, not scope.
 
 ## Auditor seed template
 

@@ -569,8 +569,9 @@ def _legacy_context(
         summary_lines = [
             "## Available Skills",
             "",
-            "If a user request relates to any skill below, read the full "
-            "skill file first with `cat <path>` before responding.",
+            "If a user request relates to any skill below, read its `SKILL.md` "
+            "with your file-read tool before responding, and a file under its "
+            "`references/` only when `SKILL.md` points you there for your step.",
             "To run a skill's scripts, `cd` into the directory containing its `SKILL.md`.",
             "",
         ]
