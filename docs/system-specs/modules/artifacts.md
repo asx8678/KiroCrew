@@ -479,17 +479,26 @@ doc stored as `widget` renders as raw inner HTML).
 | `artifact_versions` | List version numbers for a slug |
 | `artifact_revert` | Revert the live state to a prior version; writes that version's content as a fresh snapshot tagged `reverted`, so the activity timeline shows the rollback |
 | `artifact_delete` | Permanent delete (artifact + all versions) |
-| `artifact_folder_list` | List the folder tree (id, name, parent_id, path, item_count) |
-| `artifact_folder_create` | Create a folder; `parent` = id or path (mkdir -p) |
-| `artifact_folder_rename` | Rename a folder (id or path) |
-| `artifact_folder_move` | Reparent a folder; cycle-guarded |
-| `artifact_folder_delete` | Delete a folder; default keeps contents (re-parent), `delete_contents=true` cascades |
+| `artifact_folder(action="list")` | List the folder tree (id, name, parent_id, path, item_count) |
+| `artifact_folder(action="create")` | Create a folder; `parent` = id or path (mkdir -p) |
+| `artifact_folder(action="rename")` | Rename a folder (id or path) |
+| `artifact_folder(action="move")` | Reparent a folder; cycle-guarded |
+| `artifact_folder(action="delete")` | Delete a folder; default keeps contents (re-parent), `delete_contents=true` cascades |
 | `artifact_move` | Move an artifact into a folder / unfile it (metadata-only, no version bump) |
-| `artifact_get_comments` | Read all comments on an artifact (local + provider-synced); `exclude_resolved=true` omits resolved threads (root-granular) so a mid-review read is not re-handed feedback already addressed |
-| `artifact_post_comment` | Post a comment; agent comments carry the structured `is_agent` flag (no emoji stamped into the body — dashboard renders a lucide `Bot` icon, CLI prefixes a plain-text `[agent]` marker) + SEL-audited; `scope='shared'` syncs to the provider |
-| `artifact_mark_review` | Advance a comment thread to REVIEW status (agent can mark_review but NEVER resolve) |
-| `artifact_reply_comment` | Reply to an existing comment thread; a reply to a provider-origin parent posts back to the provider |
-| `artifact_delete_comment` | Delete a fully-applied comment thread (root cascades to replies); provider-synced comments refused; SEL-audited with a `reason` |
+| `artifact_comment(action="list")` | Read all comments on an artifact (local + provider-synced); `exclude_resolved=true` omits resolved threads (root-granular) so a mid-review read is not re-handed feedback already addressed |
+| `artifact_comment(action="post")` | Post a comment; agent comments carry the structured `is_agent` flag (no emoji stamped into the body — dashboard renders a lucide `Bot` icon, CLI prefixes a plain-text `[agent]` marker) + SEL-audited; `scope='shared'` syncs to the provider |
+| `artifact_comment(action="mark_review")` | Advance a comment thread to REVIEW status (agent can mark_review but NEVER resolve) |
+| `artifact_comment(action="reply")` | Reply to an existing comment thread; a reply to a provider-origin parent posts back to the provider |
+| `artifact_comment(action="delete")` | Delete a fully-applied comment thread (root cascades to replies); provider-synced comments refused; SEL-audited with a `reason` |
+
+The comment and folder verbs are advertised as two action-enum tools,
+`artifact_comment` and `artifact_folder` (TOOL-2): every request resends the
+definitions of every mounted tool, and ten descriptors cost far more than two.
+Each action still runs its own handler (`mcp_tools/artifacts.py`
+`_COMMENT_ACTIONS` / `_FOLDER_ACTIONS`) against its own per-verb schema, so a
+field another action takes is refused, not ignored. The per-verb names remain in
+`validation.py`, the HTTP routes, the SEL audit labels and the title table (for
+tool-call rows recorded before the collapse).
 
 Schemas live in `validation.py` (`ARTIFACT_*_SCHEMA`) and are registered in
 `MCP_CORE_SCHEMAS`. The MCP tool layer always proxies through the HTTP API so

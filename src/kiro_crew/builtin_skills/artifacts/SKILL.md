@@ -123,19 +123,21 @@ about style when the user delegated that choice.
 | `artifact_versions` | List version numbers for a slug |
 | `artifact_delete` | Permanently remove |
 | `artifact_move` | File an existing artifact into a folder, or unfile it |
-| `artifact_folder_list` | Read the folder tree — ids, paths, item counts |
-| `artifact_folder_create` | Create a folder; missing path segments are auto-created |
-| `artifact_folder_rename` | Rename a folder |
-| `artifact_folder_move` | Reparent a folder (cycle-guarded) |
-| `artifact_folder_delete` | Remove a folder; safe by default, destructive with `delete_contents=true` |
-| `artifact_get_comments` | Read every comment thread on an artifact; pass `exclude_resolved` to skip threads already resolved |
-| `artifact_post_comment` | Open a thread, optionally anchored to a quoted span |
-| `artifact_reply_comment` | Reply in an existing thread |
-| `artifact_mark_review` | Advance a thread to REVIEW — addressed, awaiting human check |
-| `artifact_delete_comment` | Delete a thread you demonstrably applied; requires a reason |
+| `artifact_folder(action="list")` | Read the folder tree — ids, paths, item counts |
+| `artifact_folder(action="create")` | Create a folder (`name`, `parent`); missing path segments are auto-created |
+| `artifact_folder(action="rename")` | Rename a folder (`folder`, `name`) |
+| `artifact_folder(action="move")` | Reparent a folder (`folder`, `new_parent`; cycle-guarded) |
+| `artifact_folder(action="delete")` | Remove a folder; safe by default, destructive with `delete_contents=true` |
+| `artifact_comment(action="list")` | Read every comment thread on an artifact; pass `exclude_resolved` to skip threads already resolved |
+| `artifact_comment(action="post")` | Open a thread (`text`, `scope`), optionally anchored to a quoted span |
+| `artifact_comment(action="reply")` | Reply in an existing thread (`parent_id`, `text`) |
+| `artifact_comment(action="mark_review")` | Advance a thread to REVIEW (`comment_id`) — addressed, awaiting human check |
+| `artifact_comment(action="delete")` | Delete a thread you demonstrably applied (`comment_id`); requires a `reason` |
 | `deploy_artifact` | Preview-only deploy of a static artifact (`widget`/`html`/`markdown`) or a local built directory; a `kind=webapp` slug is rejected |
 
-All under the `@kirocrew-core` MCP server.
+All under the `@kirocrew-core` MCP server. `artifact_comment` and `artifact_folder` take one
+`action` per call, plus only the fields that action uses: a field another action takes is
+refused, not ignored.
 
 ## When to save proactively
 
@@ -281,7 +283,7 @@ you to iterate / "address the comments"), triage EVERY open comment as part
 of the same pass — never leave the human to re-read and clean up stale
 annotations by hand.
 
-A comment may be **anchored**: `artifact_get_comments` returns the exact quoted
+A comment may be **anchored**: `artifact_comment(action="list")` returns the exact quoted
 span it was attached to, because the human selected that text in the artifact
 before writing the note. Treat an anchored comment as an instruction *about that
 span* — resolve it there rather than applying it globally, and re-read the span
@@ -291,9 +293,9 @@ guessing where it used to point.
 
 | Case | Action |
 |---|---|
-| Unambiguous directive, fully applied ("delete this", "fix typo", a clear reframe) | `artifact_delete_comment` with a reason ("applied in vN: <what you did>") |
-| Applied with interpretation or judgment the human may want to check | `artifact_mark_review` + short `artifact_reply_comment` stating what was done |
-| Not applied / you disagree / needs discussion | `artifact_reply_comment` with your reasoning; leave the thread open |
+| Unambiguous directive, fully applied ("delete this", "fix typo", a clear reframe) | `artifact_comment(action="delete")` with a reason ("applied in vN: <what you did>") |
+| Applied with interpretation or judgment the human may want to check | `action="mark_review"` + a short `action="reply"` stating what was done |
+| Not applied / you disagree / needs discussion | `action="reply"` with your reasoning; leave the thread open |
 | Anchor text deleted *as part of* applying the comment | Same as row 1 — delete |
 
 Rules:
@@ -331,12 +333,11 @@ The library is a tree. `artifact_save` and `artifact_move` both take `folder`
 as a folder id OR a `/`-separated human path (`Reports/Q3`), and missing
 segments are created for you — so file an artifact at save time whenever it
 belongs with others instead of leaving it at the top level. `''` or `root`
-unfiles one. `artifact_folder_list` gives ids, paths and item counts, which is
-what you read before moving anything; `artifact_folder_create` /
-`artifact_folder_rename` / `artifact_folder_move` reshape the tree, and a move
-cannot make a folder its own descendant.
+unfiles one. `artifact_folder(action="list")` gives ids, paths and item counts,
+which is what you read before moving anything; the `create` / `rename` / `move`
+actions reshape the tree, and a move cannot make a folder its own descendant.
 
-`artifact_folder_delete` defaults to SAFE: it re-parents the folder's children
+`artifact_folder(action="delete")` defaults to SAFE: it re-parents the folder's children
 up to its parent and removes only the folder. `delete_contents=true`
 permanently deletes the whole subtree INCLUDING every descendant artifact —
 echo the affected count to the user and get agreement before calling it that
