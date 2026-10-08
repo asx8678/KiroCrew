@@ -2385,6 +2385,10 @@ class RunEventCoordinator(ManagerComponent):
             # it, has finished before this one runs.
             info._session_sharing = False
             info._shared_provider = None
+            # Unpinned: request auto. Omitting the kwarg lets get_or_create
+            # fill agent.model, which is the chat pin.
+            if "model" not in extra_kwargs:
+                extra_kwargs["model"] = "auto"
 
             def _claim():
                 return self._manager._sessions.get_or_create(

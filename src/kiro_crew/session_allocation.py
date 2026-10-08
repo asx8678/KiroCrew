@@ -1214,6 +1214,7 @@ class SessionAllocationService:
         agent: str | None = None,
         cwd: str | None = None,
         approval_policy: str = "",
+        model: str | None = None,
         _won_race_retries: int = 0,
         start_priority: StartPriority = StartPriority.BACKGROUND,
     ) -> tuple[LLMProvider, bool, bool]:
@@ -1228,6 +1229,10 @@ class SessionAllocationService:
 
         owner = self._owner
         key = owner._fold_key(session_key)
+        if not model:
+            from kiro_crew.config.loader import KiroCrewConfig
+
+            model = KiroCrewConfig.load().agent.resolve_model("taskrunner")
         from kiro_crew.execution_context import read_session_execution
 
         execution = await asyncio.to_thread(read_session_execution, key)
@@ -1239,6 +1244,7 @@ class SessionAllocationService:
                 agent=agent,
                 approval_policy=approval_policy,
                 cwd=cwd,
+                model=model,
                 start_priority=start_priority,
             )
         if not owner._bg_backend_supports_runtime():
@@ -1256,6 +1262,7 @@ class SessionAllocationService:
                 agent=agent,
                 approval_policy=approval_policy,
                 cwd=cwd,
+                model=model,
                 start_priority=start_priority,
             )
         async with self._lock:
@@ -1288,6 +1295,7 @@ class SessionAllocationService:
                 agent=agent,
                 approval_policy=approval_policy,
                 cwd=cwd,
+                model=model,
                 start_priority=start_priority,
             )
         runtime = await owner._get_or_bootstrap_run_runtime(
@@ -1311,6 +1319,7 @@ class SessionAllocationService:
                 agent=agent,
                 approval_policy=approval_policy,
                 cwd=cwd,
+                model=model,
                 start_priority=start_priority,
             )
         provider = self._deps.session_provider_type()(handle, runtime)

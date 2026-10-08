@@ -374,9 +374,10 @@ its own once the cache refreshes with a list that carries it.
   current catalog. Enabling the configured effort default moves the slider thumb to
   that level before the setting write completes.
 - **Pin a cheaper model** only through `agent.role_models.<role>` (`background`,
-  `subagent`), read by `AgentConfig.resolve_model(role)` in `config/sections.py`. Roles
-  default to `"auto"` and deliberately do NOT inherit `agent.model`, so a user's chat
-  model does not silently become the price of every background task.
+  `subagent`, `cron`, `workflow`, `taskrunner`), read by `AgentConfig.resolve_model(role)`
+  in `config/sections.py`. Roles default to `"auto"` and deliberately do NOT inherit
+  `agent.model`, so a user's chat model does not silently become the price of cron,
+  workflow, task-runner, or subagent work.
 - **Entitlement checks** always use the shared predicate
   `acp.client.model_is_unusable(id, advertised)` together with
   `advertised_model_ids(...)`. It is one predicate on purpose: two spellings of "can

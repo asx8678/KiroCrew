@@ -4714,13 +4714,16 @@ class GatewayOrchestrator:
                     )
 
                 try:
+                    from kiro_crew.config.loader import KiroCrewConfig
+
+                    cron_model = job.model or KiroCrewConfig.load().agent.resolve_model("cron")
                     client, is_new, resumed = await self.sessions.get_or_create(
                         key,
                         agent=agent_id,
                         crew_agent=crew_agent,
                         channel_id=job.channel,
                         approval_policy=job.approval_mode,
-                        model=job.model or None,
+                        model=cron_model,
                         extra_env=_cron_extra_env(),
                         cwd=cwd,
                     )

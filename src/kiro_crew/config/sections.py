@@ -275,11 +275,17 @@ def normalize_agent_model(model: object) -> str:
 # Per-task-class model overrides (agent.role_models). These are the ONLY
 # sanctioned place to pin a model for a class of work — never hardcode a model
 # id in code. Every role defaults to "" ("inherit"), which resolves down to
-# agent.model and finally to DEFAULT_MODEL ("auto"), so an unpinned role is
+# DEFAULT_MODEL ("auto"), not agent.model, so an unpinned role is
 # entitlement-safe on every subscription tier (the provider picks a served
 # model). An operator who deliberately wants a cheaper model for background /
 # sub-agent work pins it here without changing the interactive chat default.
-ROLE_MODEL_KEYS: tuple[str, ...] = ("background", "subagent")
+ROLE_MODEL_KEYS: tuple[str, ...] = (
+    "background",
+    "subagent",
+    "cron",
+    "workflow",
+    "taskrunner",
+)
 
 # The kiro agents that run the "background" role: auto-titles, memory
 # consolidation, heartbeat polls. Named here rather than inline at the one place
@@ -889,13 +895,11 @@ class AgentConfig:
         default_factory=dict,
         metadata=_meta(
             "Per-role models",
-            "Optional per-task-class model overrides. Keys: 'background' "
-            "(lite / heartbeat background workers) and 'subagent' (spawned "
-            "sub-agents). An empty value or 'auto' defers to the chat default "
-            "(agent.model) and then to the provider default, so an unpinned "
-            "role stays usable on every subscription tier. Pin a cheaper model "
-            "here to run background / sub-agent work on it without changing the "
-            "interactive chat default.",
+            "Optional per-task-class model overrides. Keys: 'background', "
+            "'subagent', 'cron', 'workflow' and 'taskrunner'. An empty value "
+            "or 'auto' resolves to 'auto' and does not inherit agent.model. "
+            "Pin a cheaper model here to run that class of work on it without "
+            "changing the interactive chat default.",
         ),
     )
     role_efforts: dict[str, str] = field(
@@ -903,8 +907,8 @@ class AgentConfig:
         metadata=_meta(
             "Per-role reasoning effort",
             "Optional per-task-class reasoning effort, paired with role_models "
-            "(keys: 'background', 'subagent'). Empty for a role inherits the chat "
-            "default (agent.reasoning_effort) and then the provider/model default. "
+            "(keys: 'background', 'subagent', 'cron', 'workflow', 'taskrunner'). "
+            "Empty for a role does not inherit agent.reasoning_effort. "
             "Only applies on reasoning-capable models.",
         ),
     )
