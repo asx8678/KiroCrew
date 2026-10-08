@@ -47,7 +47,7 @@ begin on its own line; the assembly newline-terminates the caller's
 
 | # | Block | Fed by | Condition |
 |--:|---|---|---|
-| 1 | `[AGENT SYSTEM PROMPT]` | `config/prompt.md`; `_load_agent_prompt` for a custom agent | skipped on a slim resume. The operator's `prompt.md` override is read whole under the 50 MiB safe-read guard with a 100K-character warn budget: past it the text is still used untruncated but one WARNING per process names its measured size (CTX-16) |
+| 1 | `[AGENT SYSTEM PROMPT]` | `config/prompt.md`; `_load_agent_prompt` for a custom agent | skipped on a slim resume, and for a custom agent whose spec prompt the harness already delivers verbatim (kiro-cli, KAS: `ACP_BACKENDS_NATIVE_AGENT_PROMPT`; SPEC-2). The operator's `prompt.md` override is read whole under the 50 MiB safe-read guard with a 100K-character warn budget: past it the text is still used untruncated but one WARNING per process names its measured size (CTX-16) |
 | 2 | `[CRITICAL RULES]` | `_critical_rules_for` (runtime-conditional) | unless the agent sets `includeCrewContext: false` |
 | 3 | `[CURRENT DATE]` | `get_local_tz` + `KiroCrewConfig.timezone` | always |
 | 4 | `[CURRENT AGENT]` / `[RUNTIME]` | `_runtime_display_name`, trusted `runtime_source` from the dispatcher | when a session key exists |
@@ -363,6 +363,8 @@ re-adds, once:
    briefing and permanent rules back, not the pre-compaction copy;
 8. `[AGENT SYSTEM PROMPT]` — the managed spec prompt is a stub pointing at this
    block, so a compaction that drops it leaves the session with no contract.
+   A custom agent's own prompt on kiro-cli or KAS is not re-injected: it is the
+   native system prompt there, which the compaction keeps.
    This one is the *session-start* copy: `{{MAX_SUBAGENTS}}` carries the reading
    `_session_cap_figure` took when the session started, because the cap in force
    is derived from live host conditions and a second reading would hand the

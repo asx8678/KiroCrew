@@ -58,6 +58,9 @@ class ContextPromptProvider(Protocol):
     def native_steering(self) -> bool: ...
 
     @property
+    def native_agent_prompt(self) -> bool: ...
+
+    @property
     def cwd(self) -> str: ...
 
     @property

@@ -67,7 +67,7 @@ from kiro_crew.acp.types import (
     effort_config_option_id,
     effort_config_option_value,
 )
-from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
+from kiro_crew.acp_backends import ACP_BACKENDS_NATIVE_AGENT_PROMPT, POLICY_ID_BY_BACKEND
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.backends import model_registry_namespace
@@ -2468,6 +2468,12 @@ class AcpProvider(LLMProvider):
         # Kiro ACP manual/fileMatch support depends on version and engine;
         # the fallback keeps those guides reachable without a false capability.
         return self._client.backend == ACP_BACKEND_KAS
+
+    @property
+    def native_agent_prompt(self) -> bool:
+        # Opt-in membership (H6): kiro-cli and KAS deliver the spec prompt
+        # themselves; every other harness keeps Crew's injected copy.
+        return self._client.backend in ACP_BACKENDS_NATIVE_AGENT_PROMPT
 
     async def stream(self, message: str, *, allow_image: bool = True) -> AsyncIterator[LLMEvent]:
         # The direct client can respawn in ensure_ready; resolve that BEFORE

@@ -234,9 +234,11 @@ the spawn window, which is why a prepared view is preferred.
    `model` reaches them with `session/set_config_option` after `session/new` —
    the same channel `codex`, `opencode` and `goose` use, which is why `model` is
    the one field no mirror needs to carry. And `prompt` arrives as context text on
-   every harness alike (`context.py` appends the `[AGENT SYSTEM PROMPT]` block for
-   a custom agent with no backend condition on it). What a mirror decides, and
-   these two therefore go without, is the MCP surface.
+   every harness outside `ACP_BACKENDS_NATIVE_AGENT_PROMPT` (`context.py` appends
+   the `[AGENT SYSTEM PROMPT]` block for a custom agent; only kiro-cli and KAS,
+   which deliver the spec prompt themselves, have it withheld — see Prompt
+   below). What a mirror decides, and these two therefore go without, is the MCP
+   surface.
 
 **No mirrored harness READS `resources`, and the two URI schemes under that one
 key survive that differently.** Neither is loaded natively: the harness is not
@@ -396,9 +398,22 @@ fork or template copy alike — so a fork inheriting the managed contract is
 delivered exactly once, resolved, via the injection. The stub text is frozen
 once shipped: forks carry it verbatim on disk and `is_managed_prompt` matches
 by equality, so a respelled stub would leave every existing fork with the old
-stub text as a custom persona. An agent whose `prompt` names its OWN persona
-file is out of scope: it still receives that persona both natively and through
-the injection.
+stub text as a custom persona.
+
+An agent whose `prompt` is its OWN persona (inline or a `file://` it names) gets
+it once on every backend. On kiro-cli and KAS (`ACP_BACKENDS_NATIVE_AGENT_PROMPT`,
+read through the provider's `native_agent_prompt`) the native system prompt is the
+copy, and `context.py` withholds its `[AGENT SYSTEM PROMPT]` block at session start
+and after a compaction (a system prompt survives the compaction). It is withheld
+only when Crew's resolved text is byte-identical to the spec's: a persona using
+`{bot_name}`, `{{MAX_SUBAGENTS}}` or `{{WIDGET_BLOCK}}` resolves differently from
+the raw native copy, so it keeps the injected block and is still delivered twice.
+Every mirrored harness is handed no spec prompt and keeps the injection. A turn
+built with no provider in hand keeps the injection too, which fails toward the
+duplicate, never toward no persona. Paths that drive an agent without
+`build_message` (channel agents, the task runner, chat-thread and Side Chat
+read-only derivatives, the knowledge pool) are unchanged: they always relied on
+the native prompt alone.
 
 The reader also recognizes an older managed `file://` pointer under a Crew data
 home or installed package. A desktop update or fallback gateway can leave that
@@ -570,7 +585,7 @@ every other mirrored harness.
 |---|---|---|---|
 | `name` | resolves `--agent` | wire `id` | roster only |
 | `description` | roster only | wire field | roster only |
-| `prompt` | read from disk | inlined over the wire | Crew injects it at session start; the built-in agent gets the Kiro Crew persona |
+| `prompt` | read from disk; a custom persona is NOT also injected (`ACP_BACKENDS_NATIVE_AGENT_PROMPT`) | inlined over the wire; same withholding | Crew injects it at session start; the built-in agent gets the Kiro Crew persona |
 | `model` | honoured, `"auto"` resolvable | not projected | `cc_model` sidecar instead |
 | `tools` | honoured | wire field; absent means NO tools | roster only |
 | `allowedTools` | honoured | translated to `permissions` | not read |

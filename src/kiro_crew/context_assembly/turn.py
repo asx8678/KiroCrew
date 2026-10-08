@@ -84,6 +84,9 @@ def post_compaction_parts(
         is_cc=is_cc,
         private_owner=private_owner,
         session_start=False,
+        native_agent_prompt=(
+            context_provider is not None and bool(context_provider.native_agent_prompt)
+        ),
     )
     if _agent_prompt:
         parts.append(f"[AGENT SYSTEM PROMPT]\n{_agent_prompt}\n[END AGENT SYSTEM PROMPT]\n\n")
