@@ -70,6 +70,7 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel as _sel
 from kiro_crew.start_priority import StartPriority
+from kiro_crew.turn_tokens import count_turn
 
 _PROMPT_BUSY_RETRIES = 2
 _PROMPT_BUSY_DELAY = 1.5  # seconds between retries
@@ -2966,6 +2967,10 @@ async def stream_and_collect(
             turn_billed = _sum_usage(
                 turn_billed, _attempt_usage(provider, since=attempt_stats_before)
             )
+            # USE-2: a workflow call's budget charges the terminal turn's spend
+            # here, once per turn, whatever the surface label.
+            if not retrying:
+                count_turn(turn_billed)
             # A caller that passed ``usage_surface`` gets its row written below
             # instead, so nothing is left behind for a second reader to persist.
             if not retrying and not usage_surface:
