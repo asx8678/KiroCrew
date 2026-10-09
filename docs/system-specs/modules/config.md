@@ -1290,6 +1290,9 @@ keys`. Three exclusions from that warning are named in code:
 A deprecated field is announced only when it holds something: `null` and an
 empty map, list or string carry nothing to migrate, so `validation` stays
 silent on them (`False` and `0` are chosen values and are still announced). A
+value equal to the field's schema default is silent too: a save materializes
+the default (`agent.subagent_cpu_cost_cores` is preserved on save, so a fresh
+`config.json` carries `1.0`), and the operator never wrote it. A
 schema entry that is marked `deprecated=True` therefore accepts that an empty
 value of its type gets no notice; a field for which `""` or `[]` is itself a
 meaningful choice must not rely on the deprecation notice to surface that

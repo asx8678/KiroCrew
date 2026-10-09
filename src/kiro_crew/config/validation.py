@@ -147,6 +147,18 @@ def _holds_nothing(value: object) -> bool:
     return value is None or (isinstance(value, (dict, list, str)) and not value)
 
 
+def _is_schema_default(value: object, default: object) -> bool:
+    """True when a stored deprecated value is still the field's own schema default.
+
+    A default the product materialized into the file on save carries nothing for
+    the operator to migrate. ``bool`` is compared by type too, so ``True`` is not
+    taken for a numeric ``1`` default and an operator-chosen flag still warns.
+    """
+    if default is None or isinstance(value, bool) != isinstance(default, bool):
+        return False
+    return value == default
+
+
 def _get_help_text(schema: dict, dot_path: str) -> str:
     """Return the help text for the field at *dot_path*."""
     node = _lookup_schema_node(schema, dot_path)
@@ -514,7 +526,8 @@ def validate_config_data(data: dict) -> dict:
     # nothing (an empty map/list/string, or null) carries nothing for the
     # operator to migrate, so it is not announced: warning on bare presence would
     # scold an install whose earlier build materialized the key's empty default
-    # into every save, which the operator never wrote and cannot act on.
+    # into every save, which the operator never wrote and cannot act on. A value
+    # still equal to the schema default is skipped for the same reason.
     for entry in SCHEMA_REGISTRY:
         if not entry.deprecated:
             continue
@@ -528,7 +541,7 @@ def validate_config_data(data: dict) -> dict:
             else:
                 found = False
                 break
-        if found and not _holds_nothing(node):
+        if found and not _holds_nothing(node) and not _is_schema_default(node, entry.default_value):
             logger.warning(
                 "Config: deprecated field '%s': %s",
                 entry.path,
