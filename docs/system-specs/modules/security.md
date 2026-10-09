@@ -111,7 +111,10 @@ threat and the read is not.
 
 Both are also in `sandbox._CREW_NO_ALIAS_LEAVES`, which REFUSES the spawn when the
 leaf is reachable under a second name — a symlink, or a regular file carrying an
-extra hardlink. Every other SEALED ceiling only warns and continues, because a
+extra hardlink. Every other SEALED ceiling only warns and continues (an extra
+hardlink is re-read for up to `_PUBLISH_LINK_SETTLE_SECS` first, because a
+concurrent spawn publishing the ceiling holds a second name for an instant
+between `link(tmp, target)` and unlinking `tmp`), because a
 user who symlinks a config file into a dotfiles repository is doing something
 ordinary and refusing would turn a normal setup into a spawn failure over a
 pre-existing hole. Neither of these is a config file and nothing has a reason to

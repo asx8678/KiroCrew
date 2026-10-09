@@ -2224,6 +2224,9 @@ def _warn_if_alias_backed(target: str) -> None:
             target,
         )
     elif stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+        info = _settled_link_count(target, info)
+        if info.st_nlink <= 1:
+            return
         logger.warning(
             "sandbox: the governance ceiling %s has %d hardlinks. The seal covers this "
             "path only, so a write through another name reaches the same inode. Remove the "
@@ -2231,6 +2234,30 @@ def _warn_if_alias_backed(target: str) -> None:
             target,
             info.st_nlink,
         )
+
+
+#: How long :func:`_settled_link_count` waits for a second link to go away.
+_PUBLISH_LINK_SETTLE_SECS = 0.05
+
+
+def _settled_link_count(target: str, info: os.stat_result) -> os.stat_result:
+    """Re-read *target* until its extra link is gone or the settle window ends.
+
+    :func:`_publish_empty_ceiling` publishes by ``link(tmp, target)`` then unlinks
+    ``tmp``, so for an instant the ceiling it just created carries two names. A
+    concurrent spawn's pass (several start at once on a fresh data home) can lstat
+    in that instant and would report a hardlink that is about to vanish. A real
+    second name persists, so it still warns once the window ends; this only costs
+    time when ``st_nlink > 1``, which a healthy host never shows for long.
+    """
+    deadline = time.monotonic() + _PUBLISH_LINK_SETTLE_SECS
+    while info.st_nlink > 1 and time.monotonic() < deadline:
+        time.sleep(0.005)
+        try:
+            info = os.lstat(target)
+        except OSError:
+            break
+    return info
 
 
 def _refuse_if_dangling_symlink(target: str) -> None:
