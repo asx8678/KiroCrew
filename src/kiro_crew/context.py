@@ -1425,6 +1425,11 @@ PROMPT_SECTION_BROWSER_TOOL = "BROWSER_TOOL"
 PROMPT_SECTION_BROWSER_CLI = "BROWSER_CLI"
 PROMPT_SECTION_WAIT_WEBHOOK = "WAIT_WEBHOOK"
 PROMPT_SECTION_ORCHESTRATION = "ORCHESTRATION"
+#: Guidance for tools or surfaces only some sessions have, kept off the rest.
+PROMPT_SECTION_DASHBOARD = "DASHBOARD"
+PROMPT_SECTION_PEER_SESSIONS = "PEER_SESSIONS"
+PROMPT_SECTION_SLACK = "SLACK"
+PROMPT_SECTION_WEBHOOK_SESSION = "WEBHOOK_SESSION"
 
 
 def _playwright_cli_available() -> bool:
@@ -1470,6 +1475,13 @@ def _prompt_section_gates(
     keeps the ``browser``-tool paragraphs only for an agent whose spec mounts that
     ``kirocrew-ops`` tool; otherwise ``BROWSER_CLI`` teaches ``playwright-cli``
     alone, and the whole section drops when neither path exists.
+
+    ``DASHBOARD`` keeps guidance for tools that refuse off a dashboard surface
+    (``ask_question`` gates on the same ``has_dashboard_surface``);
+    ``PEER_SESSIONS`` keeps the peer-session note only for an agent whose spec
+    mounts the opt-in ``kirocrew-dashboard`` session tools; ``SLACK`` keeps the
+    Slack-thread rule for Slack sessions and ``WEBHOOK_SESSION`` the restored-
+    context note for webhook-triggered (``hook:``) sessions.
     """
     from kiro_crew.agent import _computer_use_spec_gate
 
@@ -1482,6 +1494,12 @@ def _prompt_section_gates(
         PROMPT_SECTION_BROWSER_CLI: not tool_granted,
         PROMPT_SECTION_WAIT_WEBHOOK: not minimal_context,
         PROMPT_SECTION_ORCHESTRATION: not minimal_context and source != "cron",
+        PROMPT_SECTION_DASHBOARD: has_dashboard_surface(session_key),
+        PROMPT_SECTION_PEER_SESSIONS: _agent_grants_server_tool(
+            agent, _DASHBOARD_SERVER, "session_create"
+        ),
+        PROMPT_SECTION_SLACK: source == "slack",
+        PROMPT_SECTION_WEBHOOK_SESSION: source == "webhook",
     }
 
 
@@ -1529,23 +1547,26 @@ def _read_agent_spec_dict(agent: str) -> dict[str, Any] | None:
     return None
 
 
-# Per-agent memo of "the spec grants the ``kirocrew-ops`` ``browser`` tool", for
-# the same per-turn reason as ``_INCLUDE_CREW_CONTEXT_CACHE``; cleared with it.
-_GRANTS_OPS_BROWSER_CACHE: dict[str, bool] = {}
+# Per-(agent, server, tool) memo of "the spec mounts that tool", for the same
+# per-turn reason as ``_INCLUDE_CREW_CONTEXT_CACHE``; cleared with it.
+_SERVER_TOOL_GRANTS_CACHE: dict[tuple[str, str, str], bool] = {}
 _OPS_SERVER = "kirocrew-ops"
+_DASHBOARD_SERVER = "kirocrew-dashboard"
 
 
-def _agent_grants_ops_browser(agent: str | None) -> bool:
-    """Whether *agent*'s spec mounts the ``browser`` tool of ``kirocrew-ops``.
+def _agent_grants_server_tool(agent: str | None, server: str, tool: str) -> bool:
+    """Whether *agent*'s spec mounts *tool* of the opt-in MCP *server*.
 
-    ``browser`` moved to the opt-in ``kirocrew-ops`` server (TOOL-2), which a
-    default spec does not carry, so the BROWSER prompt section must not name it
-    as the primary tool for every dashboard session. Presentation only: this
-    grants nothing. ``True`` on an unreadable or missing spec, so a read failure
-    keeps the previous wording rather than hiding guidance a granted agent needs.
+    An opt-in server reaches a session only when the spec lists it in
+    ``mcpServers`` AND references it in ``tools`` (``*``, ``@server`` or
+    ``@server/tool``) — the mount rule on every harness. Presentation only: this
+    grants nothing; it decides which prompt sections describe the tool. ``True``
+    on an unreadable or missing spec, so a read failure keeps the guidance
+    rather than hiding it from an agent that does have the tool.
     """
     name = agent or "kirocrew"
-    cached = _GRANTS_OPS_BROWSER_CACHE.get(name)
+    key = (name, server, tool)
+    cached = _SERVER_TOOL_GRANTS_CACHE.get(key)
     if cached is not None:
         return cached
     data = _read_agent_spec_dict(name)
@@ -1557,11 +1578,21 @@ def _agent_grants_ops_browser(agent: str | None) -> bool:
         tool_list = tools if isinstance(tools, list) else []
         granted = (
             isinstance(servers, dict)
-            and _OPS_SERVER in servers
-            and any(t in ("*", f"@{_OPS_SERVER}", f"@{_OPS_SERVER}/browser") for t in tool_list)
+            and server in servers
+            and any(t in ("*", f"@{server}", f"@{server}/{tool}") for t in tool_list)
         )
-    _GRANTS_OPS_BROWSER_CACHE[name] = granted
+    _SERVER_TOOL_GRANTS_CACHE[key] = granted
     return granted
+
+
+def _agent_grants_ops_browser(agent: str | None) -> bool:
+    """Whether *agent*'s spec mounts the ``browser`` tool of ``kirocrew-ops``.
+
+    ``browser`` moved to the opt-in ``kirocrew-ops`` server (TOOL-2), which a
+    default spec does not carry, so the BROWSER prompt section must not name it
+    as the primary tool for every dashboard session.
+    """
+    return _agent_grants_server_tool(agent, _OPS_SERVER, "browser")
 
 
 def _read_include_crew_context(agent: str) -> bool:
@@ -1611,10 +1642,10 @@ def invalidate_include_crew_context_cache() -> None:
     not-yet-written spec — would otherwise stay wrong until a gateway restart, the
     exact restart-heals failure class this fix exists to remove. Clearing forces
     the next ``build_session_context`` / ``build_message`` to re-read the flag.
-    The ``kirocrew-ops`` browser-grant memo is cleared with it, for the same reason.
+    The opt-in server-tool grant memo is cleared with it, for the same reason.
     """
     _INCLUDE_CREW_CONTEXT_CACHE.clear()
-    _GRANTS_OPS_BROWSER_CACHE.clear()
+    _SERVER_TOOL_GRANTS_CACHE.clear()
 
 
 def build_cancelled_turn_preamble(
