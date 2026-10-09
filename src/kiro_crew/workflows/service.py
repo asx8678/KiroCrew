@@ -94,6 +94,12 @@ def _workflow_step_agent(run_id: str) -> Optional[str]:
     return None
 
 
+#: Cycle cap for a nudge loop a workflow arms with ``ctx.nudge`` and no positive
+#: ``max_cycles`` (LOOP-8). Each cycle is a full turn on the originating session,
+#: and nothing watches an unattended script's loop, so 0 does not mean unlimited
+#: on this path.
+WORKFLOW_NUDGE_DEFAULT_MAX_CYCLES = 50
+
 # Bounded attempts to coax a valid script out of the model (mirrors schema retry).
 _AUTHOR_RETRIES = 2
 # A failed run's error is stored and served verbatim (runner joins ``errors``),
@@ -643,6 +649,12 @@ class WorkflowService:
             except Exception:  # noqa: BLE001 - visibility must never break the run
                 logger.debug("ctx.nudge notify failed", exc_info=True)
 
+        # LOOP-8: a loop armed by an agent-authored script runs unattended, so
+        # "no cap" (the contract's 0) gets a bounded default here; a loop the
+        # operator arms from the AutoNudge popover keeps its explicit choice.
+        if not isinstance(max_cycles, int) or max_cycles <= 0:
+            max_cycles = WORKFLOW_NUDGE_DEFAULT_MAX_CYCLES
+
         authorizer = self._nudge_authorizer
         if authorizer is None:
             logger.warning("workflow ctx.nudge skipped: no nudge authorizer wired")
@@ -993,6 +1005,7 @@ class WorkflowService:
 
             source = ""
             attempts = _AUTHOR_RETRIES + 1
+            matches: list[dict[str, Any]] = []
             for i in range(attempts):
                 if errors:
                     _say(
@@ -1000,21 +1013,30 @@ class WorkflowService:
                     )
                 else:
                     _say(f"Drafting the workflow script (attempt {i + 1}/{attempts})…")
-                matches = await asyncio.to_thread(self._search_definitions, intent)
-                references = _authoring_references(matches)
-                prompt = _AUTHOR_SYSTEM.format(intent=intent, references=references)
-                if errors and cut_off:
-                    # Regenerating at the same length gets cut off at the same
-                    # place, so say why it failed and ask for less output.
-                    prompt += (
-                        "\n\nYour previous script was CUT OFF before it ended, most likely "
+                if i == 0:
+                    matches = await asyncio.to_thread(self._search_definitions, intent)
+                    references = _authoring_references(matches)
+                    prompt = _AUTHOR_SYSTEM.format(intent=intent, references=references)
+                elif cut_off:
+                    # Every attempt shares this one session, so the system text,
+                    # intent and references are already in its window: a retry
+                    # sends only what went wrong (they were ~13k tokens re-sent
+                    # per attempt). Regenerating at the same length gets cut off
+                    # at the same place, so say why it failed and ask for less.
+                    prompt = (
+                        "Your previous script was CUT OFF before it ended, most likely "
                         f"at the output length limit ({'; '.join(errors)}). Write a "
                         "SHORTER complete script: keep every phase the intent asks for, "
                         "but use loops and helper functions instead of repeated blocks, "
-                        "keep agent prompts terse, and leave out comments."
+                        "keep agent prompts terse, and leave out comments. Reply with "
+                        "ONLY the complete Python module (no prose, no code fence)."
                     )
-                elif errors:
-                    prompt += f"\n\nYour previous script was INVALID: {'; '.join(errors)}. Fix it."
+                else:
+                    prompt = (
+                        f"Your previous script was INVALID: {'; '.join(errors)}. Fix it. "
+                        "Reply with ONLY the complete corrected Python module "
+                        "(no prose, no code fence)."
+                    )
                 from kiro_crew.messaging.identity import publish_turn_identity
 
                 await publish_turn_identity(self._sessions, key)

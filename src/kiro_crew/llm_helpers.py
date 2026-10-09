@@ -356,6 +356,25 @@ def first_advertised_fallback(advertised: Any, rejected: str | None) -> str | No
     return None
 
 
+def rejected_model_substitute(
+    advertised: Any, rejected: str | None, served: str = ""
+) -> str | None:
+    """The model to retry with after *rejected* was refused (MOD-4).
+
+    Prefers *served*, the backend-confirmed model already serving the session
+    (``served_model``: the ``session/new`` default when nothing was set), when it
+    is advertised and is neither the rejected id nor ``"auto"`` — the same
+    reset-to-default the interactive path makes. Only then the first advertised
+    model, whose position in the list says nothing about what it costs.
+    """
+    served_low = (served or "").strip().lower()
+    if served_low and served_low not in ((rejected or "").strip().lower(), "auto"):
+        for m in advertised or []:
+            if isinstance(m, str) and m.strip().lower() == served_low:
+                return m
+    return first_advertised_fallback(advertised, rejected)
+
+
 # ── Throttle-exhaustion fallback chain (agent.fallback_model) ──
 #
 # When the active model's same-model transient budget (_TRANSIENT_RETRIES)
@@ -1832,7 +1851,9 @@ async def run_bg_oneliner(
             rejected = getattr(exc, "rejected_model", None)
             advertised = getattr(exc, "advertised", None) or []
             fallback = (
-                first_advertised_fallback(advertised, rejected)
+                rejected_model_substitute(
+                    advertised, rejected, str(getattr(session, "served_model", "") or "")
+                )
                 if rejected and not strict_model and retry_rejected_model
                 else None
             )
@@ -2952,7 +2973,9 @@ async def stream_and_collect(
                 and advertised
                 and not _model_fallback_attempted
             ):
-                fallback = first_advertised_fallback(advertised, rejected)
+                fallback = rejected_model_substitute(
+                    advertised, rejected, str(getattr(provider, "served_model", "") or "")
+                )
                 if fallback:
                     _model_fallback_attempted = True
                     set_model_fn = getattr(provider, "set_model", None)

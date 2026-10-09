@@ -240,8 +240,8 @@ CLI, tests) keeps no record and always sends whole — and the heartbeat passes
 
 | Block | Source | When |
 |---|---|---|
-| `[RUNTIME]` refresh | trusted `runtime_source` | when the runtime CHANGED since the session last saw it (a per-session digest, reset on a new session, re-injection and an agent switch); an unchanged turn gets a one-line `[RUNTIME] unchanged` pointer, and a channel turn's diff-block mandate rides the full block |
-| Channel history | `channel_history.context_for` | group-channel turns, except a thread turn that carries `[SLACK THREAD REPLIES]`; a thread turn sends only buffered messages the session has not been shown yet (a per-(session, thread) watermark, reset on a new session and after compaction, committed at the turn seam like the skill-body record), never the current incoming message, with absolute `HH:MM` stamps |
+| `[RUNTIME]` refresh | trusted `runtime_source` | when the runtime CHANGED since the session last saw it (a per-session digest, reset on a new — not resumed — session, re-injection and an agent switch); an unchanged turn gets a one-line `[RUNTIME] unchanged` pointer, and a channel turn's diff-block mandate rides the full block |
+| Channel history | `channel_history.context_for` | group-channel turns, except a thread turn that carries `[SLACK THREAD REPLIES]`; a thread turn sends only buffered messages the session has not been shown yet (a per-(session, thread) watermark, reset on a new — not resumed — session and after compaction, committed at the turn seam like the skill-body record), never the current incoming message, with absolute `HH:MM` stamps |
 | `[SLACK THREAD CONTEXT]` | thread parent / metadata | Slack threads |
 | `[SLACK THREAD REPLIES]` | `slack/thread_replies.py`, fenced as untrusted | a Slack thread turn with replies it has not seen |
 | `[PROJECT]` | the slot's project dir | when the project CHANGED (or the first turn / a window rebuild); an unchanged follow-up gets a one-line `[PROJECT] unchanged` pointer — `project` group |
@@ -315,6 +315,11 @@ on its next match, never drops the skill.
 - **Reset.** The record for a session is dropped on a new session, on the first
   turn after Kiro Crew's own compaction (`needs_reinjection`), and when the agent
   on that key changes. The reset runs whether or not a skill matches that turn.
+  A **resumed** session (`session/load` restored the backend transcript) is not a
+  new window, so it keeps this record, the rail-block digests and the thread
+  watermark (`_reset_sent_records` in `build_message`, SKL-3): resetting them
+  re-pasted bodies and guidance the restored window already held. After a gateway
+  restart the in-memory records are empty, so everything is re-sent once anyway.
 - **Commit or roll back.** The record is written at build time, and each build
   keeps an undo entry for what it wrote. A turn that lands calls
   `commit_skill_bodies`; a turn that does not land calls `rollback_skill_bodies`,

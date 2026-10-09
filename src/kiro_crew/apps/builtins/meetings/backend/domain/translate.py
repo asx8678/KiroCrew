@@ -90,6 +90,15 @@ def translation_prompt(text: str, language_code: str) -> str:
     )
 
 
+#: On a backend without a cheap clean slate, the batches one translation session
+#: serves before it is reset. Each reused batch replays the earlier ones; a reset
+#: per batch would instead cold-start a process every few seconds.
+_RESET_EVERY_BATCHES = 20
+#: Batches served since the last reset, per translation session key (only for
+#: backends outside ``ACP_BACKENDS_SESSION_EVICTION``); cleared on reset and close.
+_batches_since_reset: dict[str, int] = {}
+
+
 def translation_session_key(meeting_id: str) -> str:
     """One session per meeting, reused across batches."""
     return f"{k.SLOT_PREFIX}-translate-{meeting_id}"
@@ -101,14 +110,37 @@ async def run_oneshot_translation(sessions: Any, prompt: str, meeting_id: str = 
     ``kirocrew-lite`` scopes the session to ``tools: []`` and resolves a cheaper
     model than the interactive default, and ``REJECT_ALL`` means no tool can run
     even if one were offered. The session is released, not destroyed: the next
-    batch in this meeting reuses it. ``TranslationQueue.clear`` destroys it.
+    batch in this meeting reuses the warm process. ``TranslationQueue.clear``
+    destroys it.
+
+    Each batch prompt is self-contained, so a reused session starts a fresh
+    conversation first: otherwise every 5 s batch replayed every earlier batch
+    and its translation, a cost that grew with the square of the meeting length.
+    The cheap clean slate exists only on backends in
+    ``ACP_BACKENDS_SESSION_EVICTION``; elsewhere the warm session is reused and
+    reset after every ``_RESET_EVERY_BATCHES`` batches instead, because resetting
+    after each 5 s batch would cold-start a process per batch.
 
     BACKGROUND, like any start no caller claims (rule: ``kiro_crew.start_priority``).
     """
+    from kiro_crew.agent_sdk.backends import ACP_BACKENDS_SESSION_EVICTION
     from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect
 
     key = translation_session_key(meeting_id or "meeting")
-    provider, _is_new, _resumed = await sessions.get_or_create(key, agent="kirocrew-lite")
+    provider, is_new, resumed = await sessions.get_or_create(key, agent="kirocrew-lite")
+    stale = False
+    # A resumed session (session/load after a restart) carries earlier batches.
+    if not is_new or resumed:
+        if getattr(provider, "backend", None) in ACP_BACKENDS_SESSION_EVICTION:
+            try:
+                await provider.new_conversation()
+            except Exception:
+                stale = True
+                logger.debug("meetings translate: new_conversation failed", exc_info=True)
+        else:
+            used = _batches_since_reset.get(key, 0) + 1
+            _batches_since_reset[key] = used
+            stale = used >= _RESET_EVERY_BATCHES
     try:
         return await stream_and_collect(
             provider,
@@ -122,10 +154,17 @@ async def run_oneshot_translation(sessions: Any, prompt: str, meeting_id: str = 
             sessions.release(key)
         except Exception:
             logger.debug("meetings translate: session release failed", exc_info=True)
+        if stale:
+            _batches_since_reset.pop(key, None)
+            try:
+                await sessions.reset(key, skip_if_busy=True)
+            except Exception:
+                logger.debug("meetings translate: session reset failed", exc_info=True)
 
 
 async def close_translation_session(sessions: Any, meeting_id: str) -> None:
     key = translation_session_key(meeting_id)
+    _batches_since_reset.pop(key, None)
     try:
         sessions.release(key)
     except Exception:

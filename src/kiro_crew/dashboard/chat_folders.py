@@ -201,6 +201,8 @@ async def generate_emoji_for_name(state: DashboardState, name: str) -> str:
                 prompt,
                 sel_source="chat_folders",
                 timeout=30,
+                # One emoji is expected; a runaway reply is stopped, not paid for.
+                max_output_bytes=2048,
             )
         except Exception:  # noqa: BLE001 — best-effort background task
             text = ""

@@ -446,7 +446,7 @@ losing the feature.
 |---|---|---|
 | `enabled` | `false` | Top-level switch; the subsystem is inert while off |
 | `min_user_turns` | `2` | A one-exchange session has no intent structure |
-| `regenerate_after_turns` | `1` | Turns between rebuilds; raise to trade freshness for tokens |
+| `regenerate_after_turns` | `3` | Turns between rebuilds. Each rebuild re-reads up to 40k chars of transcript (~11k tokens with the prompt), so the default keeps the panel at most two turns behind instead of paying a pass per turn; `1` restores per-turn freshness |
 | `max_intents` | `50` | Safety ceiling, not a display limit; the oldest-touched tail is dropped from the record before the write |
 | `max_constraints` | `50` | Safety ceiling on project notes; `0` suppresses the section |
 | `assistant_excerpt_chars` | `400` | Head/tail kept per assistant message |

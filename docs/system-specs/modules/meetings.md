@@ -407,6 +407,13 @@ It is **not** an `AgentQueue` variant. Lines batch for `TRANSLATION_BATCH_SECS`
 (5s), at most `TRANSLATION_BATCH_LINES` (25) per call, on one `kirocrew-lite`
 session per meeting. A call happens only after `GET …/translations` — the panel
 poll, which runs only while that panel is open. No poll means no model call.
+Each batch prompt is self-contained, so a reused or resumed session starts a fresh
+conversation (`provider.new_conversation()`) before the call: the process stays
+warm but no earlier batch is replayed, which made a batch's cost grow with the
+meeting's length. The clean slate exists only on `ACP_BACKENDS_SESSION_EVICTION`
+backends; elsewhere the warm session is reused and reset every
+`_RESET_EVERY_BATCHES` (20) batches, since a reset per 5 s batch would cold-start a
+process each time (a failed `new_conversation` also resets after the call).
 The session is destroyed when the queue is cleared. Usage is recorded on
 `meetings_translate`.
 

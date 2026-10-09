@@ -5386,6 +5386,19 @@ def _install_cron_agent() -> None:
 #: is in ``HEARTBEAT_SAFE_TOOLS``.
 HEARTBEAT_OPS_VERBS: tuple[str, ...] = ("local_knowledge_search",)
 
+#: The ``kirocrew-core`` verbs the heartbeat mounts, verb by verb: exactly the
+#: core tools in ``HEARTBEAT_SAFE_TOOLS``. Mounting the whole server sent all of
+#: its schemas (~13k tokens) on every heartbeat request, though the gateway's
+#: ``_heartbeat_approval`` rejects every tool outside that allowlist anyway.
+HEARTBEAT_CORE_VERBS: tuple[str, ...] = (
+    "learn_list",
+    "spawn_list",
+    "spawn_status",
+    "artifact_list",
+    "artifact_get",
+    "artifact_versions",
+)
+
 
 def _install_heartbeat_agent() -> None:
     """Generate and install the kirocrew-heartbeat agent config.
@@ -5454,6 +5467,13 @@ def _install_heartbeat_agent() -> None:
             cleaned["args"] = filtered
         mcp[name] = cleaned
 
+    # Build from the servers actually resolved so we never reference a tool
+    # namespace without a matching mcpServers entry — the rebuild_agent_config
+    # flow may run before either main entry exists. Only the allowlisted core
+    # verbs are referenced (HEARTBEAT_CORE_VERBS).
+    tools: list[str] = [
+        f"@kirocrew-core/{verb}" for verb in HEARTBEAT_CORE_VERBS if "kirocrew-core" in mcp
+    ]
     config: dict[str, object] = {
         "name": "kirocrew-heartbeat",
         "description": (
@@ -5465,10 +5485,7 @@ def _install_heartbeat_agent() -> None:
         "includeMcpJson": False,
         "prompt": _HEARTBEAT_SYSTEM_PROMPT,
         "mcpServers": mcp,
-        # Build from the servers actually resolved so we never reference a
-        # tool namespace without a matching mcpServers entry — the
-        # rebuild_agent_config flow may run before either main entry exists.
-        "tools": [f"@{name}" for name in mcp],
+        "tools": tools,
     }
     # TOOL-2: the knowledge search moved to the opt-in ``kirocrew-ops`` server,
     # so the heartbeat is granted that ONE verb (and the server's entry) to keep
@@ -5478,7 +5495,7 @@ def _install_heartbeat_agent() -> None:
     from kiro_crew.agent_materialization import managed_mcp as _managed_mcp
 
     mcp["kirocrew-ops"] = _managed_mcp._managed_opt_in_entry("mcp-ops")
-    config["tools"] = [*config["tools"], *(f"@kirocrew-ops/{v}" for v in HEARTBEAT_OPS_VERBS)]
+    config["tools"] = [*tools, *(f"@kirocrew-ops/{v}" for v in HEARTBEAT_OPS_VERBS)]
 
     _atomic_json_write(path, config)
     # CC model for the heartbeat agent lives in the sidecar, not the kiro spec.

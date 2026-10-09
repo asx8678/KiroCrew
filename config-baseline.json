@@ -2937,7 +2937,7 @@
       "defaultValue": {
         "enabled": false,
         "min_user_turns": 2,
-        "regenerate_after_turns": 1,
+        "regenerate_after_turns": 3,
         "max_intents": 50,
         "max_constraints": 50,
         "assistant_excerpt_chars": 400
@@ -2980,10 +2980,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Regenerate Every N Turns",
-      "help": "How many completed turns must pass before the summary is rebuilt (>=1). 1 keeps the panel current at the cost of one pass per turn; raise it to trade freshness for tokens. A cached summary whose session has not changed is never rebuilt regardless of this value.",
+      "help": "How many completed turns must pass before the summary is rebuilt (>=1). Each rebuild re-reads the transcript, so 1 keeps the panel current at the cost of one pass per turn; the default 3 trades a little freshness for tokens. A cached summary whose session has not changed is never rebuilt regardless of this value.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 1
+      "defaultValue": 3
     },
     {
       "path": "session_summary.max_intents",

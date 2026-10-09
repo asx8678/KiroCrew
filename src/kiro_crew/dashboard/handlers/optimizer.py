@@ -24,6 +24,13 @@ from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
 
+#: On a backend without a cheap clean slate (outside
+#: ``ACP_BACKENDS_SESSION_EVICTION``), the rewrites one ``_optimizer`` session
+#: serves before it is reset; a reset per call would cold-start every rewrite.
+_OPTIMIZER_RESET_EVERY_CALLS = 10
+#: Rewrites served since the last reset on such a backend (one shared session).
+_optimizer_calls_since_reset = 0
+
 #: What the model is told when the prompt optimizer refuses a tool call. The
 #: optimizer SURFACE runs no tools at all -- it rewrites one prompt inside a
 #: constrained side-session and returns text -- so nothing about the call was
@@ -309,13 +316,35 @@ async def handle_optimize(request: web.Request) -> web.Response:
         async def _optimize() -> str:
             """Acquire session, stream, release — all under one timeout."""
             logger.debug("Optimizer: acquiring dedicated session")
-            client, _is_new, _resumed = await state.sessions.get_or_create(
+            client, is_new, resumed = await state.sessions.get_or_create(
                 optimizer_session_key,
                 agent="kirocrew-lite",
                 # The owner is waiting on the composer (kiro_crew.start_priority).
                 start_priority=owner_start_priority(request),
             )
             logger.debug("Optimizer: session acquired, streaming")
+            # Each rewrite is self-contained, so a reused session starts a fresh
+            # conversation on the warm process: earlier, unrelated prompts would
+            # otherwise be replayed (and bias this rewrite) on every call. Only
+            # backends in ACP_BACKENDS_SESSION_EVICTION have that cheap clean
+            # slate; elsewhere the warm session is reset every
+            # _OPTIMIZER_RESET_EVERY_CALLS calls rather than cold-started per call.
+            from kiro_crew.agent_sdk.backends import ACP_BACKENDS_SESSION_EVICTION
+
+            global _optimizer_calls_since_reset
+            stale = False
+            # A resumed session (session/load after a restart) carries earlier
+            # rewrites too, so it gets the same clean slate.
+            if not is_new or resumed:
+                if getattr(client, "backend", None) in ACP_BACKENDS_SESSION_EVICTION:
+                    try:
+                        await client.new_conversation()
+                    except Exception:
+                        stale = True
+                        logger.debug("Optimizer: new_conversation failed", exc_info=True)
+                else:
+                    _optimizer_calls_since_reset += 1
+                    stale = _optimizer_calls_since_reset >= _OPTIMIZER_RESET_EVERY_CALLS
             try:
                 text = ""
                 # USE-1: the optimizer turn's one usage row, on every exit.
@@ -355,6 +384,14 @@ async def handle_optimize(request: web.Request) -> web.Response:
             finally:
                 logger.debug("Optimizer: releasing dedicated session")
                 state.sessions.release(optimizer_session_key)
+                if stale:
+                    # No cheap clean slate here: drop the session so the next
+                    # call cold-starts rather than replaying the earlier ones.
+                    _optimizer_calls_since_reset = 0
+                    try:
+                        await state.sessions.reset(optimizer_session_key, skip_if_busy=True)
+                    except Exception:
+                        logger.debug("Optimizer: session reset failed", exc_info=True)
 
         text = await asyncio.wait_for(_optimize(), timeout=30.0)
     except asyncio.TimeoutError:

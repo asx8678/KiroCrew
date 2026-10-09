@@ -352,7 +352,12 @@ async def send_message(self, channel: str, text: str) -> None
 ```
 
 `ctx.nudge` is synchronous (it arms a loop and returns) and, like `phase`/`log`,
-returns a no-op context manager at runtime.
+returns a no-op context manager at runtime. A `max_cycles` of 0 (the default) or
+less does not arm an unlimited loop on this path: `WorkflowService._nudge_port`
+substitutes `WORKFLOW_NUDGE_DEFAULT_MAX_CYCLES` (50), because each cycle is a full
+turn on the originating session and nothing watches a loop an unattended script
+armed (LOOP-8). A loop the operator arms from the AutoNudge popover keeps its own
+`max_cycles`, including 0.
 
 **In the shipped gateway, `nudge` is the only wired port.** `WorkflowService`
 builds `ports = {"nudge": _nudge}` and nothing else, so a script referencing
@@ -1085,7 +1090,10 @@ Each failed attempt is destroyed before the next. Authentication, configuration,
 permission, arbitrary, model-prompt, and validation failures are not startup
 retries. Once a session is ready, script validation still loops up to
 `_AUTHOR_RETRIES + 1` = 3 attempts and feeds the validation errors back on each
-retry. When the previous reply was cut off, the retry says so and asks for a
+retry. Every attempt runs on the same author session, so only the first sends
+`_AUTHOR_SYSTEM` with the intent and references (searched once); a retry sends
+only the failure note and the reply-format reminder, since the window already
+holds the rest. When the previous reply was cut off, the retry says so and asks for a
 shorter complete script instead of "fix it", since a same-length regeneration
 stops in the same place. A reply counts as cut off when its turn ended with ACP
 stop reason `max_tokens`, even when the script validates, or when it fails to

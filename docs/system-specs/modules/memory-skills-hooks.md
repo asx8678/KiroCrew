@@ -4485,8 +4485,13 @@ partitions one match into bodies and pointers, so a mixed match emits both.
 Two bounds (SKL-6) apply to the bodies themselves: every trigger-path body
 read is capped at `SKILL_READ_CAPACITY` (99,000 B — the same bound the `$key`
 and exact-read paths use; a matched GLOBAL body was injected whole at 153,062 B
-before), and one turn's delivered bodies share a single `SKILL_READ_CAPACITY`
-budget — a body past it arrives as its pointer line, in match order. A body
+before), and one turn's delivered bodies share a single budget — the first body
+always fits, and the rest share `context._TRIGGERED_BODIES_TURN_BUDGET`
+(`PROJECT_SKILL_BODY_CAP`, 24,750 B), so a second or later body past it arrives
+as its pointer line, in match order. The budget is tighter than the per-read cap
+because an inlined body stays in the backend's history and every later request
+re-reads it; built-in bodies measure 23-30 KB, so stacking several cost more than
+the pointer the agent can follow on demand. A body
 the cap refuses (`size_cap`) also arrives as a pointer. Both bounds are
 decided BEFORE the per-session dedup record, so a body never delivered is
 never recorded as sent.

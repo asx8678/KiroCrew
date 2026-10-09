@@ -107,7 +107,13 @@ _PREAMBLE_RE = re.compile(
 
 _LABEL_CACHE: dict[str, tuple[float, str]] = {}
 _LABEL_TTL_SECS = 24 * 60 * 60
+#: An empty label (the model narrated or refused) is cached too, for a shorter
+#: time: otherwise every later batch that carries the same link re-asks the
+#: model for it, and a link the model will not label is re-billed each time.
+_EMPTY_LABEL_TTL_SECS = 60 * 60
 _LABEL_CACHE_MAX = 256
+#: Output ceiling for one labelling call (20 links x 80-char labels is ~1.6 KB).
+_LINK_LABELS_MAX_OUTPUT_BYTES = 8 * 1024
 
 
 def _label_key(url: str, context: str) -> str:
@@ -117,14 +123,15 @@ def _label_key(url: str, context: str) -> str:
 
 def _cached_label(url: str, context: str) -> str | None:
     hit = _LABEL_CACHE.get(_label_key(url, context))
-    if hit is None or time.time() - hit[0] > _LABEL_TTL_SECS:
+    if hit is None:
+        return None
+    ttl = _LABEL_TTL_SECS if hit[1] else _EMPTY_LABEL_TTL_SECS
+    if time.time() - hit[0] > ttl:
         return None
     return hit[1]
 
 
 def _store_label(url: str, context: str, label: str) -> None:
-    if not label:
-        return
     if len(_LABEL_CACHE) >= _LABEL_CACHE_MAX:
         _LABEL_CACHE.clear()
     _LABEL_CACHE[_label_key(url, context)] = (time.time(), label)
@@ -142,6 +149,9 @@ async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> l
             state.sessions,
             prompt,
             sel_source="chat_nav",
+            # At most 20 labels of <=80 chars each: anything far past that is a
+            # runaway reply, stopped instead of paid for (the caller fails soft).
+            max_output_bytes=_LINK_LABELS_MAX_OUTPUT_BYTES,
         )
 
     # Parse: one label per line. The frontend merges the reply POSITIONALLY

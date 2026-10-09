@@ -660,6 +660,14 @@ async def _build_store_vectors(name: str) -> "VectorMemoryStore | None":
 # descriptor-pinned byte/read bound, not unlimited project-file injection.
 _PINNED_PROJECT_BODY_CAP = PROJECT_SKILL_BODY_CAP
 
+# Shared byte budget for the triggered skill bodies one turn inlines. The first
+# body is exempt (it is read up to SKILL_READ_CAPACITY); a second or later
+# confident match past this total arrives as its pointer line. An inlined body
+# stays in the backend's history and is re-read on every later request, and
+# built-in bodies measure 23-30 KB, so stacking two or three cost far more than
+# the one the turn's request most needs.
+_TRIGGERED_BODIES_TURN_BUDGET = PROJECT_SKILL_BODY_CAP
+
 
 def _member_marker_spans(text: str) -> list[tuple[int, int]]:
     """Merged spans of forgeable member-authority markers, in ORIGINAL coords.
@@ -3015,7 +3023,9 @@ class ContextBuilder:
         if minimal_context:
             _, tz = get_local_tz()
             now = datetime.now(tz)
-            parts.append(f"[CURRENT DATE] {now.strftime('%A, %Y-%m-%d %H:%M %Z')}\n\n")
+            # The date is the one per-run value here, so it trails the essentials
+            # envelope (CTX-4): two runs then share every byte up to that line.
+            _date_line = f"[CURRENT DATE] {now.strftime('%A, %Y-%m-%d %H:%M %Z')}\n\n"
             agent_label = agent or "kirocrew"
             parts.append(f"[CURRENT AGENT] {agent_label}\n")
             if session_key:
@@ -3034,7 +3044,7 @@ class ContextBuilder:
                 agent_label,
                 sum(len(p) for p in parts),
             )
-            return "".join(parts) + essentials
+            return "".join(parts) + essentials + _date_line
 
         if is_custom:
             logger.info(
@@ -3957,7 +3967,15 @@ class ContextBuilder:
         # — a window-rebuild turn re-sends [PROJECT]/[RUNTIME]/guidance whole.
         # The key is normalized HERE (the assignment further down runs too late)
         # and the skill-body reset below shares the same flags.
-        if (skill_bodies_session or session_key) and (is_new_session or needs_reinjection):
+        #
+        # SKL-3: a RESUMED session (session/load restored the backend's own
+        # transcript) is "new" to the provider but its window still holds every
+        # block this process already recorded as sent, so it keeps the records:
+        # resetting them re-pasted skill bodies, guidance and the thread tail
+        # into a window that already had them. After a gateway restart the
+        # records are empty anyway; a compacted window arms needs_reinjection.
+        _reset_sent_records = (is_new_session and not resumed) or needs_reinjection
+        if (skill_bodies_session or session_key) and _reset_sent_records:
             self.reset_rail_blocks(skill_bodies_session or session_key, agent)
         # The stable session key describes conversation identity, not
         # necessarily the interface carrying this turn: refresh the runtime on
@@ -4048,7 +4066,7 @@ class ContextBuilder:
             # re-sends.
             _since_ts: str | None = None
             if thread_ts and session_key:
-                if is_new_session or needs_reinjection:
+                if _reset_sent_records:
                     self._reset_thread_watermark(session_key, thread_ts)
                 _since_ts = self._thread_watermark_since(session_key, thread_ts)
             _watermark: list[str] = []
@@ -4164,7 +4182,7 @@ class ContextBuilder:
         # chokepoints to arm this flag is a correctness refinement, not a
         # safety fix, and is deliberately out of scope here.
         skill_bodies_session = skill_bodies_session or session_key
-        if skill_bodies_session and (is_new_session or needs_reinjection):
+        if skill_bodies_session and _reset_sent_records:
             self._dedup_triggered_bodies(skill_bodies_session, agent, reset=True, candidates=[])
 
         # Triggered skills (on-demand, any message) — skip for custom agents.
@@ -4281,7 +4299,11 @@ class ContextBuilder:
                             too_big.append(name)
                         continue
                     stripped = self.skills.strip_frontmatter(content)
-                    if spent + len(stripped) > SKILL_READ_CAPACITY and loadable:
+                    # The FIRST body always fits (up to SKILL_READ_CAPACITY); the
+                    # rest share _TRIGGERED_BODIES_TURN_BUDGET, so several confident
+                    # matches in one turn no longer stack whole bodies into the
+                    # window that every later request re-reads.
+                    if spent + len(stripped) > _TRIGGERED_BODIES_TURN_BUDGET and loadable:
                         over_budget.append(name)
                         continue
                     # Key the session record by the body actually about to
@@ -4303,7 +4325,7 @@ class ContextBuilder:
                 demote = self._dedup_triggered_bodies(
                     skill_bodies_session,
                     agent,
-                    reset=is_new_session or needs_reinjection,
+                    reset=_reset_sent_records,
                     candidates=[(name, digest) for name, _stripped, digest in loadable],
                 )
                 demoted: list[str] = []

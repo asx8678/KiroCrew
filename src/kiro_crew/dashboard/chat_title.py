@@ -1002,6 +1002,28 @@ def _fallback_title_from_messages(messages: list[dict[str, Any]]) -> str:
 # purpose — a title that NAMES a small number is usually describing its topic,
 # not echoing a key.
 _TITLE_OPAQUE_ID_RE = re.compile(r"\d{6,}")
+# What a low-signal opener is made of: links and opaque identifiers.
+_OPENER_NOISE_RE = re.compile(r"\S+://\S+|www\.\S+|\S*\d{6,}\S*")
+# Fewer topic words than this, once the noise is removed, is a bare link/id.
+_OPENER_MIN_TOPIC_WORDS = 3
+
+
+def _opener_is_low_signal(messages: list[dict[str, Any]]) -> bool:
+    """True when the first user message is only a link or an opaque id.
+
+    Deterministic, no LLM call. Removing URLs and long digit runs leaves fewer
+    than ``_OPENER_MIN_TOPIC_WORDS`` words: the titler could only echo the link,
+    so the on-send attempt waits for the first reply (see ``_maybe_auto_title``).
+    """
+    first = next((m for m in messages if m.get("role") == "user"), None)
+    if first is None:
+        return False
+    text, removed = _OPENER_NOISE_RE.subn(" ", str(first.get("content") or ""))
+    if not removed:
+        # No link or id at all: a short opener ("fix cron") still names a topic.
+        return False
+    words = [w for w in text.split() if any(c.isalpha() for c in w)]
+    return len(words) < _OPENER_MIN_TOPIC_WORDS
 
 
 def _is_low_signal_title(title: str, messages: list[dict[str, Any]]) -> bool:
@@ -1132,9 +1154,20 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
 
     cancelled = False
     try:
-        title = await _generate_title_via_kiro(
-            state, messages, session_key=effective_session_key(slot)
-        )
+        if not attempt_has_assistant and _opener_is_low_signal(messages):
+            # A bare link or ticket id gives the on-send titler nothing to name
+            # but the link: it SKIPs, the end-of-turn retry runs anyway, and a
+            # link-echo title then spends the early refresh too. Skip the call;
+            # the fallback below shows the truncated name unlocked, and the
+            # end-of-turn attempt titles the session from the first reply.
+            title = ""
+            logger.info(
+                "Auto-title: low-signal opener for slot %s; waiting for the reply", slot.key
+            )
+        else:
+            title = await _generate_title_via_kiro(
+                state, messages, session_key=effective_session_key(slot)
+            )
         logger.info("Auto-title: kiro returned %r for slot %s", title, slot.key)
         # RACE GUARD: an explicit title (manual rename / manual generate) may
         # have landed while we awaited generation. Keep it and discard ours.

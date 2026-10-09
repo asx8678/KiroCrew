@@ -538,9 +538,12 @@ it, or an unentitled concrete id — resolves to `""` and **skips the
 send**, inheriting the session's served backend default. So these tasks never
 put an unserved model or a literal unavailable `"auto"` on the wire (which would
 fail with `Invalid model ID`). A reactive retry in `run_bg_oneliner`
-(retry once with the first advertised model on a mid-prompt rejection) remains a
-thin backstop for the fail-open case where the advertised set was unknown at
-send time.
+(retry once on a mid-prompt rejection) remains a thin backstop for the fail-open
+case where the advertised set was unknown at send time. Its substitute is
+`llm_helpers.rejected_model_substitute` (MOD-4): the session's own
+backend-confirmed `served_model` when it is advertised and is not the rejected id,
+and only otherwise the first advertised model, whose list position says nothing
+about its cost. `stream_and_collect`'s opt-in `model_fallback` uses the same pick.
 
 ## Account-identity retirement (identity sweep)
 

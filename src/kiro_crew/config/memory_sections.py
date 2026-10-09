@@ -781,13 +781,17 @@ class SessionSummaryConfig:
         ),
     )
     regenerate_after_turns: int = field(
-        default=1,
+        # Each pass re-reads up to 40k chars of transcript plus the prompt
+        # (~11k tokens), so every-turn rebuilds cost about as much as a turn's
+        # own context; 3 keeps the panel at most two turns behind.
+        default=3,
         metadata=_meta(
             "Regenerate Every N Turns",
             "How many completed turns must pass before the summary is rebuilt "
-            "(>=1). 1 keeps the panel current at the cost of one pass per turn; "
-            "raise it to trade freshness for tokens. A cached summary whose "
-            "session has not changed is never rebuilt regardless of this value.",
+            "(>=1). Each rebuild re-reads the transcript, so 1 keeps the panel "
+            "current at the cost of one pass per turn; the default 3 trades a "
+            "little freshness for tokens. A cached summary whose session has not "
+            "changed is never rebuilt regardless of this value.",
         ),
     )
     max_intents: int = field(
