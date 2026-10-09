@@ -318,7 +318,7 @@ namespace-distinct from every other server's tools.
 |---|---|---|---|
 | `computer_list_apps` | — | — | observe |
 | `computer_launch_app` | `app` (≤128) | — | mutate |
-| `computer_get_state` | `app` | `text_limit` (1..20000, d=500), `max_tree_nodes` (1..5000, d=1200), `max_tree_depth` (1..128, d=64), `screenshot` (bool, d from config) | observe |
+| `computer_get_state` | `app` | `text_limit` (1..20000, d=500), `max_tree_nodes` (1..5000, d=1200), `max_tree_depth` (1..128, d=64), `screenshot` (bool, d from config), `from_index` (0..5000, d=0; render paging only) | observe |
 | `computer_click` | `app` + **exactly one of** (`element_index` \| `x`+`y`) | `click_count` (1..3, d=1), `mouse_button` (`left`\|`right`\|`middle`, d=left), `click_method` (`auto`\|`accessibility`\|`app_post`\|`sky_click`\|`global`, d=auto) | mutate, pointer |
 | `computer_drag` | `app`, `from_x`, `from_y`, `to_x`, `to_y` | `mouse_button`, `click_method`, `steps` (1..512, d=1), `path` (`straight`\|`curved`, d=straight) | mutate, pointer |
 | `computer_type_text` | `app`, `text` (≤10000), `element_index` | — | mutate, keyboard, text_entry |
@@ -409,13 +409,25 @@ Exactly what `validation.build_tool_response` emits:
 ```
 
 Text only, capped at `MAX_RESPONSE_LEN` (`tool_result_cap.MAX_TOOL_RESULT_CHARS`,
-48 KiB). `render_tree` has no total budget of its own, so a dense window at the
-default walk budget can exceed that cap. The transport then keeps the head (the
-header and the first elements) and the tail (the truncation notes, the trailer and
-the screenshot note), each cut on a line boundary, and saves the full text to a
-spill file the truncation marker names. Elements in the omitted middle cannot be
-addressed from the inline text until the model reads that file or walks a narrower
-view. **There is no `isError` field and no
+48 KiB). `render_tree` also carries a total character budget of its own
+(`char_budget`; `GET_STATE_CHAR_BUDGET` = 24,000 for `computer_get_state` and a
+launch, `ACTION_CHAR_BUDGET` = 8,000 for a mutating tool's reply — TOOL-8), so a
+dense window no longer reaches the transport cut. Only element rows are dropped to
+meet it: the header, the `[tree truncated …]` / `[subtree elided …]` notes, the
+trailer (origin, focus, selection) and the screenshot note are always kept, and an
+omission line names how many rows were left out, which index ranges they cover, and
+the `from_index` that continues from the first of them. A plain budgeted render
+keeps a contiguous head of the tree, so the omitted rows are one tail range, and
+`computer_get_state(from_index=N)` is the stateless next page: the walk is the same
+whole window every call, only the first printed row moves, and a page that starts
+past 0 opens with a `[Elements before index N are not shown …]` line. The
+render budget is separate from the WALK budget: the walk still runs at
+`max_tree_nodes` (default 1200, unchanged), so the cache, the drift check and the
+screenshot's secure-field proof all see the whole window; an omitted row is still
+addressable by index, the model has just not been shown it. If the transport cut
+does fire (a huge `text_limit`), it keeps the head and the tail, each cut on a line
+boundary, and saves the full text to a spill file the truncation marker names.
+**There is no `isError` field and no
 image block** — an image block is not expressible on this transport, so
 "tree-first, relay the screenshot as a path" is a property of the transport
 rather than a policy someone can regress. An error is the literal string
@@ -440,19 +452,41 @@ Screenshot: /var/folders/…/kirocrew-computer-shots/shot-1769472013411.jpeg
   insufficient.
 ```
 
-Every mutating tool returns the REFRESHED tree at the configured budgets, so the
-model always acts against indices it has just been shown. The guidance says so in
-all three places the model reads it (the `computer_get_state` description,
-`config/prompt.md`, the `computer-use` skill): snapshot before the first action on
-each request, with a screenshot so the live view opens, and again only when the
-window may have changed outside the model's own actions — not "every turn", which a
-model can read as before every action (TOOL-8). Two further TOOL-8 savings are
-deliberately not taken. A post-action DIFF (changed rows only) would have the model
-act on indices pieced together from two walks; the drift check refuses a stale one,
-but a diff that drops a row still leaves the model working from a wrong picture of
-the operator's real screen, so it waits for driver-level tests. A lower default
-`max_tree_nodes` would make a truncated walk the normal case, and a truncated walk
-suppresses the screenshot (it cannot rule out a secure field). Its response is
+Every mutating tool re-walks the window at the cached snapshot's walk budget and
+caches the whole post-action tree, so every index stays addressable — but since
+TOOL-8 its reply is a **diff**, not the whole tree. `tools._action_rows` takes the
+baseline from the service's per-session snapshot cache (`svc.index.get(window_key,
+session_key=…)`, read just before the action; never a module global, so two sessions
+driving the same window never diff against each other's walks) and
+`render.diff_rows` picks, in priority order: the acted element (or the focused one
+when the action named no element — a coordinate click, a drag, a bare key press),
+its `ACTION_NEIGHBOURHOOD_ROWS` (5) neighbours either side by tree position, its
+ancestors, then every row whose RENDERED line differs from the baseline's row at the
+same index. Rows are compared by rendered line, not by identity, because indices are
+positional: an inserted row shifts every later index, so each shifted row counts as
+changed and is shown with its new meaning. A row NOT shown is therefore
+byte-identical, at the same index, to the previous walk — which is what answers the
+earlier objection that a diff has the model act on indices pieced together from two
+walks: it acts on the new walk, and the reply states exactly which rows differ. The
+selected rows print in tree order with a `…` gap marker where rows were skipped,
+followed by a `[Changes only: …]` note (plus `[N element(s) from the previous walk no
+longer exist.]` when the tree shrank) saying the full tree is one
+`computer_get_state` call away. The whole reply is capped at `ACTION_CHAR_BUDGET`;
+rows past it are named by the omission line. With no baseline — none cached, its TTL
+expired, or the action moved to a different window (`Snapshot.key` differs) — the
+reply is a budgeted render of the acted element's neighbourhood and the head of the
+tree, with a note saying there was nothing to compare against. The drift check still
+guards every action, unchanged.
+
+The guidance says when to snapshot in all three places the model reads it (the
+`computer_get_state` description, `config/prompt.md`, the `computer-use` skill):
+before the first action on a window, with a screenshot so the live view opens, and
+again only after the UI changed outside the model's own actions — not "CALL THIS
+FIRST every turn", which a model can read as before every action (TOOL-8). A lower
+default `max_tree_nodes` is deliberately not taken: it would make a truncated walk
+the normal case, and a truncated walk suppresses the screenshot (it cannot rule out a
+secure field); the render budget above bounds what the model reads without shrinking
+what is walked. A mutating tool's response is
 `"<detail>\n\nRefreshed state:\n<tree>"`, and **the two halves are redacted
 separately — deliberately, and neither is optional.**
 
@@ -2603,12 +2637,12 @@ unexplained session reset reads as a crash. Pinned by
 | `computer_use/types.py` | Every constant + frozen dataclass; dependency-free and platform-free |
 | `computer_use/keymap.py` | The platform-free spec grammar (`parse_spec()` → `KeySpec`, `KEY_ALIASES` / `MODIFIER_ALIASES` and their canonicalizers) over macOS's Carbon keycodes + CG flag masks (`parse_key()`) |
 | `computer_use/policy.py` | The one retained app refusal (Kiro Crew's own window) + the operator's allow/deny lists, secure-target + text refusals, the click-target/method/button refusals + `resolve_click_method`, `redact_result` |
-| `computer_use/render.py` | Tree/app-list rendering, `fingerprint`, secure placeholder |
+| `computer_use/render.py` | Tree/app-list rendering (total character budget, post-action `diff_rows`), `fingerprint`, secure placeholder |
 | `computer_use/index.py` | `SnapshotIndex`: TTL, cap, `resolve`, `end_turn`, drift message |
 | `computer_use/enable_state.py` | The keystone primary enable + the operator's app allow/deny lists (read fail-soft to off) |
 | `computer_use/backend.py` | `ComputerUseBackend` ABC, `UnsupportedBackend`, registry, the one platform branch |
 | `computer_use/gate.py` | The SEL audit of every call and every real-pointer gesture, plus the pass-through shims (`apply_observation_ceiling`, `permitted_observation_channels`) the renderers still route through |
-| `computer_use/tools.py` | The single in-gateway dispatch chokepoint: validation, enable, audit, target/freshness/input checks, driver dispatch and response shaping |
+| `computer_use/tools.py` | The single in-gateway dispatch chokepoint: validation, enable, audit, target/freshness/input checks, driver dispatch and response shaping (incl. the post-action diff, `_action_rows`) |
 | `computer_use/service.py` | Blocking snapshot/index/screenshot orchestration over the active backend; no policy decisions |
 | `computer_use/windows_driver.py` | `WindowsBackend`: observation + all seven input verbs — the UIA pattern ladder, pointer confinement, verified focus, and the closed `perform_action` vocabulary |
 | `computer_use/windows_ffi.py` | The ONLY module touching Windows-native code: the UIA COM client, the one vtable-slot table, VARIANT/BSTR marshalling, the fail-closed secure read, the bounded walk, the DPI scope, `window_render_scale`, window enumeration |

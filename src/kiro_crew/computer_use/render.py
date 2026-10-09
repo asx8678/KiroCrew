@@ -18,12 +18,17 @@ Pure: no ctypes, no I/O, no platform calls.
 
 from __future__ import annotations
 
+from typing import Sequence
+
 from kiro_crew.computer_use import policy
 from kiro_crew.computer_use.types import (
     DEPTH_NOTE,
+    DIFF_GAP_MARKER,
     FOCUS_MARKER,
     FOCUS_NOTE,
     NO_APPS_NOTE,
+    OMITTED_ROWS_NOTE,
+    PAGED_FROM_NOTE,
     SCREENSHOT_NOTE,
     SCREENSHOT_SCALE_NOTE,
     SECURE_PLACEHOLDER,
@@ -48,6 +53,14 @@ _MIB = _KIB * _KIB
 #: crowding out the rest of the list; the flattening it comes with (see ``_clip``)
 #: is what stops an embedded newline forging additional entries.
 _APP_FIELD_LIMIT = 200
+
+#: Characters held back from a tree budget for the omission line itself, whose length
+#: depends on the index ranges it names (at most :data:`_MAX_OMITTED_RANGES` of them).
+_OMITTED_NOTE_RESERVE = len(OMITTED_ROWS_NOTE) + 96
+#: How many omitted index ranges the omission line spells out before it says "…".
+_MAX_OMITTED_RANGES = 4
+#: Per-row allowance for a gap marker line (``…`` plus its newline) in a sparse render.
+_GAP_ALLOWANCE = len(DIFF_GAP_MARKER) + 1
 
 
 def render_apps(apps: "tuple[AppRef, ...]") -> str:
@@ -75,39 +88,62 @@ def render_apps(apps: "tuple[AppRef, ...]") -> str:
     return policy.redact_result("\n".join(lines))
 
 
-def render_tree(snap: Snapshot, *, text_limit: int) -> str:
+def render_tree(
+    snap: Snapshot,
+    *,
+    text_limit: int,
+    char_budget: int = 0,
+    rows: "Sequence[int] | None" = None,
+    tree_notes: Sequence[str] = (),
+    from_index: int = 0,
+) -> str:
     """Render one snapshot: header, indented element tree, screenshot reference.
 
     *text_limit* caps each individual title/value string. It is applied per
     field rather than to the whole body so a single verbose node (a text area
     holding a whole document) cannot crowd out the rest of the tree.
 
+    *char_budget* (``0`` = unbounded) caps the WHOLE rendered result. Only element
+    rows are ever dropped to meet it: the header, the truncation/depth notes, the
+    trailer, *tree_notes* and the screenshot note are always kept, and an omission
+    line says how many rows were left out and which index ranges they cover — so a
+    dense window can no longer push the notes past the transport cut.
+
+    *rows* selects WHICH element rows are eligible, by element ``index`` and in
+    priority order (the first ones are kept when the budget bites); ``None`` means
+    every element, in tree order. Selected rows are always printed in tree order,
+    with a gap marker where unselected rows were skipped, so indentation still
+    reads as structure. Used by the post-action diff (see ``diff_rows``).
+
+    *from_index* pages a plain render (``rows=None``): elements with a lower index
+    are skipped and a leading note says so. It is the stateless way past the budget —
+    the omission line names the ``from_index`` that continues where this page
+    stopped, and the walk itself is unchanged, so every index stays addressable.
+
     Ends with the redaction pass — accessibility values are arbitrary user
     content and can contain credentials verbatim.
     """
-    lines: list[str] = [f"App={snap.app.label}"]
+    head: list[str] = [f"App={snap.app.label}"]
     header = _window_header(snap, text_limit=text_limit)
     if header:
-        lines.append(header)
-    lines.append("")
+        head.append(header)
+    head.append("")
+    if rows is None and from_index > 0:
+        head.append(PAGED_FROM_NOTE.format(index=from_index))
 
-    for rec in snap.elements:
-        lines.append(_render_record(rec, text_limit=text_limit))
-
+    notes: list[str] = list(tree_notes)
     if not snap.elements:
-        lines.append("(no accessible elements — the window exposed an empty tree)")
+        notes.append("(no accessible elements — the window exposed an empty tree)")
     if snap.truncated:
-        lines.append(TRUNCATED_NOTE.format(count=len(snap.elements)))
+        notes.append(TRUNCATED_NOTE.format(count=len(snap.elements)))
     if snap.depth_truncated:
-        lines.append(DEPTH_NOTE.format(depth=_max_depth(snap)))
+        notes.append(DEPTH_NOTE.format(depth=_max_depth(snap)))
     trailer = _trailer(snap, text_limit=text_limit)
     if trailer:
         # Blank separator: these lines are ABOUT the tree, not nodes in it, and
         # without the gap the origin note reads as a sibling of the last element.
-        lines.append("")
-        lines.extend(trailer)
-
-    body = policy.redact_result("\n".join(lines))
+        notes.append("")
+        notes.extend(trailer)
 
     # The image note is appended AFTER the redaction pass, deliberately.
     #
@@ -122,9 +158,164 @@ def render_tree(snap: Snapshot, *, text_limit: int) -> str:
     # can land under. The tree body above, which DOES carry arbitrary user
     # content, is still fully redacted.
     image_note = _render_image_note(snap)
+
+    fixed = sum(len(line) + 1 for line in (*head, *notes))
+    if image_note:
+        fixed += len(image_note) + 2
+    body_lines, omitted_note = _select_rows(
+        snap,
+        rows,
+        text_limit=text_limit,
+        char_budget=char_budget,
+        fixed=fixed,
+        from_index=from_index,
+    )
+    lines = [*head, *body_lines]
+    if omitted_note:
+        lines.append(omitted_note)
+    lines.extend(notes)
+
+    body = policy.redact_result("\n".join(lines))
     if image_note:
         return f"{body}\n\n{image_note}"
     return body
+
+
+def diff_rows(
+    before: "Snapshot | None",
+    after: Snapshot,
+    *,
+    text_limit: int,
+    anchor: "int | None",
+    neighbourhood: int,
+) -> "tuple[tuple[int, ...], int]":
+    """The rows a post-action render shows, in priority order, plus the removed count.
+
+    Priority: the *anchor* (the acted element, or the focused one), then its
+    neighbourhood within *neighbourhood* tree positions (nearest first), then its
+    ancestors, then every row whose RENDERED line differs from *before*'s row at the
+    same index — in tree order. A row is compared by its rendered line rather than
+    by identity because indices are positional: an inserted row shifts every later
+    index, and the model must be told that "17" now means something else. So a row
+    that is NOT returned is byte-identical, at the same index, to what *before*
+    rendered — which is what lets the caller say "everything not shown is unchanged".
+
+    With no *before* every row counts as changed (the caller then states that it has
+    no baseline). The second value is how many trailing indices *before* had that
+    *after* no longer does.
+
+    Pure: compares two snapshots this session already walked.
+    """
+    positions = {rec.index: pos for pos, rec in enumerate(after.elements)}
+    priority: list[int] = []
+    seen: set[int] = set()
+
+    def add(index: int) -> None:
+        if index not in seen and index in positions:
+            seen.add(index)
+            priority.append(index)
+
+    if anchor is not None and anchor in positions:
+        pos = positions[anchor]
+        add(anchor)
+        for step in range(1, neighbourhood + 1):
+            for near in (pos - step, pos + step):
+                if 0 <= near < len(after.elements):
+                    add(after.elements[near].index)
+        depth = after.elements[pos].depth
+        for back in range(pos - 1, -1, -1):
+            rec = after.elements[back]
+            if rec.depth < depth:
+                add(rec.index)
+                depth = rec.depth
+                if depth == 0:
+                    break
+
+    old = {} if before is None else {rec.index: rec for rec in before.elements}
+    for rec in after.elements:
+        prev = old.get(rec.index)
+        if prev is None or _render_record(prev, text_limit=text_limit) != _render_record(
+            rec, text_limit=text_limit
+        ):
+            add(rec.index)
+
+    removed = 0
+    if before is not None:
+        removed = sum(1 for index in old if index not in positions)
+    return tuple(priority), removed
+
+
+def _select_rows(
+    snap: Snapshot,
+    rows: "Sequence[int] | None",
+    *,
+    text_limit: int,
+    char_budget: int,
+    fixed: int,
+    from_index: int = 0,
+) -> "tuple[list[str], str]":
+    """Element lines to print (tree order, gap-marked) and the omission line, or ``""``.
+
+    Greedy in priority order and STOPS at the first row that does not fit, rather
+    than skipping to a shorter one, so a plain budgeted render keeps a contiguous
+    head of the tree and the omitted rows form one tail range the note can name.
+    """
+    if rows is None:
+        order = [rec.index for rec in snap.elements if rec.index >= from_index]
+    else:
+        order = list(rows)
+    by_index = {rec.index: (pos, rec) for pos, rec in enumerate(snap.elements)}
+    eligible = [index for index in dict.fromkeys(order) if index in by_index]
+    sparse = rows is not None
+
+    rendered = {
+        index: _render_record(by_index[index][1], text_limit=text_limit) for index in eligible
+    }
+    chosen: set[int] = set()
+    if char_budget <= 0:
+        chosen = set(eligible)
+    else:
+        available = char_budget - fixed - _OMITTED_NOTE_RESERVE
+        used = 0
+        for index in eligible:
+            cost = len(rendered[index]) + 1 + (_GAP_ALLOWANCE if sparse else 0)
+            if used + cost > available:
+                break
+            used += cost
+            chosen.add(index)
+
+    lines: list[str] = []
+    last_pos = -1
+    for pos, rec in enumerate(snap.elements):
+        if rec.index not in chosen:
+            continue
+        if sparse and pos != last_pos + 1:
+            lines.append(DIFF_GAP_MARKER)
+        lines.append(rendered[rec.index])
+        last_pos = pos
+    if sparse and lines and last_pos != len(snap.elements) - 1:
+        lines.append(DIFF_GAP_MARKER)
+
+    omitted = sorted(index for index in eligible if index not in chosen)
+    if not omitted:
+        return lines, ""
+    return lines, OMITTED_ROWS_NOTE.format(
+        omitted=len(omitted), budget=char_budget, ranges=_ranges(omitted), next=omitted[0]
+    )
+
+
+def _ranges(indices: "Sequence[int]") -> str:
+    """``[3, 4, 5, 9]`` -> ``"3-5, 9"``; at most :data:`_MAX_OMITTED_RANGES`, then ``…``."""
+    spans: list[tuple[int, int]] = []
+    for index in indices:
+        if spans and index == spans[-1][1] + 1:
+            spans[-1] = (spans[-1][0], index)
+        else:
+            spans.append((index, index))
+    parts = [str(a) if a == b else f"{a}-{b}" for a, b in spans[:_MAX_OMITTED_RANGES]]
+    if len(spans) > _MAX_OMITTED_RANGES:
+        parts.append("…")
+    return ", ".join(parts)
 
 
 def fingerprint(rec: ElementRec) -> str:

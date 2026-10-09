@@ -68,11 +68,13 @@ computer_get_state(app="Finder", screenshot=True)
 Request a screenshot on the first snapshot of each request: do not pass
 `screenshot=false` while the user is watching. The capture opens the floating live
 view. You receive a file path, not an image; keep using the outline unless the
-pixels are needed. Within a request, your own actions return the refreshed tree
+pixels are needed. Within a request, your own actions return what they changed
 (see below); snapshot again only when the window may have changed outside them.
 
 Optional: `text_limit` (per-element text cap), `max_tree_nodes`, `max_tree_depth`,
-`screenshot` (bool). You get a numbered outline:
+`screenshot` (bool), `from_index` (start the listing at that index — a dense window
+is shown up to a size budget, and the closing note names the `from_index` that shows
+the rest). You get a numbered outline:
 
 ```
 App=com.apple.finder (pid 1041)
@@ -141,8 +143,11 @@ keystroke would go there. So name the field you mean; if you want to tab through
 form, address each field by index instead of tabbing blind. `computer_click` is the
 only exception, and only because it takes coordinates as the alternative.
 
-Every action returns a **refreshed** tree, so after a click you already have the
-new indices — do not call `computer_get_state` again just to re-read them. The same
+Every action returns a **diff** of the refreshed tree: the rows around the element
+you acted on plus every row whose line changed, each at its current index, under a
+`[Changes only: …]` note. Any element not listed is unchanged at the same index, so
+after a click you already have the new indices — do not call `computer_get_state`
+again just to re-read them. The same
 goes for window position and size: they are in the snapshot header you were already
 shown. **Re-probing something the last response already told you is the most common
 wasted turn.**
@@ -301,12 +306,13 @@ React to an observed failure, do not predict one.
 
 ## Do not report success you have not observed
 
-An action that returned without an error is **not** proof it landed. The refreshed
-tree that comes back with every action is your evidence — read it and name what
+An action that returned without an error is **not** proof it landed. The changed
+rows that come back with every action are your evidence — read them and name what
 changed: a new value, a dialog that appeared, a menu that closed, a button that
 became disabled.
 
-- **If nothing in the tree changed, the action probably did nothing.** Say so and go
+- **If the diff lists nothing beyond the neighbourhood you acted on, and none of
+  those rows changed, the action probably did nothing.** Say so and go
   down the ladder. Do not report success.
 - **A target that VANISHED is usually success, not failure.** A button that is gone
   after you clicked it, a dialog that closed, a row that disappeared after delete —
@@ -340,6 +346,7 @@ These are **answers**, not failures. Relay them and adapt; do not loop.
 | You see | What it means | What to do |
 |---|---|---|
 | a value ending in `…` | the text was cut at `text_limit`, not truncated by the app | re-snapshot with a larger `text_limit`; do NOT read the screenshot to recover it, and do not tell the user the content is missing |
+| `[N element(s) not shown to stay within the …-character budget (indices …)]` | the walk saw them; the reply was cut to a size budget | call `computer_get_state` with the `from_index` the note names; they are still addressable by index |
 | `[tree truncated at N nodes]` | the window has more controls than the budget | raise `max_tree_nodes`, or scroll to bring your target into range — the rest of the window is real, you just have not been shown it |
 | `Screenshot suppressed: the accessibility tree was truncated …` | a cut-off walk cannot prove the window holds no password field, so no pixels were captured. Routine for a browser or an Electron app at the default budget | if you actually need the image, re-snapshot with a higher `max_tree_nodes` / `max_tree_depth`; otherwise work from the tree and do not re-request the screenshot |
 | `no state for 'X'. Call computer_get_state first.` | you acted without a snapshot | snapshot, then act |
@@ -411,7 +418,7 @@ this is what stops you clicking the same wrong index four times:
   screenshots**, including yours — so if a user says "I can see the cursor moving"
   and your screenshot shows no cursor, both are correct and nothing is wrong. Do
   not go looking for a cursor in a screenshot, and do not describe the overlay as
-  proof an action landed; the refreshed tree is the evidence.
+  proof an action landed; the changed rows an action returns are the evidence.
 
 ## Worked example
 
@@ -440,4 +447,4 @@ Two things to copy from this:
 - **Three screenshots, not seven.** One to open the live view, one when the row turned
   into a field, one to show the result. The `click`, `set_value` and the first
   `press_key` produced no separate frame — they are steps toward one visible change,
-  and their refreshed trees already told me what I needed.
+  and the changed rows they returned already told me what I needed.

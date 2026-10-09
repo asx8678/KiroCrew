@@ -102,6 +102,8 @@ from typing import Any, Mapping, Sequence
 
 from kiro_crew.computer_use import enable_state, gate, keymap, overlay, policy, render, service
 from kiro_crew.computer_use.types import (
+    ACTION_CHAR_BUDGET,
+    ACTION_NEIGHBOURHOOD_ROWS,
     CLICK_METHOD_ACCESSIBILITY,
     CLICK_METHOD_APP_POST,
     CLICK_METHOD_AUTO,
@@ -112,11 +114,15 @@ from kiro_crew.computer_use.types import (
     DEFAULT_DRAG_STEPS,
     DEFAULT_MOUSE_BUTTON,
     DEFAULT_SCROLL_PAGES,
+    DIFF_NO_BASELINE_NOTE,
+    DIFF_NOTE,
+    DIFF_REMOVED_NOTE,
     DRAG_PATHS,
     ERR_UNKNOWN_CLICK_METHOD,
     ERR_UNKNOWN_DRAG_PATH,
     ERR_UNKNOWN_KEY,
     ERROR_PREFIX,
+    GET_STATE_CHAR_BUDGET,
     GOVERNED_VALUE_PLACEHOLDER,
     OBS_A11Y_TREE,
     OBS_ELEMENT_VALUES,
@@ -174,6 +180,7 @@ ARG_SCREENSHOT = "screenshot"
 ARG_TEXT_LIMIT = "text_limit"
 ARG_MAX_TREE_NODES = "max_tree_nodes"
 ARG_MAX_TREE_DEPTH = "max_tree_depth"
+ARG_FROM_INDEX = "from_index"
 ARG_X = "x"
 ARG_Y = "y"
 ARG_CLICK_COUNT = "click_count"
@@ -626,6 +633,7 @@ def _run(
             session_key=session_key,
             agent=agent,
             app=app,
+            char_budget=GET_STATE_CHAR_BUDGET,
         )
         return f"{ACTION_RESULT_HEADER.format(detail=policy.redact_result(text))}\n{body}"
 
@@ -687,6 +695,10 @@ def _run(
             app=app,
             extra_notes=tuple(notes),
             screenshot_suppressed=bool(notes),
+            char_budget=GET_STATE_CHAR_BUDGET,
+            # Stateless paging past the render budget: the walk is the same whole
+            # window every time, only the first row printed moves.
+            from_index=_opt_int(clean, ARG_FROM_INDEX) or 0,
         )
 
     # ── Mutating verbs ──
@@ -726,6 +738,12 @@ def _run(
                 refusal, session_key=session_key, agent=agent, app=app, tool_name=tool_name
             )
 
+    # The pre-action tree this session was last shown for this window, read from the
+    # service's per-session snapshot cache (keyed by ``session_key`` — never a module
+    # global, so two sessions driving the same window never diff against each other's
+    # walks). It is the baseline the post-action reply is diffed against below.
+    before = svc.index.get(target.window_key, session_key=session_key)
+
     detail = _perform(tool_name, clean, svc, target, rec, text, request)
     # LET THE UI REPAINT before re-reading it. Without this the refresh walk can
     # observe the PRE-action tree, so the model is shown a result that looks like
@@ -739,7 +757,22 @@ def _run(
     # keeps the cache authoritative and gives the model the post-action tree in the
     # same turn.
     snap = svc.snapshot(target, req, session_key=session_key)
-    body = _render_snapshot(snap, req, session_key=session_key, agent=agent, app=app)
+    # The reply is a DIFF, not the whole tree (TOOL-8): the full post-action walk is
+    # cached above, so every index stays addressable, but the model is shown only the
+    # acted element's neighbourhood and the rows whose rendered line changed. A row
+    # left out is byte-identical at the same index to the previous walk, which is what
+    # makes the omission safe to state; the drift check still guards every action.
+    rows, tree_notes = _action_rows(before, snap, rec, text_limit=req.text_limit)
+    body = _render_snapshot(
+        snap,
+        req,
+        session_key=session_key,
+        agent=agent,
+        app=app,
+        char_budget=ACTION_CHAR_BUDGET,
+        rows=rows,
+        tree_notes=tree_notes,
+    )
     # ``detail`` is redacted SEPARATELY, and it has to be. The body was already
     # redacted inside ``render_tree``, but the header was concatenated after that
     # pass — and ``detail`` is not our prose: every driver confirmation interpolates
@@ -1103,8 +1136,15 @@ def _render_snapshot(
     app: str,
     extra_notes: tuple[str, ...] = (),
     screenshot_suppressed: bool = False,
+    char_budget: int = 0,
+    rows: "tuple[int, ...] | None" = None,
+    tree_notes: tuple[str, ...] = (),
+    from_index: int = 0,
 ) -> str:
     """Shape and render one snapshot through the observation ceiling.
+
+    *char_budget*, *rows*, *tree_notes* and *from_index* pass straight to ``render.render_tree``:
+    they choose which already-shaped rows are printed, never what a row discloses.
 
     The snapshot is flattened into the structured payload the ceiling understands,
     narrowed, and then rebuilt — so the ceiling shapes the DATA rather than a
@@ -1139,7 +1179,48 @@ def _render_snapshot(
         image_width=snap.image_width if kept_image else 0,
         image_height=snap.image_height if kept_image else 0,
     )
-    return _with_notes(render.render_tree(rebuilt, text_limit=req.text_limit), shaped)
+    tree = render.render_tree(
+        rebuilt,
+        text_limit=req.text_limit,
+        char_budget=char_budget,
+        rows=rows,
+        tree_notes=tree_notes,
+        from_index=from_index,
+    )
+    return _with_notes(tree, shaped)
+
+
+def _action_rows(
+    before: "Snapshot | None",
+    after: Snapshot,
+    rec: "ElementRec | None",
+    *,
+    text_limit: int,
+) -> "tuple[tuple[int, ...], tuple[str, ...]]":
+    """Rows and notes for a mutating action's reply: a diff against *before*.
+
+    Anchored on the acted element, or on the focused one when the action addressed
+    no element (a coordinate click, a drag, a bare key press). *before* belongs to a
+    different window when the action switched windows; it is then no baseline at all,
+    and the reply says so rather than diffing two unrelated trees.
+    """
+    anchor = rec.index if rec is not None else None
+    if anchor is None:
+        anchor = next((elem.index for elem in after.elements if elem.focused), None)
+    baseline = before if before is not None and before.key == after.key else None
+    rows, removed = render.diff_rows(
+        baseline,
+        after,
+        text_limit=text_limit,
+        anchor=anchor,
+        neighbourhood=ACTION_NEIGHBOURHOOD_ROWS,
+    )
+    if baseline is None:
+        return rows, (DIFF_NO_BASELINE_NOTE,)
+    notes = [DIFF_NOTE.format(shown=len(rows), total=len(after.elements))]
+    if removed:
+        notes.append(DIFF_REMOVED_NOTE.format(count=removed))
+    return rows, tuple(notes)
 
 
 def _element_payload(elem: ElementRec) -> dict[str, Any]:

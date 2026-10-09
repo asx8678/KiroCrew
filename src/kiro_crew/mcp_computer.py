@@ -365,11 +365,13 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "description": (
                 "Read one application's window as an indexed accessibility tree "
                 "(roles, titles, values, available actions) plus, when permitted, "
-                "the path to a compressed screenshot. CALL THIS FIRST, before your "
-                "first click/type/scroll on each request: the other tools address "
-                "elements by the index this returns and refuse a stale one. Every "
-                "action returns the refreshed tree, so call it again only when the "
-                "window may have changed outside your own actions. The tree is the "
+                "the path to a compressed screenshot. Call it before your first "
+                "action on a window, and again only after the UI changed outside "
+                "your own actions: the other tools address elements by the index "
+                "this returns and refuse a stale one, and every action already "
+                "returns what it changed. A dense window is shown up to a character "
+                "budget; the note at the end names the from_index that pages on. "
+                "The tree is the "
                 "primary channel — read the screenshot file only when the tree is "
                 "insufficient. Password fields are reported as present but their "
                 "contents are never readable, and a window containing one is not "
@@ -396,6 +398,16 @@ def _tool_definitions() -> list[dict[str, Any]]:
                         "minimum": 1,
                         "maximum": MAX_TREE_DEPTH_LIMIT,
                         "description": "Max tree depth to walk (default 64).",
+                    },
+                    "from_index": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": MAX_ELEMENT_INDEX,
+                        "description": (
+                            "Start the listing at this element index (default 0). "
+                            "Use the value an omission note names to see the rest "
+                            "of a dense window."
+                        ),
                     },
                     "screenshot": {
                         "type": "boolean",

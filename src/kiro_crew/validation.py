@@ -4472,6 +4472,7 @@ MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {
             FieldSpec("text_limit", int, min_val=1, max_val=_cu_types.MAX_TEXT_LIMIT),
             FieldSpec("max_tree_nodes", int, min_val=1, max_val=_cu_types.MAX_TREE_NODES_LIMIT),
             FieldSpec("max_tree_depth", int, min_val=1, max_val=_cu_types.MAX_TREE_DEPTH_LIMIT),
+            FieldSpec("from_index", int, min_val=0, max_val=_cu_types.MAX_ELEMENT_INDEX),
             # No default: absent means "use the operator's config", which is
             # resolved in ``service.snapshot_request``. A default here would
             # override the operator's ``attach_screenshot: false``.

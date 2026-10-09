@@ -367,6 +367,45 @@ DEFAULT_MAX_TREE_DEPTH = 64
 MAX_TREE_DEPTH_LIMIT = 128
 DEFAULT_TEXT_LIMIT = 500
 MAX_TEXT_LIMIT = 20000
+#: Total RENDERED budget, in characters, for the tree a ``computer_get_state`` (or a
+#: launch) returns. Separate from the WALK budget above on purpose: the walk stays at
+#: ``DEFAULT_MAX_TREE_NODES`` so the cache, the drift check and the screenshot's
+#: secure-field proof all see the whole window, while the model is shown the head of
+#: it. Element lines are dropped first; the header, the truncation/depth notes, the
+#: trailer and the screenshot note are always kept, and an omission line names the
+#: index range left out and the ``from_index`` that pages on to them (TOOL-8).
+GET_STATE_CHAR_BUDGET = 24_000
+#: Total rendered budget for the post-action tree a mutating tool returns. That tree
+#: is a DIFF against this session's cached pre-action snapshot (the acted element's
+#: neighbourhood plus every row whose rendered line changed), so the common case is a
+#: few hundred characters and this cap only bites when an action re-laid out the
+#: whole window.
+ACTION_CHAR_BUDGET = 8_000
+#: Rows either side of the acted element (by tree position) that a post-action diff
+#: always shows, changed or not, so the model sees the control it touched in context.
+ACTION_NEIGHBOURHOOD_ROWS = 5
+OMITTED_ROWS_NOTE = (
+    "[{omitted} element(s) not shown to stay within the {budget}-character budget "
+    "(indices {ranges}). Call computer_get_state with from_index={next} to see them.]"
+)
+#: Leading line of a ``computer_get_state`` page that starts past index 0.
+PAGED_FROM_NOTE = (
+    "[Elements before index {index} are not shown (from_index={index}); "
+    "call computer_get_state without from_index for the start of the tree.]"
+)
+DIFF_NOTE = (
+    "[Changes only: of {total} elements, the {shown} that changed or neighbour the "
+    "acted element are listed (less any named as omitted above). Every other element "
+    "is unchanged, at the same index, since the previous walk of this window. The "
+    "full tree is one computer_get_state call away.]"
+)
+DIFF_REMOVED_NOTE = "[{count} element(s) from the previous walk no longer exist.]"
+DIFF_NO_BASELINE_NOTE = (
+    "[No earlier state for this window to compare against, so the acted element's "
+    "neighbourhood and the head of the tree are shown. The full tree is one "
+    "computer_get_state call away.]"
+)
+DIFF_GAP_MARKER = "…"
 MAX_ELEMENT_INDEX = 5000
 MAX_TYPE_TEXT_LEN = 10000
 MAX_KEY_LEN = 64
