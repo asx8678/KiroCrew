@@ -1285,7 +1285,16 @@ export default function ChatPane({
     // steer flag, leaving doSend owning the draft and bubble bookkeeping
     // (it inlines attachments as this path does below, so a send the server
     // demotes to the text-only queue still carries them).
-    if (!running) { doSend(undefined, true); return }
+    //
+    // "No turn" is read from the slot's server flag too, not only this tab's
+    // stream state: a background slot (a crewmate DM) turns busy here only on
+    // a chunk or tool frame, so while its turn thinks, or was already running
+    // when the pane mounted, the stream state still reads idle. Taking the
+    // send path then minted no bubble (the slot is busy) and the message
+    // showed only when the server echoed it. A stale flag
+    // is safe: the server finds no turn, dispatches one, and the receipt's
+    // `turn` ruling demotes the steer bubble to a plain row.
+    if (!running && !paneSlot?.running) { doSend(undefined, true); return }
     const raw = input.trim()
     const files = pendingFiles
     const sentQuote = consumeQuote('').quote
@@ -1358,7 +1367,7 @@ export default function ChatPane({
         stashDemoted: (queueId) => queuedSendStash.set(queueId, { raw: steerPastes.length ? expandPasteTokens(raw, steerPastes) : raw, files, sent: txt, ...(sentQuote ? { quote: sentQuote } : {}) }),
       })
     })
-  }, [running, doSend, input, pendingFiles, pasteBlocks, setPasteBlocks, slotKey, dispatch, reportSendFailure, restoreIntoComposer, consumeQuote, recoverQuoteInto])
+  }, [running, paneSlot?.running, doSend, input, pendingFiles, pasteBlocks, setPasteBlocks, slotKey, dispatch, reportSendFailure, restoreIntoComposer, consumeQuote, recoverQuoteInto])
 
   // Stop mirrors ChatPage's press protocol (ChatPage.onStop): the first press
   // is the cooperative cancel, a second press while the slot reports
