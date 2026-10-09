@@ -1411,21 +1411,15 @@ _DIFF_RULE_POINTER = (
 )
 PROMPT_SECTION_COMPUTER_USE = "COMPUTER_USE"
 PROMPT_SECTION_BROWSER = "BROWSER"
+#: Nested in BROWSER: the paragraphs that name the ``browser`` MCP tool, kept only
+#: when the session's agent is granted it; BROWSER_CLI is the complement.
+PROMPT_SECTION_BROWSER_TOOL = "BROWSER_TOOL"
+PROMPT_SECTION_BROWSER_CLI = "BROWSER_CLI"
 PROMPT_SECTION_WAIT_WEBHOOK = "WAIT_WEBHOOK"
 PROMPT_SECTION_ORCHESTRATION = "ORCHESTRATION"
 
 
-def _browser_reachable(session_key: str) -> bool:
-    """Whether the ``browser`` tool can do anything for this session.
-
-    The tool is always listed (``mcp_tools.browser.schemas``); it acts through the
-    dashboard's native Browser panel, which only a dashboard-displayed session
-    has, or falls back to ``playwright-cli`` when that is installed. With neither,
-    every call returns an install hint, so the section teaching it is dead weight.
-    Fails closed, like ``mcp_tools.browser._browsing_available``.
-    """
-    if has_dashboard_surface(session_key):
-        return True
+def _playwright_cli_available() -> bool:
     try:
         from kiro_crew.browser_cli import install as _browser_install
 
@@ -1434,8 +1428,27 @@ def _browser_reachable(session_key: str) -> bool:
         return False
 
 
+def _browser_reachable(session_key: str, tool_granted: bool = True) -> bool:
+    """Whether any browsing path can do anything for this session.
+
+    The ``browser`` tool is served by the opt-in ``kirocrew-ops`` server, so it is
+    in the session only when *tool_granted* (``_agent_grants_ops_browser``); it
+    acts through the dashboard's native Browser panel, which only a
+    dashboard-displayed session has. ``playwright-cli`` works wherever it is
+    installed. With neither, every path ends in an install hint, so the section
+    teaching them is dead weight. Fails closed, like
+    ``mcp_tools.browser._browsing_available``.
+    """
+    if tool_granted and has_dashboard_surface(session_key):
+        return True
+    return _playwright_cli_available()
+
+
 def _prompt_section_gates(
-    session_key: str, runtime_source: str | None, minimal_context: bool
+    session_key: str,
+    runtime_source: str | None,
+    minimal_context: bool,
+    agent: str | None = None,
 ) -> dict[str, bool]:
     """Which capability/surface sections of the managed prompt this session keeps.
 
@@ -1445,14 +1458,20 @@ def _prompt_section_gates(
     operator opt-in, with no scope of its own. ``ORCHESTRATION`` (the delegation
     walkthrough) and ``WAIT_WEBHOOK`` (the wait/poll and webhook-session
     patterns) are withheld from minimal-context runs, whose wake is a bounded
-    poll; ``ORCHESTRATION`` is withheld from every cron run too.
+    poll; ``ORCHESTRATION`` is withheld from every cron run too. ``BROWSER_TOOL``
+    keeps the ``browser``-tool paragraphs only for an agent whose spec mounts that
+    ``kirocrew-ops`` tool; otherwise ``BROWSER_CLI`` teaches ``playwright-cli``
+    alone, and the whole section drops when neither path exists.
     """
     from kiro_crew.agent import _computer_use_spec_gate
 
     source = _resolve_runtime_source(session_key, runtime_source)
+    tool_granted = _agent_grants_ops_browser(agent)
     return {
         PROMPT_SECTION_COMPUTER_USE: _computer_use_spec_gate(),
-        PROMPT_SECTION_BROWSER: _browser_reachable(session_key),
+        PROMPT_SECTION_BROWSER: _browser_reachable(session_key, tool_granted),
+        PROMPT_SECTION_BROWSER_TOOL: tool_granted,
+        PROMPT_SECTION_BROWSER_CLI: not tool_granted,
         PROMPT_SECTION_WAIT_WEBHOOK: not minimal_context,
         PROMPT_SECTION_ORCHESTRATION: not minimal_context and source != "cron",
     }
@@ -1466,20 +1485,18 @@ def _prompt_section_gates(
 _INCLUDE_CREW_CONTEXT_CACHE: dict[str, bool] = {}
 
 
-def _read_include_crew_context(agent: str) -> bool:
-    """Read ``includeCrewContext`` from *agent*'s materialized JSON. True on any miss.
+def _read_agent_spec_dict(agent: str) -> dict[str, Any] | None:
+    """*agent*'s materialized JSON spec as a dict, or ``None`` on any miss.
 
     Reuses ``_load_agent_prompt``'s sensitive-path-gated scan: skip ``._`` macOS
     sidecars, ``resolve(strict=True)``, refuse a sensitive resolved target, tolerate
     ``ValueError``/``OSError``, and match on the declared ``name`` (or the filename
-    stem). Returns ``True`` unless the matched spec carries an explicit boolean
-    ``false`` — an absent flag, a non-boolean value, a missing/unreadable spec, or a
-    directory error all default to injecting, reproducing the pre-opt-out behavior.
+    stem).
     """
     try:
         candidates = iter_agent_spec_files(kiro_agents_dir(), ordered=False)
     except OSError:
-        return True
+        return None
     for f in candidates:
         if f.name.startswith("._"):
             continue
@@ -1498,12 +1515,63 @@ def _read_include_crew_context(agent: str) -> bool:
             if not isinstance(data, dict):
                 continue
             if data.get("name") == agent or f.stem == agent:
-                val = data.get("includeCrewContext", True)
-                # Honor only an explicit boolean; anything else defaults to inject.
-                return val if isinstance(val, bool) else True
+                return data
         except (OSError, ValueError):
             continue
-    return True
+    return None
+
+
+# Per-agent memo of "the spec grants the ``kirocrew-ops`` ``browser`` tool", for
+# the same per-turn reason as ``_INCLUDE_CREW_CONTEXT_CACHE``; cleared with it.
+_GRANTS_OPS_BROWSER_CACHE: dict[str, bool] = {}
+_OPS_SERVER = "kirocrew-ops"
+
+
+def _agent_grants_ops_browser(agent: str | None) -> bool:
+    """Whether *agent*'s spec mounts the ``browser`` tool of ``kirocrew-ops``.
+
+    ``browser`` moved to the opt-in ``kirocrew-ops`` server (TOOL-2), which a
+    default spec does not carry, so the BROWSER prompt section must not name it
+    as the primary tool for every dashboard session. Presentation only: this
+    grants nothing. ``True`` on an unreadable or missing spec, so a read failure
+    keeps the previous wording rather than hiding guidance a granted agent needs.
+    """
+    name = agent or "kirocrew"
+    cached = _GRANTS_OPS_BROWSER_CACHE.get(name)
+    if cached is not None:
+        return cached
+    data = _read_agent_spec_dict(name)
+    if data is None:
+        granted = True
+    else:
+        servers = data.get("mcpServers")
+        tools = data.get("tools")
+        tool_list = tools if isinstance(tools, list) else []
+        granted = (
+            isinstance(servers, dict)
+            and _OPS_SERVER in servers
+            and any(t in ("*", f"@{_OPS_SERVER}", f"@{_OPS_SERVER}/browser") for t in tool_list)
+        )
+    _GRANTS_OPS_BROWSER_CACHE[name] = granted
+    return granted
+
+
+def _read_include_crew_context(agent: str) -> bool:
+    """Read ``includeCrewContext`` from *agent*'s materialized JSON. True on any miss.
+
+    Reuses ``_load_agent_prompt``'s sensitive-path-gated scan: skip ``._`` macOS
+    sidecars, ``resolve(strict=True)``, refuse a sensitive resolved target, tolerate
+    ``ValueError``/``OSError``, and match on the declared ``name`` (or the filename
+    stem). Returns ``True`` unless the matched spec carries an explicit boolean
+    ``false`` — an absent flag, a non-boolean value, a missing/unreadable spec, or a
+    directory error all default to injecting, reproducing the pre-opt-out behavior.
+    """
+    data = _read_agent_spec_dict(agent)
+    if data is None:
+        return True
+    val = data.get("includeCrewContext", True)
+    # Honor only an explicit boolean; anything else defaults to inject.
+    return val if isinstance(val, bool) else True
 
 
 def _agent_includes_crew_context(agent: str | None) -> bool:
@@ -1535,8 +1603,10 @@ def invalidate_include_crew_context_cache() -> None:
     not-yet-written spec — would otherwise stay wrong until a gateway restart, the
     exact restart-heals failure class this fix exists to remove. Clearing forces
     the next ``build_session_context`` / ``build_message`` to re-read the flag.
+    The ``kirocrew-ops`` browser-grant memo is cleared with it, for the same reason.
     """
     _INCLUDE_CREW_CONTEXT_CACHE.clear()
+    _GRANTS_OPS_BROWSER_CACHE.clear()
 
 
 def build_cancelled_turn_preamble(
@@ -3454,7 +3524,7 @@ class ContextBuilder:
         )
         raw_prompt = agent_prompt
         sections = (
-            _prompt_section_gates(session_key or "", runtime_source, minimal_context)
+            _prompt_section_gates(session_key or "", runtime_source, minimal_context, agent)
             if "{{#" in agent_prompt
             else None
         )
