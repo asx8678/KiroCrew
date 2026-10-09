@@ -413,12 +413,25 @@ async def api_upload_file(request: web.Request) -> web.Response:
             # text uploads aren't worth the I/O.
             if ext in _ALLOWED_DOC_EXT or ext in _ALLOWED_IMAGE_EXT:
                 try:
-                    sent_sha = hashlib.sha256(bytes(data)).hexdigest()
-                    on_disk = dest.read_bytes()
-                    disk_sha = hashlib.sha256(on_disk).hexdigest()
-                    head_hex = on_disk[:4].hex() if on_disk else ""
                     is_zip_ext = ext in {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".zip"}
-                    is_zip = zipfile.is_zipfile(str(dest)) if is_zip_ext else None
+
+                    def _diagnose(
+                        sent: bytes, path: Path = dest, zip_ext: bool = is_zip_ext
+                    ) -> tuple[str, bytes, str, bool | None]:
+                        # Hashing and re-reading an upload of up to the size
+                        # cap is CPU and disk work: off the event loop.
+                        on_disk_bytes = path.read_bytes()
+                        return (
+                            hashlib.sha256(sent).hexdigest(),
+                            on_disk_bytes,
+                            hashlib.sha256(on_disk_bytes).hexdigest(),
+                            zipfile.is_zipfile(str(path)) if zip_ext else None,
+                        )
+
+                    sent_sha, on_disk, disk_sha, is_zip = await asyncio.to_thread(
+                        _diagnose, bytes(data)
+                    )
+                    head_hex = on_disk[:4].hex() if on_disk else ""
                     logger.info(
                         "upload.file diagnostic: name=%s ext=%s sent_size=%d disk_size=%d "
                         "sent_sha256=%s disk_sha256=%s match=%s magic=%s is_zipfile=%s",

@@ -3668,16 +3668,32 @@ async def api_session_agent_stream(request: web.Request) -> web.StreamResponse:
     resp.headers["Cache-Control"] = "no-cache"
     await resp.prepare(request)
 
-    last_pos = 0
+    import codecs
+
     from kiro_crew.security import redact_credentials, redact_exfiltration_urls  # noqa: F811
+
+    # Read only the bytes appended since the last tick, off the event loop: the
+    # whole-file re-read every second grew O(n^2) over a long result and blocked
+    # the loop on each pass. The incremental decoder keeps a multi-byte character
+    # split across two reads intact.
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    last_pos = 0
+
+    def _read_appended(pos: int) -> bytes:
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(pos)
+                return fh.read()
+        except FileNotFoundError:
+            return b""
 
     for _ in range(1200):  # 20 min max
         try:
-            if path.exists():
-                content = path.read_text(encoding="utf-8")
-                if len(content) > last_pos:
-                    chunk = content[last_pos:]
-                    last_pos = len(content)
+            data = await asyncio.to_thread(_read_appended, last_pos)
+            if data:
+                last_pos += len(data)
+                chunk = decoder.decode(data)
+                if chunk:
                     chunk, _ = redact_exfiltration_urls(chunk)
                     chunk, _ = redact_credentials(chunk)
                     await resp.write(f"data: {json.dumps(chunk)}\n\n".encode())
