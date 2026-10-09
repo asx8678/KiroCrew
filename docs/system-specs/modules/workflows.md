@@ -200,8 +200,11 @@ all, and returns results in input order. A task may be a zero-arg thunk
 (`lambda: ctx.agent(p)`) **or** an already-created awaitable (`ctx.agent(p)`);
 both are accepted deliberately, because Python authors reach for the latter out of
 `gather(*coros)` habit and a coroutine is not callable, which would otherwise turn
-every task into `None`. A task that raises resolves to `None` and the call itself
-never raises, so callers filter falsy entries. An empty list returns `[]`.
+every task into `None`. A task that raises resolves to `None` (logged at INFO) and
+the call itself never raises, so callers filter falsy entries. The one exception is
+`BudgetExceeded`, the run's ceiling: it cancels the other tasks and propagates, so a
+fan-out that hits the budget or the agent cap ends the run on the `ceiling` path
+instead of the script carrying on past the stop. An empty list returns `[]`.
 
 **`pipeline(items, *stages)` has no barrier between stages.** Each item flows
 through all stages in its own chain, so item B can reach stage 2 while item A is
@@ -209,7 +212,8 @@ still in stage 1; wall clock is the slowest single chain, not the sum of the
 slowest per stage. Stages are called `stage(prev, item, index)`, **arity-adapted**
 (a 1-arg stage receives only `prev`); for stage 0, `prev` is the item itself. A
 stage may be sync or async. A stage that raises drops that item to `None` and
-skips its remaining stages. Results come back in input order; with no stages, the
+skips its remaining stages; `BudgetExceeded` instead cancels the other chains and
+propagates, as in `parallel`. Results come back in input order; with no stages, the
 items are returned as-is.
 
 Both take an optional `limit` at the `dsl` level (a semaphore); the runner passes
@@ -307,7 +311,8 @@ class Budget(Protocol):
 `run_failed` with `where="ceiling"`. The same exception is raised by
 `context.AgentCounter.increment()` once the per-run agent-call cap
 (`DEFAULT_MAX_AGENTS_PER_RUN` = 1000) is reached, so a runaway fan-out lands on the
-same terminal path.
+same terminal path. `parallel` and `pipeline` let it through for that reason
+(`dsl._gather_or_stop`); every other task failure still resolves to `None`.
 
 **Charging (USE-2).** The runner's `_invoke` wraps every `agent_fn` call, including
 each schema re-ask and each retry, in a fresh `turn_tokens.TURN_TOKEN_SINK`. Every
