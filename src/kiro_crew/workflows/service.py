@@ -795,10 +795,12 @@ class WorkflowService:
         timeout_secs: Optional[int] = None,
         memory_scope: Any = None,
         session_key: str = "",
+        workflow_name: str = "",
     ) -> WorkflowRunner:
         # ``timeout_secs`` overrides the service default for THIS run only (clamped
         # into [MIN, MAX] so a per-run value can lengthen the ceiling but never
-        # remove it). None → the service default.
+        # remove it). None → the service default. ``workflow_name`` only names the
+        # run on its steps' usage rows (``service`` ``workflow:<name>``).
         ceiling = clamp_run_timeout(timeout_secs, default=self._timeout_secs)
 
         # Native ports wired for every run of this service. ``nudge`` bridges
@@ -841,6 +843,7 @@ class WorkflowService:
                     context_builder=self._context_builder,
                     session_key=session_key,
                     app=app,
+                    workflow_name=workflow_name,
                 )
             except Exception:  # noqa: BLE001 - never let pooling break run start
                 agent_fn, pool = None, None
@@ -860,6 +863,7 @@ class WorkflowService:
                 context_builder=self._context_builder,
                 session_key=session_key,
                 app=app,
+                workflow_name=workflow_name,
             )
         # Both paths meter through the task queue when one is attached: the
         # lane (not the pool's semaphore alone) is what the adaptive controller
@@ -1164,6 +1168,7 @@ class WorkflowService:
             timeout_secs=timeout_secs,
             memory_scope=memory_scope,
             session_key=session_key,
+            workflow_name=name or run_id,
         ).run_background(
             "",  # no source — author inside the run
             registry=self.registry,
@@ -1228,11 +1233,13 @@ class WorkflowService:
         )
         if self._admission_closed():
             return {"error": "gateway admission is closed"}
+        run_name = name or (vr.meta or {}).get("name", "") or run_id
         started = await self._runner(
             run_id,
             timeout_secs=timeout_secs,
             memory_scope=memory_scope,
             session_key=session_key,
+            workflow_name=run_name,
         ).run_background(
             source,
             registry=self.registry,
@@ -1242,7 +1249,7 @@ class WorkflowService:
             memory_mode=memory_scope.memory_mode,
             run_id=run_id,
             now=self._now_fn(),
-            name=name or (vr.meta or {}).get("name", "") or run_id,
+            name=run_name,
             args=args or {},
             author=author,
             session_key=session_key,
@@ -1633,6 +1640,7 @@ class WorkflowService:
             timeout_secs=timeout_secs,
             memory_scope=memory_scope,
             session_key=origin,
+            workflow_name=prior.name or new_id,
         ).run_background(
             run_source,
             registry=self.registry,

@@ -54,7 +54,12 @@ from kiro_crew.hooks import (
     hooks_config_from_config_dict,
 )
 from kiro_crew.json_line import parse_json_object_line
-from kiro_crew.llm_helpers import _steer_host_deny
+from kiro_crew.llm_helpers import (
+    _billing_stats,
+    _steer_host_deny,
+    record_turn_usage,
+    turn_exit_outcome,
+)
 from kiro_crew.permission_floor import (
     OUTCOME_PENDING_APPROVAL,
     OUTCOME_REJECTED_TRANSPORT_FLOOR,
@@ -1211,6 +1216,17 @@ def _summarize_stream_event(obj: dict) -> dict | None:
     return None
 
 
+def _run_outcome(ok: bool, error: str) -> str:
+    """The usage row's ``outcome`` for a run that ended through ``_finish``."""
+    if ok:
+        return "ok"
+    if error.startswith("timeout"):
+        return "timeout"
+    if error.startswith("stopped"):
+        return "cancelled"
+    return "error"
+
+
 class SessionAgentRunner:
     """A backend-AGNOSTIC agent runner that drives a Kiro Crew **provider/session** instead
     of shelling out to ``claude -p`` directly (task #23). The provider is whatever the
@@ -1469,6 +1485,16 @@ class SessionAgentRunner:
         cost = 0.0
         credits = 0.0
         cost_accounted = False
+        # USE-1 bookkeeping for the usage row the finally writes: the stats object
+        # pinned before the stream (a run that never dispatched writes nothing),
+        # the turn's wall-clock start, and how it ended. ``_finish`` names the
+        # in-band endings (timeout / stop / max_turns return, never raise); an
+        # exception is read off ``run_exc``.
+        stream_started = False
+        usage_since: Any = None
+        turn_t0 = 0.0
+        exit_outcome = ""
+        run_exc: BaseException | None = None
         try:
             if owns_provider:
                 try:
@@ -1509,6 +1535,9 @@ class SessionAgentRunner:
             # REMAINING budget. A stall is force-cancelled and we return the accumulated text
             # (so any findings already streamed survive). Falls back to the plain async-for if
             # the provider stream isn't a true async iterator.
+            usage_since = _billing_stats(provider)
+            turn_t0 = time.monotonic()
+            stream_started = True
             stream = provider.stream(full_prompt)
             ait = stream.__aiter__() if hasattr(stream, "__aiter__") else None
 
@@ -1519,11 +1548,12 @@ class SessionAgentRunner:
                 # The tool calls billed before an early return are real money — omitting
                 # them (the old behavior, which only accrued on success) made the ceiling
                 # under-count for timeout/max_turns, the EXPECTED common outcomes.
-                nonlocal cost_accounted
+                nonlocal cost_accounted, exit_outcome
                 with self._cost_lock:
                     self._total_cost_usd += cost
                     self._total_credits += credits
                 cost_accounted = True
+                exit_outcome = _run_outcome(ok, error)
                 return AgentResult(
                     ok=ok,
                     error=error,
@@ -1726,16 +1756,48 @@ class SessionAgentRunner:
                     break
             text_buf.flush()  # emit any trailing partial line at turn end
             return _finish(ok=True)
+        except BaseException as exc:
+            run_exc = exc
+            raise
         finally:
             if not cost_accounted:
                 with self._cost_lock:
                     self._total_cost_usd += cost
                     self._total_credits += credits
-            if provider is not None and owns_provider:
-                try:
-                    await provider.shutdown()
-                except Exception:  # noqa: BLE001
-                    pass
+            try:
+                if stream_started and provider is not None:
+                    # USE-1: the run's ONE usage row, written on every exit --
+                    # success, timeout, stop, max_turns, a raise, a cancel --
+                    # BEFORE the provider is torn down, since the turn's billing
+                    # lives on it. The app's own meter above is unaffected: it is
+                    # the budget, this row is the account's record of the spend.
+                    # Stamped with the owning app so its own audit
+                    # (``/api/usage/turns``) can read the row. Analytics only:
+                    # nothing here may fail the run it measures.
+                    try:
+                        # Imported here, not at module scope, to keep the backend
+                        # package off this module's import path.
+                        from ..backend.store import APP_NAME
+
+                        await record_turn_usage(
+                            provider,
+                            surface="auto_improvement",
+                            since=usage_since,
+                            slot_key=session_key,
+                            agent=governance_agent,
+                            app=APP_NAME,
+                            elapsed_ms=int((time.monotonic() - turn_t0) * 1000),
+                            service=f"auto_improvement:{governance_agent}",
+                            outcome=exit_outcome or turn_exit_outcome(run_exc),
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.debug("auto-improvement usage row failed", exc_info=True)
+            finally:
+                if provider is not None and owns_provider:
+                    try:
+                        await provider.shutdown()
+                    except Exception:  # noqa: BLE001
+                        pass
 
     @staticmethod
     async def _reject(

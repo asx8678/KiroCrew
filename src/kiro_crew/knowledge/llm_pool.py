@@ -329,6 +329,10 @@ class Worker(ABC):
     # ``__init__``, so a subclass that does not chain up still has the counter
     # (``+=`` rebinds it per instance).
     calls_since_reset: int = 0
+    # The usage row's ``service`` for the prompt being served (``knowledge:extraction``,
+    # ``auto_research``, …). The pool sets it on each checkout, before the send, from
+    # the pool's own workload name; one worker serves one prompt at a time.
+    usage_service: str = ""
 
     @abstractmethod
     async def start(self) -> None:
@@ -609,7 +613,7 @@ class AcpWorker(Worker):
         try:
             # USE-1: each knowledge prompt (extraction, agent fetch) is a billed
             # turn; one usage row, on every exit, before a failed client is shut.
-            async with metered_turn(self._client, surface="knowledge"):
+            async with metered_turn(self._client, surface="knowledge", service=self.usage_service):
                 return await self._client.send_message(prompt, timeout=timeout)
         except Exception:
             # A timed-out turn is still running in the child, so a reused client
@@ -911,7 +915,12 @@ class CCWorker(Worker):
         try:
             if usage_has_billing(usage):
                 await persist_token_record_async(
-                    "_bg", model, usage, "claude_code", surface="knowledge"
+                    "_bg",
+                    model,
+                    usage,
+                    "claude_code",
+                    surface="knowledge",
+                    service=self.usage_service,
                 )
         except Exception:
             logger.debug("CCWorker: knowledge usage row failed", exc_info=True)
@@ -1010,8 +1019,12 @@ class LLMPool:
         effort_key: Optional[str] = None,
         fallback_effort: str = "",
         config_pool_size_key: Optional[str] = None,
+        service: str = "",
     ):
         self._pool_size = pool_size
+        # The usage row's ``service`` for this pool's workload (``knowledge:extraction``,
+        # ``auto_research``, …), stamped on each worker as it is checked out.
+        self._service = service
         self._effort = _normalize_effort(effort)
         # Workload-bound effort resolution: when ``effort_key`` is set, the
         # effort is re-resolved from the config read in ``start()`` (explicit
@@ -1353,6 +1366,7 @@ class LLMPool:
         """Convenience: acquire a worker, send prompt, release, return response."""
         idx, worker = await self.acquire()
         try:
+            worker.usage_service = self._service
             return await worker.send_message(prompt, timeout=timeout)
         finally:
             try:

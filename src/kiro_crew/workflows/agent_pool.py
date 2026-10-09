@@ -83,6 +83,7 @@ async def _run_step(
     *,
     timeout: Optional[float] = None,
     usage_session_key: str = "",
+    usage_service: str = "",
 ) -> str:
     """Stream one workflow agent step through ``provider`` and redact its output.
 
@@ -95,7 +96,8 @@ async def _run_step(
     credential or exfiltration-URL leakage into workflow results stored in
     history / injected into parent chat). USE-1: the step writes its one usage
     row (surface ``workflow``) on success, a raise, and the per-task timeout's
-    cancellation alike, filed under ``usage_session_key``.
+    cancellation alike, filed under ``usage_session_key`` and named by
+    ``usage_service`` (``workflow:<name>``).
     """
     coro = stream_and_collect(
         provider,
@@ -104,6 +106,7 @@ async def _run_step(
         max_turns=_MAX_TURNS_PER_STEP,
         usage_surface="workflow",
         usage_session_key=usage_session_key,
+        usage_service=usage_service,
     )
     text = await (asyncio.wait_for(coro, timeout) if timeout is not None else coro)
     return redact(text)
@@ -129,9 +132,11 @@ class _WorkflowSessionWorker:
         context_builder: Any = None,
         effort: str = "",
         include_memory: bool = False,
+        usage_service: str = "",
     ) -> None:
         self._sessions = sessions
         self._include_memory = include_memory
+        self._usage_service = usage_service
         self._key = key
         self._agent = agent
         self._model = model
@@ -187,7 +192,11 @@ class _WorkflowSessionWorker:
                 include_memory=self._include_memory,
             )
         result = await _run_step(
-            self._provider, prompt, timeout=timeout, usage_session_key=self._key
+            self._provider,
+            prompt,
+            timeout=timeout,
+            usage_session_key=self._key,
+            usage_service=self._usage_service,
         )
         if self._memory_scope is not None:
             await self._memory_scope.validate()
@@ -302,6 +311,7 @@ def build_pooled_agent_fn(
     context_builder: Any = None,
     session_key: str = "",
     app: str = "",
+    workflow_name: str = "",
 ) -> "tuple[Callable[[str, dict], Any], _AggregatePool]":
     """Return ``(agent_fn, pool)`` where ``agent_fn`` reuses WARM sessions.
 
@@ -319,8 +329,12 @@ def build_pooled_agent_fn(
     built for one identity never serves a call that asked for another). Calls
     with no override share the default sub-pool. ``pool.shutdown()`` tears down
     every sub-pool.
+
+    ``workflow_name`` names the run on every step's usage row (``service``
+    ``workflow:<name>``, else ``workflow:<run_id>``), as ``build_agent_fn`` does.
     """
     worker_ids = itertools.count()
+    usage_service = f"workflow:{workflow_name or run_id}"
 
     def _validated_step_effort(value: object) -> str:
         """WF-5: validate ctx.agent(effort=...) — invalid warns and falls back
@@ -355,6 +369,7 @@ def build_pooled_agent_fn(
                 context_builder=context_builder,
                 effort=effort or "",
                 include_memory=include_memory,
+                usage_service=usage_service,
             )
 
         return WorkerPool(
@@ -450,7 +465,9 @@ def build_pooled_agent_fn(
                     cwd=opts.get("cwd") or cwd,
                     include_memory=step_memory(memory_scope, opts.get("memory")),
                 )
-            result = await _run_step(provider, prompt, usage_session_key=key)
+            result = await _run_step(
+                provider, prompt, usage_session_key=key, usage_service=usage_service
+            )
             if memory_scope is not None:
                 await memory_scope.validate()
             return result

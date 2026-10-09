@@ -55,7 +55,10 @@ GitHub CLI credentials readable and requires the same explicit risk acknowledgem
 as `auto` and `standard`. Setting `agent.sandbox` to an unsupported value is not a
 substitute. Kiro reports credits rather than USD, so `maxCostUsd` never trips on it;
 bound these runs with `maxCredits` (off by default) and the cycle and time limits.
-The app does not convert credits to dollars.
+The app does not convert credits to dollars. Each agent run also writes one row to
+the gateway's usage store (surface `auto_improvement`, service
+`auto_improvement:<agent>`), whether it finishes, times out, is stopped or fails, so
+its spend shows beside the rest of the account's.
 
 ### Recover a missing or changed member
 

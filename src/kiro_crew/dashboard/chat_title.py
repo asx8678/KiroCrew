@@ -802,6 +802,7 @@ async def _generate_title_via_kiro(
         # No model: inherit the pinned background spec model.
         crew_log_kind="title",
         crew_log_session_key=session_key,
+        service="chat_title",
     )
     title = _validate_title_reply(text)
     if not title:
@@ -836,6 +837,7 @@ async def _generate_refreshed_title(
         # No model: inherit the pinned background spec model.
         crew_log_kind="title",
         crew_log_session_key=session_key,
+        service="chat_title",
     )
     title = _validate_title_reply(text)
     if not title:

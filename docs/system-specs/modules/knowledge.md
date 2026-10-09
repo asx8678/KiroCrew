@@ -33,7 +33,9 @@ at the next idle boundary without one). Both pools drive the same
 existing model resolution: `knowledge.extraction_model` →
 `agent.resolve_model("background")` → `auto`. It does not inherit the chat
 model. Each prompt also starts a fresh worker conversation
-(`WORKER_RECYCLE_CALLS` = 1), and each call records one `knowledge` usage row.
+(`WORKER_RECYCLE_CALLS` = 1), and each call records one `knowledge` usage row,
+named by the pool's `service` (`knowledge:extraction`, `knowledge:agent_fetch`; the
+auto_research pool writes `auto_research`).
 
 Still open from MOD-2, deliberately: an edited artifact is re-extracted chunk by
 chunk with no per-chunk cache (`ingestion.py` re-extracts every chunk; a

@@ -208,6 +208,17 @@ def _build_ai_prompt(
     )
 
 
+#: The usage row's ``service`` per one-shot feature, keyed by the session-key
+#: prefix each caller already mints, so the four features share the
+#: ``issue_radar`` surface but are told apart on the row.
+_ONESHOT_SERVICE_BY_PREFIX = {
+    "issue-radar-ai": "issue_radar:issue_triage",
+    "issue-radar-pr-ai": "issue_radar:pr_summary",
+    "issue-radar-tagging": "issue_radar:tagging",
+    "issue-radar-reco": "issue_radar:recommendations",
+}
+
+
 async def _run_oneshot_model(request: web.Request, key: str, prompt: str) -> str:
     """Run ONE tool-less model call in an isolated ephemeral session; return the raw text.
 
@@ -236,8 +247,12 @@ async def _run_oneshot_model(request: web.Request, key: str, prompt: str) -> str
             provider,
             prompt,
             approval_policy=ToolApprovalPolicy.REJECT_ALL,
+            # Stamps the row with the owning app (no tool can run under
+            # REJECT_ALL, so the gate sees no call this could change).
+            app=store.APP_NAME,
             usage_surface="issue_radar",
             usage_session_key=key,
+            usage_service=_ONESHOT_SERVICE_BY_PREFIX.get(key.split(":", 1)[0], "issue_radar"),
         )
     finally:
         try:

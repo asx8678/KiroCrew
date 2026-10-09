@@ -700,6 +700,8 @@ async def api_mcp_apps_message(request: web.Request) -> web.Response:
                     # same injector dispatching directly. "app" is the crew-log
                     # actor for app-authored turns (crew_log.emit.ACTORS).
                     _turn_actor="app",
+                    # The usage row names the MCP app's server (bounded, redacted).
+                    _usage_service=f"mcp_app:{server}" if server else "mcp_app",
                 ),
             )
             slot.task = task

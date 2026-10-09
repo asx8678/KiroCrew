@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import random
+import sys
 import time
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
@@ -1653,6 +1654,7 @@ async def run_bg_oneliner(
     max_output_bytes: int | None = None,
     retry_rejected_model: bool = True,
     start_priority: StartPriority = StartPriority.BACKGROUND,
+    service: str = "",
 ) -> str:
     """Stream a single prompt through an ephemeral background session and return
     the accumulated text.
@@ -1707,6 +1709,10 @@ async def run_bg_oneliner(
     ``retry_rejected_model=False`` disables the extra reactive model call for a
     caller that accounts each attempt against a hard call budget. Neither changes
     the configured-model resolution or the default behavior of other callers.
+
+    ``service`` names the feature on the usage row (``chat_title``,
+    ``session_summary``, …) when ``sel_source`` is left at its generic default;
+    it changes nothing in the SEL audit, which keeps ``sel_source``.
     """
     # Pinned before the acquisition below, not in the teardown that writes it: a
     # slot reset, switch or compaction gives the successor a new ACP session id,
@@ -1836,6 +1842,7 @@ async def run_bg_oneliner(
             return await asyncio.wait_for(_drive(model_to_use), timeout)
         return await _drive(model_to_use)
 
+    exit_exc: BaseException | None = None
     try:
         try:
             return await _run(model)
@@ -1863,6 +1870,9 @@ async def run_bg_oneliner(
                 "bg oneliner: model %r rejected; retrying once with %r", rejected, fallback
             )
             return await _run(fallback)
+    except BaseException as exc:
+        exit_exc = exc
+        raise
     finally:
         # Account BEFORE destroy(): the turn's billing lives on the session this
         # tears down. Every caller of this helper — titles, link labels, folder
@@ -1907,6 +1917,14 @@ async def run_bg_oneliner(
                         usage=usage,
                         slot_key=sel_session_key,
                         elapsed_ms=_elapsed_ms,
+                        service=service,
+                        outcome=turn_exit_outcome(exit_exc),
+                        # USE-12: the session it served (the chat a title or
+                        # summary was written for). No ``request``: a one-liner's
+                        # prompt quotes that chat's own text, which an Incognito
+                        # or Temporary chat must not have copied anywhere.
+                        for_slot=crew_log_session_key
+                        or (sel_session_key if sel_session_key != "_bg" else ""),
                     )
             except Exception:
                 logger.debug("bg oneliner accounting failed source=%s", sel_source, exc_info=True)
@@ -2109,10 +2127,33 @@ def _sum_usage(left: TurnUsage, right: TurnUsage) -> TurnUsage:
             + int(getattr(right, "cache_read_tokens", 0) or 0),
             cost_usd=float(getattr(left, "cost_usd", 0.0) or 0.0)
             + float(getattr(right, "cost_usd", 0.0) or 0.0),
+            # USE-12 activity: a retried turn or a multi-prompt run did all of it.
+            tool_calls=int(getattr(left, "tool_calls", 0) or 0)
+            + int(getattr(right, "tool_calls", 0) or 0),
+            tool_kinds=_merge_counts(
+                getattr(left, "tool_kinds", None), getattr(right, "tool_kinds", None)
+            ),
+            prompt_chars=int(getattr(left, "prompt_chars", 0) or 0)
+            + int(getattr(right, "prompt_chars", 0) or 0),
+            output_chars=int(getattr(left, "output_chars", 0) or 0)
+            + int(getattr(right, "output_chars", 0) or 0),
+            compactions=int(getattr(left, "compactions", 0) or 0)
+            + int(getattr(right, "compactions", 0) or 0),
         )
     except Exception:
         logger.debug("usage sum failed", exc_info=True)
         return left
+
+
+def _merge_counts(left: object, right: object) -> dict[str, int]:
+    """Add two ``{kind: count}`` tallies; anything not a dict counts as empty."""
+    out: dict[str, int] = {}
+    for tally in (left, right):
+        if isinstance(tally, dict):
+            for key, value in tally.items():
+                if isinstance(key, str) and isinstance(value, int):
+                    out[key] = out.get(key, 0) + value
+    return out
 
 
 def provider_last_turn_usage(provider: Any, *, since: Any = _NO_PRIOR_STATS) -> TurnUsage:
@@ -2180,6 +2221,12 @@ async def record_turn_usage(
     agent: str = "",
     app: str = "",
     elapsed_ms: int = 0,
+    service: str = "",
+    outcome: str = "",
+    parent_slot: str = "",
+    ttft_ms: int = 0,
+    request: str = "",
+    for_slot: str = "",
 ) -> TurnUsage:
     """Write the ONE usage row for a model turn just driven on *provider*.
 
@@ -2199,9 +2246,14 @@ async def record_turn_usage(
     served the turn, else *agent*. ``slot_key`` groups the row; a
     caller with no session key of its own files under ``_bg`` (the shared
     background session's key, classified ``background``) rather than an empty
-    key the dashboard reads as ``unknown``. Returns the usage it read. Never raises
-    an ``Exception``: the row is analytics and must not fail the turn it
-    measures.
+    key the dashboard reads as ``unknown``. ``service`` names the specific job
+    (``cron:<job name>``, ``workflow:<name>``, …) beneath the bounded ``surface``
+    label, ``outcome`` how the turn ended (see :func:`turn_exit_outcome`), and
+    ``parent_slot`` / ``ttft_ms`` / ``request`` (what was asked; the row
+    redacts and bounds it) / ``for_slot`` (the session the work served) are
+    passed through to the row.
+    Returns the usage it read. Never raises an ``Exception``: the row is
+    analytics and must not fail the turn it measures.
     """
     if usage is None:
         usage = provider_last_turn_usage(provider, since=since)
@@ -2235,10 +2287,36 @@ async def record_turn_usage(
             elapsed_ms=elapsed_ms,
             app=app,
             model_source=provider,
+            service=service,
+            outcome=outcome,
+            parent_slot=parent_slot,
+            ttft_ms=ttft_ms,
+            request=request,
+            for_slot=for_slot,
         )
     except Exception:
         logger.debug("usage row persist failed surface=%s", surface, exc_info=True)
     return usage
+
+
+def turn_exit_outcome(exc: BaseException | None) -> str:
+    """The usage row's ``outcome`` for a drive that exited with *exc*.
+
+    ``None`` is a drive that returned (``ok``). A cancellation is its own
+    outcome, never ``error`` (the same rule ``metrics.turns.turn_outcome``
+    applies to a user Stop), and a timeout is told apart from other failures.
+    Anything else that is not an ``Exception`` (``GeneratorExit``,
+    ``KeyboardInterrupt``) says nothing about the turn and reads ``""``.
+    """
+    if exc is None:
+        return "ok"
+    if isinstance(exc, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "timeout"
+    if isinstance(exc, Exception):
+        return "error"
+    return ""
 
 
 @asynccontextmanager
@@ -2249,6 +2327,10 @@ async def metered_turn(
     slot_key: str = "",
     agent: str = "",
     app: str = "",
+    service: str = "",
+    parent_slot: str = "",
+    request: str = "",
+    for_slot: str = "",
 ) -> "AsyncIterator[None]":
     """Write the ONE usage row for a turn a caller drives on *provider* itself.
 
@@ -2258,12 +2340,18 @@ async def metered_turn(
     :func:`record_turn_usage`. The stats object is pinned on entry so a turn that
     never dispatched (and so left the previous turn's already-recorded stats in
     place) writes nothing. Enter it AFTER acquiring the session, so the acquire
-    wait is not charged as turn time.
+    wait is not charged as turn time. The row's ``outcome`` is how the wrapped
+    block exited (:func:`turn_exit_outcome`); ``service`` / ``parent_slot`` are
+    passed through.
     """
     since = _billing_stats(provider)
     started = time.monotonic()
+    exit_exc: BaseException | None = None
     try:
         yield
+    except BaseException as exc:
+        exit_exc = exc
+        raise
     finally:
         await record_turn_usage(
             provider,
@@ -2273,6 +2361,11 @@ async def metered_turn(
             agent=agent,
             app=app,
             elapsed_ms=int((time.monotonic() - started) * 1000),
+            service=service,
+            outcome=turn_exit_outcome(exit_exc),
+            parent_slot=parent_slot,
+            request=request,
+            for_slot=for_slot,
         )
 
 
@@ -2379,6 +2472,7 @@ async def background_turn(
     memory_store: str = "",
     crew_log_kind: str = "",
     crew_log_session_key: str = "",
+    service: str = "",
 ) -> "AsyncIterator[Any]":
     """Take the shared background session for ONE turn, then release and account.
 
@@ -2395,7 +2489,8 @@ async def background_turn(
     ``task`` labels the work in the ``surface`` dimension as ``bg:<task>`` so spend
     is attributable per background job instead of pooling into one anonymous
     bucket. Keep it a short fixed label — never per-session text, which would make
-    the dimension unbounded.
+    the dimension unbounded. ``service`` is where a finer name goes (it lands in
+    the row store only, never on a metric).
 
     ``agent`` is forwarded to ``get_or_create`` ONLY when a caller supplies it:
     the key decides which session is returned, but the agent decides what the
@@ -2454,8 +2549,12 @@ async def background_turn(
     # not charged as turn time. The acp provider never fills TurnUsage.duration_ms,
     # so this is the only duration a background row can carry.
     turn_started = time.monotonic()
+    exit_exc: BaseException | None = None
     try:
         yield client
+    except BaseException as exc:
+        exit_exc = exc
+        raise
     finally:
         turn_elapsed_ms = int((time.monotonic() - turn_started) * 1000)
         # Snapshot the billing BEFORE releasing. ``last_prompt_stats`` is shared
@@ -2507,6 +2606,10 @@ async def background_turn(
                         slot_key=key,
                         agent=agent or BACKGROUND_AGENT,
                         elapsed_ms=turn_elapsed_ms,
+                        service=service,
+                        outcome=turn_exit_outcome(exit_exc),
+                        # USE-12: the session this background work served.
+                        for_slot=crew_log_session_key,
                     )
             except Exception:
                 logger.debug("background turn accounting failed task=%s", task, exc_info=True)
@@ -2543,6 +2646,8 @@ async def stream_and_collect(
     usage_surface: str = "",
     usage_session_key: str = "",
     usage_agent: str = "",
+    usage_service: str = "",
+    usage_request: str = "",
 ) -> str:
     """Stream a message through an LLM provider and collect the full response.
 
@@ -2628,6 +2733,13 @@ async def stream_and_collect(
         usage_agent: The row's agent when the provider cannot name the one that
             served the turn; defaults to ``agent``. Row-only: unlike ``agent`` it
             never reaches the PreToolUse gate.
+        usage_service: The row's ``service`` — the specific job beneath the
+            bounded ``usage_surface`` label (``workflow:<name>``, …). Row-only.
+        usage_request: What the row says was asked (the row redacts and bounds
+            it). Opt-in, empty by default: a labelled call can run on behalf of
+            an Incognito or Temporary chat (a side question, a thread), whose
+            text must not be copied into the usage store, so only a caller that
+            knows its session is Persistent passes one. Row-only.
 
     Returns:
         The complete response text.
@@ -2661,6 +2773,10 @@ async def stream_and_collect(
     # Accumulates across attempts, so it lives OUTSIDE the retry loop: a turn that
     # was billed and then retried must report the sum, not the last attempt.
     turn_billed = TurnUsage()
+    # An exception a CALLER is already handling when it calls in. ``sys.exc_info``
+    # inside the finally below reports that one too, so the row's outcome compares
+    # against it rather than reading a clean turn as the caller's error.
+    _outer_exc = sys.exc_info()[1]
     while True:
         result_text = ""
         tool_call_count = 0
@@ -3057,6 +3173,7 @@ async def stream_and_collect(
                 # raises before ``retrying`` is set) -- writes the one row. Last in
                 # this block, after the synchronous callbacks, so the only await
                 # the finally makes cannot cost them a delivery.
+                _exit_exc = sys.exc_info()[1]
                 await record_turn_usage(
                     provider,
                     surface=usage_surface,
@@ -3065,6 +3182,9 @@ async def stream_and_collect(
                     agent=usage_agent or agent,
                     app=app,
                     elapsed_ms=int((time.monotonic() - _usage_t0) * 1000),
+                    service=usage_service,
+                    outcome=turn_exit_outcome(None if _exit_exc is _outer_exc else _exit_exc),
+                    request=usage_request,
                 )
 
 
@@ -3079,13 +3199,14 @@ async def stream_and_collect_json(
     usage_surface: str = "",
     usage_session_key: str = "",
     usage_agent: str = "",
+    usage_service: str = "",
 ) -> dict | None:
     """Stream a message and parse the response as JSON.
 
     Combines ``stream_and_collect`` with ``parse_llm_json``.
     Returns parsed dict or None on failure. ``usage_surface`` /
-    ``usage_session_key`` / ``usage_agent`` are forwarded (see
-    :func:`stream_and_collect`).
+    ``usage_session_key`` / ``usage_agent`` / ``usage_service`` are forwarded
+    (see :func:`stream_and_collect`).
     """
     text = await stream_and_collect(
         provider,
@@ -3097,6 +3218,7 @@ async def stream_and_collect_json(
         usage_surface=usage_surface,
         usage_session_key=usage_session_key,
         usage_agent=usage_agent,
+        usage_service=usage_service,
     )
     return parse_llm_json(text)
 

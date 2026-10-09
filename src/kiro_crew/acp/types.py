@@ -673,6 +673,40 @@ class TurnUsage:
     credits: float = 0.0
     num_turns: int = 0
     duration_ms: int = 0
+    # What the turn DID (USE-12), copied from ``AcpPromptStats`` by
+    # ``to_turn_usage``: distinct tool calls and their count per tool KIND (never
+    # a title, which can carry a path or a whole command), the characters sent
+    # and streamed back, and how many times the session compacted mid-turn. Cost
+    # drivers for the usage row, not billing: a backend bills one opaque figure.
+    tool_calls: int = 0
+    tool_kinds: dict[str, int] = field(default_factory=dict)
+    prompt_chars: int = 0
+    output_chars: int = 0
+    compactions: int = 0
+
+
+#: Bounds on the per-turn tool-kind tally: a kind label is a short identifier,
+#: and an unbounded set of distinct kinds (one per MCP server) folds into ``other``.
+_TOOL_KIND_MAX_CHARS = 48
+_TOOL_KINDS_MAX = 24
+
+
+def tool_kind_label(event: object) -> str:
+    """The kind a tool call is counted under: ``mcp:<server>`` or the ACP kind.
+
+    Only a provenance-verified MCP identity names its server; anything else
+    falls back to the protocol's own ``kind`` (``read``, ``edit``, ``execute``,
+    ``search``, ``fetch``, …), which carries no argument text.
+    """
+    server = (
+        getattr(event, "mcp_server_name", "")
+        if getattr(event, "mcp_identity_trusted", False)
+        else ""
+    )
+    if isinstance(server, str) and server:
+        return f"mcp:{server}"
+    kind = getattr(event, "tool_kind", "")
+    return kind if isinstance(kind, str) and kind else "other"
 
 
 def _normalize_to_kebab(name: str) -> str:
@@ -1200,6 +1234,30 @@ class AcpPromptStats:
     # this turn, so ``carry_over()`` drops it -- a refusal that survived into
     # the next turn would brand an ordinary answer as declined.
     refusal: "RefusalInfo | None" = None
+    # What this turn DID (USE-12), for the usage row's cost drivers. PER-TURN:
+    # ``carry_over()`` starts each at zero. Tool calls count DISTINCT ids (one
+    # call can stream several frames) per tool kind (``read``, ``execute``,
+    # ``mcp:<server>``, …) -- never the title, which can carry a file path or a
+    # whole shell command. Counted at the shared seams every harness runs
+    # through, with no backend branch.
+    tool_call_count: int = 0
+    tool_kinds: dict[str, int] = field(default_factory=dict)
+    seen_tool_call_ids: set[str] = field(default_factory=set)
+    prompt_chars: int = 0
+    output_chars: int = 0
+    compactions: int = 0
+
+    def note_tool_call(self, tool_call_id: str, kind: str) -> None:
+        """Count one tool call, once per id, under a bounded set of kinds."""
+        if tool_call_id:
+            if tool_call_id in self.seen_tool_call_ids:
+                return
+            self.seen_tool_call_ids.add(tool_call_id)
+        self.tool_call_count += 1
+        label = (kind or "other")[:_TOOL_KIND_MAX_CHARS]
+        if label not in self.tool_kinds and len(self.tool_kinds) >= _TOOL_KINDS_MAX:
+            label = "other"
+        self.tool_kinds[label] = self.tool_kinds.get(label, 0) + 1
 
     def carry_over(self) -> "AcpPromptStats":
         """Return fresh per-turn stats carrying this turn's context state.
@@ -1322,8 +1380,8 @@ class AcpPromptStats:
         fields, so a backend that bills in cost/tokens (the claude seam) and
         one that bills in credits (kiro) both surface whatever they reported.
         A backend that sends neither cost nor token counts leaves the new
-        dimensions at their zero defaults, so the result is byte-identical to
-        ``TurnUsage(credits=...)`` (harness parity).
+        dimensions at their zero defaults (harness parity). The activity counters
+        (tool calls, characters, compactions) are filled for every backend alike.
         """
         return TurnUsage(
             input_tokens=self.input_tokens,
@@ -1333,6 +1391,11 @@ class AcpPromptStats:
             cache_creation_tokens=self.cache_write_tokens,
             cost_usd=self.cost_usd,
             credits=self.credits,
+            tool_calls=self.tool_call_count,
+            tool_kinds=dict(self.tool_kinds),
+            prompt_chars=self.prompt_chars,
+            output_chars=self.output_chars,
+            compactions=self.compactions,
         )
 
     @staticmethod

@@ -3660,6 +3660,11 @@ class HistoryConsolidator:
                         self._sessions,
                         task="consolidation",
                         agent="kirocrew-lite",
+                        # Both jobs share the ``bg:consolidation`` surface; the
+                        # usage row tells them apart. A turn charged to a session
+                        # is that session's memory consolidation, and the one
+                        # caller that passes no key is skill extraction.
+                        service=("memory_consolidation" if session_key else "skill_extraction"),
                         # This turn is spent on ONE session's transcript, so its
                         # cost belongs in that session's log even though the user
                         # never asked for it. Callers that pass no key -- skill

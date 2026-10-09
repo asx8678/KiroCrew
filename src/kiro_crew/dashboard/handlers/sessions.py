@@ -703,6 +703,19 @@ def _publish_usage(payload: dict[str, object]) -> None:
     _usage_cache_ts = time.time()
 
 
+async def _record_account_reading(payload: dict[str, object]) -> None:
+    """Append an identity-proven reading to the account history, off-loop.
+
+    The Usage page compares the account's own consumption between readings with
+    what the row store recorded (``credit_report.reconcile``); without the
+    history every reading was dropped at the next refresh. Best-effort: the
+    append swallows its own failures and must never cost the readout.
+    """
+    from kiro_crew.dashboard.handlers.credit_report import record_account_reading
+
+    await asyncio.to_thread(record_account_reading, dict(payload))
+
+
 def _cache_transient_failure(identity: dict[str, object] | None, reason: str | None = None) -> None:
     """Record a usage-fetch failure without blanking the pill for the same account.
 
@@ -1111,6 +1124,7 @@ async def _fetch_usage_bg() -> str | None:
                         }
                     )
                 _publish_usage(api_usage)
+                await _record_account_reading(api_usage)
                 logger.info(
                     "Kiro usage refreshed (api): %s / %s credits",
                     api_usage.get("credits_used", "?"),
@@ -1254,6 +1268,7 @@ async def _fetch_usage_bg() -> str | None:
                 {k: _redact_strings(v) for k, v in after.items() if not k.startswith("_")}
             )
             _publish_usage(parsed)
+            await _record_account_reading(parsed)
             logger.info(
                 "Kiro usage refreshed (text): %s credits used",
                 parsed.get("credits_used", "?"),
@@ -1967,7 +1982,11 @@ async def _summarize_one(state: DashboardState, key: str, *, owner_app: str = ""
         return ""
     try:
         text = await run_bg_oneliner(
-            state.sessions, prompt, model=_SUMMARIZE_MODEL, timeout=_SUMMARIZE_TIMEOUT_SECS
+            state.sessions,
+            prompt,
+            model=_SUMMARIZE_MODEL,
+            timeout=_SUMMARIZE_TIMEOUT_SECS,
+            service="session_summary",
         )
     except Exception:
         logger.debug("Session summary generation failed for %s", key, exc_info=True)

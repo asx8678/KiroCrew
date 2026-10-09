@@ -576,6 +576,10 @@ async def api_tasks_summary(request):
     return await handler(request)
 
 
+from kiro_crew.dashboard.handlers.credit_report import (  # noqa: E402, F401
+    api_usage_credits_summary,
+    api_usage_credits_turns,
+)
 from kiro_crew.dashboard.handlers.telemetry import (  # noqa: E402, F401
     api_beacon_status,
     api_collection_status,

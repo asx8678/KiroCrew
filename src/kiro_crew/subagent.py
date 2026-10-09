@@ -128,6 +128,8 @@ from kiro_crew.llm_helpers import (
     provider_fallback_active,
     provider_last_turn_usage,
     transient_retry_delay,
+    turn_exit_outcome,
+    usage_has_billing,
 )
 from kiro_crew.mcp_gateway import STUB_MODULE
 from kiro_crew.platform.context import redact_via_context
@@ -1081,9 +1083,25 @@ class _RunCreditAccounting:
     stats_before: object | None = None
     pending: bool = False
     total: Any = field(default_factory=lambda: provider_last_turn_usage(None))
+    # What this attempt's usage row needs from the run body, recorded as the body
+    # learns it (``_run_inner_impl`` sets them when its stream starts).
+    row_agent: str = ""
+    row_provider: str = "acp"
+    turn_started: float | None = None
+    run_started: float = field(default_factory=time.monotonic)
+    # Credits this attempt inherited from ``info`` (a respawn re-runs the same
+    # record), so its row bills only what it spent itself.
+    seed_credits: float = 0.0
 
     def __post_init__(self) -> None:
         self.total.credits = self._valid_credits(self.info.credits) or 0.0
+        self.seed_credits = self.total.credits
+
+    def attempt_usage(self) -> Any:
+        """This attempt's own billing: the settled total less the seeded credits."""
+        own = _sum_usage(self.total, provider_last_turn_usage(None))
+        own.credits = max(0.0, float(own.credits or 0.0) - self.seed_credits)
+        return own
 
     @staticmethod
     def _valid_credits(value: object) -> float | None:
@@ -5977,8 +5995,12 @@ class SubagentManager:
     async def _run_inner(self, info: SubagentInfo, session_key: str) -> None:
         usage = _RunCreditAccounting(info)
         info._credit_accounting = usage
+        exit_exc: BaseException | None = None
         try:
             return await self._run_events._run_inner_impl(info, session_key, usage)
+        except BaseException as exc:
+            exit_exc = exc
+            raise
         finally:
             # Cancellation may land in the event consumer, outside the stream
             # generator's exception handlers. Settle before terminal reporting.
@@ -5987,6 +6009,121 @@ class SubagentManager:
             finally:
                 if info._credit_accounting is usage:
                     info._credit_accounting = None
+                # USE-1: the attempt's ONE usage row, from the settled total, on
+                # every ending -- completed, failed, cancelled, timed out, reaped.
+                self._schedule_run_usage_row(info, session_key, usage, exit_exc)
+
+    def _run_usage_outcome(
+        self, info: SubagentInfo, usage: _RunCreditAccounting, exit_exc: BaseException | None
+    ) -> str:
+        """How this attempt ended, as the usage row's ``outcome``.
+
+        The run's own record is more precise than the exception: a user Stop
+        unwinds as a cancellation and a classified stop reason names a stall or
+        an error the stream ended on. Inside ``_run_inner`` the run deadline is
+        also just a cancellation (``wait_for`` cancels the body before ``_run``
+        stamps the timeout), so an attempt cancelled at or past the deadline,
+        outside a shutdown, reads ``timeout``.
+        """
+        if info.user_stopped:
+            return "cancelled"
+        if exit_exc is not None:
+            if isinstance(exit_exc, asyncio.CancelledError):
+                deadline = float(self._default_timeout or 0)
+                if (
+                    deadline > 0
+                    and not self._shutting_down
+                    and time.monotonic() - usage.run_started >= deadline
+                ):
+                    return "timeout"
+            return turn_exit_outcome(exit_exc)
+        from kiro_crew.metrics.turns import turn_outcome
+
+        outcome = turn_outcome(info.stop_reason or None)
+        return "error" if outcome == "ok" and info.error else outcome
+
+    def _schedule_run_usage_row(
+        self,
+        info: SubagentInfo,
+        session_key: str,
+        usage: _RunCreditAccounting,
+        exit_exc: BaseException | None,
+    ) -> None:
+        """Append this attempt's usage row on a task held in ``_report_tasks``.
+
+        One row per attempt, carrying everything the attempt billed: every
+        prompt it sent (transient retries, stop-recovery and infra-retry
+        continuations, post-activity re-sends), whether or not it completed. A
+        respawn re-runs the same record, so the row bills the settled total less
+        the credits the attempt was seeded with -- each attempt's own share, and
+        the attempts' rows sum to ``info.credits``. Inputs are read here,
+        synchronously; the append runs on a held task that ``cancel_all()``
+        drains within its report bound, so no ending, cancel or shutdown waits
+        on it. Never raises: the row is analytics.
+        """
+        try:
+            own = usage.attempt_usage()
+            if not usage_has_billing(own):
+                return
+            # circular import: reached while kiro_crew.slack.handler is still
+            # initialising (dashboard/handlers/files.py imports is_tracked_channel
+            # from it), so a module-scope import raises ImportError under the
+            # suite's import order.
+            from types import SimpleNamespace
+
+            from kiro_crew.dashboard.handlers.usage import (
+                persist_token_record_async,
+                read_context_tokens,
+                read_effective_agent,
+            )
+
+            client = usage.provider
+            _used, _window = read_context_tokens(client)
+            agent = usage.row_agent or info.agent
+            # A run that ended through its own stream carries the classified stop
+            # reason onto the row (and the turn histogram); an exception exit has
+            # none, so the bare usage goes through and ``outcome`` says how it ended.
+            event: Any = (
+                SimpleNamespace(usage=own, stop_reason=info.stop_reason or None)
+                if exit_exc is None
+                else own
+            )
+            started = usage.turn_started if usage.turn_started is not None else usage.run_started
+            name = agent or info.crew
+            row = asyncio.ensure_future(
+                persist_token_record_async(
+                    session_key,
+                    # Blank while a fallback serves this run: the explicit pin
+                    # would bill the fallback's spend to a model that never
+                    # executed; model_source reports what actually ran.
+                    ("" if provider_fallback_active(client) else (info.model or "")),
+                    event,
+                    provider=usage.row_provider,
+                    surface="subagent",
+                    # Ownership stamp (see _build_token_record): an app-dispatched
+                    # subagent's spend must be readable by that app's audit -- the
+                    # illustrator lane of an app is exactly this path.
+                    app=info.app or "",
+                    # Explicit/inherited `agent` FIRST here -- unlike every other
+                    # surface. Under session sharing this subagent reuses the
+                    # PARENT's runtime, so read_effective_agent() would report the
+                    # parent's agent and misattribute a `spawn_run(agent="…")` turn.
+                    agent=agent or read_effective_agent(client) or "",
+                    context_used=_used,
+                    context_window=_window,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    model_source=client,
+                    service=f"subagent:{name}" if name else "subagent",
+                    outcome=self._run_usage_outcome(info, usage, exit_exc),
+                    parent_slot=info.parent_session_key or "",
+                    # USE-12: the task the subagent was given.
+                    request=info.task or "",
+                )
+            )
+            self._report_tasks.add(row)
+            row.add_done_callback(self._report_tasks.discard)
+        except Exception:
+            logger.debug("usage row (subagent) persist failed", exc_info=True)
 
     # Facades for the completion / stop-reason handling and the lane-slot
     # waits that live in subagent_manager/run.py.

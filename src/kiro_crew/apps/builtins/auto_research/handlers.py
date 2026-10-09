@@ -1006,7 +1006,7 @@ def register_routes(app: web.Application) -> None:
         global _watchdog_task
         # Dedicated LLM pool for the grill expand endpoint — isolated from the
         # Knowledge Library's pool so the two apps don't share workers.
-        _app["auto_research_llm_pool"] = LLMPool(pool_size=1)
+        _app["auto_research_llm_pool"] = LLMPool(pool_size=1, service="auto_research")
         _watchdog_task = asyncio.create_task(watchdog._watchdog_loop(_app))
 
     async def _stop_watchdog(_app: web.Application) -> None:

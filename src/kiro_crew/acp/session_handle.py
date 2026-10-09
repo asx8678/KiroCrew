@@ -170,6 +170,7 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
     StructuredStatus,
     effort_config_option_id,
+    tool_kind_label,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.agent_sdk.drivers.acp import EntitlementRevalidating  # noqa: F401 - raised here
@@ -1525,6 +1526,9 @@ class AcpSessionHandle:
                 self._session_id,
                 summarize_prompt_structure(prompt_blocks),
             )
+            # USE-12: what this turn sends, for the usage row's cost drivers.
+            # Built after ``_run_turn`` installed the turn's fresh stats.
+            self.last_prompt_stats.prompt_chars = len(message) if isinstance(message, str) else 0
             return METHOD_PROMPT, {
                 "sessionId": self._session_id,
                 # An image reaches the model ONLY as an image block. Sending a
@@ -6627,11 +6631,17 @@ class AcpSessionHandle:
                 ):
                     continue
             filtered_events.append(ev)
+            if ev.kind == EVENT_COMPACTION_STATUS and ev.text == "completed":
+                # USE-12: a mid-turn compaction is billed inside this turn.
+                self.last_prompt_stats.compactions += 1
             if ev.kind == EVENT_TEXT_CHUNK:
                 self.last_prompt_stats.text_chunks += 1
+                self.last_prompt_stats.output_chars += len(ev.text or "")
                 self._stale_eligible = not self._active_tool_calls
                 self._prompt_or_tool_seen = True
             elif ev.kind == EVENT_TOOL_CALL:
+                # USE-12: one count per distinct call, by kind (never its title).
+                self.last_prompt_stats.note_tool_call(ev.tool_call_id or "", tool_kind_label(ev))
                 self._stale_eligible = False
                 self._tool_dispatched = True
                 self._prompt_or_tool_seen = True

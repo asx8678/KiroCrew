@@ -11577,6 +11577,8 @@ class AcpClient:
 
         req_id = await self._send_prompt(message)
         self.last_prompt_stats = self.last_prompt_stats.carry_over()
+        # USE-12: what this turn sends, for the usage row's cost drivers.
+        self.last_prompt_stats.prompt_chars = len(message) if isinstance(message, str) else 0
 
         # aclosing(): _prompt_loop holds _turn_lock and releases it in its
         # finally. Consumers below `return` on "complete" without exhausting the
@@ -11639,6 +11641,7 @@ class AcpClient:
                         # to recover it from.
                         self._claude_compaction_event(chunk)
                         self.last_prompt_stats.text_chunks += 1
+                        self.last_prompt_stats.output_chars += len(chunk)
                         yield chunk
                         if _is_tool_interrupted_marker(chunk):
                             self._emit_tool_interrupted_sel("send_message_stream")
@@ -11867,6 +11870,7 @@ class AcpClient:
                     kind = EVENT_THINKING_CHUNK if is_thinking else EVENT_TEXT_CHUNK
                     if not is_thinking:
                         self.last_prompt_stats.text_chunks += 1
+                        self.last_prompt_stats.output_chars += len(chunk)
                         self._stale_eligible = not self._active_tool_calls
                         self._prompt_or_tool_seen = True
                     yield AcpEvent(kind=kind, text=chunk, control_notice=_notice_chunk)
@@ -12635,6 +12639,7 @@ class AcpClient:
                     self._claude_compaction_event(chunk)
                     output.append(chunk)
                     self.last_prompt_stats.text_chunks += 1
+                    self.last_prompt_stats.output_chars += len(chunk)
                     if _is_tool_interrupted_marker(chunk):
                         self._emit_tool_interrupted_sel("_read_prompt_response")
                         return "".join(output)  # see _dispatch_events for rationale
@@ -13644,6 +13649,9 @@ class AcpClient:
             title = update.get("title", "unknown")
             kind = update.get("kind", "unknown")
             self.last_prompt_stats.tool_calls.append((kind, title))
+            self.last_prompt_stats.note_tool_call(
+                str(update.get("toolCallId") or ""), str(kind or "other")
+            )
             logger.debug("ACP tool_call: %s (%s)", title, kind)
 
     def _extract_tool_event(self, msg: JsonRpcMessage) -> AcpEvent | None:
@@ -13799,6 +13807,7 @@ class AcpClient:
                 kind, _ = redact_exfiltration_urls(kind)
                 kind, _ = redact_credentials(kind)
             self.last_prompt_stats.tool_calls.append((kind, title))
+            self.last_prompt_stats.note_tool_call(str(tool_call_id or ""), str(kind or "other"))
             # Trusted identity from adapter-authored markers (NOT the
             # LLM-authored title), shared with the dispatch builder so both
             # event paths carry the same classifier verdict.

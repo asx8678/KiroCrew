@@ -809,6 +809,47 @@ def _turn_outcome(stop_reason: str | None, *, exhausted: bool = False) -> str:
     return turn_outcome(stop_reason, exhausted=exhausted)
 
 
+#: The usage row's ``service`` for a turn a dispatch claimed by actor alone. The
+#: actor is the crew log's provenance vocabulary (who caused the turn); the
+#: service names the job that spent the credits, for the usage page.
+_SERVICE_BY_TURN_ACTOR: dict[str, str] = {
+    "gateway": "taskrunner_summary",
+    "cron": "cron_result",
+    "subagent": "subagent_completion",
+}
+
+
+def _usage_service_for_turn(
+    usage_service: str,
+    turn_actor: str,
+    *,
+    app: str,
+    self_wake: bool,
+    loop_id: str,
+) -> str:
+    """The usage row's ``service`` for one ``_run_chat`` turn.
+
+    A dispatch that named the job (``_usage_service``) wins. Otherwise it is
+    derived from the same structural provenance the crew log records, never from
+    the message text: an app-owned turn files under its app, a crew turn under its
+    app's crew, a nudge/monitor wake under its loop, and the injector actors under
+    their fixed names. A plain user turn has no service (``""``) -- its ``surface``
+    already says where it came from. Row-store only: free-form, never a metric
+    attribute.
+    """
+    if usage_service:
+        return usage_service
+    if turn_actor == "crew":
+        return f"{app}:crew" if app else "crew"
+    if turn_actor == "app":
+        return f"app:{app}" if app else "app"
+    if turn_actor in _SERVICE_BY_TURN_ACTOR:
+        return _SERVICE_BY_TURN_ACTOR[turn_actor]
+    if self_wake or turn_actor == "autonudge":
+        return f"autonudge:{loop_id}" if loop_id else "autonudge"
+    return ""
+
+
 def _emit_turn_metric(
     duration_ms: int | float | None,
     stop_reason: str | None,
@@ -7382,6 +7423,7 @@ async def _run_pending_synthesis(state: DashboardState, slot: _ChatSlot) -> None
                 SUBAGENT_SYNTHESIS_PROMPT,
                 _synthetic_payload=True,
                 _turn_actor="subagent",
+                _usage_service="subagent_synthesis",
             ),
         )
         try:
@@ -8057,6 +8099,9 @@ async def _persist_abnormal_turn_usage(
     elapsed_ms: int,
     stop_reason: str,
     since: object = _NO_PRIOR_STATS,
+    service: str = "",
+    ttft_ms: int = 0,
+    request: str = "",
 ) -> bool:
     """Write the usage row for a turn ending without ``EVENT_COMPLETE``.
 
@@ -8090,6 +8135,10 @@ async def _persist_abnormal_turn_usage(
     ``provider_last_turn_usage``'s identity check against ``since`` reports
     nothing rather than billing that earlier turn a second time.
 
+    ``service`` / ``ttft_ms`` are the turn's row fields (see
+    :func:`_usage_service_for_turn`); the row's ``outcome`` is ``stop_reason``
+    through :func:`_turn_outcome`, the same mapping the complete path uses.
+
     Gated by ``usage_has_billing`` for the same reason the ``EVENT_COMPLETE``
     call is: a turn that billed nothing writes no row. Returns ``True`` once the
     row has been written, so the caller marks the turn recorded and this stays
@@ -8115,6 +8164,10 @@ async def _persist_abnormal_turn_usage(
             app=getattr(slot, "_app", "") or "",
             elapsed_ms=elapsed_ms,
             model_source=client,
+            service=service,
+            outcome=_turn_outcome(stop_reason),
+            ttft_ms=ttft_ms,
+            request=request,
             # Abnormal-turn histogram sampling is out of this change's scope
             # (the usage ROW is the deliverable); opt the row's persist out of
             # the metric so it does not file a sample under slot.key, which for a
@@ -8249,6 +8302,11 @@ async def _run_chat(
     # crew log's whole premise is that a reader takes it as fact. Empty means no
     # dispatch claimed it, which the crew log records as ``user``.
     _turn_actor: str = "",
+    # The specific job this turn spends credits for, for the usage row's
+    # ``service`` field (``cron_result:<job>``, ``app:<id>``, ...). Per turn, never
+    # stored on the slot, so it cannot leak into a later user turn. Empty derives
+    # it from the provenance above (``_usage_service_for_turn``).
+    _usage_service: str = "",
     regenerate_hint: str = "",
     _on_consumed: "Callable[[bool], None] | None" = None,
     _on_irreversibly_consumed: "Callable[[], Awaitable[None] | None] | None" = None,
@@ -8271,6 +8329,22 @@ async def _run_chat(
     # two paths cannot both bill one turn and the seam's several callers write it
     # once. Hoisted here so the seam closure's ``nonlocal`` binds to this scope.
     _turn_usage_persisted = False
+    # The usage row's ``service``, from parameters only, so both writers (the
+    # complete path and the abnormal seam) read one bound value whatever exit
+    # the turn takes.
+    _row_service = _usage_service_for_turn(
+        _usage_service,
+        _turn_actor,
+        app=getattr(slot, "_app", "") or "",
+        self_wake=_directive_self_wake,
+        loop_id=_directive_loop_id,
+    )
+    # The usage row's ``request`` preview (USE-12): what this turn was asked. An
+    # Incognito or Temporary chat keeps its transcript but nothing DERIVED from it
+    # (docs/decisions/2026-09-25), so such a chat records none.
+    _row_request = (
+        message if canonical_memory_mode(getattr(slot, "memory_mode", "")) == "persistent" else ""
+    )
 
     # The abnormal-end seam (_persist_partial_reply, run from the CancelledError /
     # AcpAuthRequired / AcpProcessDied / AcpError recovery arms) reads these four
@@ -8824,6 +8898,9 @@ async def _run_chat(
             elapsed_ms=int((time.monotonic() - _turn_t0) * 1000),
             stop_reason=reason or _stop_reason or STOP_REASON_CANCELLED,
             since=_turn_stats0,
+            service=_row_service,
+            ttft_ms=_ttft_visible.ms,
+            request=_row_request,
         ):
             _turn_usage_persisted = True
 
@@ -9645,6 +9722,7 @@ async def _run_chat(
                     _directive_self_wake=_directive_self_wake,
                     _directive_channel_origin=_directive_channel_origin,
                     _turn_actor=_turn_actor,
+                    _usage_service=_usage_service,
                 )
             elif status == "blocked":
                 sel().log_tool_invocation(
@@ -15589,6 +15667,14 @@ async def _run_chat(
                             # effective session key reach the histogram; this call
                             # must not also sample, so it opts out.
                             emit_metric=False,
+                            service=_row_service,
+                            # The histogram's own outcome mapping, so the row and
+                            # the sample above cannot disagree about one turn.
+                            outcome=_turn_outcome(event.stop_reason, exhausted=_turn_exhausted),
+                            # The footer's first-visible-output clock; 0 when no
+                            # output reached the wire before the turn closed.
+                            ttft_ms=_ttft_visible.ms,
+                            request=_row_request,
                         )
                     )
                 # The turn's crew log closers are STASHED, not emitted here. This

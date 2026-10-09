@@ -96,6 +96,10 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/telemetry/startup", handlers.api_telemetry_startup)
     app.router.add_get("/api/telemetry/context-trace", handlers.api_context_trace)
     app.router.add_get("/api/usage/turns", handlers.api_usage_turns)
+    # The Usage page: the whole aggregate, and one page of per-prompt rows.
+    # Dashboard-only (an app caller gets an audited 404).
+    app.router.add_get("/api/usage/credits/summary", handlers.api_usage_credits_summary)
+    app.router.add_get("/api/usage/credits/turns", handlers.api_usage_credits_turns)
     app.router.add_get("/api/wakatime/stats", handlers.api_wakatime_stats)
     app.router.add_get("/api/wakatime/export", handlers.api_wakatime_export)
     app.router.add_get("/api/telemetry/beacon", handlers.api_beacon_status)

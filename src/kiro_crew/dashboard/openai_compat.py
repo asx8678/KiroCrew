@@ -622,6 +622,12 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                     # parameter's own default and reads as "not named", so a
                     # dashboard caller is unchanged.
                     _turn_actor="app" if request_app else "",
+                    # An external client of the OpenAI-compatible endpoint (no
+                    # app, not the dashboard) files its spend as an API request
+                    # rather than as a chat someone typed.
+                    _usage_service=(
+                        "api_request" if not request_app and not is_dashboard_caller else ""
+                    ),
                 ),
                 timeout=chat_turn_timeout_secs(),
             )

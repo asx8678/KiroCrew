@@ -39,7 +39,13 @@ from kiro_crew.hooks import (
     hook_gate_kwargs,
     permission_pre_tool_block,
 )
-from kiro_crew.llm_helpers import stream_and_collect_json
+from kiro_crew.llm_helpers import (
+    _billing_stats,
+    provider_last_turn_usage,
+    stream_and_collect_json,
+    turn_exit_outcome,
+    usage_has_billing,
+)
 from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     rearm_reinjection,
@@ -566,6 +572,72 @@ def _step_permission_policy(
     )
 
 
+async def _persist_step_usage(
+    client: Any,
+    session_key: str,
+    agent: str,
+    run: Project,
+    *,
+    complete_event: LLMEvent | None,
+    since: Any,
+    exc: BaseException | None,
+    elapsed_ms: int,
+    request: str = "",
+) -> None:
+    """Write one task-runner step turn's usage row (USE-1). Never raises.
+
+    A turn that completed carries its billing and stop reason on the completion
+    event, which is recorded as before (the row's outcome is derived from that
+    stop reason). A turn that ended WITHOUT a completion -- a process death, a
+    context overflow, a cancel -- reads what was billed off the provider against
+    the stats pinned before the stream, and writes only when something was:
+    a turn that never dispatched is not spend.
+    """
+    try:
+        # circular import: reached while kiro_crew.slack.handler is still
+        # initialising (dashboard/handlers/files.py imports is_tracked_channel
+        # from it), so a module-scope import raises ImportError under the
+        # suite's import order.
+        from kiro_crew.dashboard.handlers.usage import (
+            persist_token_record_async,
+            read_context_tokens,
+            read_effective_agent,
+        )
+
+        if complete_event is not None:
+            event: Any = complete_event
+            outcome = ""
+        else:
+            event = provider_last_turn_usage(client, since=since)
+            if not usage_has_billing(event):
+                return
+            outcome = turn_exit_outcome(exc)
+        _usage_cfg = KiroCrewConfig.load()
+        _used, _window = read_context_tokens(client)
+        await persist_token_record_async(
+            session_key,
+            # Blank, not the global config model: open_task_session may
+            # have resolved a custom agent's own model, and an explicit
+            # value here would outrank model_source and record the
+            # global default instead of what actually ran.
+            "",
+            event,
+            provider=_usage_cfg.agent.provider,
+            surface=telemetry_channel_of(session_key),
+            agent=read_effective_agent(client) or agent or "",
+            context_used=_used,
+            context_window=_window,
+            elapsed_ms=elapsed_ms,
+            model_source=client,
+            service=f"taskrunner:{run.name or run.task_id}",
+            # USE-12: the step this turn worked on.
+            request=request,
+            outcome=outcome,
+        )
+    except Exception:
+        logger.debug("usage row (taskrunner) persist failed", exc_info=True)
+
+
 async def execute_task(
     run: Project,
     task: Task,
@@ -757,87 +829,112 @@ async def execute_task(
             # build and episodic-query embed above are turn setup, not the turn,
             # and this loop re-runs per attempt so each row measures its own turn.
             _turn_t0 = _time.monotonic()
-            async for event in client.stream(full_prompt):
-                if event.kind == EVENT_COMPACTION_STATUS:
-                    # CTX-12: the backend compacted on its own and dropped the
-                    # session-start contract; the finally re-arms it.
-                    if event.text == "completed":
-                        _backend_compacted = True
-                elif event.kind == EVENT_TEXT_CHUNK:
-                    _attempt_emitted = True
-                    result_text += event.text
-                    _chunk_count += 1
-                    if _chunk_count % 50 == 0:
-                        task.result = redact_credentials(
-                            redact_exfiltration_urls(result_prefix + result_text)[0]
-                        )[0]
-                    run.last_task_time = _time.time()
-                    run.tokens_used += max(1, len(event.text) // 4)
-                elif event.kind == EVENT_PERMISSION_REQUEST:
-                    settled = await tool_permission.settle(
-                        tool_permission.Ask(event, tool_permission.AcpWire(client), session_key),
-                        _policy,
-                    )
-                    if settled.outcome == "bailed":
-                        # Not a verdict on the call: the turn is abandoned and
-                        # re-run after compaction.
-                        raise _ContextOverflow(settled.meta["pct"])
-                elif event.kind == EVENT_AGENT_SWITCHED:
-                    # A mid-run mode switch runs a different agent, so ITS spec hooks gate
-                    # the permission requests that follow, not the previous agent's. An
-                    # unnamed switch falls back to the agent the session recorded for it.
-                    switched_agent = event.text or switched_agent
-                    _spec = await turn_spec_hooks(client, event.text or "")
-                    _policy = _policy_for(spec=_spec)
-                    await refuse_stale_switch(client, event.text or "")
-                elif event.kind == EVENT_TOOL_CALL:
-                    _attempt_emitted = True
-                    # Fire PreToolUse hooks for auto-approved tools (informational only).
-                    # On a gated turn this frame precedes the call's permission request,
-                    # so nothing has approved it yet.
-                    sel().log_tool_invocation(
-                        session_key=session_key,
-                        agent=agent or "kirocrew",
-                        source="taskrunner",
-                        tool_name=event.title,
-                        tool_kind=event.tool_kind,
-                        outcome="invoked" if _spec.gated else "auto_approved",
-                        metadata={"task": task.index, "task_id": run.task_id},
-                    )
-                    # A gated turn runs them on the permission request instead.
-                    if not _spec.gated:
-                        await fire_tool_hooks(
-                            get_global_hook_store(),
-                            event.title,
-                            event.tool_input,
-                            parent_session_key=session_key or None,
-                            agent_role=(agent or "kirocrew"),
+            # Pinned before the stream: a turn that never dispatched leaves the
+            # previous turn's already-recorded stats installed and writes no row.
+            _usage_since = _billing_stats(client)
+            _turn_exc: BaseException | None = None
+            try:
+                async for event in client.stream(full_prompt):
+                    if event.kind == EVENT_COMPACTION_STATUS:
+                        # CTX-12: the backend compacted on its own and dropped the
+                        # session-start contract; the finally re-arms it.
+                        if event.text == "completed":
+                            _backend_compacted = True
+                    elif event.kind == EVENT_TEXT_CHUNK:
+                        _attempt_emitted = True
+                        result_text += event.text
+                        _chunk_count += 1
+                        if _chunk_count % 50 == 0:
+                            task.result = redact_credentials(
+                                redact_exfiltration_urls(result_prefix + result_text)[0]
+                            )[0]
+                        run.last_task_time = _time.time()
+                        run.tokens_used += max(1, len(event.text) // 4)
+                    elif event.kind == EVENT_PERMISSION_REQUEST:
+                        settled = await tool_permission.settle(
+                            tool_permission.Ask(
+                                event, tool_permission.AcpWire(client), session_key
+                            ),
+                            _policy,
                         )
-                elif event.kind == EVENT_COMPLETE:
-                    _complete_event = event
-                    break
+                        if settled.outcome == "bailed":
+                            # Not a verdict on the call: the turn is abandoned and
+                            # re-run after compaction.
+                            raise _ContextOverflow(settled.meta["pct"])
+                    elif event.kind == EVENT_AGENT_SWITCHED:
+                        # A mid-run mode switch runs a different agent, so ITS spec hooks gate
+                        # the permission requests that follow, not the previous agent's. An
+                        # unnamed switch falls back to the agent the session recorded for it.
+                        switched_agent = event.text or switched_agent
+                        _spec = await turn_spec_hooks(client, event.text or "")
+                        _policy = _policy_for(spec=_spec)
+                        await refuse_stale_switch(client, event.text or "")
+                    elif event.kind == EVENT_TOOL_CALL:
+                        _attempt_emitted = True
+                        # Fire PreToolUse hooks for auto-approved tools (informational only).
+                        # On a gated turn this frame precedes the call's permission request,
+                        # so nothing has approved it yet.
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            agent=agent or "kirocrew",
+                            source="taskrunner",
+                            tool_name=event.title,
+                            tool_kind=event.tool_kind,
+                            outcome="invoked" if _spec.gated else "auto_approved",
+                            metadata={"task": task.index, "task_id": run.task_id},
+                        )
+                        # A gated turn runs them on the permission request instead.
+                        if not _spec.gated:
+                            await fire_tool_hooks(
+                                get_global_hook_store(),
+                                event.title,
+                                event.tool_input,
+                                parent_session_key=session_key or None,
+                                agent_role=(agent or "kirocrew"),
+                            )
+                    elif event.kind == EVENT_COMPLETE:
+                        _complete_event = event
+                        break
 
-            final_result = result_prefix + result_text
-            task.result = redact_credentials(redact_exfiltration_urls(final_result)[0])[0]
-            # A stream that ended without any EVENT_COMPLETE proves nothing: the
-            # provider never said the turn finished, so it is not a PASSED step
-            # (the classifier below would read the absent reason as a normal
-            # end of turn). Retryable, like the transport-death ``error:``
-            # family: the bounded retry ladder re-prompts from the partial.
-            if _complete_event is None:
-                raise _TurnNotCompleted(
-                    STOP_CLASS_FAILED, "", partial=bool(result_text), retryable=True
-                )
-            # EVENT_COMPLETE only says the stream ended: a watchdog stall, a
-            # runtime cancel or a transport death must not become a PASSED
-            # step. Same mapping as chat_runner / subagent run.py.
-            _stop = classify_stop_reason(str(getattr(_complete_event, "stop_reason", "") or ""))
-            if not _stop.is_success:
-                raise _TurnNotCompleted(
-                    _stop.name,
-                    _stop.stop_reason,
-                    partial=bool(result_text),
-                    retryable=bool(_stop.retryable),
+                final_result = result_prefix + result_text
+                task.result = redact_credentials(redact_exfiltration_urls(final_result)[0])[0]
+                # A stream that ended without any EVENT_COMPLETE proves nothing: the
+                # provider never said the turn finished, so it is not a PASSED step
+                # (the classifier below would read the absent reason as a normal
+                # end of turn). Retryable, like the transport-death ``error:``
+                # family: the bounded retry ladder re-prompts from the partial.
+                if _complete_event is None:
+                    raise _TurnNotCompleted(
+                        STOP_CLASS_FAILED, "", partial=bool(result_text), retryable=True
+                    )
+                # EVENT_COMPLETE only says the stream ended: a watchdog stall, a
+                # runtime cancel or a transport death must not become a PASSED
+                # step. Same mapping as chat_runner / subagent run.py.
+                _stop = classify_stop_reason(str(getattr(_complete_event, "stop_reason", "") or ""))
+                if not _stop.is_success:
+                    raise _TurnNotCompleted(
+                        _stop.name,
+                        _stop.stop_reason,
+                        partial=bool(result_text),
+                        retryable=bool(_stop.retryable),
+                    )
+            except BaseException as _exc:
+                _turn_exc = _exc
+                raise
+            finally:
+                # USE-1: the step's ONE usage row, on every exit after dispatch --
+                # a landed turn, a stall, a cancel, a process death, a context
+                # overflow -- so a failed attempt's spend is not lost.
+                await _persist_step_usage(
+                    client,
+                    session_key,
+                    agent,
+                    run,
+                    complete_event=_complete_event,
+                    since=_usage_since,
+                    exc=_turn_exc,
+                    elapsed_ms=int((_time.monotonic() - _turn_t0) * 1000),
+                    request=f"{task.title}. {task.description}" if task.description else task.title,
                 )
             sessions.record_success(session_key)
             # The prompt (with any re-injected context) reached the model and
@@ -854,39 +951,6 @@ async def execute_task(
             # the chat runner clears it on a landed turn.
             runtime_death.clear_shared_deaths(session_key)
             sessions.check_context_usage(session_key, client)
-
-            # ── Per-turn usage row: attribute task-runner spend. ──
-            try:
-                # circular import: reached while kiro_crew.slack.handler is still
-                # initialising (dashboard/handlers/files.py imports is_tracked_channel
-                # from it), so a module-scope import raises ImportError under the
-                # suite's import order.
-                from kiro_crew.dashboard.handlers.usage import (
-                    persist_token_record_async,
-                    read_context_tokens,
-                    read_effective_agent,
-                )
-
-                _usage_cfg = KiroCrewConfig.load()
-                _used, _window = read_context_tokens(client)
-                await persist_token_record_async(
-                    session_key,
-                    # Blank, not the global config model: open_task_session may
-                    # have resolved a custom agent's own model, and an explicit
-                    # value here would outrank model_source and record the
-                    # global default instead of what actually ran.
-                    "",
-                    _complete_event,
-                    provider=_usage_cfg.agent.provider,
-                    surface=telemetry_channel_of(session_key),
-                    agent=read_effective_agent(client) or agent or "",
-                    context_used=_used,
-                    context_window=_window,
-                    elapsed_ms=int((_time.monotonic() - _turn_t0) * 1000),
-                    model_source=client,
-                )
-            except Exception:
-                logger.debug("usage row (taskrunner) persist failed", exc_info=True)
 
         except AcpProcessDied as _died_exc:
             # Whose failure was this? A task runs its sub-agents on its own

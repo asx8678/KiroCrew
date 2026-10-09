@@ -146,6 +146,9 @@ async def run_oneshot_translation(sessions: Any, prompt: str, meeting_id: str = 
             provider,
             prompt,
             approval_policy=ToolApprovalPolicy.REJECT_ALL,
+            # Stamps the row with the owning app, as the meeting session's own
+            # turn does (no tool can run under REJECT_ALL).
+            app=k.APP_NAME,
             usage_surface="meetings_translate",
             usage_session_key=key,
         )

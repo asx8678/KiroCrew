@@ -2258,6 +2258,12 @@ class ChannelTurns:
                     audit_agent=agent or "kirocrew",
                     closing_gate=closing_gate,
                     usage_session_key=session_key,
+                    # USE-12: the member's own words, for a Persistent session only.
+                    usage_request=(
+                        ""
+                        if self._restricted is not None and await self._restricted(session_key)
+                        else text
+                    ),
                     **driver_extra,
                 )
                 if replaying and retry_guard is not None:

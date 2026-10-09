@@ -1104,6 +1104,11 @@ async def api_send_message(request: web.Request) -> web.Response:
                                 # CRON_NOTIFICATION_KIND, and this branch is the
                                 # same injector dispatching directly.
                                 _turn_actor="cron",
+                                # The usage row names the job whose result this
+                                # turn answers (the already-redacted label).
+                                _usage_service=(
+                                    f"cron_result:{label}" if job_name else "cron_result"
+                                ),
                             ),
                         )
                         slot.task = task

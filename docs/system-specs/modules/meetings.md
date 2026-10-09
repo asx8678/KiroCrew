@@ -415,7 +415,7 @@ backends; elsewhere the warm session is reused and reset every
 `_RESET_EVERY_BATCHES` (20) batches, since a reset per 5 s batch would cold-start a
 process each time (a failed `new_conversation` also resets after the call).
 The session is destroyed when the queue is cleared. Usage is recorded on
-`meetings_translate`.
+`meetings_translate`, stamped with the `meetings` app like the meeting's own turns.
 
 Hooked into `MeetingSession.broadcast`, **not** the dispatch route, and the
 difference matters twice over: broadcast is where the text is already

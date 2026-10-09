@@ -149,6 +149,7 @@ def build_agent_fn(
     context_builder: Any = None,
     session_key: str = "",
     app: str = "",
+    workflow_name: str = "",
 ) -> AgentFn:
     """Return an ``agent_fn`` that runs each workflow agent step through a model.
 
@@ -160,8 +161,12 @@ def build_agent_fn(
     session, mirroring ``default_agent``/``default_model``/``cwd``. It is a
     per-run pin rather than a per-call override because ``WorkflowContext.agent()``
     exposes no ``env=`` parameter (that Protocol is frozen).
+
+    ``workflow_name`` names the run on each step's usage row (``service``
+    ``workflow:<name>``, else ``workflow:<run_id>``); it changes nothing else.
     """
 
+    usage_service = f"workflow:{workflow_name or run_id}"
     # Per-run, 0-based ephemeral session index (not a module-global, so each run
     # restarts at :0 as the ``wf:{run_id}:{call_index}`` contract documents).
     counter = itertools.count()
@@ -235,6 +240,7 @@ def build_agent_fn(
                 usage_surface="workflow",
                 usage_session_key=key,
                 usage_agent=opts.get("agent") or default_agent or "",
+                usage_service=usage_service,
             )
             # Apply canonical output redaction to prevent credential or
             # exfiltration-URL leakage into workflow results stored in history

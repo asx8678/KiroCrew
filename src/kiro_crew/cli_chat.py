@@ -1073,7 +1073,7 @@ async def _send_and_print(
         from kiro_crew.llm_helpers import metered_turn
 
         # USE-1: the CLI turn's one usage row, on every exit.
-        async with metered_turn(provider, surface="cli", slot_key="cli_chat"):
+        async with metered_turn(provider, surface="cli", slot_key="cli_chat", request=message):
             async for event in provider.stream(message):
                 if event.kind == EVENT_TEXT_CHUNK:
                     print(event.text, end="", flush=True)

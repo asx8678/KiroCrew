@@ -1220,6 +1220,71 @@ def _hook_mcp_spawn_notice(names: str) -> str:
     )
 
 
+async def _persist_hook_usage(
+    client: Any,
+    session_key: str,
+    agent: str | None,
+    hook_name: str,
+    *,
+    complete_event: object | None,
+    since: Any,
+    exc: BaseException | None,
+    elapsed_ms: int,
+    request: str = "",
+) -> None:
+    """Write one webhook turn's usage row (USE-1). Never raises.
+
+    A completed turn is recorded off its completion event, as before (the row's
+    outcome comes from its stop reason). A turn that ended WITHOUT one -- the
+    timeout cancel, a raise mid-stream -- reads what was billed off the provider
+    against the stats pinned before the stream, and writes only when something
+    was: a turn that never dispatched is not spend.
+    """
+    try:
+        # circular import: reached while kiro_crew.slack.handler is still
+        # initialising (dashboard/handlers/files.py imports is_tracked_channel
+        # from it), so a module-scope import raises ImportError under the
+        # suite's import order.
+        from kiro_crew.dashboard.handlers.usage import (
+            persist_token_record_async,
+            read_context_tokens,
+            read_effective_agent,
+        )
+        from kiro_crew.llm_helpers import (
+            provider_last_turn_usage,
+            turn_exit_outcome,
+            usage_has_billing,
+        )
+
+        if complete_event is not None:
+            event: Any = complete_event
+            outcome = ""
+        else:
+            event = provider_last_turn_usage(client, since=since)
+            if not usage_has_billing(event):
+                return
+            outcome = turn_exit_outcome(exc)
+        _used, _window = read_context_tokens(client)
+        await persist_token_record_async(
+            session_key,
+            "",
+            event,
+            provider=KiroCrewConfig.load().agent.provider,
+            surface="webhook",
+            agent=read_effective_agent(client) or agent or "",
+            context_used=_used,
+            context_window=_window,
+            elapsed_ms=elapsed_ms,
+            model_source=client,
+            service=f"webhook:{hook_name}" if hook_name else "webhook",
+            # USE-12: what the hook asked for (the row redacts and bounds it).
+            request=request,
+            outcome=outcome,
+        )
+    except Exception:
+        logger.debug("usage row (webhook) persist failed", exc_info=True)
+
+
 async def _run_hook_inner(
     state: DashboardState,
     session_key: str,
@@ -1227,8 +1292,12 @@ async def _run_hook_inner(
     agent: str | None,
     *,
     execution_context: ExecutionContext | None = None,
+    hook_name: str = "",
 ) -> str:
-    """Inner agent turn — called within timeout wrapper."""
+    """Inner agent turn — called within timeout wrapper.
+
+    ``hook_name`` names the hook on the turn's usage row (``webhook:<name>``).
+    """
     from dataclasses import replace
 
     from kiro_crew import name_grant
@@ -1240,6 +1309,7 @@ async def _run_hook_inner(
         hook_gate_kwargs,
         identity_grant_covers_child,
     )
+    from kiro_crew.llm_helpers import _billing_stats
     from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK  # noqa: F811
 
     execution: ExecutionContext = (
@@ -1327,182 +1397,185 @@ async def _run_hook_inner(
     # at 0, so without this the row records a literal 0. Started after the
     # context build so prompt assembly is not charged to the turn.
     _turn_t0 = time.monotonic()
-    async for event in client.stream(full_message):
-        if event.kind == EVENT_TEXT_CHUNK:
-            result_text += event.text
-        elif event.kind == _EVENT_PERMISSION_REQUEST_KIND:
-            # Webhook turns are headless and their payload is untrusted
-            # external input, so the default is DENY. An unanswered request
-            # stalls the provider until the _run_hook_agent timeout fires and
-            # the watchdog reports the turn as cancelled by the user. Route
-            # the request through the same hook gate every other headless
-            # runner uses (task_planner, llm_helpers, subagent_manager) and
-            # approve ONLY on the gate's affirmative TOOL_AUTO_APPROVE:
-            # TOOL_ALLOW means "ask the user" on interactive surfaces, and
-            # with no approver here it fails closed.
-            decision = None
-            deny_error = "no_hook_store"
-            hooks_gate = getattr(state.context_builder, "hooks", None)
-            if hooks_gate is not None:
-                try:
-                    decision = hooks_gate.on_tool_call(
-                        event.title,
-                        session_key=session_key,
-                        agent=agent or "",
-                        **hook_gate_kwargs(event),
-                    )
-                except Exception:
-                    # A raising gate must not leave the request unanswered --
-                    # an unanswered request is the exact stall this branch
-                    # exists to fix. No verdict is no positive authorization.
-                    logger.exception("webhook hook gate failed for %s", session_key)
-                    decision = None
-                    deny_error = "gate_error"
-                else:
-                    deny_error = (
-                        "hook_deny" if decision.action == TOOL_DENY else "no_interactive_approver"
-                    )
-            approve = False
-            if decision is not None and decision.action == TOOL_AUTO_APPROVE:
-                approve = True
-                if event.child_low_fidelity and not identity_grant_covers_child(decision, event):
-                    # A backend-child request whose security context is
-                    # unverified: every hook auto-approve except the
-                    # identity-keyed grant read the forgeable, agent-authored
-                    # title, so the dashboard runner and the subagent manager
-                    # both downgrade it. Headless there is no approval card to
-                    # downgrade to, so the downgrade is deny.
-                    approve = False
-                    deny_error = "child_low_fidelity"
-            if approve:
-                # An auto-approve tier is a statement about a PROGRAM name,
-                # and the shell re-resolves that name through a PATH that can
-                # lead with agent-writable directories. Verify it
-                # unconditionally, as every name-grant surface does at the
-                # point of honour; with no approver to downgrade to, a
-                # withheld grant denies (same as llm_helpers headless).
-                _ng_refusal = await name_grant.refusal_for_event(event)
-                if _ng_refusal is not None:
-                    if name_grant.should_log_decline(session_key, _ng_refusal):
-                        logger.warning(
-                            "declining a webhook hook auto-approve: %s",
-                            _ng_refusal.log_text,
+    # Pinned before the stream: a turn that never dispatched leaves the previous
+    # turn's already-recorded stats installed and writes no row.
+    _usage_since = _billing_stats(client)
+    _turn_exc: BaseException | None = None
+    try:
+        async for event in client.stream(full_message):
+            if event.kind == EVENT_TEXT_CHUNK:
+                result_text += event.text
+            elif event.kind == _EVENT_PERMISSION_REQUEST_KIND:
+                # Webhook turns are headless and their payload is untrusted
+                # external input, so the default is DENY. An unanswered request
+                # stalls the provider until the _run_hook_agent timeout fires and
+                # the watchdog reports the turn as cancelled by the user. Route
+                # the request through the same hook gate every other headless
+                # runner uses (task_planner, llm_helpers, subagent_manager) and
+                # approve ONLY on the gate's affirmative TOOL_AUTO_APPROVE:
+                # TOOL_ALLOW means "ask the user" on interactive surfaces, and
+                # with no approver here it fails closed.
+                decision = None
+                deny_error = "no_hook_store"
+                hooks_gate = getattr(state.context_builder, "hooks", None)
+                if hooks_gate is not None:
+                    try:
+                        decision = hooks_gate.on_tool_call(
+                            event.title,
+                            session_key=session_key,
+                            agent=agent or "",
+                            **hook_gate_kwargs(event),
                         )
-                    name_grant.log_decline(
-                        source="webhook",
-                        session_key=session_key,
-                        agent=agent or "kirocrew",
-                        event=event,
-                        refusal=_ng_refusal,
-                        tier="hook_auto_approve",
-                        sel_factory=_sel,
-                    )
-                    approve = False
-                    deny_error = "name_grant_headless_reject"
-            if approve:
-                # Audit-or-deny: this surface runs unattended, so an
-                # auto-approve that cannot be audited must not run.
-                # critical=True writes synchronously and re-raises on a
-                # filesystem failure; audit BEFORE the wire call so a
-                # transport failure cannot skip the audit either (the stated
-                # invariant in llm_helpers / backend-security-controls).
-                try:
-                    # critical=True writes synchronously (open/write/flush)
-                    # and this is the branch's common path: off-loop it so an
-                    # SEL disk stall cannot pause every gateway task.
-                    await asyncio.to_thread(
-                        functools.partial(
-                            _sel().log_tool_invocation,
+                    except Exception:
+                        # A raising gate must not leave the request unanswered --
+                        # an unanswered request is the exact stall this branch
+                        # exists to fix. No verdict is no positive authorization.
+                        logger.exception("webhook hook gate failed for %s", session_key)
+                        decision = None
+                        deny_error = "gate_error"
+                    else:
+                        deny_error = (
+                            "hook_deny"
+                            if decision.action == TOOL_DENY
+                            else "no_interactive_approver"
+                        )
+                approve = False
+                if decision is not None and decision.action == TOOL_AUTO_APPROVE:
+                    approve = True
+                    if event.child_low_fidelity and not identity_grant_covers_child(
+                        decision, event
+                    ):
+                        # A backend-child request whose security context is
+                        # unverified: every hook auto-approve except the
+                        # identity-keyed grant read the forgeable, agent-authored
+                        # title, so the dashboard runner and the subagent manager
+                        # both downgrade it. Headless there is no approval card to
+                        # downgrade to, so the downgrade is deny.
+                        approve = False
+                        deny_error = "child_low_fidelity"
+                if approve:
+                    # An auto-approve tier is a statement about a PROGRAM name,
+                    # and the shell re-resolves that name through a PATH that can
+                    # lead with agent-writable directories. Verify it
+                    # unconditionally, as every name-grant surface does at the
+                    # point of honour; with no approver to downgrade to, a
+                    # withheld grant denies (same as llm_helpers headless).
+                    _ng_refusal = await name_grant.refusal_for_event(event)
+                    if _ng_refusal is not None:
+                        if name_grant.should_log_decline(session_key, _ng_refusal):
+                            logger.warning(
+                                "declining a webhook hook auto-approve: %s",
+                                _ng_refusal.log_text,
+                            )
+                        name_grant.log_decline(
+                            source="webhook",
                             session_key=session_key,
                             agent=agent or "kirocrew",
-                            tool_name=event.title or "unknown",
-                            tool_kind=event.tool_kind,
-                            outcome=OUTCOME_PENDING_APPROVAL,
-                            source="webhook",
-                            request_id=str(event.request_id),
-                            critical=True,
+                            event=event,
+                            refusal=_ng_refusal,
+                            tier="hook_auto_approve",
+                            sel_factory=_sel,
                         )
-                    )
-                except Exception:
-                    logger.exception("webhook auto-approve audit failed; denying %s", session_key)
-                    # The decision itself must not vanish from SEL: hand the
-                    # denial to the ordinary (batched) writer best-effort,
-                    # naming the audit failure as the reason.
+                        approve = False
+                        deny_error = "name_grant_headless_reject"
+                if approve:
+                    # Audit-or-deny: this surface runs unattended, so an
+                    # auto-approve that cannot be audited must not run.
+                    # critical=True writes synchronously and re-raises on a
+                    # filesystem failure; audit BEFORE the wire call so a
+                    # transport failure cannot skip the audit either (the stated
+                    # invariant in llm_helpers / backend-security-controls).
                     try:
+                        # critical=True writes synchronously (open/write/flush)
+                        # and this is the branch's common path: off-loop it so an
+                        # SEL disk stall cannot pause every gateway task.
+                        await asyncio.to_thread(
+                            functools.partial(
+                                _sel().log_tool_invocation,
+                                session_key=session_key,
+                                agent=agent or "kirocrew",
+                                tool_name=event.title or "unknown",
+                                tool_kind=event.tool_kind,
+                                outcome=OUTCOME_PENDING_APPROVAL,
+                                source="webhook",
+                                request_id=str(event.request_id),
+                                critical=True,
+                            )
+                        )
+                    except Exception:
+                        logger.exception(
+                            "webhook auto-approve audit failed; denying %s", session_key
+                        )
+                        # The decision itself must not vanish from SEL: hand the
+                        # denial to the ordinary (batched) writer best-effort,
+                        # naming the audit failure as the reason.
+                        try:
+                            _sel().log_tool_invocation(
+                                session_key=session_key,
+                                agent=agent or "kirocrew",
+                                tool_name=event.title or "unknown",
+                                tool_kind=event.tool_kind,
+                                outcome="denied",
+                                source="webhook",
+                                request_id=str(event.request_id),
+                                error="audit_write_failed",
+                            )
+                        except Exception:
+                            logger.debug(
+                                "denial record after audit failure also failed", exc_info=True
+                            )
+                        await client.reject_tool(event.request_id)
+                    else:
+                        approval_sent = await client.approve_tool(event.request_id)
+                        outcome = (
+                            OUTCOME_REJECTED_TRANSPORT_FLOOR
+                            if approval_sent is False
+                            else "auto_approved"
+                        )
                         _sel().log_tool_invocation(
                             session_key=session_key,
                             agent=agent or "kirocrew",
                             tool_name=event.title or "unknown",
                             tool_kind=event.tool_kind,
-                            outcome="denied",
+                            outcome=outcome,
                             source="webhook",
                             request_id=str(event.request_id),
-                            error="audit_write_failed",
                         )
-                    except Exception:
-                        logger.debug("denial record after audit failure also failed", exc_info=True)
-                    await client.reject_tool(event.request_id)
                 else:
-                    approval_sent = await client.approve_tool(event.request_id)
-                    outcome = (
-                        OUTCOME_REJECTED_TRANSPORT_FLOOR
-                        if approval_sent is False
-                        else "auto_approved"
-                    )
+                    # Audit the denial BEFORE rejecting, for the same reason.
                     _sel().log_tool_invocation(
                         session_key=session_key,
                         agent=agent or "kirocrew",
                         tool_name=event.title or "unknown",
                         tool_kind=event.tool_kind,
-                        outcome=outcome,
+                        outcome="denied",
                         source="webhook",
                         request_id=str(event.request_id),
+                        error=deny_error,
                     )
-            else:
-                # Audit the denial BEFORE rejecting, for the same reason.
-                _sel().log_tool_invocation(
-                    session_key=session_key,
-                    agent=agent or "kirocrew",
-                    tool_name=event.title or "unknown",
-                    tool_kind=event.tool_kind,
-                    outcome="denied",
-                    source="webhook",
-                    request_id=str(event.request_id),
-                    error=deny_error,
-                )
-                await client.reject_tool(event.request_id)
-        elif event.kind == EVENT_COMPLETE:
-            _complete_event = event
-            break
-    state.sessions.record_success(session_key)  # sync; record_failure is async
-
-    # ── Per-turn usage row: attribute webhook spend. ──
-    try:
-        # circular import: reached while kiro_crew.slack.handler is still
-        # initialising (dashboard/handlers/files.py imports is_tracked_channel
-        # from it), so a module-scope import raises ImportError under the
-        # suite's import order.
-        from kiro_crew.dashboard.handlers.usage import (
-            persist_token_record_async,
-            read_context_tokens,
-            read_effective_agent,
-        )
-
-        _used, _window = read_context_tokens(client)
-        await persist_token_record_async(
+                    await client.reject_tool(event.request_id)
+            elif event.kind == EVENT_COMPLETE:
+                _complete_event = event
+                break
+    except BaseException as _exc:
+        _turn_exc = _exc
+        raise
+    finally:
+        # USE-1: the turn's ONE usage row, on every exit after dispatch -- including
+        # the timeout cancel ``_run_hook_agent``'s wait_for delivers and a raise
+        # mid-stream, which used to lose the spend.
+        await _persist_hook_usage(
+            client,
             session_key,
-            "",
-            _complete_event,
-            provider=KiroCrewConfig.load().agent.provider,
-            surface="webhook",
-            agent=read_effective_agent(client) or agent or "",
-            context_used=_used,
-            context_window=_window,
+            agent,
+            hook_name,
+            complete_event=_complete_event,
+            since=_usage_since,
+            exc=_turn_exc,
             elapsed_ms=int((time.monotonic() - _turn_t0) * 1000),
-            model_source=client,
+            request=message,
         )
-    except Exception:
-        logger.debug("usage row (webhook) persist failed", exc_info=True)
+    state.sessions.record_success(session_key)  # sync; record_failure is async
 
     return result_text, _mcp_problem_names
 
@@ -1561,7 +1634,12 @@ async def _run_hook_agent(
 
         result_text, _mcp_problem_names = await asyncio.wait_for(
             _run_hook_inner(
-                state, session_key, message, agent, execution_context=execution_context
+                state,
+                session_key,
+                message,
+                agent,
+                execution_context=execution_context,
+                hook_name=name,
             ),
             timeout=timeout_secs,
         )

@@ -68,6 +68,7 @@ from kiro_crew import (
     work_root,
 )
 from kiro_crew.acp.client import AcpAuthRequired, AcpError, AcpProcessDied
+from kiro_crew.acp.types import TurnUsage
 from kiro_crew.agent_sdk import AgentTurnUsage
 from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.autonudge import (
@@ -230,6 +231,7 @@ from kiro_crew.learn import LessonStore
 from kiro_crew.llm_helpers import (  # noqa: F401
     PromptBusyExhaustedError,
     ToolApprovalPolicy,
+    _billing_stats,
     acp_error_is_transient,
     annotate_model_fallback,
     append_fallback_story,
@@ -241,6 +243,8 @@ from kiro_crew.llm_helpers import (  # noqa: F401
     save_conversation_turn_off_loop,
     stream_and_collect,
     transient_retry_delay,
+    turn_exit_outcome,
+    usage_has_billing,
 )
 from kiro_crew.mcp_cron import vet_job_at_fire_time  # noqa: F401
 from kiro_crew.mcp_gateway import is_gateway_supported  # noqa: F401
@@ -275,6 +279,7 @@ from kiro_crew.messaging.dispatch import (
     stop_reason_landed,
 )
 from kiro_crew.messaging.display_safety import redact_for_display
+from kiro_crew.messaging.driver import usage_service_scope
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import (  # noqa: F401
     CHANNEL_SESSION_NAMESPACES,
@@ -504,15 +509,29 @@ async def _persist_turn_row(
     surface: str,
     agent_fallback: Callable[[], str],
     t0: float,
-    usage: AgentTurnUsage | None = None,
+    usage: TurnUsage | None = None,
+    model: str = "",
+    service: str = "",
+    outcome: str = "",
+    skip_unbilled: bool = False,
+    request: str = "",
 ) -> None:
     """Persist one per-turn usage row for a background dispatch surface.
 
-    The heartbeat and monitor surfaces — each with a success and a timeout twin —
-    share this one implementation rather than each carrying its own copy of the
-    block. Best-effort: a persistence failure is logged at debug and never
-    propagates into the background loop, since a dropped analytics row must not
-    abort a live turn.
+    The cron, heartbeat and monitor surfaces share this one implementation rather
+    than each carrying its own copy of the block, and each calls it on EVERY exit
+    of its turn -- success, timeout, error and cancellation -- so spend that
+    reached the provider bill always reaches the usage store too. Best-effort: a
+    persistence failure is logged at debug and never propagates into the
+    background loop, since a dropped analytics row must not abort a live turn.
+
+    ``model`` is the caller's attribution (cron's job model, blank on a
+    downgrade); blank defers to the client as ``model_source``. ``service`` names
+    the specific job (``cron:<name>``, ``heartbeat:<entry>``,
+    ``autonudge:<loop id>``) and ``outcome`` how the turn ended. A failure exit
+    passes ``skip_unbilled=True`` with a ``usage`` read against the stats pinned
+    before dispatch, so a turn that never reached the model writes nothing while
+    a completed turn keeps writing its row exactly as before.
 
     ``agent_fallback`` is a zero-arg callable, invoked INSIDE the try/except and
     only when ``read_effective_agent`` yields nothing — the short-circuit
@@ -522,16 +541,18 @@ async def _persist_turn_row(
 
     NOTE: ``test_turn_duration_recorded.py`` counts ``persist_token_record_async``
     call sites per file and requires every one to pass ``elapsed_ms``. This
-    helper is the single heartbeat/monitor call site; the two cron sites persist
-    directly (they carry a ``model`` argument). Adding a new surface that
-    bypasses this helper changes the count and fails that guard by design.
+    helper is the single cron/heartbeat/monitor call site. Adding a new surface
+    that bypasses this helper changes the count and fails that guard by design.
     """
     try:
+        _usage = provider_last_turn_usage(client) if usage is None else usage
+        if skip_unbilled and not usage_has_billing(_usage):
+            return
         _used, _window = read_context_tokens(client)
         await persist_token_record_async(
             session_key,
-            "",
-            provider_last_turn_usage(client) if usage is None else usage,
+            model,
+            _usage,
             provider=provider,
             surface=surface,
             agent=read_effective_agent(client) or agent_fallback(),
@@ -539,9 +560,95 @@ async def _persist_turn_row(
             context_window=_window,
             elapsed_ms=int((time.monotonic() - t0) * 1000),
             model_source=client,
+            service=service,
+            outcome=outcome,
+            request=request,
         )
     except Exception:
         logger.debug("usage row (%s) persist failed", surface, exc_info=True)
+
+
+#: How much of a HEARTBEAT.md entry names its usage row's ``service``.
+_HEARTBEAT_SERVICE_CHARS = 60
+
+
+def _heartbeat_service(task_text: str) -> str:
+    """``heartbeat:<entry>`` for a heartbeat task's usage row.
+
+    The entry is the operator's own HEARTBEAT.md line: collapsed to one line,
+    credential-redacted, and cut short, since it only has to tell one task's
+    spend from another's.
+    """
+    entry, _ = redact_credentials(" ".join(str(task_text or "").split()))
+    entry = entry[:_HEARTBEAT_SERVICE_CHARS]
+    return f"heartbeat:{entry}" if entry else "heartbeat"
+
+
+def _cron_row_model(job_model: str, downgraded: bool, client: Any) -> str:
+    """The model a cron usage row names for its turn.
+
+    Blank on a downgrade (the configured model was unavailable and the default
+    ran instead) or an active provider fallback: the requested id would attribute
+    spend to a model that never executed, and blank defers to ``model_source``,
+    which reports what actually ran. A half-applied pair pin bills the bare model
+    that ran, not the suffixed pin.
+    """
+    if downgraded or provider_fallback_active(client):
+        return ""
+    return (job_model and provider_model_pin_partial(client)) or job_model or ""
+
+
+async def _record_cron_turn_row(
+    client: Any,
+    session_key: str,
+    *,
+    job: CronJob,
+    since: Any,
+    carry: list[float],
+    exc: BaseException | None,
+    downgraded: bool,
+    provider: str,
+    agent: str,
+    t0: float,
+) -> TurnUsage | None:
+    """Write a cron agent turn's ONE usage row, from the turn's ``finally``.
+
+    Called on every exit after the prompt was dispatched: success, an error, and
+    the ``CancelledError`` that ``CronService._execute_with_timeout``'s wake
+    deadline delivers -- that cancel skips this callback's ``except`` blocks
+    entirely, so a row written only after a successful stream lost exactly the
+    turns that overran. ``since`` is the stats object pinned before dispatch: a
+    turn that never reached the model reads nothing against it, and a failure
+    exit (``exc`` set) writes no row for an unbilled turn. ``carry`` holds the
+    interrupted prompt's credits from a post-token resume, which the final read
+    no longer sees. Returns the usage read (the single path's footer uses it on
+    success), or ``None`` when the read itself failed. Never raises an
+    ``Exception``.
+    """
+    try:
+        usage = provider_last_turn_usage(client, since=since)
+        if carry:
+            usage.credits += sum(carry)
+        model = _cron_row_model(job.model, downgraded, client)
+    except Exception:
+        logger.debug("usage row (cron) read failed", exc_info=True)
+        return None
+    await _persist_turn_row(
+        client,
+        session_key,
+        provider=provider,
+        surface="cron",
+        agent_fallback=lambda: agent,
+        t0=t0,
+        usage=usage,
+        model=model,
+        service=f"cron:{job.name}",
+        outcome=turn_exit_outcome(exc),
+        skip_unbilled=exc is not None,
+        # USE-12: what the job asks for (its instruction, never the assembled prompt).
+        request=job.message,
+    )
+    return usage
 
 
 # Chunked wave-digest size: every multi-task wave delivers its completed
@@ -3165,6 +3272,7 @@ class GatewayOrchestrator:
                                         wrapped,
                                         _directive_user_origin=False,
                                         _turn_actor="cron",
+                                        _usage_service=f"cron_result:{label}",
                                     ),
                                 )
                                 slot.task = task
@@ -4956,25 +5064,53 @@ class GatewayOrchestrator:
                         # the episodic-query embed above are setup, not the turn.
                         _turn_t0 = time.monotonic()
                         _prompt_dispatched = True
-                        result_text, _carried_credits = await _cron_stream_with_posttoken_resume(
-                            client,
-                            full_message,
-                            job_name=job.name,
-                            approval_policy=(
-                                ToolApprovalPolicy.AUTO_APPROVE
-                                if job.approval_mode == "auto"
-                                else ToolApprovalPolicy.HOOK_BASED
-                            ),
-                            hooks=self.ctx_builder.hooks,
-                            on_tool_approval=(
-                                None
-                                if job.approval_mode == "auto"
-                                else self._interactive_approval("cron")
-                            ),
-                            on_tool_gate=_gate.note,
-                            on_complete=_seq_note_complete,
-                            fallback_models=configured_fallback_chain(),
-                        )
+                        # Pinned before dispatch for the usage row below: a turn
+                        # that never reached the model leaves this object in place.
+                        _seq_since = _billing_stats(client)
+                        _seq_carry: list[float] = []
+                        _seq_exc: BaseException | None = None
+                        try:
+                            result_text, _ = await _cron_stream_with_posttoken_resume(
+                                client,
+                                full_message,
+                                job_name=job.name,
+                                credit_carry=_seq_carry,
+                                approval_policy=(
+                                    ToolApprovalPolicy.AUTO_APPROVE
+                                    if job.approval_mode == "auto"
+                                    else ToolApprovalPolicy.HOOK_BASED
+                                ),
+                                hooks=self.ctx_builder.hooks,
+                                on_tool_approval=(
+                                    None
+                                    if job.approval_mode == "auto"
+                                    else self._interactive_approval("cron")
+                                ),
+                                on_tool_gate=_gate.note,
+                                on_complete=_seq_note_complete,
+                                fallback_models=configured_fallback_chain(),
+                            )
+                        except BaseException as _stream_exc:
+                            _seq_exc = _stream_exc
+                            raise
+                        finally:
+                            # ── Per-turn usage row: background spend, on EVERY
+                            # exit -- an error or the wake deadline's cancel
+                            # after dispatch still billed the account. ──
+                            await _record_cron_turn_row(
+                                client,
+                                agent_session_key,
+                                job=job,
+                                since=_seq_since,
+                                carry=_seq_carry,
+                                exc=_seq_exc,
+                                downgraded=_seq_downgraded,
+                                provider=(
+                                    self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
+                                ),
+                                agent=agent or "",
+                                t0=_turn_t0,
+                            )
                         # The prompt reached the model and the turn completed, so
                         # the finally must NOT restore the re-injection flag --
                         # only for a succeeded stop reason.
@@ -4983,48 +5119,6 @@ class GatewayOrchestrator:
                             result_text = _gate.empty_reply_placeholder()
                         result_text = _annotate_model_fallback(result_text, client)
                         logger.info("Cron '%s': agent '%s' completed", job.name, agent)
-
-                        # ── Per-turn usage row: background spend. ──
-                        try:
-
-                            _used, _window = read_context_tokens(client)
-                            _turn_usage = provider_last_turn_usage(client)
-                            if _carried_credits:
-                                # A resumed turn's post-turn read sees only the
-                                # continuation prompt; bill the interrupted
-                                # prompt's snapshotted credits too.
-                                _turn_usage.credits += _carried_credits
-                            await persist_token_record_async(
-                                agent_session_key,
-                                # Blank on a downgrade: the configured model was
-                                # unavailable and the default ran instead, so the
-                                # requested id would attribute spend to a model
-                                # that never executed. Blank defers to
-                                # model_source, which reports what actually ran.
-                                # A half-applied pair pin bills the bare
-                                # model that ran, not the suffixed pin.
-                                (
-                                    ""
-                                    if (_seq_downgraded or provider_fallback_active(client))
-                                    else (
-                                        (job.model and provider_model_pin_partial(client))
-                                        or job.model
-                                        or ""
-                                    )
-                                ),
-                                _turn_usage,
-                                provider=(
-                                    self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
-                                ),
-                                surface="cron",
-                                agent=read_effective_agent(client) or agent or "",
-                                context_used=_used,
-                                context_window=_window,
-                                elapsed_ms=int((time.monotonic() - _turn_t0) * 1000),
-                                model_source=client,
-                            )
-                        except Exception:
-                            logger.debug("usage row (cron seq) persist failed", exc_info=True)
                     finally:
                         # Before the reset below: a turn that consumed the
                         # post-compaction flag but never landed puts it back so
@@ -5235,23 +5329,52 @@ class GatewayOrchestrator:
                 _turn_t0 = time.monotonic()
                 _gate = _GateTally()
                 _prompt_dispatched = True
-                result_text, _carried_credits = await _cron_stream_with_posttoken_resume(
-                    client,
-                    full_message,
-                    job_name=job.name,
-                    approval_policy=(
-                        ToolApprovalPolicy.AUTO_APPROVE
-                        if job.approval_mode == "auto"
-                        else ToolApprovalPolicy.HOOK_BASED
-                    ),
-                    hooks=self.ctx_builder.hooks,
-                    on_tool_approval=(
-                        None if job.approval_mode == "auto" else self._interactive_approval("cron")
-                    ),
-                    on_tool_gate=_gate.note,
-                    on_complete=_note_complete,
-                    fallback_models=configured_fallback_chain(),
-                )
+                # Pinned before dispatch for the usage row below -- see the
+                # sequential site above.
+                _turn_since = _billing_stats(client)
+                _turn_carry: list[float] = []
+                _turn_exc: BaseException | None = None
+                _turn_usage: TurnUsage | None = None
+                try:
+                    result_text, _ = await _cron_stream_with_posttoken_resume(
+                        client,
+                        full_message,
+                        job_name=job.name,
+                        credit_carry=_turn_carry,
+                        approval_policy=(
+                            ToolApprovalPolicy.AUTO_APPROVE
+                            if job.approval_mode == "auto"
+                            else ToolApprovalPolicy.HOOK_BASED
+                        ),
+                        hooks=self.ctx_builder.hooks,
+                        on_tool_approval=(
+                            None
+                            if job.approval_mode == "auto"
+                            else self._interactive_approval("cron")
+                        ),
+                        on_tool_gate=_gate.note,
+                        on_complete=_note_complete,
+                        fallback_models=configured_fallback_chain(),
+                    )
+                except BaseException as _stream_exc:
+                    _turn_exc = _stream_exc
+                    raise
+                finally:
+                    # ── Per-turn usage row: background spend, on EVERY exit --
+                    # see the sequential site above. The same usage feeds the
+                    # result row's footer (meta.turn_stats) on success. ──
+                    _turn_usage = await _record_cron_turn_row(
+                        client,
+                        session_key,
+                        job=job,
+                        since=_turn_since,
+                        carry=_turn_carry,
+                        exc=_turn_exc,
+                        downgraded=_model_downgraded,
+                        provider=_provider,
+                        agent=cron_agent or "",
+                        t0=_turn_t0,
+                    )
 
                 # The prompt reached the model and the turn completed, so the
                 # finally must NOT restore the re-injection flag -- only for a
@@ -5282,50 +5405,20 @@ class GatewayOrchestrator:
                 # broadcast_context_usage by inject_cron_result_to_dashboard.
                 _ctx_reading = context_meter_reading(client)
 
-                # ── Per-turn usage row: attribute background spend. ──
-                # Best-effort; must never fail the cron turn.
-                # The same usage feeds the result row's footer (meta.turn_stats).
+                # The result row's footer (meta.turn_stats), from the usage the
+                # row above was written with. Best-effort; must never fail the
+                # cron turn.
                 _turn_stats: dict[str, Any] | None = None
                 try:
-
-                    _used, _window = read_context_tokens(client)
-                    _turn_usage = provider_last_turn_usage(client)
-                    if _carried_credits:
-                        # See the sequential site above: bill the interrupted
-                        # prompt's snapshotted credits alongside the
-                        # continuation's on a resumed turn.
-                        _turn_usage.credits += _carried_credits
-                    _turn_stats = turn_stats_meta(
-                        int(_turn_usage.duration_ms or (time.monotonic() - _turn_t0) * 1000),
-                        float(_turn_usage.credits or 0.0),
-                        float(_turn_usage.cost_usd or 0.0),
-                        read_turn_model(client),
-                    )
-                    await persist_token_record_async(
-                        session_key,
-                        # Blank on a downgrade or an active fallback — see the
-                        # sequential site above / provider_fallback_active. A
-                        # half-applied pair pin bills the bare model that ran.
-                        (
-                            ""
-                            if (_model_downgraded or provider_fallback_active(client))
-                            else (
-                                (job.model and provider_model_pin_partial(client))
-                                or job.model
-                                or ""
-                            )
-                        ),
-                        _turn_usage,
-                        provider=_provider,
-                        surface="cron",
-                        agent=read_effective_agent(client) or cron_agent or "",
-                        context_used=_used,
-                        context_window=_window,
-                        elapsed_ms=int((time.monotonic() - _turn_t0) * 1000),
-                        model_source=client,
-                    )
+                    if _turn_usage is not None:
+                        _turn_stats = turn_stats_meta(
+                            int(_turn_usage.duration_ms or (time.monotonic() - _turn_t0) * 1000),
+                            float(_turn_usage.credits or 0.0),
+                            float(_turn_usage.cost_usd or 0.0),
+                            read_turn_model(client),
+                        )
                 except Exception:
-                    logger.debug("usage row (cron) persist failed", exc_info=True)
+                    logger.debug("turn stats (cron) failed", exc_info=True)
 
                 # ── Error deduplication ──
                 # Suppress repeated identical results to avoid spam. This is
@@ -6343,6 +6436,13 @@ class GatewayOrchestrator:
             # without a gateway restart (cross-surface consistency).
             heartbeat_hooks = _build_heartbeat_hooks(self.ctx_builder.hooks)
             _acquired = False
+            # True from dispatch until a usage row is claimed, with the stats
+            # object pinned at dispatch, so an error or cancel exit can still write
+            # the turn's row, an exit before dispatch writes none, and a cancel
+            # landing on the success path's own write cannot add a second.
+            _row_pending = False
+            _turn_since: Any = None
+            _hb_service = _heartbeat_service(task_text)
             # Whether this task's prompt landed, read from its completion's stop
             # reason, so the finally can settle the skill-body record its build
             # wrote: a prompt that never landed must not leave the next task of
@@ -6423,6 +6523,8 @@ class GatewayOrchestrator:
                 # Clock started outside wait_for so BOTH the success path and the
                 # TimeoutError branch below can report the real elapsed time.
                 _turn_t0 = time.monotonic()
+                _turn_since = _billing_stats(client)
+                _row_pending = True
                 result_text = await asyncio.wait_for(
                     stream_and_collect(
                         client,
@@ -6443,6 +6545,7 @@ class GatewayOrchestrator:
                 result_text = _annotate_model_fallback(result_text, client)
 
                 # ── Per-turn usage row: attribute heartbeat spend. ──
+                _row_pending = False
                 await _persist_turn_row(
                     client,
                     session_key,
@@ -6450,6 +6553,9 @@ class GatewayOrchestrator:
                     surface="heartbeat",
                     agent_fallback=lambda: "kirocrew-heartbeat",
                     t0=_turn_t0,
+                    service=_hb_service,
+                    request=task_text,
+                    outcome="ok",
                 )
             except asyncio.TimeoutError:
                 # Tear down the in-flight turn so the underlying claude-agent-acp
@@ -6470,9 +6576,7 @@ class GatewayOrchestrator:
                 # silently. Record it here, BEFORE the session reset below tears
                 # the client down and takes its last-turn usage with it.
                 #
-                # No new schema field: the record has never carried a
-                # success/failure outcome for ANY surface, so a timeout row is
-                # no less honest than any other row. The duration recorded is
+                # The row says so in its ``outcome``. The duration recorded is
                 # the real elapsed time, which for a timeout is ~the ceiling.
                 await _persist_turn_row(
                     client,
@@ -6481,6 +6585,9 @@ class GatewayOrchestrator:
                     surface="heartbeat",
                     agent_fallback=lambda: "kirocrew-heartbeat",
                     t0=_turn_t0,
+                    service=_hb_service,
+                    request=task_text,
+                    outcome="timeout",
                 )
                 try:
                     await self.sessions.reset(session_key)
@@ -6491,8 +6598,26 @@ class GatewayOrchestrator:
                     f"_Heartbeat task timed out after {HEARTBEAT_TASK_TIMEOUT_SECS}s "
                     "and was cancelled._"
                 )
-            except Exception:
-                logger.exception("Heartbeat task failed: %s", task_text[:80])
+            except BaseException as exc:
+                if isinstance(exc, Exception):
+                    logger.exception("Heartbeat task failed: %s", task_text[:80])
+                # An error or a cancel after dispatch billed whatever the turn
+                # reached: record it (read against the pinned stats, so a turn
+                # that never started writes nothing), then let it propagate.
+                if _row_pending:
+                    await _persist_turn_row(
+                        client,
+                        session_key,
+                        provider=(self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"),
+                        surface="heartbeat",
+                        agent_fallback=lambda: "kirocrew-heartbeat",
+                        t0=_turn_t0,
+                        usage=provider_last_turn_usage(client, since=_turn_since),
+                        service=_hb_service,
+                        request=task_text,
+                        outcome=turn_exit_outcome(exc),
+                        skip_unbilled=True,
+                    )
                 raise
             finally:
                 if _acquired:
@@ -6665,6 +6790,16 @@ class GatewayOrchestrator:
         _completion_hook: MonitorCompletionHook | None = None
         _raw_dispositions: list[MonitorActionDisposition] = []
         _completion_reported = False
+        # Usage-row bookkeeping: pending from dispatch until a row is claimed, with
+        # the stats object pinned at dispatch. The success and timeout paths claim
+        # their row explicitly; every other exit after dispatch (an error, a
+        # cancel, the structured wake's unaccepted-completion return) is written
+        # by the finally, so a turn that billed always leaves exactly one row.
+        _row_pending = False
+        _row_outcome = "ok"
+        _turn_since: Any = None
+        _turn_usage: TurnUsage | None = None
+        _nudge_service = f"{'autonudge' if wake_message is None else 'monitor'}:{loop.id}"
         try:
             _memory_store = await session_store_for_turn(self.ctx_builder, key)
             if wake_message is None:
@@ -6699,6 +6834,8 @@ class GatewayOrchestrator:
             # never assigns TurnUsage.duration_ms, so the row needs this.
             _turn_t0 = time.monotonic()
             _turn_started = True
+            _turn_since = _billing_stats(client)
+            _row_pending = True
             if wake_message is None:
 
                 def _capture_raw_completion(event: LLMEvent) -> None:
@@ -6780,6 +6917,7 @@ class GatewayOrchestrator:
                 )
                 _completion_reported = True
             # ── Per-turn usage row: attribute monitor spend. ──
+            _row_pending = False
             await _persist_turn_row(
                 client,
                 key,
@@ -6788,6 +6926,9 @@ class GatewayOrchestrator:
                 agent_fallback=lambda: _get_agent_for_session(key),
                 t0=_turn_t0,
                 usage=_turn_usage,
+                service=_nudge_service,
+                request=tagged,
+                outcome="ok",
             )
         except SessionBusyError:
             logger.info(
@@ -6811,6 +6952,7 @@ class GatewayOrchestrator:
                     _turn_usage,
                     hook=_completion_hook,
                 )
+            _row_outcome = "cancelled"
             raise
         except asyncio.TimeoutError:
             # ── Timeout spend is REAL spend. ──
@@ -6819,9 +6961,7 @@ class GatewayOrchestrator:
             # the cancelled turn had already cost. Record it, then bail. Runs
             # before the `finally` cancels/releases the session.
             #
-            # No new schema field: the record has never carried a
-            # success/failure outcome for ANY surface, so a timeout row is no
-            # less honest than any other row.
+            # The row says so in its ``outcome``.
             logger.warning(
                 "AutoNudge: slack nudge turn timed out after %ss for %s (loop %s)",
                 _NUDGE_TURN_TIMEOUT,
@@ -6836,6 +6976,7 @@ class GatewayOrchestrator:
                     _turn_usage,
                     hook=_completion_hook,
                 )
+            _row_pending = False
             await _persist_turn_row(
                 client,
                 key,
@@ -6844,6 +6985,9 @@ class GatewayOrchestrator:
                 agent_fallback=lambda: _get_agent_for_session(key),
                 t0=_turn_t0,
                 usage=_turn_usage,
+                service=_nudge_service,
+                request=tagged,
+                outcome="timeout",
             )
             if wake_message is None:
                 return False
@@ -6851,6 +6995,7 @@ class GatewayOrchestrator:
                 return MonitorDispatchResult.DISPATCHED
             return MonitorDispatchResult.BUSY
         except Exception as exc:
+            _row_outcome = "error"
             logger.exception("AutoNudge: slack nudge turn failed for %s (loop %s)", key, loop.id)
             await self._stop_message_loop_if_structural_terminal(
                 loop, exc, wake_message, _fired_generation
@@ -6867,15 +7012,38 @@ class GatewayOrchestrator:
                 return False
             return MonitorDispatchResult.BUSY
         finally:
-            if _acquired:
-                try:
-                    await self.sessions.cancel_current(key)
-                except Exception:
-                    logger.debug("AutoNudge: cancel_current failed for %s", key, exc_info=True)
-                try:
-                    self.sessions.release(key)
-                except Exception:
-                    logger.exception("AutoNudge: failed to release session %s", key)
+            # The row write is an await: a second cancel landing on it must not
+            # skip the release below, or the session's semaphore stays held.
+            try:
+                if _row_pending:
+                    _row_pending = False
+                    await _persist_turn_row(
+                        client,
+                        key,
+                        provider=(self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"),
+                        surface="monitor",
+                        agent_fallback=lambda: _get_agent_for_session(key),
+                        t0=_turn_t0,
+                        usage=(
+                            _turn_usage
+                            if _turn_usage is not None
+                            else provider_last_turn_usage(client, since=_turn_since)
+                        ),
+                        service=_nudge_service,
+                        request=tagged,
+                        outcome=_row_outcome,
+                        skip_unbilled=True,
+                    )
+            finally:
+                if _acquired:
+                    try:
+                        await self.sessions.cancel_current(key)
+                    except Exception:
+                        logger.debug("AutoNudge: cancel_current failed for %s", key, exc_info=True)
+                    try:
+                        self.sessions.release(key)
+                    except Exception:
+                        logger.exception("AutoNudge: failed to release session %s", key)
         # Post the response into the originating thread (best-effort — the
         # turn itself already ran, so failures here don't fail the cycle).
         try:
@@ -7059,8 +7227,14 @@ class GatewayOrchestrator:
             # on it would latch the conversation and then refuse the human's next
             # message. Marked here rather than passed down because this is the one
             # place that knows, and the channels' dispatch signatures in between
-            # have no business carrying it.
-            with turn_ceiling.generated_turn():
+            # have no business carrying it. The usage row's ``service`` travels
+            # the same way, for the same reason (spent by the first metered turn).
+            with (
+                turn_ceiling.generated_turn(),
+                usage_service_scope(
+                    f"{'autonudge' if wake_message is None else 'monitor'}:{loop.id}"
+                ),
+            ):
                 dispatch_result = await asyncio.wait_for(
                     dispatcher.handle_message(synthetic, **dispatch_kwargs),
                     timeout=_NUDGE_TURN_TIMEOUT,
@@ -7603,6 +7777,11 @@ class GatewayOrchestrator:
         # applied via an atomic (id, generation) fence and a stale completion
         # cannot deactivate a loop whose config advanced under the turn.
         run_kwargs["_directive_loop_id"] = loop.id
+        # The usage row's ``service``: which loop paid for this turn, and whether
+        # it was a periodic nudge or a structured monitor wake.
+        run_kwargs["_usage_service"] = (
+            f"{'autonudge' if wake_message is None else 'monitor'}:{loop.id}"
+        )
         # Pass the generation captured when THIS turn fired, for both fire
         # shapes. A plain nudge and a monitor wake_message both snapshot
         # ``loop.config_generation`` into ``_fired_generation`` above, before the
@@ -9162,6 +9341,7 @@ class GatewayOrchestrator:
                         # failure this recovery drains, so the sub-agent is what
                         # caused the turn.
                         _turn_actor="subagent",
+                        _usage_service="subagent_recovery",
                     )
                 ),
             )
@@ -9197,7 +9377,8 @@ class GatewayOrchestrator:
 
                     try:
                         # USE-1: the completion turn is real spend on the parent
-                        # session; one row per attempt, filed under the parent.
+                        # session; one row per attempt, filed under the parent and
+                        # named after the subagent whose result it delivers.
                         return await stream_and_collect(
                             client,
                             msg,
@@ -9206,6 +9387,7 @@ class GatewayOrchestrator:
                             on_tool_gate=_on_tool_gate,
                             usage_surface="subagent_completion",
                             usage_session_key=parent_key,
+                            usage_service=(f"subagent_completion:{info.agent or 'subagent'}"),
                         )
                     except PromptBusyExhaustedError:
                         # Provider is dead after exhausting prompt-busy retries.
@@ -10113,6 +10295,9 @@ class GatewayOrchestrator:
                                     # SUBAGENT_COMPLETION_KIND, and this branch
                                     # is the same injector dispatching directly.
                                     _turn_actor="subagent",
+                                    _usage_service=(
+                                        f"subagent_completion:{info.agent or 'subagent'}"
+                                    ),
                                     **_run_kwargs,
                                 )
                             )

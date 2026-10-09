@@ -48,6 +48,7 @@ import logging
 import math
 import re
 import uuid
+from contextvars import ContextVar
 from typing import Any, Awaitable, Callable
 
 from kiro_crew.decisions.types import Answer, Answers, Choice, Noul, Question, Score, is_model_id
@@ -118,6 +119,11 @@ RunnerFactory = Callable[[str], Runner]
 
 _runner: Runner | None = None
 _runner_factory: RunnerFactory | None = None
+
+#: The decision point an ask is for, set by :meth:`LlmOracle.ask` around the
+#: runner call. Usage-row metadata only: the session runner names its row
+#: ``judge:<point>`` from it, and a :data:`Runner` keeps its one-argument shape.
+_ASK_POINT: ContextVar[str] = ContextVar("decisions_judge_point", default="")
 
 
 def set_runner_factory(factory: RunnerFactory | None) -> None:
@@ -224,6 +230,8 @@ def build_session_runner(sessions: Any, *, model: str = "") -> Runner:
                 # what it spent.
                 usage_surface="bg:judge",
                 usage_session_key=key,
+                # The decision point the gate asked for, e.g. ``judge:nudge_wake``.
+                usage_service=f"judge:{_ASK_POINT.get() or 'unknown'}",
             )
             return text
         finally:
@@ -553,7 +561,7 @@ class LlmOracle:
     timeout and the fallback.
     """
 
-    def __init__(self, runner: Runner | None = None, *, model: str = "") -> None:
+    def __init__(self, runner: Runner | None = None, *, model: str = "", point: str = "") -> None:
         #: Injected for tests and for a caller that already holds one; ``None``
         #: resolves the registered runner at ASK time rather than at construction,
         #: so the gate can build an oracle before the gateway has registered one.
@@ -563,6 +571,8 @@ class LlmOracle:
         #: id the gate scrubbed and logged is the id actually asked for, and empty
         #: means inherit the agent's own.
         self._model = model
+        #: The decision point asked about; names the call's usage row only.
+        self._point = point
 
     async def ask(self, state: dict | str, questions: list[Question]) -> Answers:
         """One model call carrying every question. Raises on any failure.
@@ -580,5 +590,9 @@ class LlmOracle:
         if runner is None:
             raise LlmRunnerMissing("no judge runner is registered")
         prompt = render_prompt(state, questions)
-        text = await runner(prompt)
+        token = _ASK_POINT.set(self._point)
+        try:
+            text = await runner(prompt)
+        finally:
+            _ASK_POINT.reset(token)
         return parse_answers(text, questions)

@@ -7,6 +7,7 @@ publication, and its cancellation at shutdown.
 from __future__ import annotations
 
 import asyncio
+import functools
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -71,7 +72,14 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
                         "came back incomplete, say that plainly and state what is "
                         "still unknown."
                     )
-                    started = slot.enqueue_or_run_prompt(prompt, _run_chat, state)
+                    # The usage row names the workflow whose result this turn
+                    # answers. Applies when the turn starts now; a queued twin is
+                    # drained without it, like its actor.
+                    started = slot.enqueue_or_run_prompt(
+                        prompt,
+                        functools.partial(_run_chat, _usage_service=f"workflow_result:{name}"),
+                        state,
+                    )
                     state.push_slots_update()
                     logger.info(
                         "workflow %s result -> chat slot %s: agent turn %s",

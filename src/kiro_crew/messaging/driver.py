@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import re
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterator
 
 from kiro_crew import name_grant, session_directive
 from kiro_crew.acp.types import (
@@ -416,6 +417,47 @@ def _redact(text: str | None) -> str:
     return out
 
 
+class _UsageService:
+    """One pending ``service`` name for the next metered turn in scope."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+_usage_service_scope: contextvars.ContextVar[_UsageService | None] = contextvars.ContextVar(
+    "kirocrew_driver_usage_service", default=None
+)
+
+
+@contextlib.contextmanager
+def usage_service_scope(name: str) -> Iterator[None]:
+    """Name the usage row of the next metered :meth:`TurnDriver.run` in scope.
+
+    For a caller that reaches a channel's driver only through that channel's
+    dispatcher (the gateway's DM nudge), whose signatures have no business
+    carrying a row label. Spent by the FIRST metered run inside the scope, like
+    ``turn_ceiling.generated_turn``: a queue drain that replays a person's
+    message later in the same span must not have its spend filed under the
+    nudge that happened to drain it.
+    """
+    token = _usage_service_scope.set(_UsageService(name))
+    try:
+        yield
+    finally:
+        _usage_service_scope.reset(token)
+
+
+def _take_usage_service() -> str:
+    """Spend the scoped ``service`` name, if one is pending."""
+    pending = _usage_service_scope.get()
+    if pending is None or not pending.name:
+        return ""
+    name, pending.name = pending.name, ""
+    return name
+
+
 class TurnDriver:
     """Channel-neutral turn loop: provider events -> abstract output events.
 
@@ -469,6 +511,10 @@ class TurnDriver:
         cancellation (a caller's ``wait_for`` timeout or Stop). Empty leaves the
         row to the caller, which is how a caller that persists its own (the Slack
         gateway's monitor nudge) avoids a second row for the same turn.
+    usage_service:
+        The row's ``service`` -- the specific job beneath the bounded
+        ``usage_surface`` label. Empty takes a name pending from
+        :func:`usage_service_scope`, if any.
     closing_gate:
         Optional synchronous gate invoked immediately before the provider stream
         starts. Callers use it to reject a lease that shutdown cannot
@@ -495,6 +541,8 @@ class TurnDriver:
         monitor_completion: MonitorCompletionHook | None = None,
         usage_surface: str = "",
         usage_session_key: str = "",
+        usage_service: str = "",
+        usage_request: str = "",
     ) -> None:
         self.provider = provider
         self.renderer = renderer
@@ -558,6 +606,8 @@ class TurnDriver:
         self.closing_gate = closing_gate
         self.usage_surface = usage_surface
         self.usage_session_key = usage_session_key
+        self.usage_service = usage_service
+        self.usage_request = usage_request
 
     async def run(self, message: str) -> str:
         """Drive one turn; return the accumulated channel-safe assistant text.
@@ -577,6 +627,10 @@ class TurnDriver:
             surface=self.usage_surface,
             slot_key=self.usage_session_key or self.audit_session_key,
             agent=self.audit_agent,
+            service=self.usage_service or _take_usage_service(),
+            # USE-12: what was asked -- opt-in from the caller, which knows whether
+            # the session is Persistent (an Incognito or Temporary one passes none).
+            request=self.usage_request,
         ):
             return await self._drive(message)
 

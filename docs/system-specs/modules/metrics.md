@@ -896,9 +896,19 @@ Each row (`_build_token_record`) carries:
 | `context_used` | int | **(#647)** context-window tokens occupied after the turn (int-coerced) |
 | `context_window` | int | **(#647)** served context-window size in tokens (int-coerced) |
 | `stop_reason` | str | the turn's terminal stop reason read off the EVENT_COMPLETE event (`""` when the producer has none, e.g. a bare `TurnUsage` from `provider_last_turn_usage`). Free-form is fine HERE (the row store has no cardinality limit, unlike OTel attrs) — this is where per-agent stall analysis happens: joining `stop_reason` (`error: tool stall` / `stale_recover`) against the row's `agent` field attributes watchdog outcomes to free-form agent names retroactively |
+| `service` | str | **(USE-10)** the specific job beneath `surface`: `cron:<job name>`, `heartbeat:<entry>`, `autonudge:<loop id>`, `webhook:<hook>`, `workflow:<name>`, `subagent:<agent>`, `judge:<decision point>`, … (table below). Row store only and free-form, so it must never become an OTEL attribute; one line, at most 160 characters. `""` when the path names nothing finer than its `surface` (a plain user turn) |
+| `outcome` | str | **(USE-10)** how the turn ended: `ok` / `error` / `cancelled` / `timeout`, or a `metrics.turns.turn_outcome` label (`tool_stall`, `stall_exhausted`, …). The writer's value wins; otherwise it is derived from the event's `stop_reason` when the event carries one; `""` when unknown |
+| `ttft_ms` | int | **(USE-10)** time to the first streamed token where the surface measures it (the dashboard chat runner's footer clock); `0` = not measured |
+| `parent_slot` | str | **(USE-10)** for a subagent row, the session key that spawned the run, so a reader can roll the spend up into its parent; `""` elsewhere |
+| `tool_calls` / `tool_kinds` | int / object | **(USE-12)** distinct tool calls the turn made, and their count per tool KIND (`read`, `edit`, `execute`, `search`, `fetch`, `mcp:<server>`, …; at most 12 kinds kept). Never a tool title, which can carry a path or a whole command |
+| `prompt_chars` / `output_chars` | int | **(USE-12)** characters sent in the prompt (the assembled one, injected context included) and streamed back as answer text |
+| `compactions` | int | **(USE-12)** compactions that completed during the turn (kiro-cli bills that summary inside the turn) |
+| `request` | str | **(USE-12)** a preview of what the turn was asked: the user's own text after the `[CURRENT USER REQUEST` header when the prompt carries injected context, else the start of the prompt; one line, credential- and exfil-URL-redacted, at most 240 characters. Writers leave it empty for an Incognito or Temporary chat (they keep their transcript but nothing derived from it, `docs/decisions/2026-09-25-…`). Row store only: never a metric attribute, never in `/api/usage/turns` |
+| `for_slot` | str | **(USE-12)** the session a piece of background work served (`background_turn`'s and `run_bg_oneliner`'s crew-log owner: the chat a title or a summary was written for); `""` when the row's own slot is the session |
 
-The `surface` / `agent` / `context_used` / `context_window` fields (all #647) and
-`stop_reason` are all **additive** — every field defaults (`""` / `0`) so existing
+The `surface` / `agent` / `context_used` / `context_window` fields (all #647),
+`stop_reason`, and the USE-10 `service` / `outcome` / `ttft_ms` / `parent_slot`
+fields are all **additive** — every field defaults (`""` / `0`) so existing
 callers stay valid and shards predating a field (which lack its key) remain
 parseable; readers must tolerate their absence.
 
@@ -948,26 +958,107 @@ with the provider as `model_source` fallback), the agent that served the turn
   `_bg`) in a `finally` in `send_message`: a timed-out, cancelled or error reply
   still records what its result reported.
 
-Enforced by `scripts/check_usage_surface.py` (AST, no test run): every
-`stream_and_collect(` and `stream_and_collect_json(` call site must pass a
-non-empty `usage_surface=`, sit inside `async with background_turn`/`metered_turn`,
+Enforced by `scripts/check_usage_surface.py` (AST, no test run), two checks in one
+walk. Every `stream_and_collect(` and `stream_and_collect_json(` call site must pass
+a non-empty `usage_surface=`, sit inside `async with background_turn`/`metered_turn`,
 or appear in the script's `ALLOWED` list with the reason its row is written
 elsewhere (the Slack heartbeat and autonudge, the cron callback, and the history
 consolidation turn, whose `background_turn` is entered through an `AsyncExitStack`
-the walk cannot see). CI runs it in Fast Gate's `static-ratchets` job, mirrored in
-the main ratchet lane (`main-ratchet-audit.yml` `ratchet-gates`). It does not walk
-direct `provider.stream` loops; those rely on `metered_turn` /
-`TurnDriver(usage_surface=...)` at review.
+the walk cannot see). And every DIRECT drive -- a `.stream(` / `.prompt(` call on a
+receiver named `client`, `provider`, `session`, `handle`, … outside the provider
+implementations (`acp/`, `providers/`) and test modules -- must sit inside
+`metered_turn`/`background_turn` or appear in `DRIVE_ALLOWED` naming where the row
+is written on every exit (the dashboard chat runner, the task step, webhooks, the
+subagent run, the auto_improvement runner, `TurnDriver`, the eval harness, …).
+The second check is what a hand-driven path once escaped with the gate green. CI
+runs it in Fast Gate's `static-ratchets` job, mirrored in the main ratchet lane
+(`main-ratchet-audit.yml` `ratchet-gates`).
 
-Deliberately unchanged (USE-1, decided 2026-10-09): the writers that own their row
-and write it after the stream returns rather than in a `finally`, so some error or
-cancel exits write none — cron, the heartbeat, the autonudge / monitor wake, the
-task-runner step, webhooks, and the subagent run — stay as they are. Each is listed in `ALLOWED` or writes outside `stream_and_collect`, the task
-step drives `provider.stream` itself (it would need `metered_turn`, not a label),
-and converting six owners at once is how the double row this section guards
-against gets in. The auto_improvement app's external-CLI spend stays out of the
-usage shard: what counts as usage for a separately billed CLI is a product
-question, not a metering gap.
+**Every exit writes the row (USE-10, 2026-10-09, superseding that day's earlier
+"deliberately unchanged" ruling).** The writers that own their row used to write it
+only after a successful stream, so an error, a cancel or a timeout billed the
+account and left the usage store empty. Each now writes from a `finally` (or
+`metered_turn`) against the billing stats pinned just before dispatch, so a turn
+that never reached the model still writes nothing and a completed one writes
+exactly one row, with `outcome` saying how it ended:
+
+- **cron** (`slack/gateway.py` `_record_cron_turn_row`, both the sequential and the
+  single-agent path): every exit after dispatch, including the wake-deadline
+  `CancelledError` from `CronService._execute_with_timeout`, which skips the
+  callback's own handlers. A post-token resume's interrupted prompt is carried in a
+  caller-owned `credit_carry` list, so a resume that then fails still bills both
+  prompts. Each ACP-death / transient retry re-enters the callback and writes its
+  own row.
+- **heartbeat** and the **autonudge / monitor wake** (`_persist_turn_row`): error
+  and cancel exits too, guarded by a pending-row flag so a cancel landing during the
+  success write cannot add a second row.
+- **task-runner step** (`task_executor._persist_step_usage`) and **webhooks**
+  (`hooks._persist_hook_usage`): in the stream's `finally`; a retried attempt that
+  billed writes its own row.
+- **subagent run** (`SubagentManager._run_inner`'s `finally`): ONE row per attempt
+  carrying the run's settled total over every prompt (transient retries,
+  stop-recovery continuations, post-activity re-sends), less the credits a respawned
+  attempt inherited, on every ending. The old row from the completion event, which
+  carried only the last prompt, is gone.
+- **auto_improvement** session runs (`spine/agent_runner._run_async`, surface
+  `auto_improvement`): its Kiro-provider drive is metered in the run's `finally`;
+  the app's own budget meter is unchanged. Its external `claude -p` path still
+  writes no row -- what counts as usage for a separately billed CLI is a product
+  question, not a metering gap.
+
+The turn histogram agrees with these rows: for a bare-usage turn (no `stop_reason`
+on the event) `_emit_turn_histogram` takes the row's observed `error` / `cancelled` /
+`timeout` instead of `unclassified`, so with telemetry on, background faults now reach
+`fault_rate`; a writer's `ok` for a bare usage still emits `unclassified`.
+
+What still writes nothing: a turn that billed nothing, a process killed before its
+`finally` runs, and spend this host never drives (a remote-relay turn served by a
+peer, an AWS crew container, kiro-cli used outside Kiro Crew).
+
+**Turn activity and request (USE-12).** The activity fields are counted where every
+harness's turn passes, with no backend branch: `AcpPromptStats` gains
+`tool_call_count` / `tool_kinds` (distinct `tool_call_id`s, via `note_tool_call` and
+`acp.types.tool_kind_label`), `prompt_chars`, `output_chars` and `compactions`, all
+per-turn (`carry_over()` starts them at zero), set in `AcpSessionHandle` (the
+prompt's request builder, the event loop's text-chunk, tool-call and
+compaction-completed branches) and in the legacy `AcpClient`'s equivalents.
+`to_turn_usage()` copies them onto `TurnUsage`, and `llm_helpers._sum_usage` adds them
+across a turn's attempts and a subagent run's prompts. They are cost DRIVERS, not a
+split of the bill: kiro-cli reports one credit figure per turn (its metadata frame
+carries `contextUsagePercentage`, `meteringUsage`, `stopReason` and `refusal`, and
+names no model and no token counts). `request` is passed by the writers that know
+what was asked: the dashboard chat runner (the user's message, Persistent chats only),
+the cron callback (`job.message`), the heartbeat (its entry), the autonudge / monitor
+wake (the nudge text), the subagent run (`info.task`), the task step (title and
+description), webhooks (the hook message), the CLI chat, and `TurnDriver` when its
+caller passes `usage_request` (the generic channel dispatcher does, with the member's
+own text, unless `ChannelTurns._restricted` says the session is Incognito or
+Temporary; the Slack and Telegram transports pass none yet). A labelled
+`stream_and_collect` records only an explicit `usage_request` (empty by default: a
+side question or thread can run for an Incognito chat), and `run_bg_oneliner` records
+none, since a title or summary prompt quotes the chat it serves. `for_slot` comes
+from the background helpers' crew-log owner. An external client of the OpenAI-compatible endpoint (no app,
+not the dashboard) is filed under service `api_request`.
+
+**Service names (USE-10).** `surface` stays a short fixed label; the finer name
+goes in `service`. In use: `cron:<job name>`; `cron_result[:<label>]` (a cron result
+injected into a dashboard or messaging session); `heartbeat:<entry>` (the
+HEARTBEAT.md line, one line, credential-redacted, 60 characters); `autonudge:<loop
+id>` / `monitor:<loop id>` (Slack and dashboard nudges; a DM nudge reaches
+`TurnDriver(usage_service=...)` through the spend-once `usage_service_scope()`);
+`webhook:<hook name>`; `taskrunner:<run name or id>`, `taskrunner_summary`;
+`subagent:<agent>`, `subagent_completion[:<agent>]`, `subagent_recovery`,
+`subagent_synthesis`; `workflow:<run name>`, `workflow_result:<name>`;
+`judge:<decision point>`; `knowledge:extraction`, `knowledge:agent_fetch`,
+`auto_research`; `chat_title`, `session_summary`; `memory_consolidation`,
+`skill_extraction`; `issue_radar:<feature>`, `issue_radar:crew`; `app:<app id>`,
+`mcp_app:<server>`, `spec_builder`; `auto_improvement:<agent>`. A dashboard turn
+takes the caller's per-turn `_run_chat(_usage_service=...)`, else
+`chat_runner._usage_service_for_turn` derives it from `_turn_actor` and the
+self-wake loop id; a plain user turn is `""`. The name is never stored on the slot,
+so it cannot leak into a later user turn. `service` changes no attribution:
+channel and category still come from the slot key, and monitor spend stays booked
+to the conversation it nudged.
 
 **Per-surface daily total (USE-1 follow-up).** `dashboard/handlers/usage.py`
 `surface_daily_credits(day)` sums a local day's `tokens` rows by canonical surface,
@@ -980,14 +1071,14 @@ Labels in use: `workflow` (cold and pooled stages), `workflow_author`, `bg:judge
 `side`, `thread`, `subagent_completion` (the Slack gateway's completion injection,
 filed under the parent key), `taskrunner_lesson`, `taskrunner` for the task
 runner's self-review turn (`telemetry_channel_of` of its `taskrunner:…:review`
-key; the task step itself still writes its own row after a successful stream),
+key; the task step itself writes its own row from its stream's `finally`),
 `issue_radar`, `meetings`,
 `meetings_translate`, `slack` (native handler and Slack transport), `telegram`,
 the transport label for the generic channel dispatcher (`discord`, …), `monitor`
 for its monitor wakes, `channel`, `cli`, `optimizer`, `taskrunner_decompose`,
 `taskrunner_refine`, `compaction` (native `/compact` through the provider and the
-compaction coordinator), `code_review_sage`, `knowledge` (the knowledge pool's ACP
-workers), and `bg:<source>` / `bg:<task>` from the two background helpers, which
+compaction coordinator), `code_review_sage`, `auto_improvement`, `knowledge` (the
+knowledge pool's ACP workers), and `bg:<source>` / `bg:<task>` from the two background helpers, which
 share the same persist. The offline eval harness is metered too: `eval/runner.py`
 writes one `eval` row per scenario turn and `eval/judge.py` one `eval_judge` row
 per judge call, both through `metered_turn`. The knowledge pool's external-CLI
@@ -1108,8 +1199,10 @@ READ rather than where it is grouped — so the window totals, the prior-period
 deltas, `by_model`, `by_channel`, `by_category`, the context bands, the priciest
 turn and the occupancy percentiles are all computed over one population and cannot
 contradict each other. A subagent is a fragment of another session's turn rather
-than a session with its own lifecycle, and its usage row carries no field pointing
-back at the session that spawned it, so it can be neither listed nor attributed.
+than a session with its own lifecycle. Rows written before USE-10 carry no field
+pointing back at the session that spawned them; newer rows carry `parent_slot`, which
+a reader that wants a session's full cost (its own turns plus its subagents) can sum
+by, but these two readers still exclude subagent rows.
 The consequence is deliberate and worth stating: these totals are the totals of the
 sessions the panel lists, NOT of the account.
 
@@ -1232,9 +1325,11 @@ Telemetry panel's Spend table is the dashboard consumer — each session row
 expands into its per-turn rows through this endpoint, which is where a
 mid-session model switch or a single runaway turn becomes visible (an average
 hides both).
-**Stamping boundary:** rows are stamped at the two write sites that can run
-app-owned work — the dashboard chat runner (the slot's `_app`) and the
-subagent completion path (`info.app`, an app-dispatched subagent's spend).
+**Stamping boundary:** rows are stamped at the write sites that can run
+app-owned work — the dashboard chat runner (the slot's `_app`), the
+subagent run (`info.app`, an app-dispatched subagent's spend), and the app
+backends that drive their own model calls: issue_radar's one-shot AI routes,
+meetings (session and translate), and the auto_improvement runner.
 The task-runner, workflow, Slack and background-one-liner writers do not
 stamp because those surfaces are not app-owned — an empty stamp there is the
 correct value, not a gap. Webhook-session rows are currently unstamped and
@@ -1336,6 +1431,87 @@ toward `context_used`, not a compaction). Growth and the projection are
 a long conversation freshly past a compaction knows nothing about its new
 trajectory, and withholding is the honest answer rather than extrapolating from
 two or three points.
+
+**Credit report (USE-11).** `dashboard/handlers/credit_report.py` is the Usage
+page's reader, and it answers a different question from the Spend tab's: what the
+ACCOUNT spent, on what, and when. So every row counts, subagents included -- a
+subagent row is filed under the session that spawned it through `parent_slot`
+(normalised with `spend_key_for_slot`) and reported as that session's
+`subagent_credits` beside its `own_credits`; a pre-USE-10 subagent row with no
+parent stays under its own key. The Spend tab's readers above are unchanged and still
+exclude subagents, so the two pages answer their own questions and are not expected
+to agree. Each row gets one page category (`row_category`, first match wins):
+`subagents` (surface `subagent`), `workflows`, `apps` (an app stamp or an app
+backend's surface), `background` (a `service`, a `bg:*` surface, a background
+surface such as cron/heartbeat/monitor/webhook/compaction/knowledge, or a
+background session), `chat` (the CLI and dashboard sessions), else `channels`.
+A row's name on the page is its `service`, else its `surface`.
+
+- `GET /api/usage/credits/summary?from=YYYY-MM-DD&to=YYYY-MM-DD` (`from` defaults
+  to 29 days before `to`, `to` to today; at most `MAX_RANGE_DAYS`): totals
+  (credits, USD, turns, sessions, models, p50/p90 duration and TTFT, faults, the
+  outcome counts), the preceding window of equal length, a series (hourly for one
+  day, daily to 120 days, monthly beyond) split by category with per-point p50/p90
+  duration, `by_category`, `by_service`, `by_model` (every key, never truncated),
+  credits by hour of day, the duration / TTFT / credits-per-turn distributions,
+  the top `_MAX_SESSIONS` sessions with their titles (resolved as
+  `_with_conversation_titles` does, both scanners applied), the twelve calendar
+  months ending with `to`'s, and the reconciliation below.
+- `GET /api/usage/credits/turns` -- one page of per-prompt rows, newest first, with
+  exact filters (`session`, which matches a subagent row through its parent;
+  `service`; `category`; `model`; `outcome`), `limit` up to `MAX_TURNS_LIMIT`, and
+  a `before` cursor (`next_before` of the previous page).
+
+Both are dashboard-only: an app caller gets the indistinguishable `404` and the
+refusal is SEL-audited, like `/api/telemetry/context-trace`. Their consumer is the
+**Usage** page (rail **Usage**, `/usage`, `website/src/pages/UsagePage.tsx` and
+`website/src/pages/usage/`): the plan balance from the credit pill's own query, KPI
+tiles, credits over time stacked by category (with a table view), categories,
+services and models as ranked lists that filter the prompt list, response-time and
+time-to-first-token distributions, credits by hour and by day, the reconciliation,
+the twelve months, the session ranking and the paged prompt list. Its category
+colours are the polarity-fixed `--usage-cat-*` tokens (`website/docs/theming-contract.md`). Shards are parsed once
+per (size, mtime) and kept in a bounded in-memory cache, so a long range does not
+re-read closed days on every poll; rows are dated by their own timestamp, not their
+shard's name.
+
+**Attribution and cost drivers in the credit report (USE-12).** Each row is filed
+under exactly ONE session, precedence `parent_slot` > `for_slot` > its own slot, and
+reported as that session's `own`, `subagents` or `background` share, so the three
+sum to the session's total; title, summary and consolidation spend therefore moves
+off the shared `_bg` session onto the chat it was done for. `row_reasons` labels a
+turn with the facts that made it heavier than a plain answer -- `tools` (8+ tool
+calls), `context` (window at least half full), `compacted`, `big_request` (60k+
+characters sent), `long_answer` (20k+ streamed back), `long_run` (5+ minutes),
+`premium_model` (credit rate multiplier 1.5+) and `unfinished` (billed but errored,
+timed out, stalled or stopped) -- and a counter written before USE-12 (read as `-1`)
+never produces one. The summary adds `drivers` (average credits per prompt by
+tool-call band and by context-fill band, over the rows that carry the counters),
+`top_turns` (the most expensive prompts with their reasons), `recurring` (each
+background service's runs per day, credits per run and per day, and a 30-day pace),
+`tools` (calls per kind with the prompts that used it and their credits -- the total
+of those prompts, not a share of their bill) and `account_rate` (the account's own
+credits per day across its readings of the last 14 days, `null` until they span six
+hours), which the page's plan projection prefers to the recorded rate. Every
+per-prompt row (`/turns` and `top_turns`) carries the activity fields, `request`,
+`for_slot`, `share`, `stop_reason`, `rate_multiplier` and its `reasons`, and `/turns`
+filters by a reason code.
+
+**Account-reading history and reconciliation (USE-11).** Each identity-proven
+reading the credit pill publishes (`sessions._fetch_usage_bg`, both the API and the
+`/usage` branch) is appended off-loop to `<data home>/usage/account/YYYY-MM.jsonl`
+by `credit_report.record_account_reading`: `ts`, a pseudonymous `account` key (the
+first 16 hex of SHA-256 over the email or start URL -- the file carries no email),
+`consumed` (`credits_used` plus every bonus pool's `used`, since bonus credits are
+spent first), the plan figures, `resets` and the source. An unchanged reading is
+re-appended at most hourly. `reconcile` then compares, over the summary's window,
+what the most recent account consumed between consecutive readings (a fall is a
+cycle reset: the next reading's figure is the consumption since it) with the
+credits the row store recorded over the same span; `unattributed_credits` is the
+difference -- spend this host never wrote a row for (kiro-cli used outside Kiro
+Crew, a remote peer, a container) or a metering gap. Kiro meters with a delay, so a
+short window can read briefly negative. An API-key account publishes no reading and
+has no reconciliation (`null`).
 
 Tests: `test/test_usage.py` (`TestReadContextTokens`,
 `TestBuildTokenRecordContextFields`, `TestBuildTokenRecordCtxBlocks`,

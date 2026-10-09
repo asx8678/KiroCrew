@@ -463,6 +463,9 @@ def _dispatch_turn(
         _directive_user_origin=directive_user_origin,
         _on_consumed=on_consumed,
         _on_irreversibly_consumed=on_irreversibly_consumed,
+        # The usage row names the app for a turn it composed; a message the
+        # user typed keeps the plain user-turn row.
+        _usage_service="" if directive_user_origin else "spec_builder",
     )
     if bounded_chat_turn is not None:
         task = asyncio.create_task(bounded_chat_turn(run_chat))

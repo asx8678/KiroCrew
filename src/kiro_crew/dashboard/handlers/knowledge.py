@@ -3274,8 +3274,9 @@ def setup_knowledge_routes(app: web.Application) -> None:
             effort_key="extraction_effort",
             fallback_effort=DEFAULT_EXTRACTION_EFFORT,
             config_pool_size_key="extraction_pool_size",
+            service="knowledge:extraction",
         )
-        fetch_pool = LLMPool(pool_size=1)
+        fetch_pool = LLMPool(pool_size=1, service="knowledge:agent_fetch")
         embedder = _create_embedder(app)
         pipeline = IngestionPipeline(
             store=store,

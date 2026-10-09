@@ -478,7 +478,12 @@ _annotate_model_fallback = annotate_model_fallback
 
 
 async def _cron_stream_with_posttoken_resume(
-    client: Any, message: str, *, job_name: str, **stream_kwargs: Any
+    client: Any,
+    message: str,
+    *,
+    job_name: str,
+    credit_carry: list[float] | None = None,
+    **stream_kwargs: Any,
 ) -> tuple[str, float | None]:
     """Run a cron agent turn, resuming ONCE after a post-token transient error.
 
@@ -507,6 +512,13 @@ async def _cron_stream_with_posttoken_resume(
     prompt's ``AcpPromptStats.carry_over()`` zeroes the per-turn counter — so
     the caller's usage row can bill both prompts instead of only the
     continuation.
+
+    ``credit_carry`` is the same snapshot handed over through a list the CALLER
+    owns, appended to the moment it is taken. The return value is lost when the
+    continuation raises (or the wake deadline cancels it), and the caller's
+    usage row is written on every exit, so a failed resume would otherwise bill
+    only the continuation. A caller reading the box must not also add the
+    returned value -- it is the same credits.
 
     Eligibility deliberately reuses ``acp_error_is_transient`` — the one
     authoritative classifier — so auth/validation failures and every other
@@ -571,6 +583,8 @@ async def _cron_stream_with_posttoken_resume(
             # per-turn credit counter, and the caller's single post-turn read
             # would otherwise bill only the continuation.
             carried_credits = provider_last_turn_usage(client).credits
+            if credit_carry is not None:
+                credit_carry.append(carried_credits)
             _delay = transient_retry_delay(1)
             logger.warning(
                 "Cron '%s': transient backend error after %d chars streamed — "

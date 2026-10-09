@@ -115,7 +115,6 @@ if TYPE_CHECKING:
         logger,
         platform_compat,
         process_survived_async,
-        provider_fallback_active,
         read_tombstone,
         refuse_stale_switch,
         replace_stale_shared_session,
@@ -3059,6 +3058,12 @@ class RunEventCoordinator(ManagerComponent):
         # Includes transient-retry backoff, which is real wall time the caller
         # waited for this turn.
         _turn_t0 = time.monotonic()
+        # What the attempt's usage row (written by ``_run_inner``'s finally, on
+        # every ending) needs from this body: billing only begins in the stream
+        # below, so a run that never gets here has nothing to record.
+        usage.turn_started = _turn_t0
+        usage.row_agent = agent
+        usage.row_provider = "claude_code" if is_cc else "acp"
         # TOOL-20: the same repeat-loop watch the dashboard chat runs, so an
         # unattended run that repeats one call is told (advice, never a stop).
         from kiro_crew.acp.types import TERMINAL_TOOL_STATUSES
@@ -3425,55 +3430,10 @@ class RunEventCoordinator(ManagerComponent):
             write_result_chunk(info.id, f"\n\n{_warn}\n")
         evict_completed_agents(self._manager._agents)
 
-        # ── Per-turn usage row: attribute subagent spend. ──
-        # Its inputs are read here, synchronously, and the append itself is
-        # best-effort analytics on a task the manager holds (``_report_tasks``,
-        # which ``cancel_all()`` drains within its bound): no ending waits on
-        # it, so a cancel, the shutdown or a wedged FS can never hold one.
-        try:
-            # circular import: reached while kiro_crew.slack.handler is still
-            # initialising (dashboard/handlers/files.py imports is_tracked_channel
-            # from it), so a module-scope import raises ImportError under the
-            # suite's import order.
-            from kiro_crew.dashboard.handlers.usage import (
-                persist_token_record_async,
-                read_context_tokens,
-                read_effective_agent,
-            )
-
-            _used, _window = read_context_tokens(client)
-            _usage_row = asyncio.ensure_future(
-                persist_token_record_async(
-                    session_key,
-                    # Blank while a fallback serves this run: the explicit pin
-                    # would bill the fallback's spend to a model that never
-                    # executed; model_source reports what actually ran.
-                    ("" if provider_fallback_active(client) else (info.model or "")),
-                    _complete_event,
-                    provider="claude_code" if is_cc else "acp",
-                    surface="subagent",
-                    # Ownership stamp (see _build_token_record): an app-dispatched
-                    # subagent's spend must be readable by that app's audit — the
-                    # illustrator lane of an app is exactly this path.
-                    app=info.app or "",
-                    # Explicit/inherited `agent` FIRST here — unlike every other
-                    # surface. Under session sharing this subagent reuses the
-                    # PARENT's runtime, so read_effective_agent() would report the
-                    # parent's agent and misattribute a `spawn_run(agent="…")` turn.
-                    # `agent` is already the resolved value (it inherits the parent
-                    # session's agent when the spawn did not name one), and the
-                    # helper stays as the fallback for when it is empty.
-                    agent=agent or read_effective_agent(client) or "",
-                    context_used=_used,
-                    context_window=_window,
-                    elapsed_ms=int((time.monotonic() - _turn_t0) * 1000),
-                    model_source=client,
-                )
-            )
-            self._manager._report_tasks.add(_usage_row)
-            _usage_row.add_done_callback(self._manager._report_tasks.discard)
-        except Exception:
-            logger.debug("usage row (subagent) persist failed", exc_info=True)
+        # The usage row is NOT written here: ``_run_inner``'s finally writes the
+        # attempt's one row from the settled total, so a run that fails, is
+        # cancelled or ends without a complete event is recorded too, and every
+        # prompt this attempt sent (retries, recovery continuations) is in it.
 
         def _count_success() -> None:
             # The one success bookkeeping, for a claimed ending and the tail's alike.

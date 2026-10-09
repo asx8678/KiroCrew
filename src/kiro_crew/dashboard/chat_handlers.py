@@ -1718,6 +1718,8 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         _turn_kwargs: dict = {"_directive_user_origin": not bool(request_app)}
         if request_app:
             _turn_kwargs["_turn_actor"] = "app"
+            # The usage row names the calling app, stamped by auth like the actor.
+            _turn_kwargs["_usage_service"] = f"app:{request_app}"
         if _accepted_attachments:
             _turn_kwargs["_attachments"] = _accepted_attachments
             # Typed form for the refusal replay: keeps ``dirs`` entries as folders.

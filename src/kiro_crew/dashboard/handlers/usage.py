@@ -30,6 +30,7 @@ from kiro_crew.metrics.turns import (
     emit_turn_usage,
     turn_outcome,
 )
+from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
 
@@ -1514,6 +1515,12 @@ def _build_token_record(
     context_window: int = 0,
     elapsed_ms: int = 0,
     app: str = "",
+    service: str = "",
+    outcome: str = "",
+    ttft_ms: int = 0,
+    parent_slot: str = "",
+    request: str = "",
+    for_slot: str = "",
 ) -> dict[str, Any]:
     """Build the JSONL token-usage record dict (no I/O).
 
@@ -1542,6 +1549,30 @@ def _build_token_record(
     This mirrors the precedence the OTEL emit path already uses
     (``chat_runner._attach_turn_stats``: ``value = duration_ms or elapsed_ms``),
     so the histogram and the row store cannot disagree about one turn.
+
+    ``service`` names the specific job behind the turn (``cron:<job name>``,
+    ``webhook:<hook>``, ``workflow:<name>``, ``subagent:<agent>``, …) where
+    ``surface`` only says which code path ran it. It is row-store only and
+    free-form (bounded by :func:`_clean_service`), so it must never become an
+    OTEL attribute. ``outcome`` is how the turn ended (``ok`` / ``error`` /
+    ``cancelled`` / ``timeout`` / the :func:`turn_outcome` labels): the caller's
+    value wins, else it is derived from the event's ``stop_reason`` when the
+    event carries one, else ``""`` (unknown). ``ttft_ms`` is the time to the
+    first streamed token where the surface measured it (``0`` = not measured),
+    and ``parent_slot`` is the session that spawned a subagent's turn, so a
+    reader can roll that spend up into its parent without guessing.
+
+    USE-12 adds what the turn DID and what it was FOR. ``tool_calls`` /
+    ``tool_kinds`` / ``prompt_chars`` / ``output_chars`` / ``compactions`` come
+    off the usage itself (``TurnUsage``, filled from the turn's stats): cost
+    DRIVERS, not a split of the bill, which the backend reports as one figure.
+    ``request`` is a short preview of what was asked (:func:`_clean_request`:
+    the user's own text when the prompt carries injected context, one line,
+    credential- and exfil-URL-redacted, bounded); writers leave it empty for an
+    incognito or temporary chat. ``for_slot`` names the session a piece of
+    background work served (the chat a title or summary was written for), so a
+    reader can file that spend under the session that caused it. Neither text
+    field ever reaches a metric, and neither is returned to an app caller.
     """
     # Usage lives on event.usage (TurnUsage). Fall back to the event itself when
     # it isn't a real TurnUsage (legacy / non-AcpEvent producers, test doubles).
@@ -1559,7 +1590,9 @@ def _build_token_record(
     # attrs), so watchdog outcomes (STOP_REASON_TOOL_STALL / _STALE_RECOVER)
     # can be joined against the row's ``agent`` field retroactively — this is
     # where per-agent stall analysis happens, deliberately NOT on metric attrs.
-    _stop = getattr(event, "stop_reason", "")
+    _stop = getattr(event, "stop_reason", _NO_STOP_REASON)
+    if not outcome and _stop is not _NO_STOP_REASON:
+        outcome = turn_outcome(_stop if isinstance(_stop, str) else None)
     return {
         "_type": "tokens",
         "ts": now.isoformat(),
@@ -1590,7 +1623,86 @@ def _build_token_record(
         # produced this row's credits (None when the id is not in the cached
         # catalog — unknown model, cold cache). Old shards lack the key.
         "rate_multiplier": _catalog_rate_multiplier(model),
+        # Additive (USE-10): the specific job, how the turn ended, time to first
+        # token, and a subagent's parent session. Old shards lack the keys.
+        "service": _clean_service(service),
+        "outcome": outcome if isinstance(outcome, str) else "",
+        "ttft_ms": _coerce_int(ttft_ms),
+        "parent_slot": parent_slot if isinstance(parent_slot, str) else "",
+        # Additive (USE-12): what the turn did and what it was for.
+        "tool_calls": _coerce_int(getattr(u, "tool_calls", 0)),
+        "tool_kinds": _clean_counts(getattr(u, "tool_kinds", None)),
+        "prompt_chars": _coerce_int(getattr(u, "prompt_chars", 0)),
+        "output_chars": _coerce_int(getattr(u, "output_chars", 0)),
+        "compactions": _coerce_int(getattr(u, "compactions", 0)),
+        "request": _clean_request(request),
+        "for_slot": for_slot if isinstance(for_slot, str) else "",
     }
+
+
+#: Sentinel for an event that carries no ``stop_reason`` attribute at all (a
+#: bare ``TurnUsage``), which says nothing about how the turn ended — unlike an
+#: ``AcpEvent`` whose ``None`` stop reason reports a clean turn.
+_NO_STOP_REASON = object()
+
+#: Row outcomes a writer sets from an exit it observed (``turn_exit_outcome``),
+#: which the turn histogram may take for a bare-usage turn. All are labels
+#: ``metrics.turns.turn_outcome`` itself returns, so the fault classifier knows them.
+_OBSERVED_FAULT_OUTCOMES = frozenset({"error", "cancelled", "timeout"})
+
+#: Upper bound on a stored ``service`` name. The name embeds operator-chosen
+#: text (a cron job's name, a hook's name), so it is bounded rather than trusted.
+_SERVICE_MAX_CHARS = 160
+
+
+def _clean_service(service: object) -> str:
+    """Normalise a ``service`` name: one line, trimmed, bounded."""
+    if not isinstance(service, str):
+        return ""
+    return " ".join(service.split())[:_SERVICE_MAX_CHARS]
+
+
+#: Longest stored ``request`` preview. A preview says what was asked; the
+#: transcript holds the rest.
+_REQUEST_MAX_CHARS = 240
+#: How much of a prompt is scanned for the preview: enough for the marker search
+#: and one bounded line, never a whole assembled prompt.
+_REQUEST_SCAN_CHARS = 4000
+#: The header the context assembly writes before the user's own text. When a
+#: prompt carries it, the preview starts after it: the injected rules and memory
+#: in front of it are not what was asked.
+_CURRENT_REQUEST_MARKER = "[CURRENT USER REQUEST"
+#: Most tool kinds a row keeps (the largest), so the tally stays bounded.
+_ROW_TOOL_KINDS_MAX = 12
+
+
+def _clean_request(text: object) -> str:
+    """A one-line, redacted, bounded preview of what a turn was asked."""
+    if not isinstance(text, str) or not text:
+        return ""
+    at = text.rfind(_CURRENT_REQUEST_MARKER)
+    if at >= 0:
+        close = text.find("]", at)
+        text = text[close + 1 :] if close >= 0 else text[at:]
+    line = " ".join(text[:_REQUEST_SCAN_CHARS].split())
+    line, _ = redact_exfiltration_urls(line)
+    line, _ = redact_credentials(line)
+    if len(line) > _REQUEST_MAX_CHARS:
+        return line[: _REQUEST_MAX_CHARS - 1].rstrip() + "…"
+    return line
+
+
+def _clean_counts(tally: object) -> dict[str, int]:
+    """A ``{kind: count}`` tally with string keys and positive ints, largest kept."""
+    if not isinstance(tally, dict):
+        return {}
+    items = [
+        (str(k)[:48], v)
+        for k, v in tally.items()
+        if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v > 0
+    ]
+    items.sort(key=lambda kv: (-kv[1], kv[0]))
+    return dict(items[:_ROW_TOOL_KINDS_MAX])
 
 
 def _finite_only(record: dict[str, Any]) -> dict[str, Any]:
@@ -1720,6 +1832,12 @@ def persist_token_record(
     elapsed_ms: int = 0,
     app: str = "",
     model_source: object = None,
+    service: str = "",
+    outcome: str = "",
+    ttft_ms: int = 0,
+    parent_slot: str = "",
+    request: str = "",
+    for_slot: str = "",
 ) -> None:
     """Append a token usage record to today's shard under
     ``<data home>/usage/tokens/YYYY-MM-DD.jsonl`` (synchronous).
@@ -1746,6 +1864,9 @@ def persist_token_record(
     explicitly and would otherwise record an empty string, losing the
     per-model attribution dimension). An explicit ``model`` always wins.
 
+    ``service`` / ``outcome`` / ``ttft_ms`` / ``parent_slot`` are described on
+    :func:`_build_token_record`.
+
     On the async chat hot path, prefer ``persist_token_record_async`` which
     offloads the blocking write off the event loop.
     """
@@ -1765,6 +1886,12 @@ def persist_token_record(
                 context_window=context_window,
                 elapsed_ms=elapsed_ms,
                 app=app,
+                service=service,
+                outcome=outcome,
+                ttft_ms=ttft_ms,
+                parent_slot=parent_slot,
+                request=request,
+                for_slot=for_slot,
             ),
             now,
         )
@@ -1785,6 +1912,12 @@ async def persist_token_record_async(
     elapsed_ms: int = 0,
     app: str = "",
     model_source: object = None,
+    service: str = "",
+    outcome: str = "",
+    ttft_ms: int = 0,
+    parent_slot: str = "",
+    request: str = "",
+    for_slot: str = "",
     emit_metric: bool = True,
 ) -> None:
     """Async variant: builds the record on-loop, offloads the file write.
@@ -1838,6 +1971,12 @@ async def persist_token_record_async(
             context_window=context_window,
             elapsed_ms=elapsed_ms,
             app=app,
+            service=service,
+            outcome=outcome,
+            ttft_ms=ttft_ms,
+            parent_slot=parent_slot,
+            request=request,
+            for_slot=for_slot,
         )
         # Before the offloaded write: a file-write failure must not cost the
         # latency sample, which needs nothing from disk.
@@ -1880,10 +2019,20 @@ def _emit_turn_histogram(
     case ``ok`` claims successes nobody observed, while labelling it ``unknown``
     puts it in ``telemetry._TERMINAL_FAULT_OUTCOMES`` and invents a fault for
     every clean background turn.
+
+    A bare-usage turn whose writer OBSERVED a failure (USE-10: the row's
+    ``outcome`` is ``error`` / ``cancelled`` / ``timeout``, set from the exit
+    the writer saw) takes that label, so the row and the sample agree and
+    background faults reach ``fault_rate``. A writer's ``ok`` for a bare usage
+    stays ``unclassified``: a drive that returned did not report a stop reason.
     """
     _MISSING = object()
     stop = getattr(event, "stop_reason", _MISSING)
-    outcome = OUTCOME_UNCLASSIFIED if stop is _MISSING else turn_outcome(stop)  # type: ignore[arg-type]  # noqa: E501
+    if stop is _MISSING:
+        _row_outcome = str(record.get("outcome") or "")
+        outcome = _row_outcome if _row_outcome in _OBSERVED_FAULT_OUTCOMES else OUTCOME_UNCLASSIFIED
+    else:
+        outcome = turn_outcome(stop)  # type: ignore[arg-type]
     model = str(record.get("model") or "")
     provider = str(record.get("provider") or "")
     emit_turn_duration(

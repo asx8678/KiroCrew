@@ -597,14 +597,14 @@ def lane_model(config: Any | None = None, *, lane: str) -> str:
     return str(getattr(provider, "model", "") or _DEFAULT_MODEL)
 
 
-def _oracle(lane: str, provider: Any, model: str = "") -> Any:
+def _oracle(lane: str, provider: Any, model: str = "", point: str = "") -> Any:
     """The implementation *lane* names, imported at call time.
 
     Function-local imports for the reason every import in this module is: the
     package is reached from hot paths, and neither ``aiohttp`` (the Jev lane) nor
     the session layer (the LLM lane) belongs on their import graph. Each lane also
     pays only its own dependency, so a machine using the LLM lane never imports
-    ``aiohttp`` for a decision.
+    ``aiohttp`` for a decision. *point* names the LLM lane's usage row only.
     """
     if lane == LANE_LLM:
         from kiro_crew.decisions.impl_llm import JUDGE_MODEL_DEFAULT, LlmOracle
@@ -613,7 +613,7 @@ def _oracle(lane: str, provider: Any, model: str = "") -> Any:
         # and the log will record. Passing it is what makes the picker mean
         # anything: without it the call inherits whatever the boot-time runner
         # captured. The inherit sentinel is not a model to ask for.
-        return LlmOracle(model="" if model == JUDGE_MODEL_DEFAULT else model)
+        return LlmOracle(model="" if model == JUDGE_MODEL_DEFAULT else model, point=point)
     from kiro_crew.decisions.impl_jev import JevOracle
 
     return JevOracle(provider)
@@ -1057,7 +1057,7 @@ async def decide(
     started = time.monotonic()
     try:
         answers = await asyncio.wait_for(
-            _oracle(lane, provider, model).ask(state, questions), timeout=budget
+            _oracle(lane, provider, model, point).ask(state, questions), timeout=budget
         )
     except asyncio.TimeoutError:
         # Named apart from the generic branch: "timeout" is the one failure an

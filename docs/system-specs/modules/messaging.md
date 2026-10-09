@@ -202,8 +202,14 @@ before dispatch bills nothing and writes nothing. Slack transport passes `slack`
 Telegram `telegram`, the generic dispatcher `telemetry_channel_of(session_key)`
 (`discord`, …) for an ordinary turn and `monitor` for a monitor wake. The Slack
 gateway's monitor nudge passes NO surface: it persists its own row through
-`_persist_turn_row`, success and timeout twins included, and a label there would
-write a second one.
+`_persist_turn_row` on every exit after dispatch (success, timeout, error, cancel,
+and the structured wake's unaccepted-completion return), and a label there would
+write a second one. `usage_service=` names the row's `service` (the specific job
+beneath the surface label); a caller that reaches the driver only through a
+dispatcher sets it with `messaging.driver.usage_service_scope(name)`, which the
+FIRST metered `run()` in scope spends — the gateway's DM nudge files its turn as
+`autonudge:<loop id>` / `monitor:<loop id>` that way without a queue drain later in
+the span inheriting the name.
 
 The dashboard does **not** flow through `TurnDriver`; it remains unchanged as the authoritative transcript surface. Direct channel paths that bypass the driver are sanitized at source: Discord's explicit five-message resume replay strips legacy steering frames and summary-bearing compaction notices, shortens each entry to the shared splitter's first (sealed) chunk so a replayed code block cannot arrive with its fence cut in half, and puts the role icon on its own line so the body's first line still starts where the fence grammar needs it; direct compact commands publish only terse receipts. Stored transcripts remain intact for audit.
 

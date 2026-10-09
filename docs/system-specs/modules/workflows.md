@@ -1156,7 +1156,8 @@ never spawns `kiro-cli` in tests. Two production adapters:
   through `redact_credentials` and `redact_exfiltration_urls` before it can reach a
   run record, history, or parent chat. The per-turn usage row (`surface="workflow"`,
   filed under the stage's key, the step's agent as the fallback attribution) is
-  written by `stream_and_collect(..., usage_surface="workflow")` itself, so a stage
+  written by `stream_and_collect(..., usage_surface="workflow")` itself, named
+  `service` `workflow:<run name>` (the run id when it has none), so a stage
   that raises or is cancelled still records what it spent (USE-1); the context
   read is guarded on its own inside `record_turn_usage`, so an enrichment failure
   cannot drop the row. The pooled path below writes the same row from
