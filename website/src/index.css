@@ -469,6 +469,30 @@ html:lang(ko) {
   --term-magenta:#c678dd;
   --term-cyan:#56b6c2;
 }
+/* Usage page categories (chat, channels, background, subagents, workflows,
+   apps). Polarity-fixed rather than themable: a category's colour is an identity
+   the reader learns once, and it must stay the same hue in every theme. The two
+   columns are the same six hues stepped for each polarity, in an order validated
+   for colour-blind separation of ADJACENT pairs (the stacked columns and the
+   ranked lists only ever put neighbours side by side) against every built-in
+   theme's --card. Three light steps sit under 3:1 on white, so every chart that
+   uses them also prints its values as text and offers a table view. */
+:root{
+  --usage-cat-chat:#3987e5;
+  --usage-cat-channels:#d95926;
+  --usage-cat-background:#199e70;
+  --usage-cat-subagents:#c98500;
+  --usage-cat-workflows:#d55181;
+  --usage-cat-apps:#008300;
+}
+[data-mode="light"]{
+  --usage-cat-chat:#2a78d6;
+  --usage-cat-channels:#eb6834;
+  --usage-cat-background:#1baf7a;
+  --usage-cat-subagents:#eda100;
+  --usage-cat-workflows:#e87ba4;
+  --usage-cat-apps:#008300;
+}
 /* Stronger shadows for some dark themes */
 [data-theme="monokai-dark"],[data-theme="solarized-dark"],[data-theme="nord-dark"],[data-theme="dracula-dark"],[data-theme="rosepine-dark"],[data-theme="catppuccin-dark"],[data-theme="tokyonight-dark"],[data-theme="gruvbox-dark"],[data-theme="ice-dark"]{
   --shadow-sm:0 1px 2px rgba(0,0,0,.3);

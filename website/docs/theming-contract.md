@@ -109,10 +109,14 @@ rises. The hue modifiers `glass-accent` / `glass-warn` / `glass-danger` /
 readout capsule, a hovered pane, a receding row) mix into `--glass-tint-step` on
 the host, so they land on the pane's own thickness and follow the polarity too.
 And
-the `--tile-*` set behind the Settings section icons. They are fixed on purpose —
+the `--tile-*` set behind the Settings section icons, and the `--usage-cat-*` set
+behind the Usage page's six spend categories. They are fixed on purpose —
 the glass must read as a lit pane on any light palette and as smoked glass on any
-dark one, and a section's tile is an identity mark that must look the same in
-every theme — the same reasoning as the neutral `glass-shadow` rest shadow. Adding one
+dark one, and a section's tile or a spend category's colour is an identity mark
+that must look the same in every theme — the same reasoning as the neutral
+`glass-shadow` rest shadow. The `--usage-cat-*` order was validated for
+colour-blind separation of adjacent pairs against every built-in theme's `--card`;
+reorder it only after re-running that check. Adding one
 of these takes a `:root` line plus a `[data-mode="light"]` line and no allowlist
 work; adding a color a pack should be able to change takes the role path below.
 

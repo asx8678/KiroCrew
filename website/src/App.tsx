@@ -175,6 +175,7 @@ const SettingsPage = lazyPage(() => import('./pages/SettingsPage'))
 const EmbedSettingsPage = lazyPage(() => import('./pages/EmbedSettingsPage'))
 const DeveloperPage = lazyPage(() => import('./pages/DeveloperPage'))
 const SchedulePage = lazyPage(() => import('./pages/SchedulePage'))
+const UsagePage = lazyPage(() => import('./pages/UsagePage'))
 const AppPage = lazyPage(() => import('./pages/AppPage'))
 const AppDetailPage = lazyPage(() => import('./pages/AppDetailPage'))
 const MigrationPage = lazyPage(() => import('./pages/MigrationPage'))
@@ -2693,6 +2694,7 @@ export default function App() {
             <Route path="/overview" element={<Navigate to="/settings/overview" replace />} />
             <Route path="/crew-board" element={<ErrorBoundary><Suspense fallback={null}><CrewBoardPage /></Suspense></ErrorBoundary>} />
             <Route path="/schedule" element={<SchedulePage />} />
+            <Route path="/usage" element={<UsagePage />} />
             {/* Agents and Connections live in the Agent Capabilities panel. */}
             <Route path="/agents" element={<Navigate to="/capabilities" replace />} />
             <Route path="/mc-agents" element={<Navigate to="/capabilities" replace />} />

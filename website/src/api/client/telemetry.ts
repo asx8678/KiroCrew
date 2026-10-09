@@ -29,6 +29,214 @@ export type WakaTimeStats = {
   }
 }
 
+/** The Usage page's spend categories, in display order (`credit_report.CATEGORIES`). */
+export type UsageCategory = 'chat' | 'channels' | 'background' | 'subagents' | 'workflows' | 'apps'
+
+/** Running totals for one breakdown key of the credit summary. */
+export type UsageFigures = {
+  credits: number
+  turns: number
+  avg_credits: number
+  faults: number
+  p50_duration_ms: number | null
+  last_ts: number | null
+}
+
+/** One bucket of a distribution: `[lo, hi)`; `hi` is null for the open top bucket. */
+export type UsageBucket = { lo: number; hi: number | null; count: number }
+
+export type UsageSessionRow = {
+  slot: string
+  title: string | null
+  category: UsageCategory
+  channel: string
+  credits: number
+  own_credits: number
+  subagent_credits: number
+  background_credits: number
+  turns: number
+  subagent_turns: number
+  background_turns: number
+  models: string[]
+  first_ts: number
+  last_ts: number
+  peak_context_pct: number | null
+}
+
+/** The account's own consumption against what the row store recorded. */
+export type UsageReconciliation = {
+  from_ts: number
+  to_ts: number
+  readings: number
+  account_credits: number
+  recorded_credits: number
+  unattributed_credits: number
+  series: { ts: number; account: number; recorded: number }[]
+}
+
+/** GET /api/usage/credits/summary — every figure counts every row, subagents included. */
+export type UsageCreditSummary = {
+  range: { from: string; to: string; days: number; granularity: 'hour' | 'day' | 'month' }
+  totals: {
+    credits: number
+    cost_usd: number
+    turns: number
+    sessions: number
+    models: number
+    avg_credits: number
+    p50_duration_ms: number | null
+    p90_duration_ms: number | null
+    p50_ttft_ms: number | null
+    p90_ttft_ms: number | null
+    faults: number
+    outcomes: Record<string, number>
+  }
+  prior: { from: string; to: string; credits: number; turns: number; delta_pct: number | null }
+  series: {
+    key: string
+    credits: number
+    turns: number
+    by_category: Partial<Record<UsageCategory, number>>
+    p50_duration_ms: number | null
+    p90_duration_ms: number | null
+  }[]
+  by_category: (UsageFigures & { category: UsageCategory })[]
+  by_service: (UsageFigures & { service: string; surface: string; category: UsageCategory })[]
+  by_model: (UsageFigures & { model: string })[]
+  by_hour: number[]
+  distributions: { duration_ms: UsageBucket[]; ttft_ms: UsageBucket[]; credits: UsageBucket[] }
+  sessions: UsageSessionRow[]
+  sessions_total: number
+  months: { month: string; credits: number; turns: number }[]
+  reconciliation: UsageReconciliation | null
+  /** Average credits per prompt by tool-call count and by context fill. */
+  drivers: {
+    tool_calls: UsageDriverBand[]
+    context_fill: UsageDriverBand[]
+    measured_turns: number
+  }
+  /** The range's most expensive prompts, each with its reasons. */
+  top_turns: UsageTurnRow[]
+  /** Background services' rhythm: runs, cost per run and per day, a 30-day pace. */
+  recurring: UsageRecurringRow[]
+  /** Tool kinds by calls; `credits` totals the prompts that used the kind. */
+  tools: { kind: string; calls: number; turns: number; credits: number }[]
+  /** The account's own credits per day across its recent readings. */
+  account_rate: { per_day: number; days: number; readings: number } | null
+}
+
+export type UsageDriverBand = { band: string; turns: number; credits: number; avg_credits: number }
+
+export type UsageRecurringRow = {
+  service: string
+  runs: number
+  active_days: number
+  runs_per_day: number
+  credits: number
+  credits_per_run: number
+  credits_per_day: number
+  projected_30d: number
+  faults: number
+  last_ts: number
+}
+
+/** A fact that made a turn heavier than a plain answer (never a share of its bill). */
+export type UsageReason = { code: string; value: number | string }
+
+/** One per-prompt row of GET /api/usage/credits/turns. */
+export type UsageTurnRow = {
+  ts: number
+  session: string
+  slot: string
+  parent: string | null
+  for_slot: string | null
+  share: 'own' | 'subagents' | 'background'
+  title?: string | null
+  category: UsageCategory
+  surface: string
+  service: string
+  request: string | null
+  model: string
+  rate_multiplier: number | null
+  agent: string
+  app: string
+  credits: number
+  cost_usd: number
+  duration_ms: number | null
+  ttft_ms: number | null
+  outcome: string | null
+  stop_reason: string | null
+  context_pct: number | null
+  context_tokens: number | null
+  tool_calls: number | null
+  tool_kinds: Record<string, number>
+  prompt_chars: number | null
+  output_chars: number | null
+  compactions: number | null
+  reasons: UsageReason[]
+}
+
+/** Exact-match filters for the per-prompt page; empty values are omitted. */
+export type UsageTurnsQuery = {
+  from: string
+  to: string
+  session?: string
+  service?: string
+  category?: string
+  model?: string
+  outcome?: string
+  reason?: string
+  before?: number
+  limit?: number
+}
+
+export type UsageTurnsPage = {
+  turns: UsageTurnRow[]
+  next_before: number | null
+  range: { from: string; to: string }
+}
+
+/**
+ * Fill the fields a gateway older than the page may not send (the cost-driver
+ * blocks, the per-turn activity and reasons), so a dashboard served by a gateway
+ * that has not restarted onto the new backend renders the older data instead of
+ * failing on an absent array.
+ */
+function normalizeTurnRow(row: Partial<UsageTurnRow>): UsageTurnRow {
+  return {
+    parent: null,
+    for_slot: null,
+    share: row.parent ? 'subagents' : 'own',
+    request: null,
+    rate_multiplier: null,
+    stop_reason: null,
+    context_tokens: null,
+    tool_calls: null,
+    prompt_chars: null,
+    output_chars: null,
+    compactions: null,
+    ...row,
+    tool_kinds: row.tool_kinds ?? {},
+    reasons: row.reasons ?? [],
+  } as UsageTurnRow
+}
+
+function normalizeSummary(summary: Partial<UsageCreditSummary>): UsageCreditSummary {
+  return {
+    ...summary,
+    sessions: (summary.sessions ?? []).map(s => ({
+      ...s,
+      background_credits: s.background_credits ?? 0,
+      background_turns: s.background_turns ?? 0,
+    })),
+    drivers: summary.drivers ?? { tool_calls: [], context_fill: [], measured_turns: 0 },
+    top_turns: (summary.top_turns ?? []).map(normalizeTurnRow),
+    recurring: summary.recurring ?? [],
+    tools: summary.tools ?? [],
+    account_rate: summary.account_rate ?? null,
+  } as UsageCreditSummary
+}
+
 export function createTelemetryEndpoints({ get, post, j }: ClientTransport) {
   const usageReadouts = {
     /** The five session folds of a crew log, keyed by name, in ONE request.
@@ -123,6 +331,24 @@ export function createTelemetryEndpoints({ get, post, j }: ClientTransport) {
      */
     sessionsUsageRefresh: () => post('/api/sessions/usage/refresh').then(j) as Promise<KiroUsageRefreshResponse>,
     providerUsage: () => fetch('/api/usage').then(j),
+    /** The Usage page's aggregate over the local days `[from, to]` (YYYY-MM-DD). */
+    usageCreditsSummary: (from: string, to: string) =>
+      fetch(`/api/usage/credits/summary?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`)
+        .then(j)
+        .then(body => normalizeSummary(body as Partial<UsageCreditSummary>)),
+    /** One page of per-prompt rows, newest first; pass `next_before` back as `before`. */
+    usageCreditsTurns: (query: UsageTurnsQuery) => {
+      const params = new URLSearchParams()
+      for (const [key, value] of Object.entries(query)) {
+        if (value !== undefined && value !== '') params.set(key, String(value))
+      }
+      return fetch('/api/usage/credits/turns?' + params.toString())
+        .then(j)
+        .then(body => {
+          const page = body as UsageTurnsPage
+          return { ...page, turns: (page.turns ?? []).map(normalizeTurnRow) }
+        })
+    },
   }
 
   const kiroUsage = {

@@ -5,7 +5,7 @@
  * at a time, a right body shows a large live graph plus that resource's numbers.
  * No process/session table — that belongs to Sessions.
  */
-import { type CSSProperties, type MutableRefObject, useCallback, useEffect, useRef, useState } from 'react'
+import { type MutableRefObject, useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
 import { ChevronRight } from 'lucide-react'
@@ -17,6 +17,7 @@ import { isMetricNumber, metricNumber } from '../../utils/metrics'
 import type { SessionStorageReport, SystemData } from '../../types'
 import type { PlaneState } from '../SystemPage'
 import SessionStorageScreen from './SessionStorageScreen'
+import { areaStyle, strokeStyle, vertices } from '../../components/charts/clipPath'
 
 type Resource = 'cpu' | 'memory' | 'disk' | 'network'
 
@@ -294,57 +295,6 @@ function StorageEntryRow({ onOpen }: { onOpen: () => void }) {
 }
 
 /* ── Mini sparkline for the left rail tiles ── */
-
-/* ── Traces are CSS clip-path polygons, NOT inline SVG ──────────────────────
- * `use-lucide-icons` in code-review.yml is a BLOCKING gate that greps ADDED
- * lines for an inline svg tag carrying a viewBox attribute, exempting only
- * brand assets (KiroGhost, *Logo, *Ghost). An SVG polyline here fails CI, so
- * the trace is drawn by clipping a filled div. Coordinates are percentages,
- * which is what lets these scale with the container without measuring it.
- *
- * Do not spell that tag-and-attribute pair out on one line anywhere in this
- * file, comments included: the gate is a plain grep and cannot tell prose
- * about the rule from a violation of it. */
-
-/** Vertices as `x% y%` pairs across a 0–100 box; y is inverted for screen space. */
-function vertices(values: number[], max: number): { x: number; y: number }[] {
-  const lastX = values.length - 1
-  return values.map((v, i) => ({
-    x: lastX === 0 ? 0 : (i / lastX) * 100,
-    y: 100 - Math.min(100, (v / max) * 100),
-  }))
-}
-
-/** Filled region under the trace.
- *
- * Returns the style OBJECT, not a bare clip-path string. Two reasons, and the
- * second is load-bearing: a bare string can be dropped into any attribute, and
- * the `unitLiterals` gate recognises CSS context by the shape of the code —
- * "an object property whose key is a CSS property". Building `${n}%` inside a
- * function that returns a plain string reads to that gate as user-visible copy
- * that should have gone through `fmtPercent`, and it fails the build. Naming
- * `clipPath` here is what makes the CSS intent visible at the construction
- * site instead of only at the call site. */
-function areaStyle(pts: { x: number; y: number }[]): CSSProperties {
-  const closed = [{ x: 0, y: 100 }, ...pts, { x: 100, y: 100 }]
-  return {
-    clipPath: `polygon(${closed.map(p => `${p.x.toFixed(2)}% ${p.y.toFixed(2)}%`).join(', ')})`,
-  }
-}
-
-/**
- * The trace itself, as a band of constant PIXEL thickness: forward along the
- * top edge, back along the bottom. `calc(y% ± half)` is what keeps the line the
- * same weight in a 16px rail and a 240px graph — a purely percentage-based band
- * would grow with the container, which is the same distortion an SVG stroke
- * suffers under `preserveAspectRatio: none`.
- */
-function strokeStyle(pts: { x: number; y: number }[], weightPx: number): CSSProperties {
-  const half = (weightPx / 2).toFixed(2)
-  const fwd = pts.map(p => `${p.x.toFixed(2)}% calc(${p.y.toFixed(2)}% - ${half}px)`)
-  const back = [...pts].reverse().map(p => `${p.x.toFixed(2)}% calc(${p.y.toFixed(2)}% + ${half}px)`)
-  return { clipPath: `polygon(${[...fwd, ...back].join(', ')})` }
-}
 
 function MiniSparkline({ history, resource }: { history: HistoryPoint[]; resource: Resource }) {
   if (history.length < 2) return null

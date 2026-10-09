@@ -7,7 +7,7 @@
  * Order in this file = order in the rail (within each group). Add new
  * built-in surfaces here; do not add hardcoded badge logic to `App.tsx`.
  */
-import { MessageSquare, Bell, Component, CalendarDays, Settings, ClipboardCheck, Compass, Webhook, BookOpen, Link2, Library, MessageSquareText, Workflow, ScrollText, Bot } from 'lucide-react'
+import { MessageSquare, Bell, Component, CalendarDays, ChartColumnBig, Settings, ClipboardCheck, Compass, Webhook, BookOpen, Link2, Library, MessageSquareText, Workflow, ScrollText, Bot } from 'lucide-react'
 import type { ReactElement } from 'react'
 import { createSelector } from '@reduxjs/toolkit'
 import { KiroGhostMark } from '../components/KiroGhostMark'
@@ -124,6 +124,17 @@ registerBuiltinSurface({
   labelKey: 'nav.schedule',
   icon: <CalendarDays size={16} />,
   group: 'Main',
+})
+
+// Kiro credit usage: what every prompt, session, background service and month
+// cost, read from the per-turn usage row store (GET /api/usage/credits/*).
+registerBuiltinSurface({
+  navId: 'usage',
+  route: '/usage',
+  label: surfaceMachineValue('Usage'),
+  labelKey: 'nav.usage',
+  icon: <ChartColumnBig size={16} />,
+  group: surfaceMachineValue('Main'),
 })
 
 // Inbound webhooks: token store, registered contexts, and run history for
