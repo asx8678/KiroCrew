@@ -2427,12 +2427,48 @@ ARTIFACT_GET_SCHEMA = ToolSchema(
     ],
 )
 
+#: Most ``{old, new}`` pairs one artifact_update ``edits`` list may carry
+#: (mirrors ``artifacts.MAX_EDITS_PER_CALL``, which the store enforces too).
+ARTIFACT_EDITS_MAX = 50
+
+
+def _validate_artifact_update(cleaned: dict) -> None:
+    """artifact_save's checks, plus the shape of an exact-match ``edits`` list (TOOL-6)."""
+    _validate_artifact_save(cleaned)
+    edits = cleaned.get("edits")
+    if edits is None:
+        return
+    if cleaned.get("content") is not None:
+        raise ValidationError("edits", "send content (full rewrite) or edits, not both")
+    if not edits:
+        raise ValidationError("edits", "must not be empty")
+    cleaned_edits = []
+    for i, edit in enumerate(edits):
+        if not isinstance(edit, dict) or set(edit) != {"old", "new"}:
+            raise ValidationError("edits", f"item {i} must be an object with exactly old and new")
+        old, new = edit["old"], edit["new"]
+        if not isinstance(old, str) or not old or not isinstance(new, str):
+            raise ValidationError(
+                "edits", f"item {i}: old must be a non-empty string, new a string"
+            )
+        if len(old) > ARTIFACT_CONTENT_MAX or len(new) > ARTIFACT_CONTENT_MAX:
+            raise ValidationError("edits", f"item {i} exceeds {ARTIFACT_CONTENT_MAX} chars")
+        # ``new`` is written into the artifact, so it gets the hidden-character
+        # pass ``content`` gets -- but not sanitize_string's edge trim, which
+        # would break an edit whose whitespace is the point. ``old`` is matched
+        # against stored text verbatim.
+        new = strip_hidden_unicode(normalize_unicode("".join(_drop_hidden_except_marks(new))))
+        cleaned_edits.append({"old": old, "new": new})
+    cleaned["edits"] = cleaned_edits
+
+
 ARTIFACT_UPDATE_SCHEMA = ToolSchema(
-    custom_validator=_validate_artifact_save,
+    custom_validator=_validate_artifact_update,
     tool_name="artifact_update",
     fields=[
         FieldSpec("slug", str, required=True, max_len=80, pattern=_ARTIFACT_SLUG_RE),
         FieldSpec("content", str, max_len=ARTIFACT_CONTENT_MAX),
+        FieldSpec("edits", list, item_type=dict, max_items=ARTIFACT_EDITS_MAX),
         FieldSpec("name", str, max_len=200),
         FieldSpec("description", str, max_len=2_000),
         FieldSpec(

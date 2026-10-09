@@ -1735,6 +1735,14 @@ async def api_artifact_update(request: web.Request) -> web.Response:
             snapshot = is_mcp  # MCP defaults to True; dashboard defaults to False.
         else:
             snapshot = bool(raw_snapshot)
+        # TOOL-6: ``edits`` is the exact-match alternative to ``content``. The
+        # store applies it under its own lock against the current content, and
+        # it always records a version -- an edit is an iteration, never a
+        # silent save. A 0- or multi-match ``old`` raises
+        # ArtifactValidationError, answered 400 below with nothing written.
+        raw_edits = body.get("edits")
+        if raw_edits is not None:
+            snapshot = True
         merr = _validate_inbound_webapp_metadata(body)
         if merr:
             _audit(tool="artifact_update", request=request, outcome="denied", error=merr)
@@ -1799,6 +1807,7 @@ async def api_artifact_update(request: web.Request) -> web.Response:
                 event_type=event_type,
                 from_version=from_version,
                 snapshot=snapshot,
+                edits=raw_edits,
             )
         )
         # store.update() only loads content into the returned Artifact when
@@ -1884,7 +1893,9 @@ async def api_artifact_update(request: web.Request) -> web.Response:
     # rollback even when the body carries no content field). Metadata-only
     # updates (rename / retag / description / folder) don't move content, so
     # open views have nothing to re-render.
-    content_changed = body.get("content") is not None or event_type == "reverted"
+    content_changed = (
+        body.get("content") is not None or raw_edits is not None or event_type == "reverted"
+    )
     if content_changed:
         _notify_artifact_update(state, art.slug, art.version)
     # Auto-sync egress: a snapshot that bumped the version on an artifact
@@ -1910,8 +1921,14 @@ async def api_artifact_update(request: web.Request) -> web.Response:
     # body IS the persisted content -- and scanning the body (not
     # ``art.content``) keeps metadata-only updates (rename/retag) from
     # warning about pre-existing content they didn't touch.
+    # An exact-match edit carries no body content; lint only the text it wrote.
+    edited_content = (
+        "\n".join(e.get("new", "") for e in raw_edits if isinstance(e, dict))
+        if isinstance(raw_edits, list)
+        else ""
+    )
     payload["theme_contrast_warning"] = has_unthemed_hardcoded_colors(
-        art.kind, body.get("content") or ""
+        art.kind, body.get("content") or edited_content
     )
     return _json_response(payload)
 

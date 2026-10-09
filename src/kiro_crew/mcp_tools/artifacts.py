@@ -147,7 +147,7 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Characters of content to return (max 40000). A larger artifact read without paging returns its first page and says how to get the next.",
+                        "description": "Characters of content to return (max 40000). Over 40000 chars, an unpaged read returns the first page; total_chars/has_more say what is left.",
                     },
                 },
                 "required": ["slug"],
@@ -156,11 +156,10 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "artifact_update",
             "description": (
-                "Update an artifact's live state. Each agent edit "
-                "automatically creates a new version (like a git commit) — "
-                "the user can revert to any prior agent iteration via "
-                "artifact_revert. Use after artifact_get when iterating "
-                "on an existing artifact at the user's request."
+                "Update an artifact's live state; each content change is a new "
+                "revertable version. For a small change send `edits` (exact-match "
+                "replacements, one version, refused with nothing written if any "
+                "`old` matches 0 or 2+ times); send `content` only for a full rewrite."
             ),
             "inputSchema": {
                 "type": "object",
@@ -171,10 +170,17 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "content": {
                         "type": "string",
-                        "description": (
-                            "New content. Each call records a new version "
-                            "automatically when invoked via MCP."
-                        ),
+                        "description": "Whole new content (full rewrite). Not with edits.",
+                    },
+                    "edits": {
+                        "type": "array",
+                        "description": "Ordered {old, new} replacements; each old must match exactly once.",
+                        "items": {
+                            "type": "object",
+                            "properties": {"old": {"type": "string"}, "new": {"type": "string"}},
+                            "required": ["old", "new"],
+                            "additionalProperties": False,
+                        },
                     },
                     "name": {
                         "type": "string",
@@ -631,17 +637,19 @@ def artifact_get(name: str, args: dict[str, Any]) -> str:
     # TOOL-6: page the content so a large artifact is never cut in the middle by
     # the transport, which a later full rewrite would then write back.
     total = len(content)
-    offset = int(args.get("offset") or 0)
+    offset = min(int(args.get("offset") or 0), total)
     limit = int(args.get("limit") or _ARTIFACT_PAGE_CHARS)
     page_note = ""
+    has_more = False
     if offset or args.get("limit") or total > _ARTIFACT_PAGE_CHARS:
         end = min(total, offset + limit)
         content = content[offset:end]
-        if end < total:
+        has_more = end < total
+        if has_more:
             page_note = (
                 f"\n--- content chars {offset}-{end} of {total}; more follows: call "
-                f"artifact_get(slug, offset={end}) for the next page. Edit with "
-                "artifact_update only once you hold the whole content. ---"
+                f"artifact_get(slug, offset={end}) for the next page. For a small change "
+                "use artifact_update(slug, edits=[{old, new}]) instead of a full rewrite. ---"
             )
         else:
             page_note = f"\n--- content chars {offset}-{end} of {total}; end of content ---"
@@ -651,6 +659,8 @@ def artifact_get(name: str, args: dict[str, Any]) -> str:
         f"kind: {d.get('kind', '?')}",
         f"version: {d.get('version', '?')}",
         f"updated_at: {d.get('updated_at', '?')}",
+        f"total_chars: {total}",
+        f"has_more: {'true' if has_more else 'false'}",
     ]
     if d.get("description"):
         meta_lines.append(f"description: {d['description']}")
@@ -678,9 +688,12 @@ def artifact_update(name: str, args: dict[str, Any]) -> str:
     slug = args["slug"]
     update_body = {k: v for k, v in args.items() if k != "slug" and v is not None}
     if not update_body:
-        return "Error: nothing to update (provide content/name/description/tags)"
+        return "Error: nothing to update (provide content/edits/name/description/tags)"
     content = update_body.get("content")
-    if isinstance(content, str) and TRUNCATION_MARKER_PREFIX in content:
+    # An edit's ``new`` is written into the artifact just as ``content`` is.
+    edits = update_body.get("edits") or []
+    written = [content] + [e.get("new") for e in edits if isinstance(e, dict)]
+    if any(isinstance(w, str) and TRUNCATION_MARKER_PREFIX in w for w in written):
         # TOOL-6: this text passed through a tool result that was cut in the
         # middle; writing it back would replace the artifact's real middle
         # with the cut note.

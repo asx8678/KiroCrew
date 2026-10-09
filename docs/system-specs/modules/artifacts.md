@@ -12,8 +12,9 @@ A typical flow:
    as an unpinned artifact under `~/.kiro/crew/artifacts/<slug>/current.html`
 3. Days later, in a fresh session, the user asks to iterate on that stable slug
    and add an age column
-4. Agent calls `artifact_get("<slug>")` to read the current HTML, modifies it,
-   then calls `artifact_update("<slug>", content=…)` to publish a new version
+4. Agent calls `artifact_get("<slug>")` to read the current HTML, then calls
+   `artifact_update("<slug>", edits=[{old, new}])` to publish the change as a new
+   version (`content=…` is the full-rewrite form)
 5. The previous version is preserved under `versions/v1.html` for rollback
 
 The dashboard provides a `/artifacts` library page for browse/search and a
@@ -473,8 +474,8 @@ doc stored as `widget` renders as raw inner HTML).
 | Tool | Purpose |
 |---|---|
 | `artifact_save` | Create a new artifact, returns slug; optional `folder` (id or `/`-separated human path, mkdir -p) files it in one call |
-| `artifact_get` | Read content + metadata (optionally a specific version). Content pages by `offset`/`limit` (chars, at most 40,000 per page); content over 40,000 chars read without paging returns its first page and a line naming the next `offset`, so a large artifact is never cut in the middle by the 48 KiB transport cap (TOOL-6) |
-| `artifact_update` | Modify content/name/description/tags; bumps version on content change. Refuses content containing the transport's truncation note (`tool_result_cap.TRUNCATION_MARKER_PREFIX`): such text is a cut copy, and writing it back would replace the artifact's middle with the note (TOOL-6). An `artifact_edit` that applies exact-match edits as one version is the open follow-up: the store has no locked read-modify-write to build it on |
+| `artifact_get` | Read content + metadata (optionally a specific version). Content pages by `offset`/`limit` (chars, at most 40,000 per page; an `offset` past the end is clamped to it); every read reports `total_chars` and `has_more` in its metadata lines; content over 40,000 chars read without paging returns its first page and a line naming the next `offset`, so a large artifact is never cut in the middle by the 48 KiB transport cap (TOOL-6). Offsets index the REDACTED content the tool returns |
+| `artifact_update` | Modify content/name/description/tags; bumps version on content change. Refuses content containing the transport's truncation note (`tool_result_cap.TRUNCATION_MARKER_PREFIX`): such text is a cut copy, and writing it back would replace the artifact's middle with the note (TOOL-6). `edits=[{old, new}]` (TOOL-6, at most 50; exclusive with `content`) is the targeted form, and it is a field of this tool rather than a verb of its own so the default tool payload does not grow (TOOL-2). The same `PATCH /api/artifacts/<slug>` carries it; `ArtifactStore.update(edits=…)` reads the current content and applies the list UNDER the store lock (`apply_exact_edits`): edits apply in order, each `old` must occur exactly once (overlapping occurrences count) in the text as the earlier edits left it, and the result is ONE snapshot version. Any `old` matching zero or several times, an empty or no-op result, or an image artifact is an `ArtifactValidationError` (400) raised before any write, so no version is created. A file-backed live pointer is edited against the live file, and refused when that read fails (dead pointer) or reaches `MAX_CONTENT_BYTES` (the bounded read may be a prefix; mirroring it back would truncate the file). `old` is matched verbatim; `new` gets the hidden-character pass `content` gets, without the edge trim. A span the read redacted cannot be matched, so an edit there is refused rather than written. Each `new` is held to the truncation-note refusal too |
 | `artifact_list` | List artifacts (filter by `tag`, `kind`, name `q`) |
 | `artifact_versions` | List version numbers for a slug |
 | `artifact_revert` | Revert the live state to a prior version; writes that version's content as a fresh snapshot tagged `reverted`, so the activity timeline shows the rollback |
@@ -1278,6 +1279,8 @@ it as `versions/v1.html`. `update(slug, content=…, snapshot=False)` updates th
 live state without adding a numbered version; `snapshot=True` also increments
 `version` and writes `versions/v{N}.html`. The MCP `artifact_update` path defaults
 to snapshots, while dashboard Save does not unless it sends `snapshot: true`.
+`update(slug, edits=[{old, new}])` is the exact-match form of a content write
+(see the `artifact_update` row); a PATCH carrying `edits` always snapshots.
 Older versions remain untouched until the prune cap is reached, so any retained
 version can be read via `get(slug, version=N)` or restored as a fresh snapshot by
 `artifact_revert`.

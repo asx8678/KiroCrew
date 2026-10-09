@@ -285,6 +285,46 @@ def _validate_content(content: str) -> str:
     return content
 
 
+#: Most exact-match replacements one edit call may carry (TOOL-6).
+MAX_EDITS_PER_CALL = 50
+
+
+def apply_exact_edits(text: str, edits: Any) -> str:
+    """Apply ``[{old, new}, ...]`` to ``text`` in order and return the result (TOOL-6).
+
+    Each ``old`` must occur EXACTLY once in the text as it stands after the
+    edits before it (overlapping occurrences count), so an edit never lands on
+    an ambiguous or vanished span. Any refusal raises before the caller writes
+    anything, so a bad edit list changes nothing.
+    """
+    if not isinstance(edits, list) or not edits:
+        raise ArtifactValidationError("edits must be a non-empty list of {old, new}")
+    if len(edits) > MAX_EDITS_PER_CALL:
+        raise ArtifactValidationError(f"at most {MAX_EDITS_PER_CALL} edits per call")
+    out = text
+    for i, edit in enumerate(edits):
+        if not isinstance(edit, dict) or set(edit) != {"old", "new"}:
+            raise ArtifactValidationError(f"edits[{i}] must be an object with exactly old and new")
+        old, new = edit["old"], edit["new"]
+        if not isinstance(old, str) or not isinstance(new, str) or not old:
+            raise ArtifactValidationError(
+                f"edits[{i}]: old must be a non-empty string, new a string"
+            )
+        first = out.find(old)
+        if first < 0:
+            raise ArtifactValidationError(
+                f"edits[{i}]: old text not found (re-read with artifact_get; it must match exactly)"
+            )
+        if out.find(old, first + 1) >= 0:
+            raise ArtifactValidationError(
+                f"edits[{i}]: old text matches more than once; include more surrounding text"
+            )
+        out = out[:first] + new + out[first + len(old) :]
+    if out == text:
+        raise ArtifactValidationError("edits leave the content unchanged")
+    return out
+
+
 def slug_is_well_formed(slug: str) -> bool:
     """Whether this string could name an artifact, said without asking whether one exists.
 
@@ -989,6 +1029,32 @@ class ArtifactStore:
             logger.warning("failed to write source_path %r: %s", source_path, exc)
             return False
 
+    def _current_text_for_edit_locked(self, art: Artifact) -> str:
+        """The live content an exact-match edit applies to. Caller holds ``self._lock``.
+
+        Reads the same source :meth:`get` serves as current, but REFUSES where
+        writing an edited copy back would lose data: a live-pointer read that hit
+        ``MAX_CONTENT_BYTES`` is a prefix (mirroring it back truncates the user's
+        file, the hazard ``snapshot_derived`` guards in :meth:`update`), and a
+        dead pointer's fallback snapshot is not what the file holds.
+        """
+        if art.kind == "image":
+            raise ArtifactValidationError("image artifacts have no text to edit")
+        if art.source_path and not art.source_copy_only:
+            live = self._try_read_source_path(art.source_path, art.source_root)
+            if live is None:
+                raise ArtifactValidationError(
+                    "the artifact's source file is unreadable; edit it with a full "
+                    "content update instead"
+                )
+            if len(live.encode("utf-8")) >= MAX_CONTENT_BYTES:
+                raise ArtifactValidationError(
+                    "the artifact's source file is at the size cap, so its read may be "
+                    f"cut; edit the file itself ({art.source_path})"
+                )
+            return live
+        return self._read_text(self._artifact_dir(art.slug) / "current.html")
+
     def update(
         self,
         slug: str,
@@ -1004,6 +1070,7 @@ class ArtifactStore:
         event_type: str | None = None,
         from_version: int | None = None,
         snapshot: bool = False,
+        edits: list[dict[str, str]] | None = None,
     ) -> Artifact:
         """Update an artifact in place. Content writes always update the live
         state (source_path on disk for file-backed artifacts, current.html
@@ -1023,10 +1090,19 @@ class ArtifactStore:
         ``user``. Must be in :data:`ALLOWED_EVENT_TYPES` if provided.
         ``from_version`` is recorded on ``reverted`` events so the timeline
         can show "Reverted to vN".
+
+        ``edits`` (TOOL-6) is the exact-match alternative to ``content``: the
+        current content is read and edited UNDER this call's lock (see
+        :func:`apply_exact_edits`), so a concurrent write cannot slip between
+        the read and the write, and a refused edit list writes nothing.
         """
         slug = _validate_slug(slug)
         with self._lock:
             art = self._load_meta(slug)
+            if edits is not None:
+                if content is not None:
+                    raise ArtifactValidationError("pass content or edits, not both")
+                content = apply_exact_edits(self._current_text_for_edit_locked(art), edits)
             changed_content = False
             # True when this call READ art.content off source_path (snapshot path),
             # which makes writing it back unsafe -- see the snapshot branch below.

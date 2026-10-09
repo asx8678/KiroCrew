@@ -116,8 +116,8 @@ about style when the user delegated that choice.
 | Tool | Purpose |
 |---|---|
 | `artifact_save` | Create a new artifact, returns slug |
-| `artifact_get` | Load content + metadata (optional version) |
-| `artifact_update` | Modify content/metadata; bumps version on content change |
+| `artifact_get` | Load content + metadata (optional version); pages large content by `offset`/`limit`, reporting `total_chars` / `has_more` |
+| `artifact_update` | `edits=[{old, new}]` for a targeted change, `content` for a full rewrite, or metadata; bumps version on content change |
 | `artifact_revert` | Restore a prior version as the new live state, snapshotting the rollback |
 | `artifact_list` | Filter by `tag`, `kind`, `q` (name substring) |
 | `artifact_versions` | List version numbers for a slug |
@@ -229,11 +229,20 @@ sessions in sync without agent action.
 The user says "iterate on artifact <slug> — change X". Flow:
 
 1. `artifact_get(slug)` → read current.html. A large artifact comes back in
-   pages: keep calling with the `offset` it names until it says end of content,
-   and edit only once you hold the whole text
-2. Modify the HTML to address the change
-3. `artifact_update(slug, content=new_html)` → version bumps to vN+1
-4. Re-emit the same widget body in chat (so the user sees the result inline)
+   pages (`total_chars`, `has_more`): read on with the `offset` it names until
+   you have the part you are changing
+2. `artifact_update(slug, edits=[{"old": "<exact current text>", "new": "<replacement>"}])`
+   → version bumps to vN+1. Each `old` must match the current content exactly
+   once (copy enough surrounding text to make it unique); edits apply in order
+   and land as ONE version. If any `old` matches zero or several times the
+   whole call is refused and nothing is written — re-read and retry.
+   Use `artifact_update(slug, content=new_html)` only for a full rewrite, and
+   only once you hold the whole content
+3. Re-emit the widget in chat (so the user sees the result inline) with the
+   slug-bearing tag the result gives you. An inline `<mcwidget>` renders the body
+   you write, not the stored one, so re-emit only a body you hold whole; after an
+   `edits` call on content you only partly read, link the artifact instead (open
+   side panels already show the saved change)
 
 ### Companion chat sessions
 
@@ -347,7 +356,8 @@ way.
 
 ## Versioning rules
 
-- `artifact_update(slug, content=X)` ALWAYS bumps the version when content changes.
+- `artifact_update(slug, content=X)` or `artifact_update(slug, edits=[...])`
+  ALWAYS bumps the version when content changes.
 - Metadata-only updates (rename, retag, edit description) do NOT bump.
 - Old versions are preserved up to the 50-version cap; older ones get pruned.
 - The user can browse versions in the dashboard at `/artifacts/<slug>` (dropdown).
@@ -410,9 +420,9 @@ widget/html content carries hardcoded colors and no `var(--…)` reference.
 ```
 User: change the badge on artifact today-s-status to red.
 You: artifact_get("today-s-status")
-     [modify the badge]
-     artifact_update("today-s-status", content=new_html)
-     <mcwidget title="Today's status" slug="today-s-status">…new body…</mcwidget>
+     artifact_update("today-s-status",
+                     edits=[{"old": "badge--green", "new": "badge--red"}])
+     <mcwidget title="Today's status" slug="today-s-status">…whole edited body…</mcwidget>
 ```
 
 
