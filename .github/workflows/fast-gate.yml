@@ -565,6 +565,12 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      - name: Check every model call site writes its usage row
+        # USE-1: a stream_and_collect / stream_and_collect_json call that passes
+        # no usage_surface writes no usage row, so its spend never reaches the
+        # usage page and nothing goes red. Stdlib AST walk over src/kiro_crew,
+        # whole-tree (it exits 0 on main), so it runs before the install.
+        run: python3 scripts/check_usage_surface.py
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true

@@ -1872,7 +1872,13 @@ folder tools individually.
 A dashboard paste over 32 KB does not enter the prompt whole. `POST /api/chat`
 stores it in the session attachments directory and sends a path marker plus a
 preview of at most 4 KB (`chat_attachments.spill_large_paste`). The file is
-removed with the session.
+written in place there (never moved in from the system temp directory, so a
+tmpfs `/tmp` cannot make the store fail and send the paste inline), and the path
+joins the END of the message's `files` list, so its marker is
+`[attached_file <N>]` with N one past the files the user attached. The file is
+removed with the session. The spill applies to the whole message on every
+`POST /api/chat` caller, programmatic ones included; narrowing it to pasted
+blocks is a maintainer decision (ATT-2).
 
 The chat routes check the switch for a script cron as well. While it is off, the
 gateway refuses a caller that presents a `cron:` session key on

@@ -156,7 +156,7 @@ class AllocationDeps:
     session_provider_type: Callable[[], Callable[[Any, Any], LLMProvider]]
     unlink_session_queue: Callable[[Any], None]
     unlink_queued_temp_paths: Callable[[dict[str, Any]], None]
-    session_model: Callable[[Any, str | None, str | None], str | None]
+    session_model: Callable[[Any, str | None, str | None, str], str | None]
     load_config: Callable[[], Any]
     resolve_crew_identity: Callable[[Any, str | None, str | None], str]
     load_watchdog_settings: Callable[[str], object]
@@ -1229,10 +1229,9 @@ class SessionAllocationService:
 
         owner = self._owner
         key = owner._fold_key(session_key)
-        if not model:
-            from kiro_crew.config.loader import KiroCrewConfig
-
-            model = KiroCrewConfig.load().agent.resolve_model("taskrunner")
+        # No explicit model: the allocation resolves it under the ``taskrunner``
+        # role, so a crew or template pin still wins over the role's own model.
+        model = model or None
         from kiro_crew.execution_context import read_session_execution
 
         execution = await asyncio.to_thread(read_session_execution, key)
@@ -1246,6 +1245,7 @@ class SessionAllocationService:
                 cwd=cwd,
                 model=model,
                 start_priority=start_priority,
+                model_role="taskrunner",
             )
         if not owner._bg_backend_supports_runtime():
             # Dispatch on the SAME membership rule ``get_bg_session`` uses: only
@@ -1264,6 +1264,7 @@ class SessionAllocationService:
                 cwd=cwd,
                 model=model,
                 start_priority=start_priority,
+                model_role="taskrunner",
             )
         async with self._lock:
             # The other publication door: a key whose run is being ended
@@ -1297,6 +1298,7 @@ class SessionAllocationService:
                 cwd=cwd,
                 model=model,
                 start_priority=start_priority,
+                model_role="taskrunner",
             )
         runtime = await owner._get_or_bootstrap_run_runtime(
             parent_session_key, agent=agent, cwd=cwd, start_priority=start_priority
@@ -1321,6 +1323,7 @@ class SessionAllocationService:
                 cwd=cwd,
                 model=model,
                 start_priority=start_priority,
+                model_role="taskrunner",
             )
         provider = self._deps.session_provider_type()(handle, runtime)
         setattr(
@@ -2087,6 +2090,7 @@ class SessionAllocationService:
         wait_if_busy: bool = True,
         _won_race_retries: int = 0,
         start_priority: StartPriority = StartPriority.BACKGROUND,
+        model_role: str = "",
         **extra_factory_kwargs: Any,
     ) -> tuple[LLMProvider, bool, bool]:
         """Reserve logical ownership for the complete claim/allocation call, held while the key is being ended."""
@@ -2136,6 +2140,7 @@ class SessionAllocationService:
                     _won_race_retries=_won_race_retries,
                     _reservation=token,
                     start_priority=start_priority,
+                    model_role=model_role,
                     **extra_factory_kwargs,
                 )
             except SessionEndingError:
@@ -2188,6 +2193,7 @@ class SessionAllocationService:
         _won_race_retries: int = 0,
         _reservation: object | None = None,
         start_priority: StartPriority = StartPriority.BACKGROUND,
+        model_role: str = "",
         **extra_factory_kwargs: Any,
     ) -> tuple[LLMProvider, bool, bool]:
         """Claim a live session or cold-start one, returning its held lease.
@@ -2331,6 +2337,7 @@ class SessionAllocationService:
                 wait_if_busy=wait_if_busy,
                 _won_race_retries=_won_race_retries + 1,
                 start_priority=start_priority,
+                model_role=model_role,
                 **extra_factory_kwargs,
             )
 
@@ -2368,7 +2375,7 @@ class SessionAllocationService:
             def resolve_model() -> str | None:
                 cfg = self._deps.load_config() if preparation.revision else owner._cfg
                 selected = preparation.member or agent
-                return self._deps.session_model(cfg, selected, claim_crew)
+                return self._deps.session_model(cfg, selected, claim_crew, model_role)
 
             model = await asyncio.to_thread(resolve_model)
 
@@ -2959,6 +2966,7 @@ class SessionAllocationService:
                 wait_if_busy=wait_if_busy,
                 _won_race_retries=_won_race_retries + 1,
                 start_priority=start_priority,
+                model_role=model_role,
                 **extra_factory_kwargs,
             )
 

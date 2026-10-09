@@ -1677,7 +1677,8 @@ abstraction Slack uses, so one bot serves many parallel, topic-scoped sessions
   and a queued message drains under the forum key (`editMessageText` is not
   threaded — the message id already identifies the message within its Topic).
 - **Should it answer, above may it.** `telegram.forum_activation` (`always` |
-  `mention` | `off`, anything else normalized to `always`) is the second decision,
+  `mention` | `off`; an absent key means `always`, and a present but unrecognized value
+  falls back to the narrower `mention`, with a warning) is the second decision,
   taken by `_activation_outcome` after `forum_gate_outcome` has authorized the turn:
   without it an allow-listed Topic cannot host a conversation between humans,
   because every message would start a turn. Scoped to non-private chats — a 1:1 DM
@@ -4880,7 +4881,19 @@ file the user attached, and the voice limit would have refused a 5 MB `.mp3` tha
 WeCom itself carried. `max_text_bytes` is the one cap left at the shared default
 on purpose — it budgets bytes READ into gateway memory, of which only
 `max_text_inject` can reach the prompt, so it is not a transport ceiling and must
-not be raised to one. A `mixed` message's caption lives in its item
+not be raised to one. Oversized text is kept by path rather than refused, so a
+text attachment's download cap is `max(max_text_bytes, max_opaque_bytes)` (50 MiB);
+to build its 8 KiB preview `_read_text_file` reads a file over two windows only at
+its ends (`_PREVIEW_READ_WINDOW`, 64 KiB each), redacts each window, then cuts
+the preview from them. The windows are many times the preview's few KiB per end,
+so their own cut lands far outside what is shown and a secret straddling it can
+never reach the preview (ATT-1). "Full
+file kept at the path" also lasts only for that turn outside Slack: the file is a
+`tempfile.mkstemp` in the system temp directory, and the dispatcher unlinks it in
+its `finally` (the attachment-ingest rule in the invariants list); only Slack moves
+it into the session's attachments directory. Keeping it longer changes how long
+decrypted bytes stay on disk for the encrypting channels, so it is a maintainer
+decision. A `mixed` message's caption lives in its item
 list rather than in `text`, and is read from there — and a media-only message is a
 message, so the empty-text early return now also requires no attachments.
 

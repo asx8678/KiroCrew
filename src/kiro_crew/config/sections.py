@@ -1272,13 +1272,17 @@ class AgentConfig:
         ),
     )
     tool_search_min_tokens: int = field(
-        default=50000,
+        # TOOL-2: below kiro-cli's own 50,000. Crew's always-on core and cron
+        # schemas measure about 15k tokens, so at 50,000 they never deferred,
+        # even on a 1M window; 10,000 defers them while a small tool set stays
+        # resident.
+        default=10000,
         metadata=_meta(
             "Tool Search threshold (tokens)",
             "Start deferring MCP tool specs once they exceed this many tokens. "
             "Paired with tool_search_min_pct — whichever is crossed first wins. "
-            "0 with tool_search_min_pct 0 defers always. Matches the kiro-cli "
-            "default.",
+            "0 with tool_search_min_pct 0 defers always. Set below kiro-cli's "
+            "own default (50000) so Kiro Crew's built-in tool schemas defer.",
         ),
     )
     session_sharing: bool = field(

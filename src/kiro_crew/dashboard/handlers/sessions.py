@@ -10,16 +10,10 @@ import json
 import logging
 import os
 import re
-import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Collection
-
-from kiro_crew.loop_lock import LoopBoundLock
-
-if TYPE_CHECKING:
-    from kiro_crew.providers.base import LLMProvider  # noqa: F811
+from typing import Any, Callable, Collection
 
 from aiohttp import web
 
@@ -84,11 +78,11 @@ from kiro_crew.history import (
 from kiro_crew.kiro_prerequisite import spawn_supervised_oneshot
 from kiro_crew.label_guard import PROSE_OPENERS, is_verdict_reply, looks_like_prose
 from kiro_crew.llm_helpers import run_bg_oneliner
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.mcp_discovery import sync_discovered_servers
 from kiro_crew.messaging.link import _in_namespace, canonical_key
 from kiro_crew.platform import redact_log_via_context
 from kiro_crew.platform_compat import _SUBPROCESS_NO_WINDOW, kill_and_reap
-from kiro_crew.runtime_ownership import release_session_lease
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     configured_sandbox_mode,
@@ -103,8 +97,6 @@ from kiro_crew.security import (
 from kiro_crew.validation import sanitize_string
 
 logger = logging.getLogger(__name__)
-
-_SHUTDOWN_TIMEOUT_SECS = 10
 
 
 def _sel():
@@ -5068,87 +5060,47 @@ async def api_session_tool_policy(request: web.Request) -> web.Response:
     return web.json_response(policy)
 
 
-async def _reset_all_sessions(request: web.Request) -> int:
-    """Reset all active sessions so they pick up config changes.
+async def _reset_all_sessions(request: web.Request, agent: str | None = None) -> int:
+    """Recycle the sessions a config change affects, so they pick it up.
 
-    Reloads provider factory (handles provider switch ACP→CC or vice versa),
-    shuts down all active sessions AND drains the warm pool (pre-spawned
-    processes loaded the old MCP config at spawn time).
-    New sessions cold-start on next message.
-    Returns the number of sessions reset.
+    ``agent`` names the one agent a save edited: only that agent's sessions are
+    recycled. ``None`` is a global change (MCP servers, computer use) and recycles
+    every session. A session whose turn is in flight is never killed mid-stream:
+    it is deferred and recycled by the cleanup tick once the turn releases
+    (:meth:`SessionManager.recycle_for_config_change`). The factory and the warm
+    pool are refreshed with :meth:`SessionManager.refresh_defaults`, which leaves
+    live sessions registered.
+
+    Returns the number of sessions scheduled for recycle. The recycle itself runs
+    in the background, so the response does not wait on a shutdown.
     """
     state: DashboardState = request.app["state"]
     sessions = state.sessions
 
-    # Reload factory so provider switch takes effect immediately
-    await sessions.reload_provider_factory()
+    # Adopt the new config for every session that starts from here on (factory,
+    # pool shape and the warm pool's stale MCP config) without touching live ones.
+    await sessions.refresh_defaults()
 
-    # Pop all active sessions
-    providers: list[LLMProvider] = []
-    count = sessions.count
-    if count > 0:
-        providers = await sessions.drain_all_providers()
-
-    # Drain warm pool — pre-spawned processes have stale MCP config
-    pool_providers = await sessions.drain_warm_pool()
-    providers.extend(pool_providers)
-
-    if count > 0 or pool_providers:
-        logger.info(
-            "Reset %d session(s) + %d pool process(es) after config change",
-            count,
-            len(pool_providers),
-        )
+    keys = [
+        key
+        for key in sorted(sessions.session_keys())
+        if agent is None or sessions.get_agent(key) in ("", agent)
+    ]
 
     state.broadcast_ws("sessions_restarting", {"status": "restarting"})
 
     async def _background_restart() -> None:
-        if providers:
-
-            async def _safe_shutdown(p: LLMProvider) -> None:
-                _timeout = _SHUTDOWN_TIMEOUT_SECS
-                try:
-                    await asyncio.wait_for(p.shutdown(), timeout=_timeout)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Session shutdown hung past %.1fs; forcing kill",
-                        _timeout,
-                    )
-                    # The timeout cancelled ``shutdown`` mid-flight, so it may not
-                    # have reached its own release. Release here before the kill --
-                    # idempotent, so a shutdown that did get that far costs
-                    # nothing, and without it the gate refuses the very kill this
-                    # arm exists to perform and the hung tree leaks.
-                    await release_session_lease(p)
-                    try:
-                        # The kill signals the provider's whole process group and
-                        # then waits out a bounded SIGTERM grace, so it blocks for
-                        # as long as that grace -- never inline on the event loop
-                        # (AUTOSDE: no-blocking-call-on-event-loop), which is what
-                        # every other caller of it already avoids. Awaited so the
-                        # tree is reaped before ``start_pool`` below spawns its
-                        # replacements, and concurrent across the ``gather``, so N
-                        # hung providers cost one grace rather than N in series.
-                        await asyncio.get_running_loop().run_in_executor(
-                            subprocess_executor(), _h._sync_kill_provider, p
-                        )
-                    except RuntimeError:
-                        # The executor is already shut down -- a gateway teardown
-                        # racing this restart. Run the kill on a plain daemon
-                        # thread instead: still off the loop, and far better than
-                        # skipping it, which is what leaks the tree.
-                        threading.Thread(
-                            target=_h._sync_kill_provider, args=(p,), daemon=True
-                        ).start()
-                    except Exception:
-                        logger.exception("Force-kill fallback also failed for %r", p)
-                except Exception:
-                    pass
-
-            await asyncio.gather(*[_safe_shutdown(p) for p in providers])
-
-        sessions._pool_started = False
-        await sessions.start_pool(blocking=False)
+        try:
+            if keys:
+                recycled = await sessions.recycle_for_config_change(keys)
+                logger.info(
+                    "Config change: recycled %d of %d session(s)%s",
+                    recycled,
+                    len(keys),
+                    "" if agent is None else f" for agent {agent!r}",
+                )
+        except Exception:
+            logger.exception("Background session restart failed")
         logger.info("Background session restarted")
         state.push_refresh("agents")
         state.push_slots_update()
@@ -5158,7 +5110,7 @@ async def _reset_all_sessions(request: web.Request) -> int:
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)
 
-    return count
+    return len(keys)
 
 
 async def api_sessions_restart(request: web.Request) -> web.Response:

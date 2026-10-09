@@ -2,7 +2,7 @@
 
 ## Overview
 
-The heartbeat service (`kiro_crew/heartbeat.py`) runs periodic background tasks on a configurable interval (default 60s).
+The heartbeat service (`kiro_crew/heartbeat.py`) runs periodic background tasks on a fixed 60 s maintenance tick (the gateway constructs it without an `interval`). `heartbeat.interval_secs` is not that tick: it is the base gap before a `HEARTBEAT_KEEP` task is sent to the model again, doubling per keep up to one hour.
 
 ## Responsibilities
 
@@ -115,7 +115,9 @@ is cold-started ~once every N cycles instead of every cycle.
 
 ### Session Identity
 
-Heartbeat runs in its own session (`HEARTBEAT_KEY = "_hb"` in `session.py`), distinct from the shared `BACKGROUND_KEY = "_bg"` used by cron / consolidator / chat-title. The session uses the dedicated `kirocrew-heartbeat` agent (installed by `_install_heartbeat_agent` in `agent.py`) — a minimal MCP surface (`kirocrew-core` only on public installs; the enterprise internal MCP server wiring is omitted, matching `_install_research_agent` / `_install_knowledge_agent`) so cycle cold-starts stay cheap. SEL audit logging stays gateway-side in `_heartbeat_approval` regardless; the per-agent narrowing is purely a cold-start cost reduction.
+Heartbeat runs in its own session (`HEARTBEAT_KEY = "_hb"` in `session.py`), distinct from the shared `BACKGROUND_KEY = "_bg"` used by cron / consolidator / chat-title. The session uses the dedicated `kirocrew-heartbeat` agent (installed by `_install_heartbeat_agent` in `agent.py`) — a minimal MCP surface (`kirocrew-core` plus the one `kirocrew-ops` verb on public installs; the enterprise internal MCP server wiring is omitted, matching `_install_research_agent` / `_install_knowledge_agent`) so cycle cold-starts stay cheap. SEL audit logging stays gateway-side in `_heartbeat_approval` regardless; the per-agent narrowing is purely a cold-start cost reduction.
+
+Two LOOP-1 steps are deliberately not taken. The heartbeat's `build_message` passes no `agent=`, so each task still carries the main persona (`prompt.md`) as its `[AGENT SYSTEM PROMPT]`; passing `agent="kirocrew-heartbeat"` would make it a custom agent, and a custom agent's context skips the skills block, so heartbeat tasks would lose skill bodies. And the spec still mounts `@kirocrew-core` whole rather than per-tool refs from `heartbeat_safe_tools()`; the gateway already rejects every unsafe call, and the spec is SHA-pinned (`test_agent_refactor_spec_bytes.py`). The per-task backoff (60 s doubling to one hour) and retirement (the 12th keep, or 7 days after the first) shipped without a `docs/decisions/` entry; together they retire a "tell me when X" task about six hours after its first keep.
 
 The session is shared across all tasks in one cycle (so concurrent gather'd tasks reuse the warm provider) and conditionally recycled by `recycle_heartbeat` between cycles when context grows past the threshold.
 
@@ -135,7 +137,7 @@ A hook `TOOL_AUTO_APPROVE` that DOES fire in `_resolve_permission` (the read-onl
 
 The allowlist is name-based and exact-match only — no verb / heuristic fallback. Heartbeat polls untrusted external content (CR comments, ticket bodies) where prompt-injection could try to widen approval via a clever read-shaped tool name (`get_all_credentials`, `list_env_secrets`, etc.). Strict enforcement is auditable and cannot be widened that way; this is deny-by-default per the security-controls guideline.
 
-The allowlist is curated for read-only / observation tools — local file reads (`Read`, `Grep`, `Glob`), `WorkspaceSearch`, and side-effect-free `kirocrew-core` reads (`learn_list`, `cron_list`, `spawn_list`, `spawn_status`, `artifact_list`, `artifact_get`, `artifact_versions`, `local_knowledge_search`). (The enterprise-internal read APIs — internal code/knowledge search, code-review/ticketing/pipeline/deploy/on-call reads, `recall` — were removed from the public fork's allowlist; an internal companion re-adds them out of band.) Write tools (`send_message`, `file_send`, `cron_add`, `Edit`, `Write`, shell `execute`/`run`) are not in the list and are rejected.
+The allowlist is curated for read-only / observation tools — local file reads (`Read`, `Grep`, `Glob`), `WorkspaceSearch`, and side-effect-free `kirocrew-core` reads (`learn_list`, `cron_list`, `spawn_list`, `spawn_status`, `artifact_list`, `artifact_get`, `artifact_versions`, `local_knowledge_search`). `local_knowledge_search` reaches the heartbeat from the opt-in `kirocrew-ops` server: since the TOOL-2 split moved it off `kirocrew-core`, `_install_heartbeat_agent` mounts that one verb (`HEARTBEAT_OPS_VERBS`, as `@kirocrew-ops/local_knowledge_search`) with the server's hand-built opt-in entry. A heartbeat cold start therefore launches a second MCP process; only the one tool's schema reaches the model. (The enterprise-internal read APIs — internal code/knowledge search, code-review/ticketing/pipeline/deploy/on-call reads, `recall` — were removed from the public fork's allowlist; an internal companion re-adds them out of band.) Write tools (`send_message`, `file_send`, `cron_add`, `Edit`, `Write`, shell `execute`/`run`) are not in the list and are rejected.
 
 When a legitimate new read tool needs to run in heartbeat, operators observe SEL `denied` events (or the gateway-log warning `Heartbeat blocked tool call: <name>`) and explicitly add the name to `HEARTBEAT_SAFE_TOOLS`.
 

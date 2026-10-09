@@ -3540,7 +3540,11 @@ class SubagentManager:
         # cleared the moment a later write commits the row terminal (the
         # pump's durable re-finish). Manager-owned like `_report_tasks`
         # because the coordinator is stateless by contract.
-        self._refused_rows: dict[str, str] = {}
+        # REL-14: persisted beside the task store and reloaded here, so the boot
+        # reconciler still finds a tombstone written before a restart.
+        from kiro_crew.subagent_manager.admission.taskq_bridge import load_refused_rows
+
+        self._refused_rows: dict[str, str] = load_refused_rows()
         # follow_up watchers (spawn_steer mode="follow_up"), keyed by run id.
         # Manager-OWNED on purpose: these tasks can spawn a brand-new run
         # (continue_conversation), so per this module's containment contract

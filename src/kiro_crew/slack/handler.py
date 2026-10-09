@@ -135,10 +135,12 @@ from kiro_crew.messaging.session_trust import (  # noqa: F401 - read by the owne
     clear_trusted_sessions,
     is_session_trusted,
 )
+from kiro_crew.messaging.turn_bracket import arm_reinjection_after_backend_compaction
 from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
 from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
 from kiro_crew.platform import current_context
 from kiro_crew.providers.base import (
+    EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -1469,6 +1471,8 @@ async def handle_message(
     # turn consumed the one-shot flag, and whether it landed (recorded success).
     _needs_reinjection = False
     _turn_landed = False
+    # CTX-12: the backend reported a completed compaction during this turn.
+    _backend_compacted = False
     # This turn's thread-replies read; its watermark moves in the finally.
     _thread_replies: ThreadReplies | None = None
     try:
@@ -1746,6 +1750,12 @@ async def handle_message(
             async for event in client.stream(full_message):
                 if event.kind == EVENT_TEXT_CHUNK:
                     await answer.on_text(event)
+
+                elif event.kind == EVENT_COMPACTION_STATUS:
+                    # CTX-12: the backend compacted on its own and dropped the
+                    # session-start contract; the finally re-arms it.
+                    if event.text == "completed":
+                        _backend_compacted = True
 
                 elif event.kind == EVENT_THINKING_CHUNK:
                     await answer.on_thinking(event)
@@ -2130,6 +2140,7 @@ async def handle_message(
                 # anyway; re-arming the one-shot flag for this abandoned prompt
                 # would only make the turn after the replay inject it twice.
                 _needs_reinjection = False
+                _backend_compacted = False
                 # This attempt is over: stop its reaction ladder and stall
                 # watchdog now (idempotent, so the ``finally`` re-call is a
                 # no-op), and take down what it posted -- the Working block and
@@ -2311,7 +2322,9 @@ async def handle_message(
     finally:
         # A turn that consumed the post-compaction flag but never landed (an
         # error arm, a cancel) discarded the prompt carrying the re-injected
-        # context; put the flag back so the next turn re-injects it.
+        # context; put the flag back so the next turn re-injects it. A backend
+        # compaction mid-turn arms it first (CTX-12).
+        arm_reinjection_after_backend_compaction(sessions, session_key, _backend_compacted)
         rearm_reinjection(sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed)
         # The replies watermark moves only past a turn that landed after a good
         # read; a cancelled or failed turn discarded the prompt that carried them.
@@ -2721,16 +2734,27 @@ async def handle_message(
                 # placeholder is replaced with the clean text. Answer-carrying —
                 # nothing streamed — so a primary-send failure raises and books a
                 # failure; a send that returns is confirmed delivery.
-                final_text = _convert_tables(clean_text) if clean_text else _NO_RESPONSE
-                await _safe_final_update(
-                    slack,
-                    channel,
-                    answer.stream_ts,
-                    final_text or _NO_RESPONSE,
-                    reply_ts,
-                    raise_on_primary_failure=True,
-                )
-                _answer_reached = True
+                from kiro_crew.slack.thread_follow import is_silent_reply
+
+                if is_silent_reply(clean_text):
+                    # The model chose to stay silent: remove the placeholder, as
+                    # the streaming seal does, rather than post the marker text.
+                    try:
+                        await slack.delete_message(channel, answer.stream_ts)
+                    except Exception:
+                        logger.debug("silent reply placeholder delete failed", exc_info=True)
+                    _answer_reached = True
+                else:
+                    final_text = _convert_tables(clean_text) if clean_text else _NO_RESPONSE
+                    await _safe_final_update(
+                        slack,
+                        channel,
+                        answer.stream_ts,
+                        final_text or _NO_RESPONSE,
+                        reply_ts,
+                        raise_on_primary_failure=True,
+                    )
+                    _answer_reached = True
             else:
                 # No stream and no placeholder — post the answer directly.
                 # Answer-carrying: a raise means the reader got nothing; a return

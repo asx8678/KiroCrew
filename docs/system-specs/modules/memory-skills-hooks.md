@@ -3799,7 +3799,7 @@ A body the session already holds — an earlier `$` turn's delivery or a trigger
 match — also arrives as its pointer, through the same per-session record
 `build_message`'s trigger path uses (`dollar_skills_already_held` /
 `record_dollar_skill_bodies`); the reset rules (fresh window, re-injection,
-agent switch) are `build_message`'s. `resolve_dollar_skills` has already
+agent switch) are `build_message`'s. `meta.skills` stores each delivered body in full rather than a reference: storing references would change the persisted transcript format, so every reader would have to handle old rows with bodies and new rows without (SKL-7, left as decided). `resolve_dollar_skills` has already
 removed frontmatter, and the runner applies credential and outbound-URL
 redaction before it writes either the model block or the snapshot. The snapshot therefore remains accurate if a
 skill changes or disappears later and adds no second filesystem read. Existing

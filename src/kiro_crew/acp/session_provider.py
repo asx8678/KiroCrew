@@ -795,6 +795,11 @@ class AcpSessionProvider(LLMProvider):
         """Return tokens used in the current context."""
         return self._handle.last_prompt_stats.context_used_tokens
 
+    def context_used_tokens_reliable(self) -> bool:
+        """Whether the used-token count can drive an absolute threshold (CTX-1)."""
+        stats = self._handle.last_prompt_stats
+        return bool(stats.context_tokens_from_usage or not stats.context_window_suspect)
+
     def billing_stats(self) -> object | None:
         """Live per-turn billing stats (public — see LLMProvider).
 

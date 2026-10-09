@@ -6,6 +6,7 @@ import asyncio as _asyncio
 import functools as _functools
 import logging as _logging
 import time as _time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Sequence
 
 from kiro_crew.subagent_wait_reasons import (
@@ -29,6 +30,47 @@ from .types import (
 )
 
 _glue_logger = _logging.getLogger("kiro_crew.subagent_manager.admission")
+
+
+def _refused_rows_path() -> Path:
+    """Where the refusal tombstones persist: beside the task store, in its
+    own ``tasks/`` directory, so they survive a restart (REL-14)."""
+    from kiro_crew.config.paths import config_dir
+
+    return config_dir() / "tasks" / "refused_rows.json"
+
+
+def load_refused_rows() -> "dict[str, str]":
+    """The persisted refusal tombstones, or ``{}`` when none can be read."""
+    import json
+
+    try:
+        data = json.loads(_refused_rows_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if isinstance(k, str)}
+
+
+def _persist_refused_rows(registry: "dict[str, str]") -> None:
+    """Write the tombstones durably; best effort, never raising.
+
+    Without this a restart forgets every tombstone, and the boot reconciler
+    requeues refused work whose terminal write never committed. A failed write
+    leaves the in-memory record in force for this process.
+    """
+    import json
+
+    from kiro_crew.atomic_write import atomic_write
+
+    try:
+        path = _refused_rows_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(path, json.dumps(registry, sort_keys=True), fsync=True, restrict_to_owner=True)
+    except Exception:  # noqa: BLE001 - the tombstone is a backstop, not the turn
+        _glue_logger.warning("taskq: refusal tombstones could not be persisted", exc_info=True)
+
 
 # How many times a single row's state is re-read before the answer is given up on, and the
 # pause between tries. Same shape and reasoning as the durable sweep's own bound: an error
@@ -1301,12 +1343,14 @@ class _TaskqBridgeMixin(ManagerComponent):
                 exc_info=exc,
             )
         registry[agent_id] = reason
+        _persist_refused_rows(registry)
 
     def _clear_refused_row(self, agent_id: str) -> None:
         """Drop the tombstone once a write commits the row terminal."""
         registry = getattr(self._manager, "_refused_rows", None)
-        if registry is not None:
+        if registry is not None and agent_id in registry:
             registry.pop(agent_id, None)
+            _persist_refused_rows(registry)
 
     def refused_row_reason(self, agent_id: str) -> str:
         """The recorded refusal reason for a row whose terminal write has not

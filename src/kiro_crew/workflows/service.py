@@ -809,9 +809,9 @@ class WorkflowService:
         # with no app carries "", which is what a non-app spawn passes.
         app = getattr(getattr(memory_scope, "execution_context", None), "app", "") or ""
         step_agent = _workflow_step_agent(run_id)
-        from kiro_crew.config.loader import KiroCrewConfig
-
-        step_model = KiroCrewConfig.load().agent.resolve_model("workflow")
+        # No run-wide default model: each step's session resolves under the
+        # ``workflow`` role (agent_exec / agent_pool pass it), so a crew or
+        # template pin on the step's agent still wins over the role's model.
         agent_fn: Optional[Callable[[str, dict], Any]] = None
         pool: Any = None
         if self._pool_agents:
@@ -823,7 +823,6 @@ class WorkflowService:
                     self._sessions,
                     run_id=run_id,
                     default_agent=step_agent,
-                    default_model=step_model,
                     max_workers=workers,
                     max_starting=min(workers, 2),
                     memory_scope=memory_scope,
@@ -845,7 +844,6 @@ class WorkflowService:
                 self._sessions,
                 run_id=run_id,
                 default_agent=step_agent,
-                default_model=step_model,
                 memory_scope=memory_scope,
                 context_builder=self._context_builder,
                 session_key=session_key,

@@ -6891,7 +6891,10 @@ class AcpClient:
             if model_registry.has_known_window(served_model_id)
             else None
         )
-        self.last_prompt_stats.rebase_to_window(win or 0)
+        self.last_prompt_stats.rebase_to_window(
+            win or 0,
+            window_suspect=model_registry.window_source(served_model_id) != "kiro-list",
+        )
 
     def _capture_available_models(self, session_resp: dict) -> None:
         """Record the model list the backend advertised in a session response.
@@ -13332,6 +13335,7 @@ class AcpClient:
                 # served window (size) instead of re-deriving it from the model id.
                 self.last_prompt_stats.context_used_tokens = int(used)
                 self.last_prompt_stats.context_window_tokens = int(size)
+                self.last_prompt_stats.context_window_suspect = False
                 # Mark the counts authoritative so a later metadata
                 # contextUsagePercentage cannot clobber this token-derived pct.
                 self.last_prompt_stats.context_tokens_from_usage = True

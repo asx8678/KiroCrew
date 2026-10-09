@@ -1535,8 +1535,8 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
                     "note": (
                         "The blocking wait ended; these sub-agents were NOT cancelled and "
                         "keep running on their own budget. Their [Subagent completion "
-                        "event] messages still arrive; poll spawn_list or spawn_status "
-                        "for progress."
+                        "event] messages still arrive and wake you, so end your turn or "
+                        "call wait; read spawn_status only when you need progress now."
                     ),
                 }
             )

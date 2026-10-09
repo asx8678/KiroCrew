@@ -108,7 +108,7 @@ import os
 import re
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -819,7 +819,11 @@ def _model_fallback(per_agent_model: str, global_default: str) -> "str | None":
 
 
 def _session_model(
-    cfg: "KiroCrewConfig", agent: str | None, *, crew_agent: str | None = None
+    cfg: "KiroCrewConfig",
+    agent: str | None,
+    *,
+    crew_agent: str | None = None,
+    role: str = "",
 ) -> "str | None":
     """Resolve the model for a new session on *agent*, for EVERY surface.
 
@@ -833,6 +837,13 @@ def _session_model(
     the provider factory to resolve the template pin / global itself. A crew pin
     is returned VERBATIM because the factory has no way to discover it: it never
     sees the crew name.
+
+    *role* names an unattended task role (``cron``, ``workflow``,
+    ``taskrunner``). Its model stands in for the CHAT default only: a crew or
+    template pin still wins, and with neither the role's own model
+    (``agent.resolve_model(role)``, ``"auto"`` unless ``agent.role_models``
+    pins one) is returned explicitly, so the factory never falls back to
+    ``agent.model`` (model-selection.md: roles do not inherit the chat model).
 
     Blocking I/O (globs + reads ``~/.kiro/agents/*.json``): call in an executor.
     """
@@ -848,6 +859,12 @@ def _session_model(
     per_agent_model = ""
     if agent and agent != "kirocrew":
         per_agent_model = cfg._resolve_named_agent_model(agent)
+    if role:
+        # A template whose own pin is the "auto" sentinel has picked nothing, so
+        # the role's model (a pin the operator set for this kind of work) applies.
+        if per_agent_model and per_agent_model not in _SENTINEL_MODELS:
+            return None
+        return cfg.agent.resolve_model(role)
     return _model_fallback(per_agent_model, cfg.agent.model)
 
 
@@ -1281,7 +1298,9 @@ class SessionManager:
             session_provider_type=lambda: _load_acp_session_provider_type(),
             unlink_session_queue=lambda session: _unlink_session_queue(session),
             unlink_queued_temp_paths=lambda kwargs: unlink_queued_temp_paths(kwargs),
-            session_model=lambda cfg, agent, crew: _session_model(cfg, agent, crew_agent=crew),
+            session_model=lambda cfg, agent, crew, role: _session_model(
+                cfg, agent, crew_agent=crew, role=role
+            ),
             load_config=lambda: KiroCrewConfig.load(),
             resolve_crew_identity=lambda cfg, agent, crew: _resolve_allocation_crew_identity(
                 cfg, agent, crew
@@ -1974,6 +1993,9 @@ class SessionManager:
         # branch inside `_sync_autocompact_pct`.
         self._adopted_autocompact_max_tokens = published_autocompact_max_tokens()
         self._provider_factory = provider_factory
+        # SES-1: keys a config save asked to recycle while their turn was in
+        # flight. The cleanup tick retries them once the turn releases.
+        self._pending_config_recycle: set[str] = set()
         # Installed by the dashboard once its state exists (set_subagent_probe);
         # None means "no dashboard, so no children can be attached".
         self._subagent_probe: "Callable[[str], bool | Awaitable[bool]] | None" = None
@@ -2605,12 +2627,15 @@ class SessionManager:
         wait_if_busy: bool = True,
         _won_race_retries: int = 0,
         start_priority: StartPriority = StartPriority.BACKGROUND,
+        model_role: str = "",
         **extra_factory_kwargs: Any,
     ) -> tuple[LLMProvider, bool, bool]:
         """Claim or allocate a session and return its held lease.
 
         ``start_priority`` orders a cold start in the start queues; a caller passes
         FOREGROUND only where a person waits on it (rule: ``kiro_crew.start_priority``).
+        ``model_role`` names the unattended task role a session with no explicit
+        ``model`` resolves under (see :func:`_session_model`).
         """
         return await self._allocation_boundary().get_or_create(
             key,
@@ -2625,6 +2650,7 @@ class SessionManager:
             wait_if_busy=wait_if_busy,
             _won_race_retries=_won_race_retries,
             start_priority=start_priority,
+            model_role=model_role,
             **extra_factory_kwargs,
         )
 
@@ -2662,6 +2688,53 @@ class SessionManager:
                 ends_conversation=ends_conversation,
                 scope=opened,
             )
+
+    async def recycle_for_config_change(self, keys: Iterable[str]) -> int:
+        """Recycle *keys* after a config save; a busy key is deferred, never killed.
+
+        A key whose turn is in flight stays registered and joins the pending set;
+        :meth:`retry_pending_config_recycle` (the cleanup tick) recycles it once the
+        turn releases. ``refuse_only_on_active_turn`` keeps a channel lifecycle
+        holder (idle, but holding its lease for its whole listening life) from
+        being deferred forever. Returns the number of keys recycled now.
+        """
+        recycled = 0
+        for key in keys:
+            try:
+                if await self.reset(key, skip_if_busy=True, refuse_only_on_active_turn=True):
+                    recycled += 1
+                    self._pending_config_recycle.discard(key)
+                elif key in self.session_keys():
+                    self._pending_config_recycle.add(key)
+            except Exception:
+                logger.warning("Config recycle of session %s failed", key, exc_info=True)
+        if self._pending_config_recycle:
+            logger.info(
+                "Config change: %d busy session(s) recycle after their turn ends",
+                len(self._pending_config_recycle),
+            )
+        return recycled
+
+    async def retry_pending_config_recycle(self) -> None:
+        """Recycle the deferred config keys whose turn has since ended (cleanup tick).
+
+        A key that left the registry is dropped, not recycled: a session that ended on
+        its own already runs the new config when it next starts. A key that is still
+        busy stays pending.
+        """
+        if not self._pending_config_recycle:
+            return
+        live = self.session_keys()
+        for key in sorted(self._pending_config_recycle):
+            if key not in live:
+                self._pending_config_recycle.discard(key)
+                continue
+            try:
+                if await self.reset(key, skip_if_busy=True, refuse_only_on_active_turn=True):
+                    self._pending_config_recycle.discard(key)
+            except Exception:
+                logger.warning("Deferred config recycle of session %s failed", key, exc_info=True)
+                self._pending_config_recycle.discard(key)
 
     def teardown_scope(self, on_pop: Callable[[Any], None] | None = None) -> Any:
         """A teardown scope to hand :meth:`reset`, with an optional hook run at its pop.

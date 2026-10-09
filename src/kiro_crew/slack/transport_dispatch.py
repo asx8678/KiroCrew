@@ -48,6 +48,7 @@ from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.inbound_spool import InboundRoute, spool_refused_turn
 from kiro_crew.messaging.link import SLACK_NAMESPACE, canonical_key
+from kiro_crew.messaging.turn_bracket import arm_reinjection_after_backend_compaction
 from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
 from kiro_crew.platform import current_context
 from kiro_crew.security import redact, redact_local_paths
@@ -508,6 +509,8 @@ async def handle_message_transport(
     # turn consumed the one-shot flag, and whether it landed (recorded success).
     _needs_reinjection = False
     _turn_landed = False
+    # The driver once the turn ran; None while it never got that far (CTX-12).
+    _ran_driver: Any = None
     # This turn's thread-replies read; its watermark moves in the finally.
     _thread_replies: ThreadReplies | None = None
 
@@ -936,6 +939,7 @@ async def handle_message_transport(
         # turn completed, so the finally must NOT restore the one-shot flag --
         # unless the user cancelled it, which discards that prompt.
         _turn_landed = driver_turn_landed(driver)
+        _ran_driver = driver
         Stats().inc_message_success()
 
         # Remember this turn's OPTIONS control, if it posted one, so the next
@@ -1324,6 +1328,9 @@ async def handle_message_transport(
         # A turn that consumed the post-compaction flag but never landed
         # discarded the prompt carrying the re-injected context; put the flag
         # back so the next turn re-injects it.
+        # CTX-12: a backend that compacted mid-turn dropped the session-start
+        # contract, so the next turn restores it, whatever this turn consumed.
+        arm_reinjection_after_backend_compaction(sessions, session_key, _ran_driver)
         rearm_reinjection(sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed)
         # The replies watermark moves only past a turn that landed after a good
         # read; a cancelled or failed turn discarded the prompt that carried them.

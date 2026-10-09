@@ -2573,7 +2573,9 @@ class AcpSessionHandle:
             if model_registry.has_known_window(resolved)
             else None
         )
-        self.last_prompt_stats.rebase_to_window(win or 0)
+        self.last_prompt_stats.rebase_to_window(
+            win or 0, window_suspect=model_registry.window_source(resolved) != "kiro-list"
+        )
 
     async def _push_model_config_option(self, model_id: str, *, strict: bool) -> str:
         """Push the model over ``session/set_config_option``, trying each spelling.
@@ -6512,6 +6514,7 @@ class AcpSessionHandle:
                         self.last_prompt_stats.context_pct = round((used / size) * 100, 1)
                         self.last_prompt_stats.context_used_tokens = int(used)
                         self.last_prompt_stats.context_window_tokens = int(size)
+                        self.last_prompt_stats.context_window_suspect = False
                         # Mark authoritative so metadata pct cannot clobber it.
                         self.last_prompt_stats.context_tokens_from_usage = True
                         self.last_prompt_stats.note_pct_reported()

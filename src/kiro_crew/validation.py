@@ -2156,8 +2156,8 @@ WORKFLOW_RUN_ID_SCHEMA = ToolSchema(
 
 #: TOOL-7: workflow_result's arguments. The default is a bounded SUMMARY; the
 #: section/offset/limit fields page through the full event stream or the agent
-#: results, so a long run no longer pushes the trailing fields past the
-#: transport's head-only cut.
+#: results, so what a long run returns does not depend on which part of it
+#: survives the transport's size cut.
 WORKFLOW_RESULT_SCHEMA = ToolSchema(
     tool_name="workflow_result",
     fields=[
@@ -2422,6 +2422,8 @@ ARTIFACT_GET_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("slug", str, required=True, max_len=80, pattern=_ARTIFACT_SLUG_RE),
         FieldSpec("version", int, min_val=1, max_val=10_000),
+        FieldSpec("offset", int, min_val=0, max_val=30_000_000),
+        FieldSpec("limit", int, min_val=1, max_val=40_000),
     ],
 )
 
@@ -3690,6 +3692,7 @@ GET_CHAT_SESSION_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("session_key", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("max_messages", int, required=False, min_val=1, max_val=200, default=50),
+        FieldSpec("before", int, required=False, min_val=0, max_val=5000, default=0),
         FieldSpec("all_workspaces", bool, required=False, default=False),
     ],
 )

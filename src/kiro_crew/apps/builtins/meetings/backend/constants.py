@@ -78,6 +78,15 @@ CALENDAR_POLL_STARTUP_DELAY_SECS = 20
 # 30s default.
 BATCH_INTERVAL_SECS = 120.0
 SKETCH_BATCH_INTERVAL_SECS = 180.0
+#: LOOP-4: transcript batches one agent session serves before it is recycled.
+#: Each batch replays the conversation so far, so a session that lives for the
+#: whole meeting pays more per batch the longer the meeting runs. 15 batches is
+#: 30 minutes at the 120 s interval; the recycle folds the re-seed into the next
+#: batch, so it costs no extra turn.
+SESSION_RECYCLE_BATCHES = 15
+#: Characters of an agent's output file carried into a recycle's re-seed. The
+#: agent can still read the whole file; past this the re-seed keeps head and tail.
+RESEED_OUTPUT_MAX_CHARS = 40_000
 AGENT_BATCH_INTERVALS = {
     "note-taker": BATCH_INTERVAL_SECS,
     "task-extractor": BATCH_INTERVAL_SECS,

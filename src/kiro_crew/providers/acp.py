@@ -2534,6 +2534,10 @@ class AcpProvider(LLMProvider):
     def context_used_tokens(self) -> int:
         return self._client.last_prompt_stats.context_used_tokens
 
+    def context_used_tokens_reliable(self) -> bool:
+        stats = self._client.last_prompt_stats
+        return bool(stats.context_tokens_from_usage or not stats.context_window_suspect)
+
     def billing_stats(self) -> object | None:
         """Live per-turn billing stats (public — see LLMProvider).
 

@@ -45,7 +45,7 @@
         "bot_name": "",
         "tool_search": true,
         "tool_search_min_pct": 5,
-        "tool_search_min_tokens": 50000,
+        "tool_search_min_tokens": 10000,
         "session_sharing": true,
         "max_subagents": 0,
         "max_stop_hook_nudges": 100,
@@ -663,10 +663,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Tool Search threshold (tokens)",
-      "help": "Start deferring MCP tool specs once they exceed this many tokens. Paired with tool_search_min_pct — whichever is crossed first wins. 0 with tool_search_min_pct 0 defers always. Matches the kiro-cli default.",
+      "help": "Start deferring MCP tool specs once they exceed this many tokens. Paired with tool_search_min_pct — whichever is crossed first wins. 0 with tool_search_min_pct 0 defers always. Set below kiro-cli's own default (50000) so Kiro Crew's built-in tool schemas defer.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 50000
+      "defaultValue": 10000
     },
     {
       "path": "agent.session_sharing",
@@ -2627,7 +2627,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Extraction Model",
-      "help": "LLM model used for document extraction and summarization. Empty uses the default model (agent.model). Set to a specific model id (e.g. 'claude-haiku-4.5') to use a cheaper model for extraction without changing your chat default.",
+      "help": "LLM model used for document extraction and summarization. Empty uses the background role's model (agent.role_models.background, else auto), not your chat default. Set a model id to pin extraction to it.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
@@ -2655,7 +2655,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Extraction Effort",
-      "help": "Reasoning effort for the document-extraction LLM pool. Empty runs the default high. Only applies on reasoning-capable models.",
+      "help": "Reasoning effort for the document-extraction LLM pool. Empty runs low (not the chat effort). Only applies on reasoning-capable models.",
       "hasChildren": false,
       "enumValues": [
         "",

@@ -538,6 +538,7 @@ def _cancel_timer(self: AutoNudgeService, loop_id: str, *, drop_claims: bool = T
     # counters. That trade is deliberate: an undelivered observation is lost rather
     # than attributed to a turn that did not carry it.
     self._pending_monitor_wake.discard(loop_id)
+    self._pending_monitor_blind.discard(loop_id)
     self._pending_floor_tick.discard(loop_id)
 
 

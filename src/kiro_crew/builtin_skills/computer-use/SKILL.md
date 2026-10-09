@@ -59,16 +59,17 @@ separate `computer_get_state`. Two things to remember:
 - **If the app already has a window it is refused**, naming that window. That is not
   a failure: call `computer_get_state` on it instead.
 
-**2. Snapshot the window. Do this FIRST, every turn — with a screenshot.**
+**2. Snapshot the window. Do this FIRST on each request — with a screenshot.**
 
 ```
 computer_get_state(app="Finder", screenshot=True)
 ```
 
-Request a screenshot on the first snapshot of each turn: do not pass
+Request a screenshot on the first snapshot of each request: do not pass
 `screenshot=false` while the user is watching. The capture opens the floating live
 view. You receive a file path, not an image; keep using the outline unless the
-pixels are needed.
+pixels are needed. Within a request, your own actions return the refreshed tree
+(see below); snapshot again only when the window may have changed outside them.
 
 Optional: `text_limit` (per-element text cap), `max_tree_nodes`, `max_tree_depth`,
 `screenshot` (bool). You get a numbered outline:

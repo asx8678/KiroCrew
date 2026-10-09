@@ -21,6 +21,7 @@
     "python3 scripts/check_sync_io_in_async.py --test",
     "python3 scripts/check_sync_io_in_async.py",
     "python3 scripts/check_lockdown_before_publish.py",
+    "python3 scripts/check_usage_surface.py",
     "isort --check-only src/kiro_crew test",
     "flake8 src/kiro_crew test",
     "mypy src/kiro_crew/",

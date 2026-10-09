@@ -364,6 +364,7 @@ class Project:
     error: str
     tokens_used: int
     replan_count: int
+    last_replan_error: str  # WF-6, in memory only
     memory: WorkingMemory
     task_id: str
     work_dir: str
@@ -397,6 +398,7 @@ class Project:
 - `_tasks` cleaned in `finally` block (no leaks)
 - `start_background()` and `execute_plan()` enforce `_MAX_CONCURRENT_TASKS` before changing run state, so rejected admission cannot leave a partially started run. With a task admission attached (below) the guard is skipped: the lane meters the steps, so an over-limit run queues instead of being refused.
 - Replanned steps also reset sessions after execution (no leaks in `_try_replan`)
+- A re-plan that ends in the same error as the one it answered (same `repeat_loop.error_fingerprint`, kept in `Project.last_replan_error`) fails the run with that error instead of re-planning again, mirroring the step retries' same-error refusal (WF-6)
 
 ## Durable task queue (`taskq.adapters.runner`)
 

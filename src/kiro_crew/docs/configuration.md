@@ -245,7 +245,7 @@ Set a registered value with, for example,
 | `agent.session_sharing` | Reuse a shared ACP runtime for subagents on the kiro-cli backend; alternate ACP backends ignore it | `true` |
 | `agent.tool_search` | Defer MCP tool definitions so the model loads them on demand with `tool_search`. kiro-cli defers once either threshold below is exceeded; KAS defers all of them, and only when the active agent's `tools` grants `tool_search` (otherwise the setting is sent off for that agent). Other ACP backends ignore it | `true` |
 | `agent.tool_search_min_pct` | Tool-definition context threshold as a percentage; `0` with the token threshold also `0` always defers | `5` |
-| `agent.tool_search_min_tokens` | Tool-definition token threshold; `0` with the percentage threshold also `0` always defers | `50000` |
+| `agent.tool_search_min_tokens` | Tool-definition token threshold; `0` with the percentage threshold also `0` always defers. Below kiro-cli's own 50000 so Kiro Crew's built-in tool schemas defer | `10000` |
 | `agent.fallback_model` | Model used after the active model exhausts its transient-retry budget. `"auto"` defers to availability-aware routing; `""` disables fallback | `"auto"` |
 | `agent.refusal_fallback_model` | Model one declined message is retried on when the active model's content filter refuses it (single-message; the primary returns on the next turn). `"auto"` uses the model the provider's refusal recommends; `""` disables the retry | `""` |
 | `agent.max_channels` | Max concurrent agent channels (1-5) | `1` |

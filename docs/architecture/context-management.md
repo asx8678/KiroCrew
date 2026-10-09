@@ -329,7 +329,12 @@ on its next match, never drops the skill.
   `compaction_completed`, and the turn bracket's settle seam marks the session
   before the re-arm and skill-body settle — the same order the heartbeat uses —
   so the next turn restores the session-start contract AND resets the skill-body
-  record (a compacted-out body re-sends as a body, not a pointer).
+  record (a compacted-out body re-sends as a body, not a pointer). The engines
+  that settle their own turn instead of using the bracket do the same through
+  `turn_bracket.arm_reinjection_after_backend_compaction`, in their `finally`
+  before `rearm_reinjection`: the Slack and Telegram transport dispatchers read
+  the driver's `compaction_completed`, and the native Slack handler and the task
+  runner watch `EVENT_COMPACTION_STATUS` `completed` in their own stream loops. After compaction the skills INDEX is re-sent in full, deliberately: the compaction dropped the model's copy, and re-sending it is what keeps skill awareness, at one index per compaction (CTX-10, left as decided). An oversized `prompt.md` override is still named only in the log (once per path and size); surfacing it on the dashboard needs a health surface `context.py` cannot reach today, and adding one is a new surface (CTX-16, left as decided).
 
 ### What comes back after compaction
 
@@ -391,7 +396,13 @@ transcript memory. An artifact value that looks like an image path is prefixed
 with a glued `file:` — the attachment grammar cannot match that form, so a
 snapshot naming a picture re-attaches it zero times instead of on every cycle,
 while the path stays readable. It is empty when the session has no ledger or its
-phase is terminal. See [Session Ledger](../../src/kiro_crew/docs/session-ledger.md), [Monitor Loops](../../src/kiro_crew/docs/monitor-loops.md).
+phase is terminal. That is the narrow half of TOOL-19. The general half stays
+open: `acp/prompt_blocks.build_prompt_blocks` still scans the WHOLE outgoing
+message for image paths, so another host-injected block naming a readable image
+(memory, lessons, a cron or subagent envelope) attaches it too. Scoping the scan
+to the user's typed span needs that range carried from context assembly through
+`LLMProvider.stream` to the ACP send seam, a signature change on every provider,
+left until it can be tested. See [Session Ledger](../../src/kiro_crew/docs/session-ledger.md), [Monitor Loops](../../src/kiro_crew/docs/monitor-loops.md).
 
 ## 3. Sub-agent sessions (`spawn_run`)
 

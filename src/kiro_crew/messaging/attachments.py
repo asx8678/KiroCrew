@@ -287,10 +287,39 @@ async def _fetch(download: DownloadFn, url: str, suffix: str) -> str:
     return dest
 
 
+#: Bytes read from EACH end of a large text attachment to build its preview. A
+#: preview shows a few KiB from each end, so a window many times that wide keeps
+#: the window's own cut far outside what is shown: a secret straddling the cut can
+#: never reach the preview, and redaction still runs before anything is cut to
+#: preview size. The full file stays on disk, kept by path (ATT-1).
+_PREVIEW_READ_WINDOW = 64 * 1024
+
+
 def _read_text_file(path: str, limit: int) -> str:
-    """Read a text attachment and redact+preview it (blocking; call offloaded)."""
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        return _preview(fh.read(), limit)
+    """Read a text attachment and redact+preview it (blocking; call offloaded).
+
+    A file up to two windows is read whole; a larger one only at its two ends, so
+    building an 8 KiB preview never reads a 50 MiB file into memory.
+    """
+    size = os.path.getsize(path)
+    if size <= 2 * _PREVIEW_READ_WINDOW:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return _preview(fh.read(), limit)
+    with open(path, "rb") as fh:
+        head = fh.read(_PREVIEW_READ_WINDOW)
+        fh.seek(size - _PREVIEW_READ_WINDOW)
+        tail = fh.read(_PREVIEW_READ_WINDOW)
+    return _preview_ends(
+        _redacted(head.decode("utf-8", errors="replace")),
+        _redacted(tail.decode("utf-8", errors="replace")),
+        limit,
+    )
+
+
+def _redacted(content: str) -> str:
+    content, _ = redact_exfiltration_urls(content)
+    content, _ = redact_credentials(content)
+    return content
 
 
 def _preview(content: str, limit: int) -> str:
@@ -298,15 +327,20 @@ def _preview(content: str, limit: int) -> str:
 
     Redaction runs first so a secret cannot survive by sitting past the cut.
     """
-    content, _ = redact_exfiltration_urls(content)
-    content, _ = redact_credentials(content)
+    content = _redacted(content)
     if len(content) <= limit:
         return content
-    marker = "\n[… truncated; full file kept at the path below]\n"
+    return _preview_ends(content, content, limit)
+
+
+def _preview_ends(head_text: str, tail_text: str, limit: int) -> str:
+    """At most *limit* characters: the start of *head_text*, a marker, the end of
+    *tail_text*. Both are already redacted."""
+    marker = "\n[… truncated; full file kept at the path above]\n"
     room = max(0, limit - len(marker))
     head = room // 2
     tail = room - head
-    return content[:head] + marker + (content[-tail:] if tail else "")
+    return head_text[:head] + marker + (tail_text[-tail:] if tail else "")
 
 
 async def ingest_attachments(

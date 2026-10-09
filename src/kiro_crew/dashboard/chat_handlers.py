@@ -1166,12 +1166,18 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
 
     from kiro_crew.chat_attachments import spill_large_paste
 
-    message, _paste_path = spill_large_paste(effective_session_key(slot), message)
+    # The spilled paste joins the END of the message's files list, so its marker
+    # number is one past the files already attached (``[attached_file N]`` is
+    # ``files[N-1]``).
+    _prior_files = user_meta.get("files") if isinstance(user_meta, dict) else None
+    _prior_files = _prior_files if isinstance(_prior_files, list) else []
+    message, _paste_path = spill_large_paste(
+        effective_session_key(slot), message, marker_index=len(_prior_files) + 1
+    )
     if _paste_path:
         if user_meta is None:
             user_meta = {}
-        files = user_meta.get("files")
-        user_meta["files"] = [*(files if isinstance(files, list) else []), _paste_path]
+        user_meta["files"] = [*_prior_files, _paste_path]
 
     if slot.turn_running or slot._turn_admission_reserved:
         # Mid-turn steer: inject into the RUNNING turn instead of queueing for
@@ -9620,12 +9626,18 @@ async def api_chat_mode(request: web.Request) -> web.Response:
     # that both leave the global override alone, declared or not: a scheduled run
     # asking for auto-approval on the one session it opened is never the
     # documented action that ends the operator's grant everywhere else.
+    #
+    # The dashboard's own picker and shortcut send ``end_override: true``: an
+    # operator stepping down from YOLO to Trust or Reads means YOLO off, so their
+    # slot-scoped trust revokes like ``normal`` does. Automation omits the flag
+    # and keeps the narrowing; app and cron callers never revoke.
     slot_scoped_trust = slot_key is not None and mode in _SLOT_SCOPED_TRUST_MODES
+    operator_step_down = body.get("end_override") is True
     if (
         not request_app
         and not cron_creator
         and mode != "yolo"
-        and (not slot_scoped_trust or safety_override().is_declared)
+        and (not slot_scoped_trust or operator_step_down or safety_override().is_declared)
     ):
         # deactivate() writes a SEL event, so it is offloaded exactly like the
         # sibling activate() — never run on the gateway loop. Safe after

@@ -29,6 +29,7 @@ from kiro_crew.execution_context import (
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import safe_read_file_bytes_nolink, validate_file_path
 from kiro_crew.llm_helpers import stream_and_collect_json
+from kiro_crew.repeat_loop import error_fingerprint
 from kiro_crew.safety_override import safety_override
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -1965,6 +1966,19 @@ class TaskRunner:
             run.status = "failed"
             run.error = f"Task limit reached ({_MAX_TOTAL_TASKS})"
             return False
+        # WF-6: the step retries already refuse a repeated error fingerprint; a
+        # re-plan that ends in the same failure as the one it answered would
+        # only plan around it again, so stop with the error instead.
+        fingerprint = error_fingerprint(failed_task.error or "")
+        if fingerprint and fingerprint == run.last_replan_error:
+            run.status = "failed"
+            clean_err, _ = redact_exfiltration_urls(failed_task.error or "")
+            clean_err, _ = redact_credentials(clean_err)
+            run.error = (
+                f"Task {failed_task.index} failed with the same error after a re-plan: {clean_err}"
+            )
+            return False
+        run.last_replan_error = fingerprint
         run.replan_count += 1
         err_preview = failed_task.error[:200]
         await self._notify(

@@ -197,6 +197,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 scripts/check_lockdown_before_publish.py
 
+      # Mirrored from fast-gate.yml static-ratchets. Whole-tree by construction
+      # (an AST walk of src/kiro_crew, no base ref), so main's integrated tree is
+      # exactly what it judges: an unlabelled model call landing through a merge
+      # has no diff of its own to appear in.
+      - name: Check every model call site writes its usage row
+        if: ${{ !cancelled() }}
+        run: python3 scripts/check_usage_surface.py
+
       # The census ratchet (TestGateSideLogRedactorSpelling / _BASELINE_LOG_SITE_CENSUS
       # in test_security_posture.py) and the config-baseline ratchet
       # (test_config_baseline.py against config-baseline.json) are the two

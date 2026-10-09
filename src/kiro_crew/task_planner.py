@@ -519,6 +519,7 @@ def update_plan_tasks(run: Project, tasks: list[dict]) -> Project:
     run.status = "planned"
     run.error = ""
     run.replan_count = 0
+    run.last_replan_error = ""
     return run
 
 

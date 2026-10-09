@@ -351,7 +351,9 @@ export const changeApprovalMode = createAsyncThunk<
   'dashboard/changeApprovalMode',
   async ({ mode, slot }, { rejectWithValue }) => {
     try {
-      await api.chatMode(mode, slot)
+      // The operator stepping down in the picker or by shortcut also ends a
+      // live YOLO grant; without the flag a slot-scoped trust leaves it on.
+      await api.chatMode(mode, slot, true)
     } catch (e) {
       const body = e instanceof ApiError ? e.body : ''
       let code = ''

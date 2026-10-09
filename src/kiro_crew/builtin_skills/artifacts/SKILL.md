@@ -228,7 +228,9 @@ sessions in sync without agent action.
 
 The user says "iterate on artifact <slug> — change X". Flow:
 
-1. `artifact_get(slug)` → read current.html
+1. `artifact_get(slug)` → read current.html. A large artifact comes back in
+   pages: keep calling with the `offset` it names until it says end of content,
+   and edit only once you hold the whole text
 2. Modify the HTML to address the change
 3. `artifact_update(slug, content=new_html)` → version bumps to vN+1
 4. Re-emit the same widget body in chat (so the user sees the result inline)

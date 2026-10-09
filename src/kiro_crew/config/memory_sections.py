@@ -472,9 +472,9 @@ class KnowledgeConfig:
         metadata=_meta(
             "Extraction Model",
             "LLM model used for document extraction and summarization. Empty "
-            "uses the default model (agent.model). Set to a specific model id "
-            "(e.g. 'claude-haiku-4.5') to use a cheaper model for extraction "
-            "without changing your chat default.",
+            "uses the background role's model (agent.role_models.background, "
+            "else auto), not your chat default. Set a model id to pin "
+            "extraction to it.",
         ),
     )
     extraction_pool_size: int = field(
@@ -493,7 +493,8 @@ class KnowledgeConfig:
         metadata=_meta(
             "Extraction Effort",
             "Reasoning effort for the document-extraction LLM pool. Empty "
-            "runs the default high. Only applies on reasoning-capable models.",
+            "runs low (not the chat effort). Only applies on reasoning-capable "
+            "models.",
             enum=["", *EFFORT_LEVELS],
             restart=True,
         ),

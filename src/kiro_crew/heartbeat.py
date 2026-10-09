@@ -1,6 +1,7 @@
 """Heartbeat service — periodic background tasks.
 
-Runs on a configurable interval (default 60s):
+Ticks every 60 s (the maintenance clock; ``heartbeat.interval_secs`` sets only
+the base gap before a kept HEARTBEAT.md task is sent again):
 - Reads HEARTBEAT.md for pending tasks → sends to agent
 - Rebuilds FTS index every 15 min
 """

@@ -136,6 +136,8 @@ class CleanupOwner(Protocol):
         ends_conversation: bool = False,
     ) -> bool: ...
 
+    async def retry_pending_config_recycle(self) -> None: ...
+
     async def _fire_recycle_callback(self, key: str, *, reason: str) -> None: ...
 
     def _pool_pids(self) -> set[int]: ...
@@ -1220,6 +1222,8 @@ class SessionCleanup:
             await self._maybe_prune_pycache()
             await self._sweep_periodic_pids()
             await self._sweep_untracked_mcps()
+            # SES-1: a config save deferred these while their turn was in flight.
+            await self._owner.retry_pending_config_recycle()
             # LAST on the tick, deliberately. Every sweep above may retract a
             # record or end a process, so running the comparison after them means
             # it reconciles the state they left rather than the state they were

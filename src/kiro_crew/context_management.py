@@ -163,6 +163,7 @@ def summarize_result(
     result_path: str,
     words: int = RESULT_SUMMARY_WORDS,
     final_segment: str = "",
+    preview_text: str = "",
 ) -> str:
     """Build a completion-event body that points at the full transcript on disk.
     Emits a first+last ``words`` preview of *result* plus the ``result_path`` to
@@ -177,10 +178,14 @@ def summarize_result(
     short result) adds nothing and the preview alone stands.
     Used when the completion-event copy was truncated (``head``/``tail``/``both``
     dropped content) or for orchestrator-mode delivery, so the deliverable at the
-    end of a long transcript is never silently lost. The preview reflects whatever
-    end ``apply_completion_keep`` retained; the file is the source of truth.
+    end of a long transcript is never silently lost. *preview_text*, when given,
+    is the full transcript the preview is drawn from, so its last words are the
+    run's real end even when *result* is a head-only kept copy; the closing
+    section is still judged against *result*, the copy the parent already has.
+    Without it the preview reflects whatever end ``apply_completion_keep``
+    retained; the file is the source of truth.
     """
-    tokens = (result or "").split()
+    tokens = (preview_text or result or "").split()
     half = max(1, words // 2)
     if len(tokens) <= words:
         preview = " ".join(tokens)

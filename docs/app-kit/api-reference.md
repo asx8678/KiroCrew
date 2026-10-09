@@ -813,6 +813,8 @@ Options: `{ source?: string, ephemeral?: boolean, maxAge?: number }`
 - `maxAge`: must be a finite positive number (rejects boolean, NaN, Infinity, ≤0); omit or pass null for no expiry
 - `content`: must be a non-empty string, ≤40,000 chars
 
+**Capacity** (429 `capacity_reached`): a slot holds at most 50 pending context entries (expired ones are dropped first). A full queue refuses the new entry rather than evicting an older one, so one app's burst cannot push out another producer's queued context; retry after the slot's next turn drains it.
+
 **Ownership** (404 on refusal; applies to app callers — a dashboard caller is unrestricted):
 - An app may only target a slot it owns, and a slot carrying no app scope is refused as well.
 - Owning the slot is not sufficient: an app is refused when the slot's session is linked elsewhere — a cron result or workflow injection holding that binding — because both writes land in the linked session, so slot ownership alone would otherwise reach a conversation the app has no claim on.

@@ -626,6 +626,7 @@ async def _update_unserialized(
         # Set only if a retarget takes this loop's pending wake claim, so the
         # rollback below restores exactly what it removed and nothing else.
         claim_discarded_for_retarget = False
+        blind_discarded_for_retarget = False
         floor_discarded_for_retarget = False
         #: Whether this update changed something that can change the WATCHED
         #: SUBJECT -- the instruction, or the brief whose target list names it.
@@ -837,6 +838,8 @@ async def _update_unserialized(
                     # retarget never lands.
                     claim_discarded_for_retarget = loop.id in self._pending_monitor_wake
                     self._pending_monitor_wake.discard(loop.id)
+                    blind_discarded_for_retarget = loop.id in self._pending_monitor_blind
+                    self._pending_monitor_blind.discard(loop.id)
                     # And the floor claim, for the identical reason. I added
                     # that second claim one round ago and wrote on the pull
                     # request that two hand-written claim sets with two release
@@ -1108,6 +1111,8 @@ async def _update_unserialized(
                 # follow-up turn. Rolling back the fields but not this is the
                 # same incomplete-restore defect as the terminal transition's.
                 self._pending_monitor_wake.add(loop.id)
+                if blind_discarded_for_retarget:
+                    self._pending_monitor_blind.add(loop.id)
             if floor_discarded_for_retarget:
                 # Same restore, same reason. This is the fourth hand-written
                 # restore of a per-loop claim in this file, and the review has now

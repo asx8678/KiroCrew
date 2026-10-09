@@ -23,8 +23,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "src" / "kiro_crew"
 
-# The call names that drive a model turn and take ``usage_surface``.
-TARGETS = frozenset({"stream_and_collect", "_facade_stream_and_collect"})
+# The call names that drive a model turn and take ``usage_surface``. The JSON
+# variant forwards the label, so an unlabelled call to it writes nothing either.
+TARGETS = frozenset(
+    {
+        "stream_and_collect",
+        "_facade_stream_and_collect",
+        "stream_and_collect_json",
+        "_facade_stream_and_collect_json",
+    }
+)
 
 # Context managers that write the usage row themselves on every exit.
 SELF_METERED = frozenset({"background_turn", "metered_turn"})
@@ -48,6 +56,18 @@ ALLOWED: dict[tuple[str, str], str] = {
         "history_consolidation.py",
         "_facade_stream_and_collect",
     ): "forwarding wrapper; every caller of it is checked as a target",
+    (
+        "history_consolidation.py",
+        "_facade_stream_and_collect_json",
+    ): "forwarding wrapper; every caller of it is checked as a target",
+    (
+        "history_consolidation.py",
+        "_call_llm",
+    ): "background_turn writes the row; it is entered through an AsyncExitStack this walk cannot see",
+    (
+        "llm_helpers.py",
+        "stream_and_collect_json",
+    ): "forwards usage_surface to stream_and_collect; its callers are checked as targets",
 }
 
 

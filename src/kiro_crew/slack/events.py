@@ -2060,6 +2060,9 @@ def take_queued_burst(orch: GatewayOrchestrator, session_key: str):
     ts, text, kwargs = first
     texts = [text]
     stamps = [ts]
+    # Every joined entry's temp images: dispatch unlinks only the merged
+    # entry's list, so a later entry's files would otherwise outlive the turn.
+    temp_paths = list(kwargs.get("image_temp_paths") or [])
     key = _queue_sender_key(kwargs)
     while len(texts) < _SLACK_COLLAPSE_MAX:
         nxt = _pop_queued(orch, session_key)
@@ -2070,8 +2073,11 @@ def take_queued_burst(orch: GatewayOrchestrator, session_key: str):
             break
         texts.append(nxt[1])
         stamps.append(nxt[0])
+        temp_paths.extend(nxt[2].get("image_temp_paths") or [])
     merged = dict(kwargs)
     merged["_collapsed_ts"] = stamps[1:]
+    if temp_paths:
+        merged["image_temp_paths"] = temp_paths
     return ts, "\n".join(part for part in texts if part), merged
 
 
@@ -2341,12 +2347,11 @@ def _thread_follow_admits(
     bot is admitted by that same rule: Slack also delivers it as a plain
     ``message`` event, which reaches here with ``is_mention`` False.
     """
-    from kiro_crew.slack.thread_follow import follow_is_fresh
+    from kiro_crew.slack.thread_follow import follow_is_fresh, has_bot_post, note_bot_post
 
-    in_active_thread = (
+    known_thread = bool(
         thread_follow
         and thread_ts
-        and follow_is_fresh(thread_ts)
         and orch.sessions
         and (
             orch.sessions.has_session(thread_ts)
@@ -2354,7 +2359,17 @@ def _thread_follow_admits(
             or (orch.conv_log and orch.conv_log.has_log(thread_ts))
         )
     )
-    if not in_active_thread:
+    if known_thread and not has_bot_post(thread_ts) and orch.conv_log:
+        # The last-post map is in memory, so a gateway restart empties it and
+        # every followed thread would stop following until a fresh mention.
+        # The thread log's last write stands in for the bot's last post.
+        last_write = orch.conv_log.session_mtime(thread_ts)  # type: ignore[arg-type]
+        if last_write:
+            note_bot_post(thread_ts, when=last_write)
+    in_active_thread = known_thread and follow_is_fresh(thread_ts)
+    if known_thread and not in_active_thread:
+        error = "thread-follow: expired"
+    elif not in_active_thread:
         error = f"activation={activation}, no mention or active thread"
     elif _addressed_to_someone_else(text, validated_self_user_id()):
         error = "thread-follow: addressed to another user"

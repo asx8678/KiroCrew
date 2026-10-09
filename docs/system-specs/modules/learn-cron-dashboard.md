@@ -354,6 +354,43 @@ ran. The `wakesCrew` grouping above is unchanged: a member-captured sequence sti
 - Chokepoint string-field gate: `_build_job`/`_update_job_locked` type/length-validate **every** caller-supplied string field through one table (`_CRON_STRING_FIELD_CAPS` — name, message, channel, thread_ts, agent_id, created_by, folder_id, chat_folder_id, session_key, model, command, script, timezone), with caps matching the REST/MCP boundary schemas. Non-string truthy values and over-cap strings raise `ValueError` at the persistence owner regardless of caller; `None`/`""` keep their "not set"/no-op semantics while any other falsy non-string is rejected. An anti-drift test (`test/test_cron_string_field_validation.py`) asserts every persisted str field on `CronJob` is either in the table or in a documented runtime-only exclusion set
 - Async stop: `stop()` is now async, cancels and awaits every run claim's tracked task before returning, then drops the claims
 
+### Default agent for new LLM jobs (`kirocrew-cron`, LOOP-6)
+
+`cron_service/fields.build_job` gives a NEW job that names no agent, command,
+script or agent sequence `agent_id="kirocrew-cron"`. Stored jobs keep whatever
+they had. `agent._install_cron_agent` writes that spec as a short prompt
+(`_CRON_AGENT_PROMPT`), `tools: ["@builtin"]` and `includeMcpJson: false`, so the
+job starts without the ~40 KB default operating contract. What that takes away
+from such a job, all of it a consequence of the spec rather than a separate rule:
+
+- **No Kiro Crew MCP server.** A spec's `tools` is the session's MCP allowlist
+  (`acp/session_mcp.py`), and `["@builtin"]` names neither `kirocrew-core` nor
+  `kirocrew-cron`, so the job has no `send_message`, `spawn_run`, `cron_*`,
+  `memory_recall` or `learn_add`. Its reply still reaches the job's channel
+  through the gateway's own delivery.
+- **No `agent.default_agent`.** The job names an agent, so it is no longer an
+  agent-less job the operator's default agent would apply to.
+- **No skills.** `kirocrew-cron` is a custom agent, and a custom agent's context
+  skips the skills block.
+
+Open: whether a new job should keep a narrow Kiro Crew surface (for example
+`@kirocrew-core/send_message`) is a maintainer decision, as are the other LOOP-6
+steps not built: `minimal_context` still defaults `False` at `CronService.add_job`
+and on all three create surfaces (MCP, dashboard, CLI), the scheduler does not back
+off on `consecutive_dupes`, `cron_add` does not warn on an LLM job under 900 s, and
+the "~200 tokens" figure in the `cron_add` help needs re-measuring before it is
+reworded.
+
+### ACP-death retry runs only before dispatch
+
+`_cron_callback` retries a run once after resetting the session when the ACP
+process died (`AcpProcessDied`, or an `AcpError` whose text says "not running" or
+"process exited"), but only while `_prompt_dispatched` is still `False`. After the
+prompt reached the provider, tools may already have run, so a death mid-turn (the
+client's "Process exited during prompt") fails the run and alerts instead of
+replaying it (NEW-D1). The cost: a job that dies mid-turn no longer heals within
+that run; it runs again on its next schedule.
+
 ### Result delivery order, and the delivery-agnostic dedup anchor
 
 A finished `message` cron fans out to three surfaces, in this order:
@@ -3089,6 +3126,8 @@ owns them:
 | `_timers` | armed and cancelled by `timers`, awaited by `maintenance`, cleared by `stop()` |
 | `_firing`, `_rearm_pending` | the fire window: opened by `firing`, deferred around by `timers`, `mutations` and `monitor_records` |
 | `_pending_monitor_wake`, `_pending_floor_tick` | charge-on-delivery claims: taken by `gate`, charged by `firing`, dropped by `timers` and a `mutations` retarget |
+| `_pending_monitor_wake_body` | the gated WAKE's brief (`irq.Verdict.body`), parked beside its claim and consumed or re-owed with it; every fire path (dashboard, Slack thread, DM) PEEKS it into the nudge text (`_monitor_wake_brief`) |
+| `_pending_monitor_blind` | claims whose wake is the kernel's own blind alert (`Verdict.blind`): delivered and charged, but they keep the blind streak and earn no follow-up tick (LOOP-7) |
 | `_rearm_fail_count`, `_start_failure_deferred` | written by `firing`, dropped by `timers` on a landed turn (the deferral) and by `mutations.remove_sync` |
 | `_accepted_monitor_turns`, `_deferred_monitor_replacements` | kept by `monitor_records`, dropped by `mutations.remove_sync`; `stop()` also clears the accepted turns |
 | `_maintenance_quiescing`, `_maintenance_quiesce_events` | set by `maintenance`, honoured by the `timers` reconciler, cleared by `stop()` |

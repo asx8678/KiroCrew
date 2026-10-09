@@ -1158,6 +1158,14 @@ class AcpPromptStats:
     # registry-derived window never clobbers real served counts. Defaults False
     # and re-inits per turn, carried across turns alongside the counts.
     context_tokens_from_usage: bool = False
+    # True when ``context_window_tokens`` came from a static source (the model
+    # registry, the supplementary map or the 1M heuristic) rather than a served
+    # ``usage_update.size`` or kiro's own ``--list-models`` catalog. A token count
+    # backfilled from such a window may be off by the window's error: the
+    # registry folds served-200K aliases onto a 1M canonical, which makes the
+    # derived count five times too high. Read through the providers'
+    # ``context_used_tokens_reliable`` (CTX-1). Carried with the window.
+    context_window_suspect: bool = False
     # Per-turn billing credits summed from kiro's _kiro.dev/metadata
     # meteringUsage (unit="credit"). 0 for providers that bill in tokens.
     credits: float = 0.0
@@ -1205,6 +1213,7 @@ class AcpPromptStats:
             context_used_tokens=self.context_used_tokens,
             context_window_tokens=self.context_window_tokens,
             context_tokens_from_usage=self.context_tokens_from_usage,
+            context_window_suspect=self.context_window_suspect,
             context_pct_unknown=self.context_pct_unknown,
             cost_session_usd=self.cost_session_usd,
         )
@@ -1234,6 +1243,7 @@ class AcpPromptStats:
         self.context_used_tokens = 0
         self.context_window_tokens = 0
         self.context_tokens_from_usage = False
+        self.context_window_suspect = False
         self.context_pct_unknown = False
         # The adapter's cumulative cost counter belongs to the OLD session; the
         # fresh session/new starts it at zero, so a kept baseline would
@@ -1381,6 +1391,7 @@ class AcpPromptStats:
                 return
             win = int(reg_win)
             self.context_window_tokens = win
+            self.context_window_suspect = model_registry.window_source(model_id) != "kiro-list"
         # sanitize_pct already clamps live telemetry, but a caller may pass a raw
         # pct here; guard the multiply so a stray NaN/inf can never overflow.
         safe_pct = 0.0 if pct != pct else min(max(pct, 0.0), 100.0)
@@ -1407,7 +1418,7 @@ class AcpPromptStats:
         self.context_pct = 0.0
         self.context_pct_unknown = True
 
-    def rebase_to_window(self, window_tokens: int) -> None:
+    def rebase_to_window(self, window_tokens: int, *, window_suspect: bool = False) -> None:
         """Re-anchor the token stats to a new model's context window.
 
         Called after a mid-session ``session/set_model``: the previous model's
@@ -1421,8 +1432,13 @@ class AcpPromptStats:
         zero out (the old model's pct must not ship in the reset broadcast),
         so downstream consumers fall back to their own model-derived value
         until the next turn's telemetry re-derives real numbers.
+        *window_suspect* says the new window came from a static source (see
+        ``context_window_suspect``).
         """
         self.context_tokens_from_usage = False
+        self.context_window_suspect = bool(window_suspect) and bool(
+            window_tokens and window_tokens > 0
+        )
         if window_tokens and window_tokens > 0:
             self.context_window_tokens = int(window_tokens)
             if self.context_used_tokens > 0:

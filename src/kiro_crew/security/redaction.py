@@ -1778,11 +1778,36 @@ def redact_credentials(text: str) -> tuple[str, list[str]]:
     """
     subject, index_map = _fold_view(text)
     spans, warnings, _rules = _credential_redaction_plan(subject)
-    if not spans:
-        return text, warnings
     if index_map is not None:
         spans = [_remap_span(s, index_map) for s in spans]
+        # Also scan the text as stored. Folding removes characters, and a
+        # pattern guarded by a lookbehind can match the original yet miss the
+        # folded view (an escape folded away leaves a word character in front
+        # of the token), so the folded pass alone redacts LESS than before.
+        raw_spans, raw_warnings, _raw_rules = _credential_redaction_plan(text)
+        spans = _union_spans(spans, raw_spans)
+        warnings = warnings + [w for w in raw_warnings if w not in warnings]
+    if not spans:
+        return text, warnings
     return _splice(text, spans), warnings
+
+
+def _union_spans(
+    first: "list[tuple[int, int, str]]", second: "list[tuple[int, int, str]]"
+) -> "list[tuple[int, int, str]]":
+    """Merge two span lists into one sorted, disjoint list for :func:`_splice`.
+
+    Overlapping spans become one covering both, keeping the replacement of the
+    span that starts first, so no credential byte survives between them.
+    """
+    merged: list[tuple[int, int, str]] = []
+    for start, end, replacement in sorted(first + second, key=lambda sp: (sp[0], -sp[1])):
+        if merged and start < merged[-1][1]:
+            prev_start, prev_end, prev_replacement = merged[-1]
+            merged[-1] = (prev_start, max(prev_end, end), prev_replacement)
+        else:
+            merged.append((start, end, replacement))
+    return merged
 
 
 #: Label forms of the key-value AWS branches: the key name, its separator and

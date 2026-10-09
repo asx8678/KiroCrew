@@ -591,11 +591,13 @@ def _digest_success_line(
     still stands for the rest.
     """
     kept = " (partial: backend failed to generate the final response)" if partial else ""
-    seg = (final_segment or "")[:DIGEST_ANSWER_CHARS]
+    # The deliverable ends the segment, so the cut keeps the END and marks the
+    # dropped start, like the run's own tail cap of the same segment.
+    seg = (final_segment or "")[-DIGEST_ANSWER_CHARS:]
     ell = "…" if len(final_segment or "") > DIGEST_ANSWER_CHARS else ""
     return f"— `{info_id}` ✅{kept} {task_text[:80]}" f"{model_tag} · {usage}" + (
         f"\n  → {result_path}" if result_path else ""
-    ) + (f"\n  Answer: {seg}{ell}" if seg else "")
+    ) + (f"\n  Answer: {ell}{seg}" if seg else "")
 
 
 def _injection_slot_busy(slot: Any) -> bool:
@@ -3126,6 +3128,11 @@ class GatewayOrchestrator:
                             _cls = json.loads(inject_cls)
                             _cls["queue_id"] = qid
                             slot.append("queued", wrapped, json.dumps(_cls))
+                            # The queued row is visible now, so the sidebar's
+                            # queue state must follow it. The dedupe anchor is
+                            # NOT advanced here: a report purged before it drains
+                            # was never seen, so its repeat must not be a bell.
+                            self.dashboard_state.push_slots_update()
                         else:
                             # `cls` is not persisted for role `inject`, so the label
                             # must also ride in `meta`, which is — otherwise the row
@@ -4723,16 +4730,17 @@ class GatewayOrchestrator:
                     )
 
                 try:
-                    from kiro_crew.config.loader import KiroCrewConfig
-
-                    cron_model = job.model or KiroCrewConfig.load().agent.resolve_model("cron")
+                    # A job's own pin is explicit; otherwise the allocation
+                    # resolves under the ``cron`` role, so the crew's or
+                    # template's pin still wins over the role's model.
                     client, is_new, resumed = await self.sessions.get_or_create(
                         key,
                         agent=agent_id,
                         crew_agent=crew_agent,
                         channel_id=job.channel,
                         approval_policy=job.approval_mode,
-                        model=cron_model,
+                        model=job.model or None,
+                        model_role="cron",
                         extra_env=_cron_extra_env(),
                         cwd=cwd,
                     )
@@ -5678,18 +5686,21 @@ class GatewayOrchestrator:
                 if (
                     # Match the death by type: the pipe-broken raise sites in
                     # acp/client.py word it "pipe broken", which no substring
-                    # below covers. The typed arm is held to before dispatch,
-                    # where no tool can have run yet. Once the retry attempt
-                    # has started, this frame skips its transient ladder, so
-                    # no prompt is sent again after that attempt.
-                    # The substrings keep their old reach.
+                    # below covers. Both arms are held to before dispatch,
+                    # where no tool can have run yet: a death mid-turn (the
+                    # client words it "Process exited during prompt") may
+                    # follow tools that already ran, and a replay would run
+                    # them twice. Once the retry attempt has started, this
+                    # frame skips its transient ladder, so no prompt is sent
+                    # again after that attempt.
                     (
-                        (isinstance(exc, AcpProcessDied) and not _prompt_dispatched)
+                        isinstance(exc, AcpProcessDied)
                         or (
                             isinstance(exc, AcpError)
                             and ("not running" in exc_msg or "process exited" in exc_msg)
                         )
                     )
+                    and not _prompt_dispatched
                     and not getattr(job, "_acp_retried", False)
                     and self.sessions is not None
                 ):
@@ -6570,6 +6581,20 @@ class GatewayOrchestrator:
         )
         await self.heartbeat_svc.start()
 
+    def _monitor_wake_brief(self, loop_id: str) -> str:
+        """The gated WAKE brief parked for *loop_id*, or ``""`` (LOOP-17).
+
+        PEEK, never take: firing's settlement consumes it with the wake claim
+        and re-owes it on a refused fire, so a busy target cannot lose it. The
+        dashboard fire path reads it the same way inline.
+        """
+        if self.autonudge_svc is None:
+            return ""
+        peeked = self.autonudge_svc.peek_monitor_wake_body(loop_id)
+        # isinstance, not truthiness: a test double's bare MagicMock returns a
+        # Mock and must not append garbage to the prompt.
+        return peeked if isinstance(peeked, str) else ""
+
     async def _fire_slack_nudge(
         self, loop: NudgeLoop, wake_message: str | None = None
     ) -> bool | MonitorDispatchResult:
@@ -6616,6 +6641,9 @@ class GatewayOrchestrator:
             _fired_generation = loop.config_generation
             msg_body = await compose_nudge_body(_fired_message, _fired_sentinel, loop.slot_key)
             tagged = f"{nudge_cycle_header(loop)}\n{msg_body}"
+            _wake_body = self._monitor_wake_brief(loop.id)
+            if _wake_body:
+                tagged = f"{tagged}\n{_wake_body}"
         else:
             tagged = wake_message
             _fired_generation = loop.config_generation
@@ -6995,6 +7023,9 @@ class GatewayOrchestrator:
                 loop.message, loop.stop_sentinel_path, loop.slot_key
             )
             tagged = f"{nudge_cycle_header(loop)}\n{msg_body}"
+            _wake_body = self._monitor_wake_brief(loop.id)
+            if _wake_body:
+                tagged = f"{tagged}\n{_wake_body}"
         else:
             tagged = wake_message
 
@@ -9342,10 +9373,33 @@ class GatewayOrchestrator:
                 # accounting below: tests drive this consumer with MagicMock
                 # infos, and only a real str participates.
                 _seg = getattr(info, "final_segment", "")
+                # The preview reads the FULL transcript on disk, as
+                # spawn_sub_agents does: drawn from the head-cut copy, its "last
+                # words" are the middle of the run, and a run that ended on a
+                # tool call (empty closing segment) loses its end entirely.
+                _full = ""
+                if isinstance(result_path, str):
+                    try:
+                        _full = await asyncio.to_thread(
+                            Path(result_path).read_text,
+                            encoding="utf-8",
+                            errors="replace",
+                        )
+                        # result.txt is the RAW stream; strip the [OPTIONS:]
+                        # marker the way info.result was derived, or a run
+                        # ending on one previews the markup, not the answer.
+                        _full, _ = extract_options(_full)
+                    except OSError:
+                        logger.debug(
+                            "subagent %s: result file unreadable; preview from kept copy",
+                            info.id,
+                            exc_info=True,
+                        )
                 detail = summarize_result(
                     info.result,
                     result_path,
                     final_segment=_seg if isinstance(_seg, str) else "",
+                    preview_text=_full,
                 )
             else:
                 detail = info.result or "_No response._"

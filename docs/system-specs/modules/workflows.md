@@ -402,7 +402,7 @@ are allowed** so a journal stays forward-compatible.
 | `agent_progress` | `agent_id`, `turns`, `last_tool`, `elapsed_s` | **builder exists, nothing emits it.** The frontend reads `last_tool` from it |
 | `agent_finished` | `agent_id`, `result_summary`, `ok` | plus an optional `error` (bounded, redacted; empty when `ok`). `result_summary` is `str(result)[:120]`, empty when the result is `None`. `error` is deliberately **not** in `REQUIRED_DATA_KEYS` so journals from an older build still deserialize |
 | `log` | `message` | from `ctx.log()`, from authoring progress, and from nudge outcomes |
-| `budget_update` | `spent`, `remaining` | **builder exists, nothing emits it** (see the Budget open question) |
+| `budget_update` | `spent`, `remaining` | emitted by `runner._charge` after each charged call whenever `budget_total` is set (see Budget) |
 | `approval_requested` | `prompt`, `approval_id` | **builder exists, nothing emits it**; `ctx.approve` delegates straight to its port |
 | `run_finished` | `result`, `duration_s` | terminal. `result` is the script's return value; `duration_s` is host `time.monotonic()` elapsed |
 | `run_failed` | `error`, `where` | terminal. `where` is one of `author`, `validate`, `ceiling`, `exec` |
@@ -556,6 +556,17 @@ the loop: the prompt is augmented with the serialized schema and a JSON-only
 instruction, and on malformed or invalid output the model is re-asked up to
 `retries` more times (default 2, so 3 attempts total) with the validation errors
 appended so it can self-correct.
+
+Each re-ask is a whole new step: it goes through `_invoke` to a fresh `agent_fn`
+call, which opens a new session (cold path) or resets a reused pool worker, and
+re-sends the full original prompt plus the errors (WF-1). That is deliberately
+unchanged for now. A same-session follow-up would need the pool to hold one worker
+across the whole schema loop, which changes the `agent_fn` contract; a single
+tool-free reformat call would change the attempt count the C2 tests pin. Both are
+maintainer decisions. What bounds the cost today is the budget: with `budget_total`
+set, every re-ask is charged like any other call (USE-2).
+
+An edited rerun replays nothing, deliberately: replaying unchanged steps keyed on a content hash would be new rerun semantics, and "replays nothing" is the safe direction (WF-4, left as decided).
 
 **A schema violation is not a run failure.** After the bounded retries,
 `run_with_schema` returns `None`, `ctx.agent()` returns `None`, and

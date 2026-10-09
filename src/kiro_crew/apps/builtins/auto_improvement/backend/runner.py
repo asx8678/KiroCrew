@@ -71,6 +71,11 @@ DEFAULT_MAX_CYCLES = 25
 DEFAULT_MAX_HOURS = 2.0
 DEFAULT_MAX_COST_USD = 5.0
 
+#: Credits cap for a run (USE-3). Kiro bills in credits, so ``maxCostUsd`` never
+#: trips on it; this is the cap that can. 0 means no credits cap, which keeps an
+#: existing run's behaviour unchanged.
+DEFAULT_MAX_CREDITS = 0.0
+
 #: How long :meth:`RunSupervisor.stop` waits for the driver to finish its current
 #: candidate. The spine stops between candidates, not mid-measurement, so a stop lands
 #: after at most one gate+measure — bounded, but not instant.
@@ -615,6 +620,8 @@ class RunSupervisor:
             max_cycles=_pos_int(config.get("maxCycles"), DEFAULT_MAX_CYCLES),
             max_hours=_pos_float(config.get("maxHours"), DEFAULT_MAX_HOURS),
             max_cost_usd=_pos_float(config.get("maxCostUsd"), DEFAULT_MAX_COST_USD),
+            # A missing, zero or invalid value falls back to the 0 default: no cap.
+            max_credits=_pos_float(config.get("maxCredits"), DEFAULT_MAX_CREDITS),
             # Consecutive no-keep cycles before the run calls the region mined out.
             # Exposed because it, not maxCycles, is the RIGHT way to end a run early:
             # it stops when there is nothing left to find instead of at an arbitrary

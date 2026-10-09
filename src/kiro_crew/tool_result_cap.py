@@ -70,6 +70,12 @@ def safe_name_part(value: object, limit: int = 64) -> str:
     return _UNSAFE_NAME_CHARS.sub("_", str(value))[:limit]
 
 
+#: The opening of every transport truncation note. A consumer that must tell the
+#: note apart from real content (TOOL-6: an artifact rewrite that would write it
+#: back) matches on this, so the note and its detection cannot drift.
+TRUNCATION_MARKER_PREFIX = "…[response truncated"
+
+
 def truncation_note(total: int, omitted: int, spill_path: str | None) -> str:
     """The line placed between the kept head and tail."""
     where = (
@@ -79,7 +85,7 @@ def truncation_note(total: int, omitted: int, spill_path: str | None) -> str:
         else "the full text was not saved; narrow the call to see the rest"
     )
     return (
-        f"\n…[response truncated: {omitted} of {total} chars omitted from the middle; "
+        f"\n{TRUNCATION_MARKER_PREFIX}: {omitted} of {total} chars omitted from the middle; "
         f"{where}]\n"
     )
 

@@ -177,23 +177,30 @@ PASTE_SPILL_BYTES = 32 * 1024
 PASTE_PROMPT_BUDGET = 4 * 1024
 
 
-def spill_large_paste(session_key: str, message: str) -> tuple[str, str]:
+def spill_large_paste(session_key: str, message: str, *, marker_index: int = 1) -> tuple[str, str]:
     """Store a dashboard paste over 32 KB and return ``(prompt, path)``.
 
     The prompt is at most 4 KB: a path marker plus a head-and-tail preview.
-    A short message is returned unchanged with an empty path. A store failure
-    returns the original text so the user's words are not dropped.
+    *marker_index* is the 1-based position the caller gives the returned path
+    in the message's ``files`` list, since ``[attached_file N]`` resolves to
+    ``files[N-1]``. A short message is returned unchanged with an empty path. A
+    store failure returns the original text so the user's words are not dropped.
     """
     if len(message.encode("utf-8")) <= PASTE_SPILL_BYTES:
         return message, ""
     import tempfile
 
-    fd, src = tempfile.mkstemp(prefix="kirocrew-paste-", suffix=".txt")
+    src = ""
     try:
+        # Written in place in the session's attachments directory: a temp file
+        # elsewhere would need a move, and a move across filesystems (a tmpfs
+        # /tmp) fails and sends the whole paste inline.
+        fd, src = tempfile.mkstemp(
+            prefix="kirocrew-paste-", suffix=".txt", dir=_session_attachments_dir(session_key)
+        )
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(message)
-        kept = adopt_channel_file(session_key, src)
-        src = ""
+        kept, src = src, ""
     except Exception:
         logger.debug("paste spill failed", exc_info=True)
         if src:
@@ -202,7 +209,7 @@ def spill_large_paste(session_key: str, message: str) -> tuple[str, str]:
             except OSError:
                 pass
         return message, ""
-    marker = f"[attached_file 1] {kept}\n"
+    marker = f"[attached_file {marker_index}] {kept}\n"
     trailer = "\n[end of paste preview; full text at the path above]"
     room = PASTE_PROMPT_BUDGET - len(marker) - len(trailer) - len("\n[…]\n")
     if room < 64:
@@ -217,12 +224,8 @@ def spill_large_paste(session_key: str, message: str) -> tuple[str, str]:
     return prompt, kept
 
 
-def adopt_channel_file(session_key: str, src: str) -> str:
-    """Move a channel download into the session attachments directory.
-
-    The directory is the one :func:`stage_attachments_removal` deletes with the
-    session. The returned path replaces *src*; the source is gone.
-    """
+def _session_attachments_dir(session_key: str) -> Path:
+    """The session's owner-only attachments directory, created when missing."""
     from kiro_crew.history import transcript_stem
     from kiro_crew.platform_compat import restrict_dir_to_owner
     from kiro_crew.session_storage import _crew_sessions_dir
@@ -230,6 +233,16 @@ def adopt_channel_file(session_key: str, src: str) -> str:
     dest_dir = attachments_dir(_crew_sessions_dir(), transcript_stem(session_key or "channel"))
     dest_dir.mkdir(parents=True, exist_ok=True)
     restrict_dir_to_owner(dest_dir)
+    return dest_dir
+
+
+def adopt_channel_file(session_key: str, src: str) -> str:
+    """Move a channel download into the session attachments directory.
+
+    The directory is the one :func:`stage_attachments_removal` deletes with the
+    session. The returned path replaces *src*; the source is gone.
+    """
+    dest_dir = _session_attachments_dir(session_key)
     name = _safe_name(Path(src).name) or "attachment"
     dest = dest_dir / name
     if dest.exists():

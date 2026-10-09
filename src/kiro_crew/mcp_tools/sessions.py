@@ -94,6 +94,11 @@ def schemas() -> list[dict[str, Any]]:
                         "description": "Max (most recent) messages to return (default 50, max 200).",
                         "default": 50,
                     },
+                    "before": {
+                        "type": "integer",
+                        "description": "Skip this many of the newest messages, to page back through a long conversation (default 0). The result says which value reaches the next older page.",
+                        "default": 0,
+                    },
                     "all_workspaces": {
                         "type": "boolean",
                         "description": "Allow reading a session from a different workspace than the caller's (default false — deny cross-workspace).",
@@ -260,6 +265,7 @@ def get_chat_session(name: str, args: dict[str, Any]) -> str:
         return refusal
     key = args["session_key"]
     max_messages = args.get("max_messages", 50)
+    before = args.get("before", 0)
     all_workspaces = args.get("all_workspaces", False)
     # Defense-in-depth on a path-bearing identifier: ConversationLog._safe_key
     # already neutralizes separators. Reject path separators outright, and ".."
@@ -332,7 +338,7 @@ def get_chat_session(name: str, args: dict[str, Any]) -> str:
     # writer can tighten it before the rows are read; the seam validates the
     # line with the rows under one lock. Same refusal as above.
     try:
-        messages = cl.derive_recent(key, max_messages=max_messages, roles=RECALL_ROLES)
+        messages = cl.derive_recent(key, max_messages=max_messages + before, roles=RECALL_ROLES)
     except TranscriptBusy:
         # The seam could not take the transcript lock in time (its own save, a
         # cron append, a second gateway). Not private -- say retry, not refused.
@@ -351,6 +357,13 @@ def get_chat_session(name: str, args: dict[str, Any]) -> str:
             outcome="refused_incognito",
         )
         return "That conversation is private (incognito/temporary) and cannot be read."
+    if before:
+        # Page back: drop the ``before`` newest messages of the wider read.
+        messages = messages[:-before] if before < len(messages) else []
+        if not messages:
+            return mcp_core._redact_history_output(
+                f"Conversation `{key}` has no messages before that point."
+            )
     if not messages:
         mcp_core.sel().log_tool_invocation(
             session_key=session_key,
@@ -389,8 +402,12 @@ def get_chat_session(name: str, args: dict[str, Any]) -> str:
         kept.append({"role": role, "content": capped})
     kept.reverse()
     if len(kept) < len(messages):
+        # A smaller ``max_messages`` returns FEWER of the newest messages, never
+        # older ones; ``before`` is what pages back.
         lines.append(
-            f"_Showing {len(kept)} of {len(messages)} messages (newest kept). Ask with a smaller `max_messages` for older ones._"
+            f"_Showing {len(kept)} of {len(messages)} messages (newest kept). For older "
+            f"ones call again with before={before + len(kept)}, or find them by keyword "
+            "with search_chat_history._"
         )
         lines.append("")
     for m in kept:

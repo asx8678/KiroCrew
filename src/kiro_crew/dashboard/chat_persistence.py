@@ -1622,62 +1622,76 @@ def _apply_recent_session(
     # No channel origin here: the caller skips every non-dashboard key, so a
     # channel-born session never reaches this — ``channel_slot_reconciler`` owns
     # surfacing those.
-    slot = state.get_or_create_slot(slot_name, **_metadata_codec.slot_args(meta, purpose))
-    # The title is the session list's (it names an untitled session after its
-    # first message); every other field comes from the line, through the one
-    # field table (``slot_persistence.metadata_codec``).
-    applied = _metadata_codec.apply(state, slot, meta, purpose)
-    if applied.minted_tab_id is not None:
-        # restore_recent_sessions runs during on_startup (event loop live) — keep
-        # the _locked flock/os.close off the loop via the off-loop backfill
-        # helper. Dispatched AFTER the transcript read (the caller prefetches
-        # messages first) so its os.replace() cannot race the read of the same
-        # file — see the equivalent note in _rehydrate_slot_from_history.
-        update_metadata_off_loop(conv_log, key, {"tab_id": applied.minted_tab_id})
-    older_cut = max(0, len(messages) - 500)
-    slot._disk_older_count = older_cut
-    # Durable-only view of the same prefix, recomputed from disk on every load —
-    # see the equivalent line (and the islice rationale) in
-    # _rehydrate_slot_from_history.
-    slot._disk_older_durable_count = durable_row_count(islice(messages, older_cut))
-    for m in messages[-500:]:
-        role = m.get("role", "assistant")
-        cls = m.get("cls") or ("msg msg-u" if role == "user" else "msg msg-a")
-        content = m.get("content", "")
-        # CONTENT is redacted on load; META is deferred to the emit sites.
-        # See the equivalent loop in _rehydrate_slot_from_history for the
-        # measured rationale (content ~0.4s / ~204 readers, meta ~5.5s /
-        # 31 readers that touch only control fields outside the emit sites).
-        if role != "user":
-            content = redact_display_content(content)
-        slot.append(
-            role,
-            content,
-            cls,
-            ts=m.get("ts", ""),
-            broadcast=False,
-            # Blocked-link records bounded where the slot retains them; see the
-            # equivalent append in _rehydrate_slot_from_history.
-            meta=(
-                with_bounded_redaction_records(m["meta"])
-                if isinstance(m.get("meta"), dict)
-                else None
-            ),
-            mint_mid=False,
-        )
-        # See the equivalent call in _rehydrate_slot_from_history.
-        carry_provenance(slot.messages[-1], m)
-        _attach_variants(slot, m)
-    slot.drain()
-    slot._resumed_count = len(slot.messages)
-    # Loaded window is the on-disk window region; older lines (counted in
-    # _disk_older_count above) are the frozen prefix saves never rewrite.
-    slot._disk_window_len = len(slot.messages)
-    slot._dirty = False
-    # The held notes the window already delivered, the local-turn marker and
-    # the title refresh mark: the fields whose read needs the loaded window.
-    applied.settle(messages)
-    logger.info("Restored session %s (%s)", slot_name, slot.title)
+    # REL-46: undo what THIS call added if any step below raises -- the empty
+    # slot and the restricted key -- as _rehydrate_slot_from_history does, so a
+    # malformed transcript never leaves a half-built tab. The callers skip the
+    # session and keep restoring the rest.
+    restricted_key = f"dashboard:{slot_name}"
+    preexisting_restricted = restricted_key in state._restricted_keys
+    preexisting_slot = slot_name in state._slots
+    try:
+        slot = state.get_or_create_slot(slot_name, **_metadata_codec.slot_args(meta, purpose))
+        # The title is the session list's (it names an untitled session after its
+        # first message); every other field comes from the line, through the one
+        # field table (``slot_persistence.metadata_codec``).
+        applied = _metadata_codec.apply(state, slot, meta, purpose)
+        if applied.minted_tab_id is not None:
+            # restore_recent_sessions runs during on_startup (event loop live) — keep
+            # the _locked flock/os.close off the loop via the off-loop backfill
+            # helper. Dispatched AFTER the transcript read (the caller prefetches
+            # messages first) so its os.replace() cannot race the read of the same
+            # file — see the equivalent note in _rehydrate_slot_from_history.
+            update_metadata_off_loop(conv_log, key, {"tab_id": applied.minted_tab_id})
+        older_cut = max(0, len(messages) - 500)
+        slot._disk_older_count = older_cut
+        # Durable-only view of the same prefix, recomputed from disk on every load —
+        # see the equivalent line (and the islice rationale) in
+        # _rehydrate_slot_from_history.
+        slot._disk_older_durable_count = durable_row_count(islice(messages, older_cut))
+        for m in messages[-500:]:
+            role = m.get("role", "assistant")
+            cls = m.get("cls") or ("msg msg-u" if role == "user" else "msg msg-a")
+            content = m.get("content", "")
+            # CONTENT is redacted on load; META is deferred to the emit sites.
+            # See the equivalent loop in _rehydrate_slot_from_history for the
+            # measured rationale (content ~0.4s / ~204 readers, meta ~5.5s /
+            # 31 readers that touch only control fields outside the emit sites).
+            if role != "user":
+                content = redact_display_content(content)
+            slot.append(
+                role,
+                content,
+                cls,
+                ts=m.get("ts", ""),
+                broadcast=False,
+                # Blocked-link records bounded where the slot retains them; see the
+                # equivalent append in _rehydrate_slot_from_history.
+                meta=(
+                    with_bounded_redaction_records(m["meta"])
+                    if isinstance(m.get("meta"), dict)
+                    else None
+                ),
+                mint_mid=False,
+            )
+            # See the equivalent call in _rehydrate_slot_from_history.
+            carry_provenance(slot.messages[-1], m)
+            _attach_variants(slot, m)
+        slot.drain()
+        slot._resumed_count = len(slot.messages)
+        # Loaded window is the on-disk window region; older lines (counted in
+        # _disk_older_count above) are the frozen prefix saves never rewrite.
+        slot._disk_window_len = len(slot.messages)
+        slot._dirty = False
+        # The held notes the window already delivered, the local-turn marker and
+        # the title refresh mark: the fields whose read needs the loaded window.
+        applied.settle(messages)
+        logger.info("Restored session %s (%s)", slot_name, slot.title)
+    except BaseException:
+        if not preexisting_slot:
+            state._slots.pop(slot_name, None)
+        if not preexisting_restricted:
+            state._restricted_keys.discard(restricted_key)
+        raise
 
 
 def _restore_recent_sessions_steps(
@@ -1711,20 +1725,26 @@ def _restore_recent_sessions_steps(
         )
         if meta is None or messages is None:
             continue
-        _apply_recent_session(
-            state,
-            key,
-            slot_name,
-            s,
-            meta,
-            messages,
-            conv_log=conv_log,
-            kiro_model_map=kiro_model_map,
-            restore_cfg=_restore_cfg,
-            member_identity=_member_id,
-            agent=agent,
-            effort_marker=effort_marker,
-        )
+        try:
+            _apply_recent_session(
+                state,
+                key,
+                slot_name,
+                s,
+                meta,
+                messages,
+                conv_log=conv_log,
+                kiro_model_map=kiro_model_map,
+                restore_cfg=_restore_cfg,
+                member_identity=_member_id,
+                agent=agent,
+                effort_marker=effort_marker,
+            )
+        except Exception:
+            # REL-46: one malformed transcript skips its own session, not the
+            # rest of the restore (the build rolled back its partial slot).
+            logger.warning("restore: session %s skipped; its restore failed", key, exc_info=True)
+            continue
         restored += 1
         # Recover an app flag whose claim outlived its row, as the open-slots
         # driver does. This driver's reads are inline by construction.
@@ -1845,20 +1865,27 @@ async def restore_recent_sessions_async(
                     gone,
                 )
                 continue
-            _apply_recent_session(
-                state,
-                key,
-                slot_name,
-                s,
-                meta,
-                messages,
-                conv_log=conv_log,
-                kiro_model_map=kiro_model_map,
-                restore_cfg=_restore_cfg,
-                member_identity=_member_id,
-                agent=agent,
-                effort_marker=effort_marker,
-            )
+            try:
+                _apply_recent_session(
+                    state,
+                    key,
+                    slot_name,
+                    s,
+                    meta,
+                    messages,
+                    conv_log=conv_log,
+                    kiro_model_map=kiro_model_map,
+                    restore_cfg=_restore_cfg,
+                    member_identity=_member_id,
+                    agent=agent,
+                    effort_marker=effort_marker,
+                )
+            except Exception:
+                # REL-46: as in _restore_recent_sessions_steps.
+                logger.warning(
+                    "restore: session %s skipped; its restore failed", key, exc_info=True
+                )
+                continue
             restored += 1
             # Same recovery, with the spool read awaited: this driver is
             # loop-affine, so a scan here would stall the gateway.

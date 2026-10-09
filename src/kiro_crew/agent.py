@@ -5382,13 +5382,19 @@ def _install_cron_agent() -> None:
     path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
 
 
+#: The ``kirocrew-ops`` verbs the heartbeat mounts (TOOL-2). Read-only, and each
+#: is in ``HEARTBEAT_SAFE_TOOLS``.
+HEARTBEAT_OPS_VERBS: tuple[str, ...] = ("local_knowledge_search",)
+
+
 def _install_heartbeat_agent() -> None:
     """Generate and install the kirocrew-heartbeat agent config.
 
     A dedicated agent for HeartbeatService.  Minimal MCP surface — only
-    ``kirocrew-core`` (learn/cron/spawn list and status, artifact reads,
-    local_knowledge_search) on
-    public installs.  Tool approval is enforced gateway-side against
+    ``kirocrew-core`` (learn/cron/spawn list and status, artifact reads) on
+    public installs, plus ``local_knowledge_search`` from the opt-in
+    ``kirocrew-ops`` server (:data:`HEARTBEAT_OPS_VERBS`, mounted verb by verb).
+    Tool approval is enforced gateway-side against
     ``HEARTBEAT_SAFE_TOOLS`` regardless; the per-agent MCP narrowing here
     keeps cold-start cost low and reduces the surface the gateway has to
     police.
@@ -5464,6 +5470,15 @@ def _install_heartbeat_agent() -> None:
         # rebuild_agent_config flow may run before either main entry exists.
         "tools": [f"@{name}" for name in mcp],
     }
+    # TOOL-2: the knowledge search moved to the opt-in ``kirocrew-ops`` server,
+    # so the heartbeat is granted that ONE verb (and the server's entry) to keep
+    # the read-only lookup HEARTBEAT_SAFE_TOOLS and its charter promise. Imported
+    # here: the module-level name is a TYPE_CHECKING import served by
+    # ``__getattr__`` to outside callers, never to a bare in-module lookup.
+    from kiro_crew.agent_materialization import managed_mcp as _managed_mcp
+
+    mcp["kirocrew-ops"] = _managed_mcp._managed_opt_in_entry("mcp-ops")
+    config["tools"] = [*config["tools"], *(f"@kirocrew-ops/{v}" for v in HEARTBEAT_OPS_VERBS)]
 
     _atomic_json_write(path, config)
     # CC model for the heartbeat agent lives in the sidecar, not the kiro spec.

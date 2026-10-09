@@ -156,6 +156,7 @@ class _WorkflowSessionWorker:
             cwd=self._cwd,
             reasoning_effort_override=self._effort,
             extra_env=self._extra_env,
+            model_role="workflow",
         )
         self._provider = provider
 
@@ -429,6 +430,7 @@ def build_pooled_agent_fn(
             cwd=opts.get("cwd") or cwd,
             extra_env=extra_env,
             reasoning_effort_override=_effort,
+            model_role="workflow",
         )
         try:
             # Same identity publication as the pooled worker (see

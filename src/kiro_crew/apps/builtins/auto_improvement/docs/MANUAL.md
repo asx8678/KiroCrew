@@ -53,8 +53,9 @@ The gateway's effective sandbox must be `strict`, selected through the
 explicit `acceptUnsandboxedAgentRisk` decision. The `cc` profile leaves SSH and
 GitHub CLI credentials readable and requires the same explicit risk acknowledgement
 as `auto` and `standard`. Setting `agent.sandbox` to an unsupported value is not a
-substitute. Kiro reports credits rather than USD; use cycle and time limits to bound
-these runs, since the app does not convert credits to dollars.
+substitute. Kiro reports credits rather than USD, so `maxCostUsd` never trips on it;
+bound these runs with `maxCredits` (off by default) and the cycle and time limits.
+The app does not convert credits to dollars.
 
 ### Recover a missing or changed member
 
@@ -230,7 +231,8 @@ at least one check actually run**, no unresolved comments.
 |---|---|---|
 | `maxCycles` | 25 | Deliberately generous. Let **time** and quiescence end a run — a low cycle cap leaves discovered findings at `seen`, never tried. |
 | `maxHours` | 2.0 | The real bound on a run. |
-| `maxCostUsd` | 5.0 | Ceiling on agent spend. |
+| `maxCostUsd` | 5.0 | Ceiling on agent spend in USD, for backends that report USD. Kiro reports credits, so this never trips there. |
+| `maxCredits` | 0 (off) | Ceiling on reported credits; the cap that bounds a Kiro run's spend. |
 | `quiesceAfter` | 3 | No-keep cycles before declaring the region mined out. |
 | `editAllowlist` | *(whole repo)* | **The blast-radius control.** Glob-confine edits to a subtree. Also focuses discovery *and* the gate's suite on that region — the single most useful setting on a large repo. |
 | `directCommit` | off | Autocommit instead of draft PRs (§6). |

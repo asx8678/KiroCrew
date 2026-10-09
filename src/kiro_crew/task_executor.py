@@ -39,18 +39,17 @@ from kiro_crew.hooks import (
     hook_gate_kwargs,
     permission_pre_tool_block,
 )
-from kiro_crew.llm_helpers import (
-    provider_last_turn_usage,
-    stream_and_collect_json,
-)
+from kiro_crew.llm_helpers import stream_and_collect_json
 from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     rearm_reinjection,
     rollback_skill_bodies,
 )
 from kiro_crew.messaging.link import telemetry_channel_of
+from kiro_crew.messaging.turn_bracket import arm_reinjection_after_backend_compaction
 from kiro_crew.providers.base import (
     EVENT_AGENT_SWITCHED,
+    EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -58,6 +57,7 @@ from kiro_crew.providers.base import (
     LLMEvent,
 )
 from kiro_crew.recovery.ladder import L3_ACP_RUNTIME, default_ladder
+from kiro_crew.repeat_loop import error_fingerprint
 from kiro_crew.safety_override import safety_override
 from kiro_crew.sandbox import (
     create_subprocess_limited,
@@ -77,7 +77,6 @@ from kiro_crew.task_models import (
     TaskStatus,
 )
 from kiro_crew.task_planner import group_parallel_tasks
-from kiro_crew.repeat_loop import error_fingerprint
 
 if TYPE_CHECKING:
     from kiro_crew.name_grant import Refusal as NameRefusal
@@ -658,6 +657,8 @@ async def execute_task(
         # turn consumed the one-shot flag, and whether it landed (recorded success).
         _needs_reinjection = False
         _turn_landed = False
+        # CTX-12: the backend reported a completed compaction during this turn.
+        _backend_compacted = False
         # Whether this attempt's stream produced output or a tool call: a death
         # after either may have left work done, so its retry resumes rather than
         # restates the step (the chat runner's ``turn_emitted``).
@@ -757,7 +758,12 @@ async def execute_task(
             # and this loop re-runs per attempt so each row measures its own turn.
             _turn_t0 = _time.monotonic()
             async for event in client.stream(full_prompt):
-                if event.kind == EVENT_TEXT_CHUNK:
+                if event.kind == EVENT_COMPACTION_STATUS:
+                    # CTX-12: the backend compacted on its own and dropped the
+                    # session-start contract; the finally re-arms it.
+                    if event.text == "completed":
+                        _backend_compacted = True
+                elif event.kind == EVENT_TEXT_CHUNK:
                     _attempt_emitted = True
                     result_text += event.text
                     _chunk_count += 1
@@ -1212,7 +1218,9 @@ async def execute_task(
         finally:
             # A turn that consumed the post-compaction flag but never landed
             # discarded the prompt carrying the re-injected context; put the
-            # flag back so the next attempt re-injects it.
+            # flag back so the next attempt re-injects it. A backend compaction
+            # mid-turn arms it first (CTX-12).
+            arm_reinjection_after_backend_compaction(sessions, session_key, _backend_compacted)
             rearm_reinjection(
                 sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
             )
@@ -1441,41 +1449,17 @@ async def self_review(
             agent=agent or None,
             cwd=str(run.work_dir) if run.work_dir else None,
         )
-        # Wall clock for the review turn (see execute_task): the acp provider
-        # reports no duration, so this local measurement is the fallback. Bracket
-        # ONLY the model stream, not open_task_session / diff fetch / prompt build.
-        _review_t0 = _time.monotonic()
-        result = await stream_and_collect_json(client, prompt)
-
-        # ── Per-turn usage row: self-review is a separate model turn. ──
-        try:
-            # circular import: reached while kiro_crew.slack.handler is still
-            # initialising (dashboard/handlers/files.py imports is_tracked_channel
-            # from it), so a module-scope import raises ImportError under the
-            # suite's import order.
-            from kiro_crew.dashboard.handlers.usage import (
-                persist_token_record_async,
-                read_context_tokens,
-                read_effective_agent,
-            )
-
-            _rv_cfg = KiroCrewConfig.load()
-            _used, _window = read_context_tokens(client)
-            await persist_token_record_async(
-                review_key,
-                # Blank — see the task site above; model_source reports what ran.
-                "",
-                provider_last_turn_usage(client),
-                provider=_rv_cfg.agent.provider,
-                surface=telemetry_channel_of(review_key),
-                agent=read_effective_agent(client) or agent or "",
-                context_used=_used,
-                context_window=_window,
-                elapsed_ms=int((_time.monotonic() - _review_t0) * 1000),
-                model_source=client,
-            )
-        except Exception:
-            logger.debug("usage row (self_review) persist failed", exc_info=True)
+        # Self-review is a separate model turn with its own usage row (USE-1),
+        # written inside the stream on every exit: a review that raises or is
+        # cancelled was still billed, and a row written after the call returned
+        # would skip it. The row's duration brackets only the model stream.
+        result = await stream_and_collect_json(
+            client,
+            prompt,
+            usage_surface=telemetry_channel_of(review_key),
+            usage_session_key=review_key,
+            usage_agent=agent or "",
+        )
 
         if result and not result.get("ok", True):
             issue = result.get("issue", "Review found issues")

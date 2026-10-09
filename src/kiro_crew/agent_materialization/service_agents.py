@@ -18,7 +18,7 @@ from kiro_crew.agent_files import KNOWLEDGE_AGENT_FILENAME as _KNOWLEDGE_AGENT_F
 from kiro_crew.agent_files import LITE_AGENT_FILENAME as _LITE_AGENT_FILENAME
 from kiro_crew.agent_files import RESEARCH_AGENT_FILENAME as _RESEARCH_AGENT_FILENAME
 from kiro_crew.agent_files import STEP_AGENT_FILENAME as _STEP_AGENT_FILENAME
-from kiro_crew.agent_materialization import auto_approve
+from kiro_crew.agent_materialization import auto_approve, managed_mcp
 
 
 def _install_guest_agent() -> None:
@@ -164,14 +164,15 @@ def _install_research_agent() -> None:
 #: The ``kirocrew-core`` verbs a step mounts, and the ONLY Crew MCP surface it has
 #: (SPEC-3). Chosen for what one delegated task needs: check on spawned work
 #: (``spawn_status``/``spawn_list``), find and read a procedure (the three skill
-#: verbs), read and record what is learned (``memory_recall``, the knowledge
-#: search, ``learn_add``/``learn_list``), reach a person (``ask_question``,
+#: verbs), read and record what is learned (``memory_recall``,
+#: ``learn_add``/``learn_list``), reach a person (``ask_question``,
 #: ``send_message``, ``send_notification``) and ``wait``. Deliberately absent:
 #: ``@kirocrew-cron`` (a recurring job outlives the step), every ``workflow_*``
 #: and ``monitor_*``/``autonudge_*`` verb (a step does not orchestrate), spawning
-#: (``spawn_run`` and friends), artifacts, app/dev tools and session control.
-#: Their mounted compact schemas total ~22 KB, against ~120 KB for the default
-#: agent's whole-server mounts; the budget is 25,000 bytes.
+#: (``spawn_run`` and friends), artifacts, app/dev tools and session control. The
+#: knowledge search is served by the opt-in ``kirocrew-ops`` server, so it is
+#: mounted from there (:data:`STEP_OPS_VERBS`). The budget for these mounted
+#: compact schemas is 25,000 bytes.
 STEP_CORE_VERBS: tuple[str, ...] = (
     "spawn_status",
     "spawn_list",
@@ -179,7 +180,6 @@ STEP_CORE_VERBS: tuple[str, ...] = (
     "skill_discover",
     "skill_fetch",
     "memory_recall",
-    "local_knowledge_search",
     "learn_add",
     "learn_list",
     "ask_question",
@@ -187,6 +187,10 @@ STEP_CORE_VERBS: tuple[str, ...] = (
     "send_notification",
     "wait",
 )
+
+#: The ``kirocrew-ops`` verbs a step mounts (TOOL-2): the knowledge search, which
+#: was a core verb before the ops split moved it.
+STEP_OPS_VERBS: tuple[str, ...] = ("local_knowledge_search",)
 
 #: The step contract. Short on purpose: a step's first turn is the task, not the
 #: default agent's ~40 KB operating contract.
@@ -244,23 +248,28 @@ def _install_step_agent() -> None:
     )
     config["prompt"] = STEP_SYSTEM_PROMPT
     verbs = [f"@kirocrew-core/{verb}" for verb in STEP_CORE_VERBS]
+    ops_verbs = [f"@kirocrew-ops/{verb}" for verb in STEP_OPS_VERBS]
     builtins = [ref for ref in (config.get("tools") or []) if isinstance(ref, str)]
-    config["tools"] = [ref for ref in builtins if not ref.startswith("@")] + verbs
-    # Only the core server's entry: a mounted verb needs its server, and no other
-    # Crew server is referenced. Absent (a broken template), the verbs resolve to
-    # nothing and the step still runs on its builtins.
+    config["tools"] = [ref for ref in builtins if not ref.startswith("@")] + verbs + ops_verbs
+    # Only the core and ops entries: a mounted verb needs its server, and no other
+    # Crew server is referenced. Absent (a broken template), the core verbs
+    # resolve to nothing and the step still runs on its builtins.
     servers = config.get("mcpServers") or {}
     core = servers.get("kirocrew-core") if isinstance(servers, dict) else None
     config["mcpServers"] = {"kirocrew-core": core} if isinstance(core, dict) else {}
+    config["mcpServers"]["kirocrew-ops"] = managed_mcp._managed_opt_in_entry("mcp-ops")
     # A grant is kept when it names a builtin, the core server whole (it reaches
     # only the mounted verbs) or one of those verbs; the cron grants and anything
-    # naming an unmounted server go.
+    # naming an unmounted server go. The ops verbs keep the pre-approval they had
+    # as core verbs under the template's whole ``@kirocrew-core`` grant.
     allowed_refs = {"@kirocrew-core", *verbs}
-    config["allowedTools"] = [
+    kept = [
         ref
         for ref in (config.get("allowedTools") or [])
         if isinstance(ref, str) and (not ref.startswith("@") or ref in allowed_refs)
     ]
+    core_granted = "@kirocrew-core" in kept
+    config["allowedTools"] = kept + (ops_verbs if core_granted else [])
     auto_approve._apply_allowed_tools_ceiling(config, source="_install_step_agent")
     config["mcpServers"] = auto_approve._strip_ungoverned_auto_approve(config["mcpServers"])
     auto_approve._write_derived_permissions(config, config["allowedTools"], _STEP_AGENT_FILENAME)

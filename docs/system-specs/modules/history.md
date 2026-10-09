@@ -385,7 +385,13 @@ workspace-scoped by default (fail-closed via `_caller_workspace`/`_ws_bucket`,
 `INCOGNITO_MEMORY_MODES` in `history.py`), and redact their output:
 
 - `search_chat_history` — keyword lookup over past transcripts (ranked snippets).
-- `get_chat_session` — read one full transcript by `session_key`.
+- `get_chat_session` — read one transcript by `session_key`, newest first: each
+  message is capped (user 8k, assistant 4k, other 2k chars, head+tail) and the
+  whole read stops at a 40,000-char total, below the transport cut. Messages past
+  that budget are reached with `before=N` (skip the N newest, up to 5,000), and
+  the truncation line names the `before` value for the next older page; a smaller
+  `max_messages` only returns fewer of the newest. `search_chat_history` reaches
+  them by keyword (TOOL-5).
 - `list_sessions` — browse/overview counterpart to search: returns recent
   sessions newest-first (title, owning agent, message count, timestamps) built
   on `ConversationLog.list_sessions()`, with `limit` (default 20, max 100).
@@ -499,7 +505,10 @@ from. It keeps the orchestration: the save transaction `_save_slot_to_history`
 stamping) with its on-loop entry point `save_slot_off_loop`; the restore drivers
 and slot builders (`restore_open_slots`, `restore_recent_sessions`, their async
 twins, `_rehydrate_slot_from_history`, `_apply_recent_session` and the prefetch
-reads they share); the reasoning-effort allowlist; the persisted-entry memo
+reads they share — both slot builders undo their own partial slot and restricted
+key when a step raises, and every restore loop skips a session whose build failed
+and restores the rest, so one malformed transcript never aborts startup restore,
+REL-46); the reasoning-effort allowlist; the persisted-entry memo
 `_build_message_entry` with its bounds; the private member-store assignment; and
 the request-side retired-mode coercion (`_coerce_requested_mode`). The rules those
 consult live in `dashboard/slot_persistence/`, and each file names the work that

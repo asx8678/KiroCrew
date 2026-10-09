@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew import name_grant, permission_floor
 from kiro_crew.acp.client import AcpError, AcpPromptBusy, advertised_model_ids
-from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage
+from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TERMINAL_TOOL_STATUSES, TurnUsage
 from kiro_crew.agent_sdk import CONTEXT_EVENT_COMPACTION
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling_on
 from kiro_crew.config.loader import KiroCrewConfig
@@ -54,10 +54,12 @@ from kiro_crew.providers.base import (
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
     EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
     LLMEvent,
     LLMProvider,
     resolve_billing_stats,
 )
+from kiro_crew.repeat_loop import RepeatLoopTracker, steer_repeat_loop_notice
 from kiro_crew.security import (
     MAX_SCANNABLE_COMMAND_CHARS,
     is_denied,
@@ -2641,6 +2643,10 @@ async def stream_and_collect(
     while True:
         result_text = ""
         tool_call_count = 0
+        # TOOL-20: the repeat-loop watch the dashboard chat runs, for every turn
+        # driven here (workflow steps among them). Advice, steered in-band; one
+        # tracker per attempt, as one attempt is one turn.
+        _repeat_loop = RepeatLoopTracker()
         # Consumption is committed on every exit EXCEPT a retry. A retry re-sends the
         # original message without the steer, so committing there would mark a steer
         # delivered that the model never saw. Every other exit — success or failure — is
@@ -2710,6 +2716,11 @@ async def stream_and_collect(
                     _turn_tool_activity = True
                     if on_tool_gate:
                         executed_calls.append((event.tool_call_id or "", event.title or ""))
+                    _advisory = _repeat_loop.note_call(
+                        event.tool_call_id, event.tool_name or "", event.tool_input, event.title
+                    )
+                    if _advisory:
+                        await steer_repeat_loop_notice(provider, _advisory)
                     if max_turns is not None and tool_call_count > max_turns:
                         logger.warning(
                             "max_turns=%d exceeded (%d tool calls), breaking",
@@ -2738,6 +2749,17 @@ async def stream_and_collect(
                         event.title,
                         event.tool_input,
                     )
+                elif event.kind == EVENT_TOOL_RESULT:
+                    _loop_notice = _repeat_loop.note_result(
+                        event.tool_call_id,
+                        status=event.tool_status,
+                        output=event.tool_output,
+                        output_digest=event.tool_output_digest,
+                        terminal=bool(event.tool_final)
+                        or (event.tool_status in TERMINAL_TOOL_STATUSES),
+                    )
+                    if _loop_notice:
+                        await steer_repeat_loop_notice(provider, _loop_notice)
                 elif event.kind == EVENT_STEER_CONSUMED:
                     consumed_this_attempt.append(event.text or "")
                 elif event.kind == CONTEXT_EVENT_COMPACTION:
@@ -3033,12 +3055,14 @@ async def stream_and_collect_json(
     allow_image: bool = True,
     usage_surface: str = "",
     usage_session_key: str = "",
+    usage_agent: str = "",
 ) -> dict | None:
     """Stream a message and parse the response as JSON.
 
     Combines ``stream_and_collect`` with ``parse_llm_json``.
     Returns parsed dict or None on failure. ``usage_surface`` /
-    ``usage_session_key`` are forwarded (see :func:`stream_and_collect`).
+    ``usage_session_key`` / ``usage_agent`` are forwarded (see
+    :func:`stream_and_collect`).
     """
     text = await stream_and_collect(
         provider,
@@ -3049,6 +3073,7 @@ async def stream_and_collect_json(
         allow_image=allow_image,
         usage_surface=usage_surface,
         usage_session_key=usage_session_key,
+        usage_agent=usage_agent,
     )
     return parse_llm_json(text)
 

@@ -161,7 +161,9 @@ the next call to make.
 **Tree first, always.** Call `computer_get_state(app=...)` before any action — it
 returns the window as a numbered element outline, and prefer addressing an element
 by its `element_index`: that is the only form the target can be checked against (a
-password field is refused by its index, not by its pixels). `computer_click` and
+password field is refused by its index, not by its pixels). Every action returns
+the refreshed tree, so read it again only when the window may have changed outside
+your own actions (a new request, a wait). `computer_click` and
 `computer_drag` also accept `x`/`y` screen coordinates for the canvases, sliders and
 custom-drawn UI that expose no usable element. By default a coordinate gesture is
 delivered to the target app alone and **the user's real pointer does not move**;

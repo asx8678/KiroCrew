@@ -978,8 +978,16 @@ async def _monitor_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> boo
     # works would otherwise read as a busy, well-used watch.
     monitor.quiet_streak = 0
     if verdict.outcome is irq.Outcome.WAKE:
-        # A real reading ends a blind streak. The next failure starts at one.
-        monitor.gate_fallbacks = 0
+        if verdict.blind:
+            # The kernel's own "watch is blind" alert is a WAKE that observed
+            # nothing: it keeps the blind streak (and with it the backoff) and
+            # earns no follow-up turn, or every alert would reset the gap to
+            # idle_secs and buy a near-immediate extra fire (LOOP-7).
+            self._pending_monitor_blind.add(loop.id)
+        else:
+            # A real reading ends a blind streak. The next failure starts at one.
+            monitor.gate_fallbacks = 0
+            self._pending_monitor_blind.discard(loop.id)
         # NOT charged here. A wake is a DELIVERED turn, and this tick has not
         # delivered one yet -- the fire that follows can still be refused (a
         # busy slot, a callback error, a loop deactivated mid-flight). Charging

@@ -106,19 +106,24 @@ never relabel it success in the friction report.
    artifact you have to remember to create is one that gets created at the end of
    the run, which is the one moment its contents no longer exist (see "What you
    write down, and when").
-4. Arm the patrol with `monitor_start` and `watch="work-ledger"`. A worker
-   report wakes that watch; the interval is only the liveness fallback, 900 to
-   1800 seconds, not a turn every cycle. Also pass an explicit `max_cycles=960`
+4. Arm the patrol with `monitor_start`, `interval_secs=900` and **no `watch`**.
+   You have no work ledger (your items live in `session_ledger`), so a
+   `watch="work-ledger"` loop finds no record: every tick reads as a failed
+   probe and the gate backs the patrol off toward six hours, which leaves the
+   fleet unwatched. Without a watch every cycle is a model turn; 900 s holds that
+   to four an hour, and `fleet_probe.py` keeps a quiet one to a single script
+   call. Also pass an explicit `max_cycles=960`
    and an explicit `max_runtime_secs=259200` — bounds that pass
-   `goal-conductor`'s `patrol_budget.py check` (LOOP-20). The runtime budget,
+   `goal-conductor`'s `patrol_budget.py check` (LOOP-20), whose interval band is
+   300..900 seconds. The runtime budget,
    not the cycle count, ends the patrol, so a live fleet is never orphaned by
    the cap. **Patrol with `monitor_start`, never `wait`.** If live work needs a
    larger or renewed bound, raise it with `monitor_update` before it expires;
    `monitor_start` is create-only. Call `autonudge_stop` yourself when the exit
    condition fires — coasting into the cycle cap is a failure, not a finish.
    The panel stale window, `BOARD_STALE_AFTER_SECONDS` in
-   `kiro_crew.dashboard.handlers.agent_panel`, is 900 s, the short end of this
-   liveness gap.
+   `kiro_crew.dashboard.handlers.agent_panel`, is 900 s, the same as this
+   interval.
 
 Standing patrol instruction template (keep it CURRENT — steering edits go here
 via `monitor_update`, see "Live steering"):

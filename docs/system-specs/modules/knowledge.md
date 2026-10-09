@@ -35,6 +35,15 @@ existing model resolution: `knowledge.extraction_model` →
 model. Each prompt also starts a fresh worker conversation
 (`WORKER_RECYCLE_CALLS` = 1), and each call records one `knowledge` usage row.
 
+Still open from MOD-2, deliberately: an edited artifact is re-extracted chunk by
+chunk with no per-chunk cache (`ingestion.py` re-extracts every chunk; a
+chunk-hash cache needs a chunk-to-items mapping in the store) and with no
+debounce between edits (`artifact_ingest.py` only serializes behind a lock).
+A debounce changes when an edit becomes searchable, so it is a maintainer
+decision. `AcpWorker.reset_conversation` respawns the worker process for every
+fresh conversation, where the workflow pool's `new_conversation()` keeps it;
+switching changes worker process lifecycle and is left until it can be tested. The URL fetch's FALLBACK (`agent_fetch.FETCH_PROMPT_TEMPLATE`, used when the SSRF-guarded local fetch fails) still asks the model to fetch and echo the page, with no egress-policy check of its own; adding one is a fence, and the sandbox and egress scope are the operator's to widen or tighten (KNOW-1, left as decided).
+
 For the Kiro ACP backend, the worker applies the resolved level through the
 `/effort` command after reading the session's advertised effort levels; Claude
 ACP keeps its `supports_config_option` gate and advertised-level descent (the

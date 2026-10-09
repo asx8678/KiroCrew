@@ -9037,23 +9037,27 @@ async def _run_chat(
             # delivered-tombstone; re-queue the ORIGINAL entries instead —
             # same contents and metas, under the recovery kind a single
             # failed completion already uses — each with a fresh admission
-            # stamp, exactly as if each had failed its own turn.
-            _last_qid = ""
-            for _part in merged_parts:
+            # stamp, exactly as if each had failed its own turn. Each part goes
+            # in after the one before it, so they keep their original order, and
+            # the id returned is the first part's: the one at *index*, as a
+            # single re-queue's is.
+            _first_qid = ""
+            for _offset, _part in enumerate(merged_parts):
                 _part_meta = {
                     **containment_meta(state, slot),
                     **(dict(_part.get("meta") or {})),
                 }
                 if _commands_off:
                     _part_meta[COMMANDS_OFF_META_KEY] = True
-                _last_qid = slot.queue_insert(
-                    index,
+                _qid = slot.queue_insert(
+                    index + _offset,
                     str(_part.get("content") or ""),
                     kind=SYNTHETIC_RECOVERY_KIND,
                     payload=payload,
                     meta=_part_meta,
                 )
-            return _last_qid
+                _first_qid = _first_qid or _qid
+            return _first_qid
 
         _recovery_meta = {
             **containment_meta(state, slot),

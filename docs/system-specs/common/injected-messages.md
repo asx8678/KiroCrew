@@ -25,8 +25,8 @@ was reachable. `dashboard/handlers/messaging.py` wraps the text:
 [End of cron notification]
 ```
 
-A script cron `Report` or `Done` uses the same wrapper, capped at 5,000
-characters. An identical report inside the success-reminder window is a bell,
+A script cron `Report` or `Done` uses the same wrapper, built in the gateway
+(`slack/gateway.py` `_deliver_script_result`), capped at 5,000 characters. An identical report inside the success-reminder window is a bell,
 not another model turn.
 
 - Prefix `CRON_NOTIFY_PREFIX = '[Cron notification from '`, terminator
@@ -41,7 +41,12 @@ not another model turn.
   reads.
 - If the slot is mid-turn the message is queued as `queued` and drained later; a
   queue at capacity evicts its oldest entry rather than growing without bound. An
-  idle slot instead gets an immediate guarded turn.
+  idle slot instead gets an immediate guarded turn — except a script cron
+  `Report`, which an idle slot records as an `inject` row plus a bell without
+  starting a turn (it is context for the next turn, not a wake); a script cron
+  `Done` still starts one. A report queued on a busy slot does not advance the
+  dedupe anchor, so a repeat of a report purged before it drained is delivered
+  again rather than reduced to a bell.
 - When the origin slot is not in memory it is rehydrated from history. A session
   that is genuinely gone (never persisted, deleted, or closed) resolves to nothing
   and delivery falls back to a dashboard notification (plus a Slack DM when the
@@ -97,7 +102,8 @@ Usage: <credits> credits · <elapsed>
 - The detail is the trimmed result when it fits. When the completion copy dropped
   content, it is a summary plus a `result_path` pointer — carrying the run's
   closing segment (the text streamed after its last tool call) whole, ahead of
-  the first+last-words preview — so
+  the first+last-words preview of the full `result.txt` transcript (`[OPTIONS:]`
+  marker stripped; the kept copy when the file cannot be read) — so
   the parent reads the full transcript on demand (`read`, `grep`, `spawn_status`)
   instead of re-running the sub-agent.
 - Usage is cumulative across all attempted turns in the run, including billed
@@ -725,7 +731,7 @@ speech rather than as the user.
 | `[Previous run result — do NOT repeat the same content]` | `cron_service/identity.py` (`build_cron_session_context`) | A recurring cron's own last output, so the turn reports only what changed. |
 | `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold, **or** the agent slice sits within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max`, **or** the macOS kernel reports memory pressure of WARN or worse (`ResourceStatus.memory_pressure_held`) while the figure reads ample or cannot be read; take the lighter path this turn. |
 | `[Relevant skills for this message]` | `skill_runtime/delivery.py` pointer renderer (`trigger_hint`) | Skill candidates named by path instead of by injected body. The body must be read before use unless that skill already appears earlier in the conversation, where native history still carries its instructions. |
-| `[Kiro Crew host notice] You have made the same tool call …` | `repeat_loop.py` (`build_repeat_loop_notice`), steered by `dashboard/chat_runner.py` (`_steer_repeat_loop_notice`) | The same tool call with the same input returned the same result `REPEAT_LOOP_THRESHOLD` times in one turn — compared BOTH exactly and through the shared volatile-token mask (`_mask_volatile`, the same normalizer the task-runner error fingerprint uses: timestamps, UUIDs, tmp paths, durations, ports, pids, hex ids), so a re-call whose input or output differs only in those bytes joins the same streak instead of defeating the detector (TOOL-20). Advice only: nothing was refused or stopped, it is sent at most once per call per turn, and it never joins the refusal ledger, so it schedules no recovery turn. Sent only where `supports_refusal_steer` holds; a hint written after the turn's last tool result may go unread, which is harmless because the loop has ended. |
+| `[Kiro Crew host notice] You have made the same tool call …` | `repeat_loop.py` (`build_repeat_loop_notice`), steered by `dashboard/chat_runner.py` (`_steer_repeat_loop_notice`), and for unattended turns by `repeat_loop.steer_repeat_loop_notice` from the subagent run loop (`subagent_manager/run.py`) and `llm_helpers.stream_and_collect` (workflow steps, cron, the task runner's helpers) — those have no slot to park a notice on, so a harness that cannot steer simply does not get it | The same tool call with the same input returned the same result `REPEAT_LOOP_THRESHOLD` times in one turn — compared BOTH exactly and through the shared volatile-token mask (`_mask_volatile`, the same normalizer the task-runner error fingerprint uses: timestamps, UUIDs, tmp paths, durations, ports, pids, hex ids), so a re-call whose input or output differs only in those bytes joins the same streak instead of defeating the detector (TOOL-20). Advice only: nothing was refused or stopped, it is sent at most once per call per turn, and it never joins the refusal ledger, so it schedules no recovery turn. Sent only where `supports_refusal_steer` holds; a hint written after the turn's last tool result may go unread, which is harmless because the loop has ended. |
 | `[Turn advisory] This turn has made … tool calls …` | `repeat_loop.py` (`build_turn_advisory_notice`), delivered by `dashboard/chat_runner.py` beside the loop notice | One advisory per turn once a turn passes `TURN_CALL_ADVISORY_AT` (60) DISTINCT tool calls: advice only, never an abort — a deliberate long sweep or poll trips the same count, and the notice says to carry on if that is what is happening. |
 | `[INCOGNITO SESSION]` / `[TEMPORARY SESSION]` | `dashboard/chat_utils.py` ephemeral-session prefixes | An instruction, not a tool-level gate: it forbids memory tools (writes in incognito, reads as well in temporary) and learns nothing from the chat — the transcript itself is kept in History for the user, but no lesson, memory or summary is derived from it. `learn_remove` and the cron tools stay permitted as active user actions, and a cron change persists outside the transcript. |
 

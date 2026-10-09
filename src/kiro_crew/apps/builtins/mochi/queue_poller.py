@@ -379,7 +379,7 @@ class QueuePoller:
 
         # 2. Missing queue → trigger plan (first run / deleted file).
         if queue is None:
-            if self._can_trigger_plan():
+            if self._can_trigger_plan() and self._take_spawn_budget():
                 self._plan_triggered = True
                 self._plan_spawn_at = self._clock()
                 try:
@@ -577,7 +577,7 @@ class QueuePoller:
                     await asyncio.to_thread(self._locked_merge_write, queue)
                 except OSError:
                     pass
-            if self._can_trigger_plan():
+            if self._can_trigger_plan() and self._take_spawn_budget():
                 self._plan_triggered = True
                 self._plan_spawn_at = self._clock()
                 try:
@@ -603,6 +603,8 @@ class QueuePoller:
             _retry = self._freestyle_retry.get(task.get("id"))
             if _retry is not None and now_ms < _retry[1]:
                 continue
+            if not self._take_spawn_budget():
+                break
             try:
                 await self._spawn_agent_task_serial(task)
             except Exception:  # noqa: BLE001
@@ -614,6 +616,30 @@ class QueuePoller:
         # the fresh read below and the atomic replace at the end would be
         # dropped by that replace (see queue_file.queue_mutation).
         await asyncio.to_thread(self._locked_merge_write, queue)
+
+    def _take_spawn_budget(self) -> bool:
+        """Charge one plan, replan or freestyle spawn to the hourly budget.
+
+        UI-2: the configured activity budget (``max_spawns_per_hour``) bounds
+        every autonomous spawn, not only watch checks, so it shares their
+        counter and window. UI-5: the charge is taken BEFORE the attempt, so a
+        refused spawn counts too. No provider, or the unlimited tier (``None``),
+        always allows: the original behaviour.
+        """
+        try:
+            budget = self._budget_provider() if self._budget_provider is not None else None
+        except Exception:  # noqa: BLE001 - an unreadable budget keeps today's behaviour
+            return True
+        if budget is None:
+            return True
+        now = self._clock()
+        if now - self._watch_window_start > 3_600_000:
+            self._watch_window_start = now
+            self._watch_spawn_count = 0
+        if self._watch_spawn_count >= budget.max_spawns_per_hour:
+            return False
+        self._watch_spawn_count += 1
+        return True
 
     def _locked_write(self, queue: Any) -> None:
         """Atomic write under the cross-process queue lock. Blocking — call via

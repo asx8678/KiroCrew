@@ -949,10 +949,25 @@ with the provider as `model_source` fallback), the agent that served the turn
   still records what its result reported.
 
 Enforced by `scripts/check_usage_surface.py` (AST, no test run): every
-`stream_and_collect(` call site must pass a non-empty `usage_surface=`, sit
-inside `background_turn`/`metered_turn`, or appear in the script's `ALLOWED`
-list with the reason its row is written elsewhere (the Slack heartbeat and
-autonudge, and the cron callback).
+`stream_and_collect(` and `stream_and_collect_json(` call site must pass a
+non-empty `usage_surface=`, sit inside `async with background_turn`/`metered_turn`,
+or appear in the script's `ALLOWED` list with the reason its row is written
+elsewhere (the Slack heartbeat and autonudge, the cron callback, and the history
+consolidation turn, whose `background_turn` is entered through an `AsyncExitStack`
+the walk cannot see). CI runs it in Fast Gate's `static-ratchets` job, mirrored in
+the main ratchet lane (`main-ratchet-audit.yml` `ratchet-gates`). It does not walk
+direct `provider.stream` loops; those rely on `metered_turn` /
+`TurnDriver(usage_surface=...)` at review.
+
+Deliberately unchanged (USE-1, decided 2026-10-09): the writers that own their row
+and write it after the stream returns rather than in a `finally`, so some error or
+cancel exits write none — cron, the heartbeat, the autonudge / monitor wake, the
+task-runner step, webhooks, and the subagent run — stay as they are. Each is listed in `ALLOWED` or writes outside `stream_and_collect`, the task
+step drives `provider.stream` itself (it would need `metered_turn`, not a label),
+and converting six owners at once is how the double row this section guards
+against gets in. The auto_improvement app's external-CLI spend stays out of the
+usage shard: what counts as usage for a separately billed CLI is a product
+question, not a metering gap.
 
 **Per-surface daily total (USE-1 follow-up).** `dashboard/handlers/usage.py`
 `surface_daily_credits(day)` sums a local day's `tokens` rows by canonical surface,
@@ -963,7 +978,10 @@ maintainer's decision, and the usage page does not show the per-surface day tota
 
 Labels in use: `workflow` (cold and pooled stages), `workflow_author`, `bg:judge`,
 `side`, `thread`, `subagent_completion` (the Slack gateway's completion injection,
-filed under the parent key), `taskrunner_lesson`, `issue_radar`, `meetings`,
+filed under the parent key), `taskrunner_lesson`, `taskrunner` for the task
+runner's self-review turn (`telemetry_channel_of` of its `taskrunner:…:review`
+key; the task step itself still writes its own row after a successful stream),
+`issue_radar`, `meetings`,
 `meetings_translate`, `slack` (native handler and Slack transport), `telegram`,
 the transport label for the generic channel dispatcher (`discord`, …), `monitor`
 for its monitor wakes, `channel`, `cli`, `optimizer`, `taskrunner_decompose`,

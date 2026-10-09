@@ -69,6 +69,12 @@ The `config_bounds_clamped` event (`outcome=clamped`, `source=background`, `oper
   hardening of this key (the out-of-process signer above, issue #302) must
   treat `session_pid_sig` as a dependent of equal weight. See
   `docs/system-specs/modules/session.md` for the sidecar contract.
+- **Recorded architectural item (SEC-7, L):** the key is still read in-process by the
+  gateway, so a compromise of the gateway process is a compromise of the key. The
+  remedy is the out-of-process signer tracked upstream (issue #302): the signing
+  operation moves behind a process that holds the key, and the gateway only asks it
+  to sign. Until that lands the sensitive-path floor above is the only fence, and
+  this entry is the acceptance, not a fix.
 
 ## Async Writer
 

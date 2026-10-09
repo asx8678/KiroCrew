@@ -218,9 +218,25 @@ evidence that every caller passed through action-item review.
 extractor. A queue batches lines and flushes on its own interval:
 `BATCH_INTERVAL_SECS` (120s) for the note taker and the task extractor,
 `SKETCH_BATCH_INTERVAL_SECS` (180s) for the sketch artist. Three default
-agents therefore stay under 100 turns per meeting-hour.
-so an agent gets a paragraph of context rather than one interruption per
-utterance. Three consecutive dispatch failures trip a circuit breaker (backoff
+agents therefore stay under 100 turns per meeting-hour. Batching also means an
+agent gets a paragraph of context rather than one interruption per
+utterance. Each agent keeps ONE session for the whole meeting, so every batch
+replays the conversation so far, and the note-taker and task-extractor prompts
+still re-read their output file before each update: per-batch cost grows with the
+meeting's length, so each agent's session is recycled every
+`SESSION_RECYCLE_BATCHES` (15) batches, 30 minutes at the 120 s interval (LOOP-4).
+`AgentQueue._recycled` destroys the session (its resume mapping too, so nothing is
+reloaded) and folds the re-seed into the next batch: one message carrying a
+"session refreshed" line, the agent's standing instructions
+(`build_agent_instructions`, the kickoff without its acknowledge-and-stop ending),
+its output file as it stands (head and tail past `RESEED_OUTPUT_MAX_CHARS`,
+40,000) and the batch, so a recycle costs no extra turn. A failed destroy keeps the
+old session and sends the plain batch; it never counts toward the dispatch-failure
+breaker. What an agent remembers mid-meeting is therefore its file plus the last
+half hour, not the whole conversation. The agents'
+model follows the background role: `dispatch_to_agent` opens their sessions with
+`model_role="background"`, and their specs' own `"model": "auto"` is the sentinel,
+not a pin, so `agent.role_models.background` applies when set and `"auto"` when not. Three consecutive dispatch failures trip a circuit breaker (backoff
 60s → 120s → stop); `POST …/reset` resumes.
 
 Each agent's first message carries the meeting context from

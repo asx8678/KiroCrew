@@ -89,9 +89,10 @@ _WECOM_FILE_BYTES = WECOM_MAX_PLAINTEXT_BYTES
 #:
 #: ``max_text_bytes`` is deliberately LEFT at the shared default and is NOT a
 #: transport ceiling: it budgets how much file CONTENT is read into gateway memory,
-#: of which only ``max_text_inject`` (50 KiB) can ever reach the prompt. Raising it
-#: to the 20 MB transport limit would read 20 MB to use 50 KiB. Slack ships the
-#: same asymmetry for the same reason.
+#: of which only ``max_text_inject`` (8 KiB per file, within the message's 48 KiB
+#: ``max_inline_total``) can ever reach the prompt. Raising it to the 20 MB
+#: transport limit would read 20 MB to use 8 KiB. Slack ships the same asymmetry
+#: for the same reason.
 WECOM_INGEST_LIMITS = IngestLimits(
     max_image_bytes=10 * 1024 * 1024,
     max_document_bytes=_WECOM_FILE_BYTES,

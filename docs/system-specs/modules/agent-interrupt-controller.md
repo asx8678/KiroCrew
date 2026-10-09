@@ -63,7 +63,15 @@ A probe implements:
   pins that distinction. The AutoNudge gate treats that unreadable tick as a
   fallback. The first three still fire. After that the re-arm gap doubles from
   idle_secs, capped at DEFAULT_REALERT_SECS, and one watch-is-blind warning is
-  logged. A later good reading resets the streak.
+  logged. A later good reading resets the streak. The kernel's own blind alert
+  (the `Report` raised once the error streak reaches `max_consecutive_errors`,
+  and the unwritable-state one) is a WAKE that observed nothing: `poll` returns it
+  with `Verdict.blind`, and the gate delivers it without resetting the streak or
+  granting the follow-up tick, so the alert neither restarts the backoff at
+  idle_secs nor buys a near-immediate extra fire (LOOP-7). A probe that RAISES
+  still bypasses the kernel's error streak (`poll` turns it into a fallback, by
+  design: a raise is a probe defect), so it gets the gate's backoff and warning
+  but never the kernel's delivered blind alert (NEW-D3, left as is).
 * Optional `Probe.tuning()` and `Probe.wake_suffix()`. `irq.run` calls both
   after identity parsing, accepts only the exercised tuning key, validates
   numeric bounds, and drops a broken or non-string suffix. The suffix is

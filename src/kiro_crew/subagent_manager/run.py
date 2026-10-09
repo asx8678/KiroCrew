@@ -1180,6 +1180,13 @@ class RunEventCoordinator(ManagerComponent):
                     info.error = append_fallback_story(
                         _describe_exception(exc), exc, budget=MAX_ERROR_DETAIL_LEN
                     )
+                    # SES-5: deliver what streamed before the failure as a
+                    # flagged partial, as the cancel and overflow arms do, so a
+                    # long run ended by an error (a second throttle on the
+                    # continue turn among them) does not lose its work.
+                    if not info.result and info.streaming_text:
+                        info.result = info.streaming_text
+                        info.partial = True
                     info.done = True
                     Stats().inc_subagent_failed()
                     self._manager._write_tombstone(info, "error")
@@ -2926,16 +2933,15 @@ class RunEventCoordinator(ManagerComponent):
                     # transients no adapter classifies and for a manager
                     # without a durable queue.
                     _signal = classify_exception(exc) if _dep_coordinator is not None else None
+                    # The coordinator bounds this wait (scope deadline and
+                    # attempts cap), so a throttle after activity does not
+                    # spend the one continue the unclassified ladder keeps:
+                    # a second throttle parks again instead of failing a run
+                    # that already produced output.
                     if _signal is not None and not _signal.terminal:
-                        if _had_activity and post_activity_attempts >= 1:
-                            raise
                         if not await self._manager._yield_for_dependency(info, _signal):
                             raise
-                        if _had_activity:
-                            post_activity_attempts += 1
-                            msg = _TRANSIENT_CONTINUE_MSG
-                        else:
-                            msg = full_message
+                        msg = _TRANSIENT_CONTINUE_MSG if _had_activity else full_message
                         continue
                     if _had_activity:
                         if post_activity_attempts >= 1:
@@ -3053,6 +3059,12 @@ class RunEventCoordinator(ManagerComponent):
         # Includes transient-retry backoff, which is real wall time the caller
         # waited for this turn.
         _turn_t0 = time.monotonic()
+        # TOOL-20: the same repeat-loop watch the dashboard chat runs, so an
+        # unattended run that repeats one call is told (advice, never a stop).
+        from kiro_crew.acp.types import TERMINAL_TOOL_STATUSES
+        from kiro_crew.repeat_loop import RepeatLoopTracker, steer_repeat_loop_notice
+
+        _repeat_loop = RepeatLoopTracker()
         async for event in _stream_with_transient_retry():
             # Refresh the activity clock for every event kind that BELONGS to
             # this session (thinking chunks, tool-call updates, etc.) before
@@ -3248,6 +3260,11 @@ class RunEventCoordinator(ManagerComponent):
                 # the permission path uses so the running-card shows live activity.
                 info.tool_count += 1
                 info.last_tool = event.title or info.last_tool
+                _advisory = _repeat_loop.note_call(
+                    event.tool_call_id, event.tool_name or "", event.tool_input, event.title
+                )
+                if _advisory:
+                    await steer_repeat_loop_notice(client, _advisory)
                 self._manager._note_tool_dispatch(info, event)
                 await self._manager._fire_event(
                     "subagent_tool",
@@ -3295,6 +3312,16 @@ class RunEventCoordinator(ManagerComponent):
                 # command that has already returned. A non-final progress frame
                 # is not the end of the tool — the gate is in _note_tool_result.
                 self._manager._note_tool_result(info, event)
+                _loop_notice = _repeat_loop.note_result(
+                    event.tool_call_id,
+                    status=event.tool_status,
+                    output=event.tool_output,
+                    output_digest=event.tool_output_digest,
+                    terminal=bool(event.tool_final)
+                    or (event.tool_status in TERMINAL_TOOL_STATUSES),
+                )
+                if _loop_notice:
+                    await steer_repeat_loop_notice(client, _loop_notice)
                 # Fire PostToolUse hooks (parity with chat_runner). Until this
                 # branch existed, hooks registered for subagent-spawned tools
                 # received PreToolUse but never PostToolUse — losing the

@@ -124,6 +124,9 @@ class Project:
     error: str = ""
     tokens_used: int = 0
     replan_count: int = 0
+    # WF-6: fingerprint of the error the last re-plan answered, so a re-plan
+    # that ends in the same failure stops instead of planning around it again.
+    last_replan_error: str = ""
     memory: WorkingMemory = field(default_factory=WorkingMemory)
     task_id: str = ""
     name: str = ""  # human-readable name (optional, display label)

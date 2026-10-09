@@ -92,6 +92,25 @@ def driver_turn_landed(driver: Any) -> bool:
     return stop_reason_landed(getattr(driver, "last_stop_reason", "") or "")
 
 
+def arm_reinjection_after_backend_compaction(
+    sessions: Any, session_key: str, evidence: Any
+) -> None:
+    """Arm re-injection when the backend compacted mid-turn (CTX-12).
+
+    For an engine that settles its own turn instead of using :class:`TurnBracket`:
+    call it in the turn's ``finally`` BEFORE :func:`rearm_reinjection` and
+    :func:`rollback_skill_bodies`, the order :meth:`TurnBracket.settle` uses.
+    *evidence* is the turn's driver (its ``compaction_completed``) or a bool from
+    an engine that watched ``EVENT_COMPACTION_STATUS`` itself; either is read
+    strictly (``is True``), so a stand-in arms nothing.
+    """
+    compacted = (
+        evidence if isinstance(evidence, bool) else getattr(evidence, "compaction_completed", False)
+    )
+    if compacted is True:
+        _mark_reinjection_flag(sessions, session_key)
+
+
 def _mark_reinjection_flag(sessions: Any, session_key: str) -> None:
     """Mark the one-shot re-injection flag, never raising (shared seam)."""
     mark = getattr(sessions, "mark_needs_reinjection", None)

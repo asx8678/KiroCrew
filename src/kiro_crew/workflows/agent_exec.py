@@ -205,6 +205,7 @@ def build_agent_fn(
             cwd=step_cwd or cwd,
             extra_env=extra_env,
             reasoning_effort_override=_effort,
+            model_role="workflow",
         )
         try:
             from kiro_crew.messaging.identity import publish_turn_identity

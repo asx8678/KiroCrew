@@ -288,6 +288,22 @@ def _compaction_harness_managed(provider: LLMProvider) -> bool:
     return claimed is not False
 
 
+def _provider_used_tokens_reliable(provider: Any) -> bool:
+    """Whether the provider vouches for its used-token count (CTX-1).
+
+    Optional like :func:`_provider_used_tokens`: a double without the method,
+    or one whose read raises, is treated as reliable, because its count reads 0
+    and cannot bind the absolute arm anyway.
+    """
+    fn = getattr(provider, "context_used_tokens_reliable", None)
+    if not callable(fn):
+        return True
+    try:
+        return fn() is not False
+    except Exception:
+        return True
+
+
 def _provider_used_tokens(provider: Any) -> int:
     """The provider's used-context token reading, or 0 when it reports none.
 
@@ -581,6 +597,13 @@ class CompactionCoordinator:
         """
         cap = self._absolute_cap_tokens()
         if cap <= 0:
+            return False
+        if not _provider_used_tokens_reliable(provider):
+            # A count derived from a percentage against a statically-sourced
+            # window can be several times the served count (the registry folds
+            # 200K aliases onto 1M). The percentage arm still guards the session;
+            # only the absolute arm stands down until the window is confirmed
+            # (CTX-1).
             return False
         return _provider_used_tokens(provider) >= cap
 

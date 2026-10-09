@@ -2163,7 +2163,15 @@ async def api_file_read(request: web.Request) -> web.Response:
         else:
             redacted = redact(content)
         as_written = content[:read_cap]
-        content = redacted[:read_cap]
+        served = read_cap
+        if len(content) >= read_cap + 1 + redact_margin:
+            # The read stopped short of the file's end, so a token may be cut at
+            # the read's own edge, where the redactor cannot match it. Masking
+            # shrinks the text, and enough masked spans before the cap pull that
+            # edge inside the first read_cap characters; never serve from the
+            # last margin of the redacted read (SEC-14).
+            served = min(read_cap, max(0, len(redacted) - redact_margin))
+        content = redacted[:served]
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="file_read", outcome="success", resources=path
         )

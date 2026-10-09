@@ -1,9 +1,17 @@
 """Bound the bundled shell-audit hook's ``audit.log`` from the gateway side.
 
 The default ``postToolUse`` hook in ``config/defaults.json`` records every
-``execute_bash`` call by appending a stamp line, the hook-event JSON kiro-cli
-hands it on stdin (the tool call -- its command and, on this event, its
-result) and a blank line to ``${KIROCREW_HOME:-$HOME/.kiro/crew}/audit.log``.
+``execute_bash`` call by appending ONE line to
+``${KIROCREW_HOME:-$HOME/.kiro/crew}/audit.log``: a UTC timestamp, ``BASH:``, and
+the hook-event JSON kiro-cli hands it on stdin (the tool call -- its command and,
+on this event, its result) with CR and LF stripped. The result is written as
+kiro-cli reports it, unredacted: on the kiro-cli backend a secret a command
+prints lands in this file verbatim. The other backends fire the hook from Crew
+with redacted output capped at 2,000 characters. Because of that content the
+hook's Python path creates the file owner-only (0600), and
+:func:`rotate_shell_audit_log` restricts both generations to the owner on every
+sweep, which covers a file the ``printf`` fallback or an older hook created
+under the umask (typically 0644).
 The command is one shell append and bounds nothing, so on a default install
 the file only grows: measured at 4.4 MB over about five weeks of ordinary
 use, as a single file with no sibling generation.
@@ -16,8 +24,8 @@ appends; routing the hook through a ``kirocrew`` helper instead costs a Python
 interpreter start on every shell tool call, through an entry point the hook
 has to find on PATH. Either shape changes the shipped command, which the agent
 spec rebuild copies into every install. A gateway-side sweep changes nothing
-the hook does: the command stays byte-identical, a user who authored their own
-hook is untouched, and the one thing the file needed -- a size bound -- is
+the hook does: the command carries no rotation logic, a user who authored
+their own hook is untouched, and the one thing the file needed -- a size bound -- is
 applied by the process that owns the data home anyway.
 
 :func:`rotate_shell_audit_log` is that sweep step. It reuses
@@ -26,7 +34,8 @@ file with a foreign writer needs: one ``.1`` generation replacing any older one
 (so disk use stays at about twice the cap), a non-blocking try-lock so two
 rotators cannot both rotate, a rename rather than a truncate or a copy (so the
 hook's ``>>`` append keeps working and no record is lost mid-write), and a
-promise never to raise. The session cleanup loop
+promise never to raise. The one other change the sweep makes is the owner-only
+mode above, applied before the size check. The session cleanup loop
 (:class:`kiro_crew.session_cleanup.SessionCleanup`) calls it on every tick,
 the first within ``MAX_TICK_INTERVAL_SECS`` of the loop starting, which is
 what bounds the overshoot: the live file can exceed the cap by at most one
@@ -50,10 +59,13 @@ or chat start on that data home bounds it.
 from __future__ import annotations
 
 import logging
+import os
+import stat
 import time
 from pathlib import Path
 
 from kiro_crew.jsonl_util import rotate_jsonl_at
+from kiro_crew.platform_compat import restrict_to_owner
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +100,29 @@ def shell_audit_log_path(data_home: Path) -> Path:
     return data_home / SHELL_AUDIT_LOG_NAME
 
 
+def _restrict_generations_to_owner(path: Path) -> None:
+    """Make ``audit.log`` and ``audit.log.1`` owner-only where they are not already.
+
+    POSIX only: on Windows the data home inherits the profile's per-user ACL, and
+    ``st_mode`` there reports 0o666 whatever the DACL says, so a mode test cannot
+    tell when a rewrite is needed. A symlink is skipped, because the data home is
+    agent-writable and ``chmod`` follows the link to whatever it names. Never
+    raises: a failure is logged at DEBUG and the sweep carries on.
+    """
+    if os.name == "nt":
+        return
+    for candidate in (path, path.with_name(path.name + ".1")):
+        try:
+            info = candidate.lstat()
+            if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o077:
+                continue
+            restrict_to_owner(candidate)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            logger.debug("could not restrict %s to its owner", candidate.name, exc_info=True)
+
+
 def rotate_shell_audit_log(data_home: Path) -> bool:
     """Rotate ``<data_home>/audit.log`` aside to ``audit.log.1`` once it reaches the cap.
 
@@ -96,7 +131,9 @@ def rotate_shell_audit_log(data_home: Path) -> bool:
     Never raises: a fresh install without the file, an unreadable or unusable
     path, or a rotation the primitive could not complete (lock lost to a
     concurrent rotator, a blocked rename) all answer ``False`` and leave the
-    live file exactly as it was. An over-cap file that stays over the cap is
+    live file exactly as it was, apart from its mode: both generations are
+    restricted to the owner first (:func:`_restrict_generations_to_owner`). An
+    over-cap file that stays over the cap is
     logged at WARNING, at most once per
     :data:`SHELL_AUDIT_LOG_WARN_INTERVAL_SECS` per data home, so a rotation that
     stopped working is told apart from a file under the cap without repeating
@@ -104,11 +141,12 @@ def rotate_shell_audit_log(data_home: Path) -> bool:
 
     Blocking filesystem work over an agent-writable tree, so callers run it on
     a worker thread, never on the event loop. A file under the cap costs one
-    ``stat`` and touches nothing else: the lock file the primitive keeps beside
+    ``lstat`` per generation and one ``stat``, and changes nothing but the mode: the lock file the primitive keeps beside
     the log is created only when a rotation is actually attempted, so a fresh
     data home gains no files from this sweep.
     """
     path = shell_audit_log_path(data_home)
+    _restrict_generations_to_owner(path)
     try:
         size_before = path.stat().st_size
     except (OSError, ValueError):

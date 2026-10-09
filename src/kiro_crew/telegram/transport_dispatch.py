@@ -133,6 +133,7 @@ from kiro_crew.messaging.session_trust import (  # noqa: F401
 )
 from kiro_crew.messaging.spawn_approval_delivery import unpressed_wait_answer  # noqa: F401
 from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.messaging.turn_bracket import arm_reinjection_after_backend_compaction
 from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
 from kiro_crew.messaging.upload_gate import (
     session_blocks_reads,
@@ -1025,6 +1026,8 @@ class TelegramDispatcher:
         # turn consumed the one-shot flag, and whether it landed (recorded success).
         _needs_reinjection = False
         _turn_landed = False
+        # The driver once the turn ran; None while it never got that far (CTX-12).
+        _ran_driver: Any = None
         try:
             # Ack placeholder first (before the potentially slow cold-start);
             # on_turn_start is idempotent so the driver's later call no-ops.
@@ -1236,6 +1239,7 @@ class TelegramDispatcher:
             # the turn completed, so the finally must NOT restore the flag --
             # unless the user cancelled it, which discards that prompt.
             _turn_landed = driver_turn_landed(driver)
+            _ran_driver = driver
             Stats().inc_message_success()
             if accumulated and not muted and self._voice_enabled(route):
                 # Its own bookkeeping step, and last-effort by design: the text
@@ -1487,6 +1491,9 @@ class TelegramDispatcher:
             # A turn that consumed the post-compaction flag but never landed
             # discarded the prompt carrying the re-injected context; put the
             # flag back so the next turn re-injects it.
+            # CTX-12: a backend that compacted mid-turn dropped the session-start
+            # contract, so the next turn restores it, whatever this turn consumed.
+            arm_reinjection_after_backend_compaction(self.sessions, session_key, _ran_driver)
             rearm_reinjection(
                 self.sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
             )

@@ -275,9 +275,20 @@ later `monitor_inspect`. A refusal means no new loop was armed.
 
 
 The conductor patrols with `monitor_start`, never `wait`, and arms the loop
-with `watch="work-ledger"` plus the full cycle instructions and the exit
-condition. A worker report wakes that watch. The interval is the liveness
-fallback, 900 to 1800 seconds, not a model turn on every quiet cycle. Two
+at `interval_secs=900` with the full cycle instructions and the exit condition,
+and **no `watch`** (LOOP-2). This conductor does not mount the work ledger (see
+below), so a `watch="work-ledger"` loop finds no record: `probes/work_ledger.py`
+answers every tick `fetch_ok=False`, the gate reads that as a FALLBACK (not
+quiet, so it fires), and after three in a row `blind_rearm_secs` doubles the gap
+toward six hours, re-arm after a delivered turn included, so the patrol stopped
+watching the fleet. Without a watch and without a judge brief every cycle is a
+full model turn; 900 s is the top of `patrol_budget.py`'s 300..900 band, and
+`fleet_probe.py` keeps a quiet cycle to one script call. A turn on every quiet
+cycle is the known cost of this shape. The fix that removes it is a fleet watch
+kind — an `irq.Probe` over what `fleet_probe.py` classifies (`fired`, BANNED,
+NOPROGRESS) — and it is deliberately not built yet: it would wrap an
+agent-configured script into the gateway process and is the third kind,
+which `probes/__init__.py` names as the point to move kinds to a registry. Two
 cycle-order rules are structural rather than stylistic:
 
 **The ledger is read at the top of every cycle, before the probe.** The

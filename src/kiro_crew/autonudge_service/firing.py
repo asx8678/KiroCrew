@@ -423,6 +423,8 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
             )
     claimed_wake = loop.id in self._pending_monitor_wake
     self._pending_monitor_wake.discard(loop.id)
+    claimed_blind = loop.id in self._pending_monitor_blind
+    self._pending_monitor_blind.discard(loop.id)
     # LOOP-17: the parked WAKE brief follows the claim's lifecycle exactly —
     # consumed here, re-owed below on a refused fire, so a busy slot cannot
     # lose the brief the next attempt still needs.
@@ -470,6 +472,8 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
             self._pending_monitor_wake.add(loop.id)
             if claimed_wake_body:
                 self._pending_monitor_wake_body[loop.id] = claimed_wake_body
+            if claimed_blind:
+                self._pending_monitor_blind.add(loop.id)
         if claimed_floor:
             # Same reasoning: a refused floor delivery spent nothing, so the charge
             # stays owed rather than being recorded or dropped.
@@ -627,7 +631,10 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
         # write is the stronger one, since it holds the lock and cannot be
         # clobbered by a concurrent update()'s snapshot.
         loop.monitor.wakes += 1
-        loop.monitor.followup_ticks = _WAKE_FOLLOWUP_TICKS
+        if not claimed_blind:
+            # A blind alert started no work the probe cannot see, so it earns
+            # no follow-up allowance (LOOP-7).
+            loop.monitor.followup_ticks = _WAKE_FOLLOWUP_TICKS
     if delivered and claimed_floor and loop.monitor is not None:
         # The floor's turn happened. No follow-up allowance goes with it: the floor
         # exists to break a silence, not to protect work the agent had already

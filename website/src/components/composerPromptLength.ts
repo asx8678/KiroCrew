@@ -1,12 +1,14 @@
 /**
  * Prompt-length check for the chat composer.
  *
- * The model's context window, in tokens, decides whether a prompt can be
- * delivered whole. `POST /api/chat` (`api_chat` in
- * `src/kiro_crew/dashboard/chat_handlers.py`) applies no per-message cap of its
- * own, so the window is the first limit a large prompt meets. The composer
- * already receives it as `contextWindowTokens` (the same value the context
- * meter shows). An unknown or invalid value skips this check.
+ * The model's context window, in tokens, is what this check compares against.
+ * `POST /api/chat` (`api_chat` in `src/kiro_crew/dashboard/chat_handlers.py`)
+ * does not deliver a message over 32 KB whole: it stores the text as a session
+ * attachment and sends a path marker plus a preview of at most 4 KB
+ * (`chat_attachments.spill_large_paste`). So past that size this check warns
+ * about a prompt the model will read from a file rather than receive inline.
+ * The composer receives the window as `contextWindowTokens` (the same value the
+ * context meter shows). An unknown or invalid value skips this check.
  *
  * The count is taken over the text the send path actually posts: collapsed
  * paste chips expanded back to their content (see `expandAll` in

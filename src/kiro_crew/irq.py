@@ -701,12 +701,14 @@ def run(
             # wrote. Repeats are the correct degradation here: dedupe needs the
             # same storage that just failed, so the alternative to repeating is
             # not repeating LESS, it is not alerting at all.
-            raise Report(
+            unwritable = Report(
                 f"Watch on {subject}: the probe is failing AND the watch's "
                 f"state directory is unwritable ({path.parent}), so the "
                 "failure streak cannot be tracked. The watch is inoperative "
                 "until both are fixed; expect this alert to repeat."
             )
+            unwritable.blind = True  # type: ignore[attr-defined]
+            raise unwritable
         if errors >= max_consecutive_errors:
             # Fire at >= threshold with the same time-bounded re-arm as every
             # other alert. An exact-equality gate (fire only when errors ==
@@ -721,12 +723,16 @@ def run(
             if not fresh:
                 alerted["blind"] = now
                 persist()
-                raise Report(
+                # Tagged like the deduped Skip below: this alert reports the
+                # failure, it does not observe the subject.
+                alert = Report(
                     f"Watch on {subject}: the probe has failed {errors} "
                     "consecutive ticks (credentials expired? network?). The "
                     "watch is blind until this is fixed; it will re-alert "
                     "every few hours while the failure persists."
                 )
+                alert.blind = True  # type: ignore[attr-defined]
+                raise alert
             blind = Skip(f"probe failed ({errors} consecutive; blind alert deduped)")
             blind.blind = True  # type: ignore[attr-defined]
             raise blind
@@ -1067,6 +1073,10 @@ class Verdict:
     #: an unusable target, say -- which a driver must treat as "ended, not
     #: necessarily well" rather than assuming success.
     keys: tuple[str, ...] = ()
+    #: For WAKE only: the wake is the kernel's own "the watch is blind" alert, not
+    #: an observation of the subject. A driver must not read it as a real reading
+    #: (it ends no blind streak and earns no follow-up turn).
+    blind: bool = False
 
 
 @dataclass(frozen=True)
@@ -1142,7 +1152,7 @@ def poll(
             return Verdict(Outcome.FALLBACK, str(exc))
         return Verdict(Outcome.QUIET, str(exc))
     except Report as exc:
-        return Verdict(Outcome.WAKE, str(exc))
+        return Verdict(Outcome.WAKE, str(exc), blind=bool(getattr(exc, "blind", False)))
     except Done as exc:
         keys = getattr(exc, "keys", ())
         return Verdict(

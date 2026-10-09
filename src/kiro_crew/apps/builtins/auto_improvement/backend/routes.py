@@ -108,6 +108,7 @@ _CONFIG_WRITABLE = frozenset(
         "quiesceAfter",
         "maxHours",
         "maxCostUsd",
+        "maxCredits",
         "proposerWide",
         "proposerDeep",
         "reproduceReps",

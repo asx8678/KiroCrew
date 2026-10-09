@@ -25,6 +25,7 @@ from kiro_crew import mcp_core
 from kiro_crew.artifacts import _infer_kind
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.tool_result_cap import TRUNCATION_MARKER_PREFIX
 from kiro_crew.validation import (
     ARTIFACT_AGENT_MARKER,
     ARTIFACT_DELETE_COMMENT_SCHEMA,
@@ -139,6 +140,14 @@ def schemas() -> list[dict[str, Any]]:
                     "version": {
                         "type": "integer",
                         "description": "Specific version to read. Omit for current.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Character offset to start reading content at (default 0).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Characters of content to return (max 40000). A larger artifact read without paging returns its first page and says how to get the next.",
                     },
                 },
                 "required": ["slug"],
@@ -599,6 +608,12 @@ def artifact_save(name: str, args: dict[str, Any]) -> str:
     )
 
 
+#: Content characters one artifact_get page carries (TOOL-6): under the
+#: transport's cut (tool_result_cap.MAX_TOOL_RESULT_CHARS) with room for the
+#: metadata and hints, so a page always arrives whole.
+_ARTIFACT_PAGE_CHARS = 40_000
+
+
 def artifact_get(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, ARTIFACT_GET_SCHEMA)
     slug = args["slug"]
@@ -613,6 +628,23 @@ def artifact_get(name: str, args: dict[str, Any]) -> str:
     content = d.get("content") or ""
     content, _ = redact_exfiltration_urls(content)
     content, _ = redact_credentials(content)
+    # TOOL-6: page the content so a large artifact is never cut in the middle by
+    # the transport, which a later full rewrite would then write back.
+    total = len(content)
+    offset = int(args.get("offset") or 0)
+    limit = int(args.get("limit") or _ARTIFACT_PAGE_CHARS)
+    page_note = ""
+    if offset or args.get("limit") or total > _ARTIFACT_PAGE_CHARS:
+        end = min(total, offset + limit)
+        content = content[offset:end]
+        if end < total:
+            page_note = (
+                f"\n--- content chars {offset}-{end} of {total}; more follows: call "
+                f"artifact_get(slug, offset={end}) for the next page. Edit with "
+                "artifact_update only once you hold the whole content. ---"
+            )
+        else:
+            page_note = f"\n--- content chars {offset}-{end} of {total}; end of content ---"
     meta_lines = [
         f"slug: {d.get('slug', '?')}",
         f"name: {d.get('name', '?')}",
@@ -624,7 +656,7 @@ def artifact_get(name: str, args: dict[str, Any]) -> str:
         meta_lines.append(f"description: {d['description']}")
     if d.get("tags"):
         meta_lines.append(f"tags: {', '.join(d['tags'])}")
-    out_body = "\n".join(meta_lines) + "\n\n--- content ---\n" + content
+    out_body = "\n".join(meta_lines) + "\n\n--- content ---\n" + content + page_note
     # Append a re-emit hint for widgets so the agent has the exact tag
     # string it should use when surfacing the artifact in chat. Without
     # this the slug rule from the artifacts skill is easy to overlook
@@ -647,6 +679,17 @@ def artifact_update(name: str, args: dict[str, Any]) -> str:
     update_body = {k: v for k, v in args.items() if k != "slug" and v is not None}
     if not update_body:
         return "Error: nothing to update (provide content/name/description/tags)"
+    content = update_body.get("content")
+    if isinstance(content, str) and TRUNCATION_MARKER_PREFIX in content:
+        # TOOL-6: this text passed through a tool result that was cut in the
+        # middle; writing it back would replace the artifact's real middle
+        # with the cut note.
+        return (
+            "Error: refused — the content contains a tool-result truncation note "
+            f"({TRUNCATION_MARKER_PREFIX} …), so it is a cut copy, not the whole "
+            "artifact. Read the full content (artifact_get with offset/limit, or the "
+            "saved file the note names) and send that."
+        )
     # 'actor' is not set in the body — the API handler infers it from the
     # X-Internal-Secret header presence (MCP=agent, dashboard=user). This is
     # more secure than trusting a body field and saves the agent from having

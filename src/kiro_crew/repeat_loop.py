@@ -15,7 +15,10 @@ per turn without importing the dashboard.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+
+logger = logging.getLogger(__name__)
 
 #: Identical results of one identical call, in one turn, before the notice.
 REPEAT_LOOP_THRESHOLD = 3
@@ -240,3 +243,30 @@ class RepeatLoopTracker:
                 self._warned.add("n" + norm_signature)
                 return build_repeat_loop_notice(title, self._streak[skey])
         return ""
+
+
+async def steer_repeat_loop_notice(client: object, notice: str) -> bool:
+    """Steer a repeat-loop or long-turn notice into a running turn (TOOL-20).
+
+    For an unattended turn (a subagent run, a workflow step) that has no slot to
+    park a notice on: advice only, never a refusal, so a harness that cannot
+    steer simply does not get it. Redacted first, since the notice quotes a tool
+    title, and bounded like the dashboard's own steer.
+    """
+    if not notice or not getattr(client, "supports_refusal_steer", False):
+        return False
+    import asyncio
+
+    from kiro_crew.constants import STEER_NOTICE_BOUND_SECS
+    from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+
+    text, _ = redact_exfiltration_urls(notice)
+    text, _ = redact_credentials(text)
+    try:
+        sent = await asyncio.wait_for(
+            client.steer(text), timeout=STEER_NOTICE_BOUND_SECS  # type: ignore[attr-defined]
+        )
+    except Exception:  # noqa: BLE001 - advice must never fail the turn
+        logger.debug("repeat-loop steer failed", exc_info=True)
+        return False
+    return sent is not False

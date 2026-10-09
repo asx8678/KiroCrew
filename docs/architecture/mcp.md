@@ -174,8 +174,12 @@ tool definitions to 69,151 B of compact JSON (from 121,370 B; measured over
 it opt-in would leave the prompt promising tools a default session does not have.
 The ~40,000 B target is not reachable without that: the verbs `config/prompt.md`
 names come to ~60 KB on their own, most of it argument schema rather than prose.
-Lowering `tool_search_min_tokens` so these defer on a 1M window is a separate,
-unvalidated follow-up (#16059).
+`agent.tool_search_min_tokens` defaults to 10,000, below kiro-cli's own 50,000, so
+these schemas (about 15k tokens) defer under Tool Search on any window instead of
+riding every request (TOOL-2). The precondition the finding named is met: #16059
+(a Tool Search resume delivering an empty context) is closed, and Crew's servers
+defer on kiro-cli >= 2.27.0. The cost is a `tool_search` round trip the first time
+a session reaches for one of them.
 
 User customizations are preserved, `autoApprove` included: a list the owner wrote
 by hand is a deliberate statement about their own tools and survives the refresh,
@@ -1581,7 +1585,7 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 | Server | Process | Tools |
 |--------|---------|-------|
 | `kirocrew-cron` | `kirocrew mcp-cron` (`mcp_cron.py`) | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_remove_all`, `cron_pause`, `cron_resume`, `cron_trigger`, `cron_secret_request` |
-| `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
+| `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact and session-directive tools (see below); the workflow and knowledge tools are on `kirocrew-ops` |
 | `kirocrew-computer` | `kirocrew mcp-computer` (`mcp_computer.py`) | `computer_list_apps`, `computer_launch_app`, `computer_get_state`, `computer_click`, `computer_drag`, `computer_type_text`, `computer_press_key`, `computer_set_value`, `computer_scroll`, `computer_perform_action`, `computer_end_turn` |
 | `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_update`, `chat_folder_move_session`, `chat_folder_delete`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `chat_tag_column_list`, `chat_tag_column_create`, `chat_tag_column_move`, `chat_session_pin`, `session_create`, `session_fork`, `session_stop`, `session_end_wait`, `session_set_model`, `session_reload`, `session_close`, `session_revive`, `session_send`, `session_broadcast`, `session_status`, `session_adopt`, `session_release`, `session_read_message`, `session_summary` |
 | `kirocrew-work` | `kirocrew mcp-work` (`mcp_work.py`) | `work_brief`, `work_report`, `work_ledger_read`, `work_ledger_rebuild`, `work_ledger_record` |
@@ -1599,6 +1603,8 @@ advertised list differs (`mcp_tools.build_ops_tool_list`). Its calls send
 dashboard audits them as unknown-internal, the same as `kirocrew-core` today.
 Monitor tools stay on `kirocrew-core`: their directives are derived from the
 `kirocrew-core` name in the gateway.
+
+A spec that does not mount `kirocrew-ops` cannot reach its tools at all: the default core process answers them as unknown. Two agents are granted the one verb they need, verb by verb with the server's hand-built opt-in entry: the heartbeat (`HEARTBEAT_OPS_VERBS`) and the step agent (`STEP_OPS_VERBS`, pre-approved where the template pre-approves `@kirocrew-core`), each `local_knowledge_search`; a cold start of either launches a second MCP process, and only that one schema reaches the model. The goal-conductor worker stays without it, and its skill no longer asks it to run a workflow. `kirocrew-cron` stays always on (TOOL-2, left after an attempt): the spec-file half of an opt-in flip is safe, because `refresh_managed_servers` keeps an opt-in entry an existing spec already carries, but a non-Kiro harness session derives Crew's servers from `managed_mcp_spec_entry`, which emits nothing for an opt-in server whatever the spec file holds, and app agents (Mochi among them) borrow the host spec's entry. An opt-in flip would therefore strip cron from every Claude/Codex session on every install, and from app agents on fresh ones, with no one choosing it. Doing it safely means a per-install grandfather record those derivations read, across about 30 files. Two more are left as decided (2026-10-09): trimming the longest tool and property descriptions (`monitor_start`, `learn_add` and its `applies` field among them) takes inline guidance away from every agent, and a per-tool description budget test is a test this pass did not write (TOOL-3); and a shared MCP server still dispatches one call at a time, in order, because concurrent dispatch is a concurrency-model change with no test behind it (REL-16).
 
 `kirocrew-panel` is opt-in and reaches a crew member's DM session the way
 `kirocrew-dashboard` does: as a session-level `mcpServers` entry carrying that
@@ -2784,8 +2790,11 @@ every path Kiro Crew can reach:
   where a result passes whole and no cliff past it. Image blocks are downscaled
   before that step (`image_budget`). A third-party server that is not stubbed
   (`mcp_gateway.stub_servers` is empty by default) is launched by kiro-cli
-  directly and gets no Kiro Crew cap; whether to stub them by default is an open
-  maintainer decision.
+  directly and gets no Kiro Crew cap. Stubbing stays OPT-IN (decided 2026-10-09,
+  TOOL-1): stubbing every third-party server by default changes process topology
+  (each one runs behind the broker), the empty default roster is deliberate, and
+  whether kiro-cli already caps tool results itself is still unmeasured. Revisit
+  once a real install answers that.
 
 The spill file is named from the call (server, request id) passed down per call,
 never module state, so the servers stay stateless. Tools that must stay

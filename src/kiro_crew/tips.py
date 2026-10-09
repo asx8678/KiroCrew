@@ -7,6 +7,7 @@ Selection uses weighted-random newer-biased pick (recency_decay ** rank).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -399,6 +400,11 @@ class TipsCache:
     # long-lived DashboardState, which outlives any single event loop.
     _lock: LoopBoundLock = field(default_factory=LoopBoundLock, repr=False)
     _task: asyncio.Task | None = field(default=None, repr=False)  # type: ignore[type-arg]
+    # UI-4: digest of the last generation's full input (the prompt, which holds
+    # the context, catalog and shown/dismissed sets, plus the model). A stale
+    # refresh with an unchanged digest reuses the tips instead of a model call.
+    # In memory only: a restart regenerates once.
+    _input_digest: str = field(default="", repr=False)
 
 
 _tips_init_lock = LoopBoundLock()
@@ -1118,6 +1124,11 @@ async def generate_tips(state: DashboardState) -> list[dict]:  # type: ignore[ty
     # unpinned install resolves to "auto", unchanged) so an explicit id and a
     # pin travel the same path. Resolved per call from the live config.
     tips_model = cfg.dashboard.tips_model or cfg.agent.resolve_model("background")
+    digest = hashlib.sha256(f"{tips_model}\0{prompt}".encode("utf-8")).hexdigest()
+    if st.tips and digest == cache._input_digest:
+        # Nothing the generation reads has changed since the tips on hand were
+        # made, so a model call would reproduce them (UI-4).
+        return list(st.tips)
     # Delegate acquire / pin-model / drive / reject-tools / destroy — and the
     # reactive model-rejection fallback — to run_bg_oneliner.
     # A rejected model is retried once against the advertised list. Any failure
@@ -1134,6 +1145,7 @@ async def generate_tips(state: DashboardState) -> list[dict]:  # type: ignore[ty
     if tips:
         tips = _redact_tips(tips)
         logger.info("Generated %d personalized tips", len(tips))
+        cache._input_digest = digest
         return tips
 
     return _fallback_tips(cache.catalog, st)

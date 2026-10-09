@@ -408,7 +408,14 @@ Exactly what `validation.build_tool_response` emits:
 {"content": [{"type": "text", "text": "…"}]}
 ```
 
-Text only, capped at `MAX_RESPONSE_LEN`. **There is no `isError` field and no
+Text only, capped at `MAX_RESPONSE_LEN` (`tool_result_cap.MAX_TOOL_RESULT_CHARS`,
+48 KiB). `render_tree` has no total budget of its own, so a dense window at the
+default walk budget can exceed that cap. The transport then keeps the head (the
+header and the first elements) and the tail (the truncation notes, the trailer and
+the screenshot note), each cut on a line boundary, and saves the full text to a
+spill file the truncation marker names. Elements in the omitted middle cannot be
+addressed from the inline text until the model reads that file or walks a narrower
+view. **There is no `isError` field and no
 image block** — an image block is not expressible on this transport, so
 "tree-first, relay the screenshot as a path" is a property of the transport
 rather than a policy someone can regress. An error is the literal string
@@ -434,7 +441,18 @@ Screenshot: /var/folders/…/kirocrew-computer-shots/shot-1769472013411.jpeg
 ```
 
 Every mutating tool returns the REFRESHED tree at the configured budgets, so the
-model always acts against indices it has just been shown. Its response is
+model always acts against indices it has just been shown. The guidance says so in
+all three places the model reads it (the `computer_get_state` description,
+`config/prompt.md`, the `computer-use` skill): snapshot before the first action on
+each request, with a screenshot so the live view opens, and again only when the
+window may have changed outside the model's own actions — not "every turn", which a
+model can read as before every action (TOOL-8). Two further TOOL-8 savings are
+deliberately not taken. A post-action DIFF (changed rows only) would have the model
+act on indices pieced together from two walks; the drift check refuses a stale one,
+but a diff that drops a row still leaves the model working from a wrong picture of
+the operator's real screen, so it waits for driver-level tests. A lower default
+`max_tree_nodes` would make a truncated walk the normal case, and a truncated walk
+suppresses the screenshot (it cannot rule out a secure field). Its response is
 `"<detail>\n\nRefreshed state:\n<tree>"`, and **the two halves are redacted
 separately — deliberately, and neither is optional.**
 

@@ -820,6 +820,10 @@ class AutoNudgeService:
         # (ledger_wake.py:455-468), and the body is rebuilt by the next probe
         # tick anyway. Consumed and re-owed with the claim in _run_fire_cycle.
         self._pending_monitor_wake_body: dict[str, str] = {}
+        # LOOP-7: the claims above whose wake is the kernel's own blind alert
+        # (``irq.Verdict.blind``). Delivered and charged like any wake, but with
+        # no follow-up allowance, and it never ends the blind streak.
+        self._pending_monitor_blind: set[str] = set()
         #: A quiet-streak floor tick that has decided to deliver but not yet
         #: delivered. Same shape and same reason as the wake claim above: the charge
         #: belongs at the single point delivery is confirmed, never at the decision.

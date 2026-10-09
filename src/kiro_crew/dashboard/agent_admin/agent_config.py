@@ -519,7 +519,7 @@ async def api_agent_config(request: web.Request) -> web.Response:
                     name,
                 )
             # Restart kiro-cli sessions so new config takes effect
-            await _h._reset_all_sessions(request)
+            await _h._reset_all_sessions(request, agent=name)
             return web.json_response({"ok": True, "applied": True})
         except Exception as exc:
             return _err500(exc)

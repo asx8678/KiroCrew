@@ -279,6 +279,16 @@ class LLMProvider(ABC):
         """
         return 0
 
+    def context_used_tokens_reliable(self) -> bool:
+        """Whether :meth:`context_used_tokens` can drive an absolute threshold.
+
+        False only when the count was derived from a percentage against a window
+        from a static source, which may not be the window the backend serves.
+        Default True: a provider that reports no count reports 0, and 0 never
+        binds a threshold anyway.
+        """
+        return True
+
     @property
     def session_id(self) -> str:
         """Provider-specific session identifier for file cleanup.

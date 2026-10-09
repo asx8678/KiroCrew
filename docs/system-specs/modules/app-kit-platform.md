@@ -499,8 +499,8 @@ the reverted value is the exact artefact `_register_mcp_servers` refuses to writ
 and scrubs on sight — a `backend.port:"auto"` app's illustrative manifest port,
 i.e. a reachable-LOOKING dead URL whose cost that path states as breaking *every*
 kiro session, not just this app's. Two facts set the window. The PUT's own tail
-calls `_reset_all_sessions`, which drains every active session **and** the warm
-pool, so the next cold start reads the reverted row rather than the revert lying
+calls `_reset_all_sessions`, which recycles every idle session (a busy one is
+deferred until its turn ends) **and** refreshes the warm pool, so the next cold start reads the reverted row rather than the revert lying
 dormant. And the only writer that puts the live port back is
 `reconcile_enabled_app_resources`, whose single call site is the gateway boot path
 (`dashboard/server_runtime/app_platform.py`) — the mid-turn rung `_recover_app_agent_binding` is gated

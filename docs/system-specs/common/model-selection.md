@@ -377,7 +377,22 @@ its own once the cache refreshes with a list that carries it.
   `subagent`, `cron`, `workflow`, `taskrunner`), read by `AgentConfig.resolve_model(role)`
   in `config/sections.py`. Roles default to `"auto"` and deliberately do NOT inherit
   `agent.model`, so a user's chat model does not silently become the price of cron,
-  workflow, task-runner, or subagent work.
+  workflow, task-runner, or subagent work. A role model stands in for the chat
+  default ONLY. For cron, workflow and task-runner sessions the precedence is: the
+  job's or step's own pin › the crew's pin › the agent template's pin › the role's
+  pin › `"auto"` (a template whose own `model` is the `"auto"` sentinel has picked
+nothing, so the role's pin applies). Meeting agents follow the same rule under the
+`background` role. Those sites pass no model and `model_role=<role>` to
+  `SessionManager.get_or_create`, and `session._session_model` resolves the role
+  only after the crew and template pins, returning the role's model explicitly so
+  the factory never falls back to `agent.model`. Never pass `resolve_model(role)`
+  as an explicit model at such a site: an explicit model skips `_session_model`,
+  and with it every crew and template pin. The subagent path is not on this rule yet: an
+  unpinned spawn omits the model and still resolves to `agent.model`, and moving
+  it is a take-away change for whoever relies on that (`take-away-changes.md`).
+  Role EFFORTS (`agent.role_efforts.cron/workflow/taskrunner`) are accepted but not
+  read: an explicit effort override would outrank a crew's effort pin the same way
+  the explicit model outranked its model pin, so they wait for the same treatment. Two UI follow-ups are left as decided: the model picker does not yet hint at a model the backend tagged `entitlement: "unverified"` (MOD-11), and the model chip has no "window unknown" indicator (CTX-18); both need new strings in the dashboard's twelve-language catalog and a frontend build and test run.
 - **Entitlement checks** always use the shared predicate
   `acp.client.model_is_unusable(id, advertised)` together with
   `advertised_model_ids(...)`. It is one predicate on purpose: two spellings of "can
