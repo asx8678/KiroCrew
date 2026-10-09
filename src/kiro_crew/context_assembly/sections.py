@@ -33,6 +33,7 @@ _RUNTIME_DISPLAY = {
     "background": "KiroCrew background",  # brand-ok: prompt bytes the model reads
     "heartbeat": "KiroCrew heartbeat",  # brand-ok: prompt bytes the model reads
     "cli": "CLI terminal",
+    "webhook": "KiroCrew webhook",  # brand-ok: prompt bytes the model reads
     "slack": "Slack",
     "discord": "Discord",
     "telegram": "Telegram",
@@ -85,6 +86,13 @@ def _resolve_runtime_source(session_key: str, runtime_source: str | None = None)
         source = "heartbeat"
     elif session_key == "cli_chat":
         source = "cli"
+    elif session_key.startswith("hook:") or session_key.startswith("hook_"):
+        # A webhook-triggered session (dashboard/handlers/hooks.py,
+        # ``_HOOK_SESSION_PREFIX``). It fell through to the legacy Slack
+        # fallback below, so its [RUNTIME] line said "Slack" and it was handed
+        # Slack-only guidance. Its result goes out as a dashboard notification
+        # and a Slack DM, so it keeps the channel critical-rules variant.
+        source = "webhook"
     else:
         source = "slack"
         lowered_key = session_key.lower()
