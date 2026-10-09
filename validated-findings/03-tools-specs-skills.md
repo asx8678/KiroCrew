@@ -5,6 +5,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 ## 5. Tools, agent specs, skills, attachments and prompt rules
 
 ### TOOL-12 [65, armed, effort S] session_ledger_read sends each event twice — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): dashboard/handlers/session_ledger.py:~100-106 pops `events` from state, serves 20-event tail; mcp_tools/ledger.py:173 compact JSON; commit f3bf61254. test/test_session_ledger.py:639 pins tail length.
 - **Verified claim:** GET /api/session-ledger returns the whole state_record (which itself carries `events`, up to _MAX_EVENTS=100) next to a separate 20-event tail, and the MCP tool session_ledger_read dumps both with json.dumps(indent=2). In steady state (>100 updates recorded) one read carries 120 event objects, 32,878 B / 9,983 o200k tokens, versus the 20 events pipeline-conductor/SKILL.md documents. Dropping state.events plus compact UTF-8 JSON measured -68.2% (3,170 tokens).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/dashboard/handlers/session_ledger.py:94-100 — state_record = read_state(...); events = state_record.get("events", [])[-_MAX_EVENT_TAIL:]; return json_response({"state": state_record, "events": events})
@@ -25,6 +27,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:TOOL-12, REVIEW_FINDINGS:F1
 
 ### TOOL-1 [60, default, effort M] Tool results: first-party cut at 100k chars with no spill; third-party servers uncapped — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): tool_result_cap.py:MAX_TOOL_RESULT_CHARS=48 KiB, head+tail+spill (cut_head_tail); validation.build_tool_response uses it; apps/builtins/auto_improvement/backend/mcp_server.py:379 routes through build_tool_response; mcp_gateway/pool.py:159 threshold equals the …
 - **Original claim:** No size cap on tool results unless the (default-off) broker is enabled (corrected below)
 - **Verified claim:** First-party results are NOT unbounded: every Kiro Crew stdio MCP server (the 8 managed servers and mochi, all via mcp_shared.run_mcp_stdio_loop) frames results through validation.build_tool_response -> sanitize_response, which cuts at MAX_RESPONSE_LEN = 100,000 chars (~25k tokens) head-only with '…[response truncated]' and no spill path, so a 1 MiB result reaches the model as 100,022 chars and anything tail-anchored is lost. The auto_improvement app's MCP server builds its own frame and bypasses build_tool_response, but it caps its own payload at _MAX_RESULT_CHARS = 60,000 chars (redact first, then a head-only slice with no truncation marker; mcp_server.py:42, :376). Third-party MCP servers are launched by kiro-cli directly and get no Kiro Crew cap at all: the broker (spill + image_budget) runs only for servers in mcp_gateway.stub_servers, which is empty by default ('an empty list means no broker runs at all'); mcp_gateway.enabled=False only controls sharing. With a stub, frames over 256 KiB spill to a 16 KiB inline prefix: measured 250 KiB -> 256,000 chars inline, 260 KiB -> 16,638 chars (the cliff holds). Whether kiro-cli caps tool results itself is unknown here.
 - **Evidence (at `397f4be`):**
@@ -105,6 +109,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:TOOL-2, REVIEW_FINDINGS:H-P1, REVIEW_FINDINGS:H-P3, REVIEW_FINDINGS:H-P5, REVIEW_FINDINGS:Part5b§5.1, REVIEW_FINDINGS:§6.1, verify_needed:O5, verify_needed:X9, verify_needed:X14, verify_needed:G16(#15899), verify_needed:G18(#16099), verify_needed:G25(#13232), verify_needed:G31(#4749), verify_needed:G36, verify_needed:G38, verify_needed:G41, verify_needed:G42, verify_needed:G43, verify_needed:G44, verification_needed:sink#5, verification_needed:opt(lazy-schemas), verification_needed:refactor(lazy-schemas)
 
 ### TOOL-4 [55, default, effort S] spawn_status default: full transcript, cut at 100k chars, so the closing answer is lost — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): mcp_tools/spawn.py:1128-1132 no-arg spawn_status requests tail=_SPAWN_STATUS_TAIL_DEFAULT_LINES (200); dashboard/messaging_api/run_views.py tail view capped by _SPAWN_TAIL_MAX_CHARS with has_more; spawn_sub_agents reads agent.completion_keep_chars (spawn.py:15…
 - **Original claim:** spawn_status returns the full transcript by default (corrected below)
 - **Verified claim:** With no offset/limit/grep, spawn_status asks /api/spawn/<id> for the full retained transcript (the schema says 'Omit for the full transcript'; _apply_result_view returns the text unchanged 'so the default spawn_status contract (full transcript) is preserved'), and the route reads the whole result.txt (capped on disk at RESULT_FILE_MAX_BYTES = 512,000 B). The model does not receive 512 KB, though: the MCP transport (build_tool_response -> sanitize_response) cuts every first-party result to 100,000 chars head-only, so a no-argument read of a large transcript costs ~25k tokens AND drops the tail, which is where the subagent's closing answer is (measured: a 438 KB transcript -> 100,022 chars, closing line lost). Separately, spawn_sub_agents compares against the constant COMPLETION_KEEP_DEFAULT_CHARS (3000) instead of the configured agent.completion_keep_chars.
 - **Evidence (at `397f4be`):**
@@ -131,6 +137,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:TOOL-4, REVIEW_FINDINGS:U4
 
 ### ATT-1 [50, default, effort M] Channel attachments: no per-message inline total — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): messaging/attachments.py:103 max_inline_total=48 KiB enforced via inline_left (:369); :290-294 head+tail preview, full file kept by path; commits 24cfad48d, 9f8b81c86.
 - **Verified claim:** messaging/attachments.py IngestLimits caps each attachment (text/document text inlined up to max_text_inject = 50 KiB chars, max 10 attachments) but has no per-message inline total; text is truncated head-only ('[... truncated]'), and the downloaded text/document file is deleted in the `finally` of the same loop, so the agent gets no path to the rest. A text file over max_text_bytes (512 KiB) is rejected with only a size note — no content, no path. Every channel that ingests attachments shares this code (slack, discord, telegram, teams, whatsapp, wecom, weixin, webex). Re-measured through the real ingest_attachments with Slack's limits: 400 KB log -> 51,244 chars head only, file not kept; 20-page PDF -> 51,255 chars; 10 x 300 KB CSV in one message -> 512,501 chars (~128k tokens) inline; 2 MB log -> an 87 B rejection note.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/messaging/attachments.py:91-103 — `class IngestLimits`: `max_text_inject: int = 50 * 1024`, `max_attachments: int = 10`; no per-message total field
@@ -155,6 +163,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:ATT-1, REVIEW_FINDINGS:Part6/ATT-1, verify_needed:Y1, verify_needed:G44
 
 ### OUT-1 [50, default, effort M] Empty-reply auto-continue fires after intentionally final tool calls — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): dashboard/chat_runner.py:9296-9330 _intentionally_final_outcome set by applied terminal outcomes and spawn receipts; guard at :16255 skips the empty-response continue; commit 840ce187d.
 - **Verified claim:** With session.empty_response_auto_continue on by default and only ask_question exempt (_record_terminal_question), a depth-0 dashboard turn that ends text -> suggest_followup / monitor_start / spawn_run -> end_turn with no closing text queues _ACTIVITY_NO_REPLY_CONTINUE_MSG (rung=continue), although those tools' receipts say 'End your turn now' / 'END YOUR TURN'. Reproduced with the real _run_chat and scripted ACP events: continuation queued for suggest_followup, monitor_start and spawn_run; none for ask_question or when one closing line follows. Each hit is one more full-context request (a fresh dashboard first message is 52,305 chars plus ~124 KB of core+cron schemas). Structured monitor turns run at _prompt_depth=1 and are exempt; unstructured prompt-loop turns run at depth 0 and get the same ladder. Frequency is unmeasured.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/config/sections.py:1880-1881 — empty_response_auto_continue: bool = field(default=True, ...)
@@ -178,6 +188,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:OUT-1, REVIEW_FINDINGS:Part6/OUT-1
 
 ### TOOL-5 [50, default, effort S] get_chat_session has no per-message or total cap — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): mcp_tools/sessions.py ~:366-400 per-role caps (user 8k, assistant 4k, other 2k, head+tail marker), 40k total budget keeping newest, `before` cursor; commit 3daaca5ea.
 - **Verified claim:** get_chat_session renders up to max_messages (default 50, max 200) messages with each message's full content and no per-message or total cap in the handler or the projection. The only bound is the MCP transport's 100,000-char head-only cut (sanitize_response), which, because the messages are the newest N in chronological order, drops the MOST RECENT messages of a long transcript instead of the oldest. Replay elsewhere caps user 8,000 / assistant 4,000 chars per message.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/mcp_tools/sessions.py:279 — max_messages = args.get('max_messages', 50)
@@ -199,6 +211,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:TOOL-5, REVIEW_FINDINGS:U5
 
 ### ATT-2 [45, default, effort M] Large dashboard pastes go inline into the prompt — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): dashboard/chat_handlers.py:1167-1180 spill_large_paste to a session file with [attached_file N] marker; chat_attachments.py:176 PASTE_SPILL_BYTES=32 KiB; commit 05e3143bc.
 - **Verified claim:** The dashboard composer collapses a large paste into a chip only for display; on send, buildOutgoingTurn expands every chip back to its full content into the wire text, and api_chat reads the body with read_bounded_json(max_bytes=None) (bounded only by the app-wide 60 MiB client_max_size) and applies no per-message cap. The composer only warns at 0.9 of the model window. So a 200 KB paste reaches the prompt whole: measured 204,871 B of prompt text for the user message, while the same content attached as a file costs a ~100 B `[attached_file N] /path` line (four files incl. a 2 MB log: 523 B). On the kiro-cli path that user message stays in native history and is replayed on later turns (FIX_PLAN 0.2; not measured here).
 - **Evidence (at `397f4be`):**
   - website/src/chat-core/composer/outgoingTurn.ts:157 — `let wire = pastes.length ? expandAll(linked, pastes) : linked`
@@ -218,6 +232,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:ATT-2, REVIEW_FINDINGS:Part6/ATT-2
 
 ### OUT-2 [45, default, effort M] Subagent, workflow, task, cron turns get the hard diff rule; [OPTIONS:] only on choices — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): context.py ~:1256-1275 _CRITICAL_RULES_MODEL_READ (no ```diff, no [OPTIONS:]); _critical_rules_for ~:1355-1392 selects it for _MODEL_READ_SOURCES (subagent, workflow, taskrunner); dashboard/channel constants unchanged; commit 73267ec51.
 - **Original claim:** Subagent/workflow/task-runner turns are told to emit diff blocks and [OPTIONS:] (corrected below)
 - **Verified claim:** _critical_rules_for gives every non-dashboard runtime source the hard _DIFF_RULE_CHANNEL ('No exceptions — even single-line changes MUST get a diff block'), and prompt.md's Output Format repeats it unconditionally; measured on the first message of subagent, workflow-step, taskrunner, cron (minimal_context=False), Slack and CLI sessions (all hard_rule=True), while only cron minimal_context=True escapes the hard rule. The per-turn re-assertion (71 tokens) is added only on follow-ups whose caller passes runtime_source (workflow steps, channels) — subagent follow-ups do not pass it and were not re-asserted. The [OPTIONS:] rule is conditional ('when presenting choices') rather than always required, but subagent results strip it (run.py:3221). Measured output cost of the mandated diff: +646 tokens creating a 40-line file, +4,756 for 400 lines, 88-130 per small edit; 3 diffs filled 3,329 of a 3,836-char subagent transcript, so the closing summary was lost past the 3,000-char completion keep.
 - **Evidence (at `397f4be`):**
@@ -243,6 +259,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:OUT-2, REVIEW_FINDINGS:Part6/OUT-2, verify_needed:B1
 
 ### TOOL-13 [45, default, effort M] Model-facing JSON pretty-printed and ASCII-escaped at ~20 sites — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): tool_result_cap.py:49 tool_json (compact, ensure_ascii=False); no model-facing json.dumps(indent=2) left in mcp_*.py / mcp_tools (grep: only file writers remain: mochi mcp_server.py:681, mcp_cleanup.py:447, mcp_quarantine.py:350, mcp_tools/control.py:1050); au…
 - **Verified claim:** Model-facing MCP results are pretty-printed and/or ASCII-escaped at 29 sites at HEAD: 20 model-facing json.dumps(indent=2) sites (24 indent sites in mcp_tools/, mcp_*.py and app mcp_server.py, minus 4 file writers) of which 9 keep the default ensure_ascii=True and 11 already pass ensure_ascii=False, plus 9 compact-but-ASCII-escaped sites (spawn.py x6, apps.py:583, browser.py:308, auto_improvement mcp_server.py:376). Compact UTF-8 measured -21.1% (ledger), -24.3% (workflow_result), -30.8% (cron_list json), -32.7% (crew_log_read), -23.2% (work_brief) of o200k tokens in English; -50.5% (workflow_result CJK) and -64.4% (spawn_sub_agents records CJK). Byte budgets in mcp_cron._render_cron_list_json and mcp_crew_log/_debug/_work renderers are measured on indented text. Safety gap: mochi goes through mcp_shared.build_tool_response -> sanitize_response, but the auto_improvement backend server has its own stdio loop that only redacts and slices to 60,000 chars (no sanitize_response), so ensure_ascii=False there would let bidi/zero-width chars through.
 - **Evidence (at `397f4be`):**
   - AST survey a throwaway script 58 json.dumps calls in MCP modules, 24 with indent=2 (4 are file writers: mochi/mcp_server.py:680, mcp_cleanup.py:446, mcp_quarantine.py:350, mcp_tools/control.py:1328), 36 with default ensure_ascii
@@ -267,6 +285,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:TOOL-13, REVIEW_FINDINGS:F2, REVIEW_FINDINGS:F3
 
 ### TOOL-3 [45, default, effort M] Tool descriptions are bloated — CONFIRMED
+
+> **CLOSED (skipped)** — not fixed. The CI budget test and the description trimming were not done. Closed at your request because the test needs pytest, which is not installed here.
 - **Verified claim:** Measured from real tools/list replies at HEAD: across all 8 managed servers (136 tools) tool-level descriptions total 84,582 chars and nested property descriptions 48,607 chars. On the always-mounted default set (core+cron, 92 tools) they are 49,631 + 38,658 = 88,289 chars, about 73% of the 120,224 B compact payload. The '10 largest tools total 48 KB' figure is whole-schema size, not description size: top 10 by compact JSON = 47,774 B (monitor_start 8,484, send_message 6,985, cron_add 6,318, issue_radar_crew_record 5,396, spawn_run 5,069, monitor_update 3,649, learn_add 3,373, work_ledger_read 3,101, chat_tag 2,717, cron_update 2,682). By description text alone (tool + property) the leaders are monitor_start 7,668, send_message 6,016, cron_add 4,963, spawn_run 4,244, issue_radar_crew_record 3,450.
 - **Evidence (at `397f4be`):**
   - measured (merge/scripts/C/desc_measure.py over merge/scripts/C/tl/tl_mcp-*.json): all 8 servers n=136 tooldesc=84,582 propdesc=48,607
@@ -333,6 +353,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SKL-1, REVIEW_FINDINGS:Part6/SKL-1
 
 ### SPEC-1 [45, armed, effort M] Conductor specs mount 117 tools whole — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): agent_materialization/conductor_agents.py:99-118 explicit @server/verb refs (monitor_inspect, session_send, spawn_run, work_report, ...); helper at :118-138 mounts only named verbs; commit a70231d96. No test asserting <= 65,000 B found.
 - **Verified claim:** The goal conductor (kirocrew-conductor, and its kirocrew-ledger-conductor twin) mounts @kirocrew-core, @kirocrew-dashboard and @kirocrew-work whole (117 tools, 149,999 B of compact schemas), the pipeline and security conductors mount core + dashboard whole (112 tools, 141,209 B), while their charters (allowedTools verbs) are 24 / 18 / 19 verbs. Keeping the charter plus every tool their prompt/skill names would mount 61,604 / 50,371 / 51,412 B (~22k tokens saved per request). The code comment justifies the whole-server mounts by Tool Search deferral, which needs > min(5% x window, 50k) tokens and so does not engage on a 1M window (TOOL-2). kirocrew-dashboard-author mounts all of @kirocrew-core (107,043 B) where its charter + prompt use 5 core verbs (6,676 B); kirocrew-research copies the default mounts (core + cron, 120,224 B) although its prompt names no Kiro Crew tool.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/agent_materialization/conductor_agents.py:649-674 — config['tools'] = [..., 'tool_search', '@kirocrew-core', '@kirocrew-dashboard', '@kirocrew-work']
@@ -357,6 +379,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SPEC-1, REVIEW_FINDINGS:Part6/SPEC-1
 
 ### SPEC-2 [45, armed, effort M] Custom and conductor agent prompts delivered twice per request — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): context_assembly/turn.py:80-97 gates the [AGENT SYSTEM PROMPT] block on native_agent_prompt (spec prompt already delivered natively); commit 516048c8c.
 - **Verified claim:** For every agent other than the managed default, the spec `prompt` is delivered natively (kiro-cli's launch view keeps it, only re-anchoring a relative file:// path; KAS inlines it as customAgents[].prompt) AND context.py injects the same text as [AGENT SYSTEM PROMPT] at session start and again after every compaction (turn.py post_compaction_parts). Only `kirocrew` escapes, because its spec carries the 224-char _NATIVE_PROMPT_STUB. Re-measured duplicated bytes per request (injected block matches the native prompt 99.6-100%): conductor and ledger-conductor 13,189; dashboard-author 7,062; pipeline conductor 5,756; security conductor 5,657; research 4,573; personal-shopper advisor 3,801; heartbeat 3,014; worker 2,299; app agents 0.8-1.7 KB; 67,825 chars across the 23 specs measured; user personas unbounded.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/context.py:2966 — is_custom = bool(agent) and agent != 'kirocrew'; :2983-2986 elif is_custom: agent_prompt = self._load_agent_prompt(...)
@@ -379,6 +403,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SPEC-2, REVIEW_FINDINGS:Part6/SPEC-2, verify_needed:G17(#15822), verify_needed:G31(#13305), verify_needed:G36, verify_needed:G37, verify_needed:G43
 
 ### TOOL-14 [40, default, effort S] memory_recall result is mostly retrieval diagnostics — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): memory_recall.py:179-210 _model_recall_payload keeps id/key + retrieval.reason, drops timestamps, counters, algorithm/policy stamps and operating_point from the model copy; commit 1d0b835db.
 - **Verified claim:** A memory_recall result is mostly retrieval diagnostics: on the 5-fact/3-episode/1-lesson fixture the model receives 1,041 o200k tokens of which only 352 are the three memory context blocks; the `retrieval` block alone is ~712 tokens (per-row id/key/source, microsecond updated_at/created_at, unrounded cosine/score floats, matched_terms), plus algorithm_version, policy_revision and the *_chars/total_chars counters. On a V2 store `operating_point` is added on top. The model-facing projection _model_recall_payload strips only snippet/text, not the diagnostics.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/memory_recall.py:92-133 — recall_evidence copies reason/algorithm/cosine_floor/.../score/similarity unrounded into each row's `retrieval`
@@ -400,6 +426,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:TOOL-14, REVIEW_FINDINGS:F4
 
 ### SKL-2 [40, armed, effort S] Kiro Crew dev skills lack repo_scope — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): repo_scope: src/kiro_crew/builtin_skills/kirocrew-dev/{kirocrew-prepare-pr,writing-tests,kirocrew-worktree-dev,dashboard-template}/SKILL.md; commit c9b524887 "scope the repo-dev skills with repo_scope frontmatter".
 - **Verified claim:** kirocrew-prepare-pr, writing-tests, kirocrew-worktree-dev and dashboard-template describe themselves as Kiro Crew repo only, but none sets `repo_scope:` (no shipped SKILL.md under builtin_skills/, deploy/skills/ or apps/builtins/ carries the key), so the loader's mechanical gate never applies. With triggers on (max_triggered > 0) and NO project, 'commit and push these changes' / 'create pr for this branch' inject prepare-pr (53,466 B per turn) and 'add a test ...' injects writing-tests (58,901 B); together the two were 326,647 B of 854,756 B injected over the 96-message corpus (38%).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/skills.py:3712 — `_repo_scope_satisfied(relpath, project_dir)`: fails CLOSED with no project
@@ -420,6 +448,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SKL-2, REVIEW_FINDINGS:Part6/SKL-2
 
 ### SPEC-3 [40, armed, effort M] kirocrew-worker is not a slim agent — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): agent_materialization/service_agents.py:~150-176 STEP_CORE_VERBS slim kirocrew-step spec (no @kirocrew-cron, no workflow_/monitor_, 25,000 B budget stated); commits 39c4da84e, b84a14a30, eb6758362. Test asserting the 25 KB byte bound not located.
 - **Verified claim:** kirocrew-worker is built as the default spec plus @kirocrew-work (and the kirocrew-work server entry), minus auto-approval of three cron scheduling verbs; @kirocrew-cron stays mounted. Its mounted schemas are 129,014 B (~32k tokens) against 120,224 B for the default: core 107,043 + cron 13,181 + work 8,790, including monitor+autonudge 14,862 B, artifacts 13,236 B, app/dev tools 13,682 B, spawn 13,079 B and workflow 4,232 B. Its injected first turn is small (8,725 chars vs 52,382 for kirocrew), so it is slim in prompt but not in tools.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/agent_materialization/worker_agent.py:681-684 — tools = default tools; if '@kirocrew-work' not in tools: tools.append('@kirocrew-work')
@@ -440,6 +470,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SPEC-3, REVIEW_FINDINGS:Part6/SPEC-3
 
 ### TOOL-7 [40, armed, effort S] workflow_result returns the full event stream uncapped — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): mcp_tools/workflows.py:127-141 section=summary events agent_results with offset/limit; :370-372 8k result cap and 20-event tail; :393 spill comment gone; commits 0f386b7e2, c34fc52b6.
 - **Verified claim:** workflow_result returns {run_id, status, result, error, events, agent_results?, partial_results?, agent_errors?} as json.dumps(indent=2) with the whole event stream and no cap, paging or summary mode (its only argument is run_id). The run registry appends events without a bound. The only limit is the MCP transport's 100,000-char head-only cut, and because agent_results / partial_results / agent_errors are serialized AFTER events, a long event stream pushes exactly the fields the completion message tells the reader to fetch past the cut. The comment claiming the gateway spill handles oversize payloads is wrong on a default install (no broker).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/mcp_tools/workflows.py:131-143 — workflow_result schema: 'full result + event stream', properties {run_id} only
@@ -460,6 +492,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:TOOL-7, REVIEW_FINDINGS:U7
 
 ### SKL-4 [35, default, effort M] Several SKILL.md files exceed 32 KiB and prompts force whole reads — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): No packaged builtin_skills/**/SKILL.md over 32,768 B (wc check at origin/main); prompt.md has no `cat <path>` whole-file instruction (grep); commit 09ee11514 "split oversized skills into a core plus on-demand references".
 - **Verified claim:** Five packaged SKILL.md files exceed 32 KiB: pipeline-conductor 105,481 B (also over the 99,000 B SKILL_READ_CAPACITY, so the skill tool pages it), writing-tests 59,478 B, kirocrew-prepare-pr 54,404 B, goal-conductor 40,625 B and kirocrew-commands 33,076 B (39 builtin SKILL.md, 656,473 B total). prompt.md:64 tells the model to load a skill by `cat <path>` (whole file, no Crew-side bound); prompt.md:204 requires reading computer-use (27,530 B) before the first computer-use call; prompt.md:89 requires loading blocked-by-policy (12,277 B) before retrying a refused call; the security-conductor skill requires reading lessons.md (12,459 B) before its first dispatch. Those forced reads are per triggering event (first computer-use call, first refusal, first dispatch), not per session.
 - **Evidence (at `397f4be`):**
   - measured (wc -c at HEAD): builtin_skills/pipeline-conductor/SKILL.md 105,481; kirocrew-dev/writing-tests 59,478; kirocrew-dev/kirocrew-prepare-pr 54,404; goal-conductor 40,625; kirocrew-commands 33,076; 39 builtin SKILL.md = 656,473 B (all identical to prior)
@@ -480,6 +514,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SKL-4, REVIEW_FINDINGS:Part6/SKL-4
 
 ### TOOL-15 [35, default, effort S] List renderers repeat the same instruction on every row — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): mcp_tools/skills.py:305-313 load instruction once in header; no per-row "load:" line; commit 174b4071e "state list-renderer instructions once".
 - **Verified claim:** List renderers repeat per-row boilerplate: skill_search appends a `load: skill_search(action='read', key=...) or `$key`` line to every row; the kirocrew-dashboard session_status renderer repeats the full 'gone' and 'unknown' explanations on every such row; list_sessions renders each row as an emoji header, a `---` rule, bold title and an italic meta line. A one-header/plain-row rendering measured -32.4% (skill_search, 20 rows), -39.1% (session_status, 12 rows) and -26.6% (list_sessions, 10 rows) of o200k tokens.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/mcp_tools/skills.py:312 — else f"load: skill_search(action='read', key='{s['key']}') or `${s['key']}`" (per row)
@@ -522,6 +558,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:A10
 
 ### SKL-6 [35, armed, effort S] Triggered global skills have no byte cap; capped confined skills re-inject on every match — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): context.py:4207 trigger path load_skill(..., max_bytes=SKILL_READ_CAPACITY) (oversized global body refused -> pointer); per-turn total via `spent` (~:4190-4225); confined skills now demotion candidates with name-only pointer (:4226-4238); commit 5ccb495b7.
 - **Original claim:** Trigger-matched skill bodies have no byte cap; confined skills re-inject every match (corrected below)
 - **Verified claim:** With skills.max_triggered > 0, the trigger path loads a matched GLOBAL (operator-installed / built-in / app) skill with `load_skill(name, project)` and no max_bytes, which reads up to the 50 MB file-safety cap: a 153,062 B global body was injected whole in one turn (the `$skill` path would refuse it, capped at SKILL_READ_CAPACITY 99,000). CONFINED project skills, however, ARE capped: every confined body read goes through PROJECT_SKILL_BODY_CAP = 24,750 B (an oversized project SKILL.md is skipped). What holds for confined skills is the dedup exclusion: they are never demotion candidates, so their full body re-injects on every matching turn (19,442 B on each of 3 consecutive matches in one session, vs the global skill demoted to a pointer on its second match). Per-turn total is bounded only by max_triggered x body size.
 - **Evidence (at `397f4be`):**
@@ -545,6 +583,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** REVIEW_FINDINGS:X2, verify_needed:X2
 
 ### OUT-3 [30, default, effort S] Checklist recovery block orders one call per row — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): dashboard/state.py:4637-4638 recovery block asks for ONE `complete` call covering every [x] task; commit 7f2e8436e.
 - **Verified claim:** After a cold start without provider history, the [Task checklist — automatic recovery] block (dashboard/state.py todo_recovery_prompt) is prepended before the user's request and orders 'one `create` call ... then one `complete` call for every task marked [x]': for a 10-row checklist with 7 done it is 1,638 chars / 508 o200k tokens and mandates 8 tool calls (1 create + 7 complete) before the request. Whether kiro-cli's todo_list `complete` accepts several ids in one call (needed for the batched fix) is not checkable here: no fixture in the repo records the complete command's argument shape and kiro-cli is not installed.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/dashboard/state.py:4583 — def todo_recovery_prompt; :4605-4610 '... one `create` call with this exact description and these tasks in this order, then one `complete` call for every task marked [x].'
@@ -586,6 +626,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SKL-3, REVIEW_FINDINGS:Part6/SKL-3
 
 ### SPEC-7 [30, armed, effort S] App specs ship a `skills` key kiro-cli may reject — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): apps/bridges.py:1031-1039 pops template "skills" and maps to skill:// resources; commit b2e78f058. (Templates still carry the key; the materialized spec does not.)
 - **Verified claim:** auto_improvement discovery.json and personal_shopper advisor.json ship a top-level `skills` array; the bridge keeps it as a user 'preference' key, so the materialized ~/.kiro/agents/auto-improvement--auto-improvement-discovery.json and personal-shopper--personal-shopper-advisor.json carry `skills`, and the native kiro launch view is a deepcopy of the spec, so the key reaches kiro-cli. agent-spec-fields.md says kiro-cli validates specs with deny_unknown_fields and falls back to the DEFAULT agent on an unknown key, and that `skills` is never written under that name 'because kiro-cli would reject the unknown field and drop the agent'; test_app_bridges.py treats `skills` as a live, user-pinnable field (agent_discovery reads it). The repo contradicts itself; whether the installed kiro-cli rejects `skills` was not run here. If the doc is right, both agents silently run as kiro-cli's default agent, losing their prompt, tools and containment.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/apps/builtins/auto_improvement/agents/discovery.json:6 — "skills": ["ai-discover", "metric-design"]
@@ -608,6 +650,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SPEC-7, REVIEW_FINDINGS:Part6/SPEC-7
 
 ### TOOL-10 [30, armed, effort S] Browser snapshot silently cut at 2000 chars — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): mcp_tools/browser.py:301 _SNAPSHOT_RESULT_BUDGET=20,000; :322-328 truncation note with omitted count and scope hint; commit 4c218d5a9.
 - **Verified claim:** mcp_tools/browser.py _result_text returns f'Browser {op}: {rendered[:2000]}' for every non-screenshot op, including op='snapshot' (which the description says to call first for element refs), with no truncation notice, total or remaining count. The tool is always advertised but only works when a native Browser panel serves the session (desktop shell); otherwise it points the model at playwright-cli.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/mcp_tools/browser.py:294-311 — _result_text: rendered = ...json.dumps(result); return f"Browser {op}: {rendered[:2000]}"
@@ -624,6 +668,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:TOOL-10, REVIEW_FINDINGS:U9
 
 ### TOOL-16 [30, armed, effort S] workflow_result events repeat run_id, timestamps and summaries — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): mcp_tools/workflows.py:375-393 _project_workflow_event: no per-event run_id, HH:MM:SS ts, result_summary dropped when agent_results present; WorkflowEvent.to_json untouched; commit c34fc52b6.
 - **Verified claim:** Each workflow_result event is serialized via WorkflowEvent.to_json with its own run_id, seq and a 32-char microsecond ISO timestamp, and each agent_finished event carries result_summary = the first 120 chars of the agent's result, which agent_results then carries in full. On a 6-agent run (28 events) all 28 events repeat run_id; a one-line-per-event rendering (run_id once, HH:MM:SS, empties dropped) measured -52.9% (4,177 -> 1,969 o200k tokens), -67.8% for CJK.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/workflows/__init__.py:221-230 — to_json returns {run_id, seq, ts, type, data} for every event
@@ -644,6 +690,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:TOOL-16, REVIEW_FINDINGS:F6
 
 ### OUT-4 [25, default, effort S] Prompt's routine resource_status pre-check is redundant only on full-context sessions — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): config/prompt.md:23 resource_status called only when [RESOURCES] line present, after a killed heavy step, or minimal-context without [RESOURCES]; commit 02fd0c11a.
 - **Original claim:** Prompt requires a routine resource_status pre-check (corrected below)
 - **Verified claim:** prompt.md (:31, :47) and the resource_status tool description tell the model to call resource_status BEFORE full tests, large builds or wide spawn waves. On full-context sessions the per-turn [RESOURCES] line already pushes the same signal and is silent when memory, task ceiling and kernel pressure are all clear, so a routine pre-check returns ~350 chars saying 'Posture: AMPLE' while [RESOURCES] is empty (measured on this host). But the [RESOURCES] line is skipped for minimal_context sessions (which still receive prompt.md), and it does not carry the live sub-agent cap, so 'absent means fine' holds only for full-context sessions; there the pre-check is redundant.
 - **Evidence (at `397f4be`):**
@@ -663,6 +711,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:OUT-4, REVIEW_FINDINGS:Part6/OUT-4
 
 ### SKL-7 [25, default, effort S] $skill expansion can stack five 99K bodies in one turn — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): dashboard/chat_runner.py:4781-4806 per-turn total SKILL_READ_CAPACITY; later bodies become pointers; commit 0c72e622a.
 - **Verified claim:** Each distinct `$name` token in a dashboard message resolves to a full skill body read with read_scoped_skill's default bound (SKILL_READ_CAPACITY 99,000 B per body; a larger body is refused, not truncated), up to `_MAX_DOLLAR_SKILLS = 5` per message, with no per-turn total, so one message can append up to ~495 KB; all bodies are appended to the user's message and every body is also snapshotted into the transcript row's `meta.skills`. Measured: five tokens ($computer-use $widgets $artifacts $kirocrew-dev/writing-tests $goal-conductor) -> 163,048 B in one turn.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/skills.py:244 — `_MAX_DOLLAR_SKILLS = 5`
@@ -682,6 +732,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** REVIEW_FINDINGS:X4, verify_needed:X4
 
 ### SPEC-4 [25, default, effort S] Background agents load the user's global steering files; workspace globs usually find none — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): acp/skill_projection.py:62-74 _INTERNAL_BACKGROUND_NO_STEERING_AGENTS = BACKGROUND_WORKER_AGENTS + kirocrew-knowledge, excluded from inherited globs; guest kept separate; commit ff57898a4.
 - **Original claim:** Internal background agents inherit user steering files (corrected below)
 - **Verified claim:** When steering inheritance is on (the default: it is off only if kiro-cli's own disable-inherit setting is true), prepare_native_skill_projection appends file://<kiro_home>/steering/**/*.md, file://.kiro/steering/**/*.md and file://AGENTS.md to EVERY launch view, internal ones included (kirocrew-lite, -knowledge, -heartbeat, -guest): re-measured, all 26 views carry the three globs and 33,973 B in a seed of 8,010 B global steering + 19,973 B AGENTS.md + 5,990 B workspace steering. The cost for internal background agents is overstated by that figure: the lite and knowledge pools run with cwd <data home>/workspace, where the two workspace-relative globs normally match nothing, so a title/summary/consolidation/extraction call pays the user's GLOBAL steering only (8,010 B in this seed; zero with none; G16 reports ~18k tokens on a heavy home). Matches kiro-cli's default; the gap is the missing opt-out.
 - **Evidence (at `397f4be`):**
@@ -703,6 +755,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SPEC-4, REVIEW_FINDINGS:Part6/SPEC-4
 
 ### TOOL-11 [25, default, effort S] kiro_cli_logs returns up to 80k chars — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): diagnostics.py:351 _DEFAULT_LOG_RESPONSE_CHARS=20,000 for default call; :345 hard 40,000 ceiling for explicit tail; commit 0d8bc22d2.
 - **Verified claim:** kiro_cli_logs is bounded but large by default: tail defaults to 200 lines per source, each source is byte-capped at min(64 KiB, 80,000 / number_of_sources), and the whole response at _MAX_LOG_RESPONSE_CHARS = 80,000 chars, trimmed from the front so the newest lines survive. With protocol-log-length lines a default call returns 65,562 chars from one 1 MB source and 79,544 chars from three (measured) — ~16-20k tokens per call; even tail=50 returns 79,543 chars with three sources, because the line count is per source.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/diagnostics.py:327 — _MAX_LOG_READ_BYTES = 64 * 1024 (per source)
@@ -721,6 +775,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:TOOL-11, REVIEW_FINDINGS:U10
 
 ### TOOL-17 [25, default, effort S] Repeated policy denials sent in full — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): deny_notice.py:207-225 build_repeat_refusal_notice ("Blocked again by host policy (not the user)"); dashboard/chat_runner.py:1221-1226 uses it for 2nd+ policy denial in a turn; commit d75b30e2c.
 - **Verified claim:** Every in-band deny notice is built in full by build_refusal_steer_notice, carrying 401 chars of invariant wording (excluding title, reason and cause text); _steer_policy_notice builds and steers a fresh full notice for every denial, with no shorter form for a 2nd+ denial in the same turn; the git-publish reason embeds the raw rule regex '(rule pattern: ...)' plus a 'Refusal diagnostic' line. Measured: git force-push notice 1,177 chars / 310 o200k tokens; a short repeat form is 198 tokens (-36.1%).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/deny_notice.py:196-204 — '[Kiro Crew host notice] The tool call you just made {clause}. This was NOT a user action — ... Decide and continue in this same turn: {guidance}{tail}'
@@ -740,6 +796,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:TOOL-17, REVIEW_FINDINGS:F7
 
 ### TOOL-21 [25, default, effort S] Repeat-loop steering is best-effort only — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): dashboard/chat_runner.py:1155-1165 undelivered notice parked on the slot (_parked_repeat_loop_notice); _take_parked_repeat_loop_notice prepends it once to the next prompt; delivery chosen by supports_refusal_steer; commit 184ac48d5.
 - **Verified claim:** When the tracker fires, _run_chat calls _steer_repeat_loop_notice and ignores its result. The steer is attempted only when client.supports_refusal_steer is true — ACP_BACKENDS_STEER = {kiro, KAS} — so on every other selectable harness the notice is never delivered at all; on kiro/KAS a failed or timed-out steer is logged at debug and dropped. There is no fallback (next-prompt injection) and no Crew-side turn cancel, so a loop the model does not break by itself runs until the turn ends or the transport timeout.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/dashboard/chat_runner.py:1089-1103 — _steer_repeat_loop_notice: if not getattr(client, 'supports_refusal_steer', False): return False; except: logger.debug('repeat-loop steer failed'); return False
@@ -757,6 +815,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:P1-5, verification_needed:refactor(repeat-loop-steer)
 
 ### SPEC-5 [25, armed, effort S] pptx composer preloads 50 KB of docs as resources — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): apps/builtins/pptx_maker/agents/pptx-maker-composer.json resources reduced to slide-json-spec.md only (drops compose/review/grid); commit 4fec2e8f0.
 - **Verified claim:** pptx-maker-composer.json declares 4 file:// resources (create-new-2-compose.md, create-new-3-review.md, slide-json-spec.md, guides/grid.md) that kiro-cli loads into every request, while its tools already include @sdpm/read_workflows and @sdpm/read_guides. In the engine files fetched for the earlier measurement (pinned engine v0.3.8 / b7c7fcf) they total 50,710 B (~12.7k tokens): 10,493 + 2,705 + 24,075 + 13,437. The engine is not downloadable here, so the byte counts come from that snapshot; the template's four declarations are verified at HEAD.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/apps/builtins/pptx_maker/agents/pptx-maker-composer.json:13-18 — resources: 4 x file://{ENGINE_ROOT}/skill/references/...
@@ -776,6 +836,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SPEC-5, REVIEW_FINDINGS:Part6/SPEC-5
 
 ### SES-4 [20, default, effort S] kirocrew-lite spec does not set includeMcpJson: false — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): agent_materialization/service_agents.py:55-66 lite_config now sets "includeMcpJson": False; commit 7635e0ecb.
 - **Verified claim:** _install_lite_agent_fallback (the only writer of kirocrew-lite.json, called from rebuild and the prerequisite repair) writes {name, model, tools: [], mcpServers: {}, prompt: ''} with no includeMcpJson, and the materialized file in a throwaway home has the key ABSENT (100 B), while the sibling guest and knowledge specs pin it false. kiro-cli reads an absent key as true, so every kirocrew-lite session (session.BACKGROUND_AGENT: titles, summaries, consolidation, the decision judge, meetings translation, workflow helpers) merges the user's global ~/.kiro/settings/mcp.json servers. tools is [], so no schemas reach the model; the cost is server processes/startup (and any slow or OAuth-prompting user server) on background calls. The repo's own comments disagree on whether kiro-cli spawns a merged server nobody references (service_agents.py:40-41 says it does).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/agent_materialization/service_agents.py:48-57 — lite_config = {name: 'kirocrew-lite', model, tools: [], mcpServers: {}, prompt: ''} (no includeMcpJson)
@@ -797,6 +859,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SES-4, REVIEW_FINDINGS:H-P7
 
 ### SKL-5 [20, default, effort S] $skill expansion bypasses the per-session dedup — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): dashboard/chat_runner.py:4797-4830 builder.dollar_skills_already_held check; held bodies re-sent as pointers; delivered bodies recorded via builder.record_dollar_skill_bodies; commit 0c72e622a.
 - **Verified claim:** `_expand_dollar_skills` (dashboard chat runner, its only caller at chat_runner.py:10595) appends the full redacted body of every resolved `$skill` to the user's message on every turn and never consults ContextBuilder's per-session record (`_dedup_triggered_bodies`) nor records the body there, so `$babysit` on two consecutive turns sends the 21,543 B body twice, and a body later matched by the trigger path is re-sent again.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/dashboard/chat_runner.py:4633 — `def _expand_dollar_skills(message, state, slot, session_key)`
@@ -835,6 +899,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:OUT-6, REVIEW_FINDINGS:Part6/OUT-6
 
 ### TOOL-18 [15, default, effort S] Non-JSON HTTP error bodies pass through uncapped — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): mcp_core.py:1623 bounded read exc.read(64 KiB); :1652-1658 non-JSON body capped at 300 chars with "(N bytes)" note; commit 0cdc6ea88.
 - **Verified claim:** mcp_core._http_error_body reads the whole HTTPError body with no size limit and, when it is not a JSON {error} object, uses it verbatim as the error message (`message = raw or str(exc)`). A 20,789-byte HTML body came back as a 20,789-char error; a 311,552-byte body as 311,552 chars. The only bound before the model is sanitize_response's MAX_RESPONSE_LEN = 100,000 chars at the MCP exit (build_tool_response), so up to 100k chars of HTML can reach the tool result.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/mcp_core.py:1620-1624 — raw = exc.read().decode('utf-8', 'replace').strip(); message = raw or str(exc)
@@ -851,6 +917,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:TOOL-18, REVIEW_FINDINGS:F8
 
 ### ATT-4 [15, armed, effort S] Slack voice-memo transcripts join turn text uncapped; bound is 1 h per memo, none on AWS — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): slack/events.py:2856-2857 joined transcript passed through _bound_transcript_inline (budget + "[transcript truncated: n of total chars omitted; full text at <path>]" note at :333); commit af4812f40.
 - **Original claim:** Voice-memo transcripts joined into turn text without a cap (corrected below)
 - **Verified claim:** slack/events.py joins every voice-memo transcript of a message into the turn text with no length cap (redaction only). The stated de-facto bound is wrong: the transcription path (_transcribe_files) does not apply IngestLimits.max_audio_bytes (25 MiB) and the Slack download has no byte cap; the only bound is a per-memo DURATION cap of 3,600 s on the local/Apple providers (batch_duration_cap_secs), and none at all on AWS Transcribe (returns None). Memos are not counted against max_attachments (a separate loop over all files). So one memo can add roughly an hour of speech (~9k words, ~50 KB, ~12k tokens) and N memos N times that, all in one turn.
 - **Evidence (at `397f4be`):**
@@ -871,6 +939,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:voice-memo-note
 
 ### SPEC-6 [15, armed, effort S] App agent templates omit includeMcpJson: false — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): All 14 shipped app agent templates now carry "includeMcpJson": false (grep count 14/14); commit 7635e0ecb.
 - **Verified claim:** Six shipped app agent templates — the four pptx-maker agents and auto-improvement discovery.json and pr-author.json — omit includeMcpJson; the bridge treats includeMcpJson as a framework-owned key copied from the template (it does not force false), so the materialized ~/.kiro/agents/<app>--<agent>.json files also lack it and kiro-cli reads them as true, merging every global mcp.json server into those sessions. The other app templates (engineer, scout, meetings x3, mochi x2, personal-shopper) state false. Their tool lists are closed (@sdpm/... or the app's own server), so the cost is processes/startup, not schemas. docs/architecture/mcp.md's 'Kiro Crew forces false on every agent it manages (the primary agent and every app agent)' is therefore inaccurate.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/apps/builtins/pptx_maker/agents/pptx-maker-{composer,spec,style,vibe}.json — no includeMcpJson key (grep count 0)
@@ -891,6 +961,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SPEC-6, REVIEW_FINDINGS:Part6/SPEC-6
 
 ### TOOL-23 [10, default, effort S] mcp_shared tools/call ignores keys outside 'arguments'; only non-conforming clients hit it — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): mcp_shared.py:1880-1900 tools/call refuses unknown top-level params keys and non-object "arguments" with JSONRPC_INVALID_PARAMS (-32602); commit 6641787b0.
 - **Original claim:** External harness: tools.call envelope ignores unknown argument keys (corrected below)
 - **Verified claim:** The X10 probe exercised the reviewing session's own tool runtime (tools.call / pi.ls), not Kiro Crew, so it is no evidence about Kiro Crew. Kiro Crew does have a narrow counterpart at the MCP envelope: mcp_shared's tools/call handler takes params.get('arguments', {}) and replaces a missing or non-object 'arguments' with {}, ignoring sibling keys such as 'input' or 'args', so a tool whose fields are all optional (e.g. list_sessions, spawn_list, kiro_cli_logs) runs with its defaults instead of refusing the call; a tool with a required field fails loudly. Inside 'arguments', unknown keys are refused by validate_tool_args ('unknown field for tool ...'). Only a non-conforming MCP client can reach the envelope gap — kiro-cli and KAS send 'arguments'.
 - **Evidence (at `397f4be`):**

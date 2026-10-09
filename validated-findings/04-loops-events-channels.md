@@ -5,6 +5,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 ## 6. Loops, cron, injected events, channels and app timers
 
 ### LOOP-3 [65, armed, effort M] Issue Radar crews take a full turn every 5 minutes with no end — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): src/kiro_crew/apps/builtins/issue_radar/backend/crew_runtime.py:113 DEFAULT_IDLE_SECS=1800 (commit a10c1bb7e); test/test_issue_radar_crew_runtime.py asserts the constant, not the 24 h fake-clock drive named in Done-when
 - **Verified claim:** Every live Issue Radar crew arms an autonudge loop with idle_secs=300 and max_cycles=0 and passes no gate, judge, watch or max_runtime_secs (all four default off/0 in autonudge add()), so the loop delivers one full crew turn every 300 s of its persistent deadline (<=288 turns/day per crew) until the crew is stopped, retired or the app disabled, while the zero-LLM 60 s sweep (watch.py) already wakes the crew with one turn per sweep when an unblock signal moves. The 10-20M tokens/day figure in the notes is modelled (288 turns x an assumed 35-70k-token crew context), not measured.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/apps/builtins/issue_radar/backend/crew_runtime.py:108 — DEFAULT_IDLE_SECS = 300 (comment :104-107: 'the fallback clock that lets an idle crew pick up NEW work')
@@ -55,6 +57,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:EVT-1, REVIEW_FINDINGS:Part6/EVT-1
 
 ### EVT-2 [60, default, effort M] Subagent completion carries the opening narration, not the answer — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): src/kiro_crew/slack/gateway.py:571 DIGEST_ANSWER_CHARS=1500 digest closing segment; subagent_manager/run.py closing-segment tracking (commit 22472c4d9, 22472c4d9 also touches subagent.py)
 - **Verified claim:** A subagent's result is every streamed text chunk of the run (narration between tool calls included), cut by completion_keep (default 'head') to completion_keep_chars (default 3,000). When that cut drops content the parent's [Subagent completion event] carries summarize_result's first-100 + last-100-word preview OF THE ALREADY HEAD-CUT TEXT plus the result.txt path, so the end of a long transcript never reaches the envelope; wave-digest success lines carry only a pointer line. Re-measured at HEAD with the real helpers: a 10,153- or 26,913-char narrated transcript whose 30-item answer is at the end gives a 1,649-char envelope with 0/30 items ('tail' mode would give 11/30); a 3-success digest is 913 chars and a 10-success digest 2,266 chars with no result text. spawn_sub_agents, by contrast, builds its preview from the full on-disk result, so its tail does contain the answer.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/subagent_manager/run.py:3013 — 'result_text += event.text' (every text event of every attempt; only reset at :2468)
@@ -79,6 +83,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:EVT-2, REVIEW_FINDINGS:Part6/EVT-2
 
 ### LOOP-2 [60, armed, effort M] Pipeline-conductor patrol: ungated turn after each 90 s idle; work-ledger watch won't fix — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): src/kiro_crew/builtin_skills/goal-conductor/references/patrol.md:11 watch="work-ledger" mandatory; patrol_budget.py present (commit d3de09a60)
 - **Original claim:** Pipeline-conductor patrol is an ungated 90 s model turn (corrected below)
 - **Verified claim:** pipeline-conductor/SKILL.md:269-271 arms the patrol with monitor_start at ~90 s, max_cycles=960, max_runtime_secs=259200 and no watch and no judge brief. With no monitor bound, _monitor_tick_is_quiet asks the judge first; a loop with no criteria of its own gets the default brief only when the nudge_evidence scope is granted (absent reads False), so the judge returns None, the gate returns not-quiet and every tick delivers a full conductor turn. The dashboard re-arms idle_secs after each nudge turn ENDS, so the run is up to 960 delivered turns over 960 x (90 s + mean turn time) (about 1-3 days), each turn mandated to do one session_ledger_read plus one fleet_probe.py call (>= 3 full-context requests; modelled, not measured). Mis-scoped part: prompt.md:120 requires watch='work-ledger' only for 'a conductor patrolling workers it dispatched on work-ledger items'; kirocrew-pipeline-conductor does not mount @kirocrew-work and keeps its items in session_ledger, so a work-ledger watch would observe an empty board and is NOT the fix. SKILL.md is 105,481 bytes (104,948 chars) > SKILL_READ_CAPACITY 99,000 (confirmed). The per-cycle session_ledger_read has no char cap but is structurally bounded (32 artifacts, 20-event tail), so 'uncapped' is overstated.
 - **Evidence (at `397f4be`):**
@@ -189,6 +195,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:MSG-1, REVIEW_FINDINGS:N5, FIX_PLAN-old:A-6
 
 ### EVT-4 [50, armed, effort M] Script-cron reports wake the main chat with no dedupe or cap — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): src/kiro_crew/slack/gateway.py:3095 message capped at 5000 chars; script report dedupe/bell (commit a1890d144)
 - **Verified claim:** A non-silent script cron's Done/Report result is delivered into the dashboard slot of the session that CREATED the job (job.session_key, typically the user's main chat — not the job's cron tab): on an idle slot it starts a full `_run_chat` turn at once, on a busy slot it is queued as CRON_NOTIFICATION_KIND and drains later as its own turn. The message is the `message` field of the last stdout JSON line, passed through redact() only — no size cap (a 228,890-char Report stays 228,890 chars after redact) — and the report branch has no hash/consecutive-dupe check, so identical reports each wake the model. The script wrapper is `[Cron notification: "<label>"] ... [/Cron notification]`, which does not start with CRON_NOTIFY_PREFIX (`[Cron notification from `), so a QUEUED script report is classified is_cron=False and its drained row is written with role 'user' (the idle-slot path writes a proper inject/cron row). The '288 turns/day, ~86M tokens/day' for a 5-minute reporter is arithmetic on an assumed 300k-token main chat (modelled).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/slack/gateway.py:3050-3101 — `_deliver_script_result`: `if message and not job.silent and self.dashboard_state and job.session_key:` -> slot of `job.session_key`; `wrapped = f'[Cron notification: "{label}"]\n{message}\n[/Cron notification]'`; running -> `slot.queue_append(wrapped, kin…
@@ -239,6 +247,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:LOOP-4, REVIEW_FINDINGS:N2
 
 ### EVT-3 [45, default, effort M] A spread-out subagent wave produces several parent turns — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 15-minute straggler deadline (commit 266cbc14b); test/test_subagent_scale.py exists
 - **Verified claim:** For a spawn_run(tasks=[…]) wave (the prompt's default fan-out), a finished member is held at most DIGEST_HOLD_SECS (120 s; env KIROCREW_SUBAGENT_DIGEST_HOLD_SECS only, no config field) and the reaper (every 60 s) force-flushes the held results as a partial [Subagent batch completion event] chunk; every chunk is its own parent turn, and >=2 completion turns also fire a synthesis turn. Re-measured with the real hold-deadline decision and a fake clock: members at 1/5/10 min -> 4 parent turns (3 chunks + synthesis); 5 members over 20 min -> 6; 2 fast + 1 straggler at 15 min -> 3; 3 members over 2.5 min -> 1 or 3 depending on reaper phase; 3 within 20 s -> 1. Context the claim omits: the 120 s deadline is a deliberate latency fix for issue #2215 (a hung straggler withheld every sibling result for up to the 3 h reap), pinned by test_subagent_scale.py::TestDigestHoldDeadline::test_expired_hold_forces_flush — so cutting turns trades back delivery latency.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/subagent.py:1487 — _DEFAULT_DIGEST_HOLD_SECS = 120.0; :1492 os.environ.get('KIROCREW_SUBAGENT_DIGEST_HOLD_SECS'); :1509 DIGEST_HOLD_SECS = _digest_hold_secs() (no config.json key)
@@ -262,6 +272,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:EVT-3, REVIEW_FINDINGS:Part6/EVT-3
 
 ### LOOP-7 [45, armed, effort M] A blind monitor probe fires a full turn on every tick — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): blind-probe back-off after first three fallbacks, one warning (commit 1ac9efb78)
 - **Verified claim:** For a gated auto-nudge loop (monitor_start's default), a probe that cannot observe its subject makes every tick fire a full turn with no backoff: a probe returning fetch_ok=False becomes Skip(blind=True) -> Outcome.FALLBACK, a probe that raises becomes FALLBACK('probe raised'), and the gate spends a turn on FALLBACK exactly like WAKE; gate_fallbacks is only a counter that nothing reads to change cadence. Measured on the real gate + irq kernel with a fake clock at idle_secs=60: 60 of 60 ticks fire in 1 h and 1,440 of 1,440 in 24 h. Two facts the claim missed: (a) the kernel already sends a 'watch is blind' alert (a Report, i.e. a WAKE turn) at the 6th consecutive fetch failure and re-alerts every 6 h (4 alerts/24 h measured) — but a probe that RAISES bypasses the kernel's error counter and gets no alert at all (0 alerts/24 h measured); (b) fallback fires are delivered turns and advance cycle_count, so the default monitor_start loop (24 cycles, 4 h, 300 s interval) is bounded to 24 wasted turns over ~2 h; the per-day cost only applies to loops armed with large caps (max_cycles up to 1000, runtime up to the 7-day ceiling).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/irq.py:686-741 — `if not tick.fetch_ok:` increments state['errors']; below the threshold raises `Skip(...); failed.blind = True`
@@ -286,6 +298,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:LOOP-7, REVIEW_FINDINGS:H2
 
 ### MSG-2 [45, armed, effort M] Slack thread-follow never expires and the model cannot stay silent — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): src/kiro_crew/slack/thread_follow.py:13 FOLLOW_TTL_SECS=45*60; [[NO_REPLY]] posts nothing (commit fd07b46d2)
 - **Verified claim:** With thread_follow on (default True), any reply from an AUTHORIZED user in a Slack thread for which a session, a session link or a conversation-log FILE exists is admitted as a full turn, in mention, review and observe channels, with no time limit: the predicate is file existence (ConversationLog.has_log), and a live transcript is never aged out (archive retention only touches trimmed archive files). Two narrowings the claim omits: unauthorized users get an ephemeral rejection and no turn, and a reply that opens with an @-mention of someone else is skipped. The model has no way to stay silent: there is no no-reply marker on any channel, and an empty answer is still finalized in Slack as a '_No response._' message.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/config/sections.py:3797-3803 — `thread_follow: bool = field(default=True, ... 'Respond to all messages in threads where bot was previously @mentioned.')`
@@ -309,6 +323,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:MSG-2, REVIEW_FINDINGS:N6
 
 ### EVT-5 [40, default, effort M] wait ends only on user end or steer, not on pushed events; poll recipe is for external CI — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): wait ends on a queued/parked session event; spawn_status marks collected; prompt no longer teaches wait-then-poll (commit 1d4177fdc); test/test_wait_tool_early_end.py exists; WAIT_PING_SECS at src/kiro_crew/mcp_core.py:473
 - **Original claim:** wait does not end on pushed events; prompt teaches wait-then-poll (corrected below)
 - **Verified claim:** Mechanism holds: a `wait` (60-1800 s) ends early for exactly two reasons — the End-wait button / session_end_wait ('user') or a steer landing after the sleep began ('steer'); a queued subagent completion, cron notification or parked completion does not end it (re-measured: 2 queued system injections -> None, 3 parked completions -> None, steer -> 'steer'), so pushed events wait behind the sleep for up to 1800 s. Reading a finished run with spawn_status does not mark it collected (only spawn_sub_agents POSTs /api/spawn/mark-collected), so the completion turn still fires after a poll. Overstated part: prompt.md's wait-then-poll recipe (:105-111, up to 5 rounds of wait(300) + a fetch) is scoped to EXTERNAL systems (code review / static analysis on a PR), and the prompt explicitly tells the model not to poll child work (:44 'Do not poll or duplicate child work'); the only shipped texts that invite polling pushed subagent events are the spawn_sub_agents timeout note (spawn.py:1572) and the orphaned-parent fallback (spawn.py:897-903, :1003), which belong to EVT-8. The request counts (spawn->wait->spawn_status x3 = 5-10 parent requests vs 2 for the blocking call) are modelled from real turn counts, not measured. Side question #2347: at HEAD the strict resolver used by the wait tool accepts a signed per-session token ABOVE KIROCREW_SESSION_KEY (switch-free, no MCP gateway needed), so the sessions.py:4453-4456 comment ('MCP gateway disabled … a subagent's wait and its parent's resolve to the SAME session key') and subagent.md:2235 (env var then session_pid file) are both stale by code read.
 - **Evidence (at `397f4be`):**
@@ -334,6 +350,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:EVT-5, REVIEW_FINDINGS:Part6/EVT-5
 
 ### LOOP-15 [40, armed, effort M] Work-ledger: staggered reports each buy a turn (no settle window, by design); bursts merge — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): src/kiro_crew/autonudge_service/ settle window and per-loop budget (commit 502154bbf, merged de6da10c3); test/test_conductor_wake.py exists
 - **Original claim:** Work-ledger wakes are not batched across items (corrected below)
 - **Verified claim:** There is no cross-item settle window and no per-conductor wake/turn budget: the work-ledger probe deliberately sets coalesce_secs=0 ('rather be woken early than woken once'), conductor_wake._admit caps pull-forwards per (loop_id, item_id) at 12/hour and ledger_wake caps wakes at 12/item/hour, so reports from different workers that arrive while the conductor is idle each buy their own full conductor turn (measured with the real service + real probe: 5 staggered `question` reports -> 5 delivered turns). Overstated part: reports that land together are already merged -- 5 reports before the pushed tick starts -> 1 turn (_admit's pending branch + one tick folds every fresh WAKE), and reports landing while a conductor turn runs collapse into one owed wake (delivered late, see LOOP-16). Only 'done', 'blocked' and 'question' wake; 'progress' never does.
 - **Evidence (at `397f4be`):**
@@ -357,6 +375,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G1(#17571), verification_needed:Part3(#17571), verify_needed:G36
 
 ### LOOP-16 [40, armed, effort S] Work-ledger wake can be lost while the conductor is mid-turn — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): busy-refused wake re-armed on first tick after turn end, _OVERDUE_REARM_SECS=10 at src/kiro_crew/autonudge_service/timers.py:58 (commit 56eeeef7e); test/test_conductor_wake.py
 - **Verified claim:** Drop point pinned (a full-interval delay, not a permanent loss): defer_if_firing only covers the _firing window, which on a dashboard slot closes as soon as _on_fire returns -- the nudge turn itself runs afterwards in a spawned task. A worker report landing while the conductor's turn runs therefore arms a pushed tick; the real probe answers WAKE (the kernel dedupes the observation), _fire_dashboard_nudge returns BUSY because slot.running, and the refused path keeps the wake owed (followup_ticks=1) and re-arms a 15 s backoff. When the running turn ends, notify_turn_complete calls _arm_from_deadline; next_due_ts was zeroed at the delivered fire, so it arms a FULL idle_secs countdown that replaces the 15 s retry. The owed wake is delivered only on that tick. Measured: idle_secs=600 -> retry armed at 15 s, turn-end re-arm 600 s, B's wake delivered on the next tick (latency = one patrol interval after the turn ends; 300-900 s for a goal conductor). The existing test test_a_push_during_the_fire_window_re_arms_at_delay_zero models the turn INSIDE on_fire, so it does not cover the dashboard shape.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/conductor_wake.py:679 — svc.fire_now(loop_id, defer_if_firing=True)
@@ -407,6 +427,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:Part3(#17455)
 
 ### EVT-6 [35, default, effort M] A separate synthesis turn follows every completion batch — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): synthesis rides last completion turn (commit 3a218b7ca)
 - **Verified claim:** On a dashboard parent, the last outstanding child arms slot._pending_synthesis in _subagent_done; once the queue drains, a SEPARATE synthesis turn runs SUBAGENT_SYNTHESIS_PROMPT unless exactly one completion turn carried the whole batch (_drop_single_turn_synthesis drops it only when _synthesis_completion_turns == 1). So every batch delivered in 2+ completion turns pays one extra full-context turn after the last completion turn. Re-measured: N single-spawn completions -> synthesis fires for N>=2; a wave flushed in 3 chunks -> synthesis fires. The 'restating' wording is a characterisation: the prompt asks for a cross-result consolidation (goal, combined findings, next actions) that the per-result turns do not produce; this is a documented design (subagent.md 'Post-fan-out Synthesis Turn', injected-messages.md:129-139), dashboard-only.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/slack/gateway.py:9579-9605 — '── Fix 2 (B1): arm a one-shot post-fan-out synthesis turn ──' … _arm_synthesis when running_agents_for(parent_key) == [] … _injection_slot._pending_synthesis = True
@@ -427,6 +449,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:EVT-6, REVIEW_FINDINGS:Part6/EVT-6
 
 ### LOOP-19 [35, armed, effort M] Conductor bind does not arm a patrol — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): conductor bind arms work-ledger loop (commit 9e2c31936, merged)
 - **Verified claim:** No code arms a patrol when a conductor binds (or creates) a work item: the bind path writes the item, the binding and a crew-dispatch record and never touches the AutoNudge service; arming is prompt-only ('Always pass watch="work-ledger"'). A conductor that never calls monitor_start leaves conductor_wake nothing to push -- work_ledger_loop_id returns '' (its own docstring: 'No loop at all is the common case (a conductor that armed nothing)') -- so worker reports reach nobody until a human prompts the conductor. Applies to kirocrew-conductor only; the pipeline and security conductors do not use the work ledger.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/work_ledger.py:2012-2077 — apply_conductor_action 'bind' commits the item/binding; no autonudge/monitor call
@@ -448,6 +472,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G15(#17051/#17603), verify_needed:G37
 
 ### LOOP-21 [35, armed, effort M] Wake judge fires every interval on a sustained run of partial readings — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): partial-reading floor (commits f9d6cfd18, b1bf12554); test/test_autonudge.py exists
 - **Verified claim:** On a loop screened by the wake judge, a reading that stays PARTIAL — any target the collector counts as dropped: a pull-request observation whose observation_status is not 'ok' (a partial fetch), an observation with no facts, a transcript target still behind after MAX_PAGES_PER_TARGET pages, or a reader that raised — makes the judge return FALLBACK ('wake judge could not read every target') before any model is asked, and every non-QUIET verdict fires the turn and RESETS the quiet streak. The only backstop, the quiet-streak floor (10), counts QUIET verdicts, i.e. complete readings; nothing counts consecutive partial readings, so a sustained partial reading fires a full turn every interval. Measured on the real gate -> judge -> nudge_wake.judge_tick path with a fake clock at idle_secs=60: one dropped target every tick -> 60 fires in 60 ticks, 0 judge calls; the same loop with complete readings judged quiet -> 6 fires in 60 ticks (the floor). Bounded, like any loop, by its cycle/runtime caps (monitor_start default 24 turns / 4 h).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/decisions/points/nudge_wake.py:802-810 — `if dropped:` ... `return irq.Verdict(irq.Outcome.FALLBACK, body="wake judge could not read every target")` (before the oracle is asked)
@@ -472,6 +498,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G39(#14071)
 
 ### LOOP-26 [35, armed, effort S] Disabling Auto-Improvement stops its run but not its PR watchers (up to 4, 6 passes each) — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): PR watchers stop on app disable (commit f87360f00, 160945ba2); test/..../auto_improvement/tests/test_pr_watchers.py extended
 - **Original claim:** Disabling Auto-Improvement does not stop its workers (corrected below)
 - **Verified claim:** Disabling Auto-Improvement now stops an in-flight RUN: the app's on_shutdown hook, which the disable teardown invokes, calls get_supervisor().stop() (bounded; the spine stops between candidates). It does NOT stop the PR watchers: their only stop on a non-explicit path is the aiohttp on_cleanup hook at gateway shutdown, nothing in pr_watchers checks whether the app is still enabled, and _require_enabled only gates the HTTP routes (403 app_disabled), which also removes the operator's per-watcher stop button. So up to MAX_ACTIVE_WATCHERS = 4 live watchers keep running agent passes (DEFAULT_MAX_NUDGES = 6 each, 1800 s apart, each pass up to 1800 s) after disable. The 'run supervisor keeps spending' half is fixed at HEAD except for the start-during-build race (LOOP-27).
 - **Evidence (at `397f4be`):**
@@ -496,6 +524,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G23(#16855), verify_needed:G36
 
 ### LOOP-5 [35, armed, effort M] Opt-in meeting translation makes one small lite call per line, unbatched, no usage row — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): src/kiro_crew/apps/builtins/meetings/backend/domain/translate.py:117 usage row per call (usage_surface=meetings_translate); batching 5 s / 25 per call, one session per meeting (commit a2766cbfe)
 - **Original claim:** Meetings translation makes one model call per transcript line (corrected below)
 - **Verified claim:** When a meeting has a translation language configured (OFF by default: DEFAULT_TRANSLATION_LANG = ""), every non-filler transcript line becomes its own model call: run_oneshot_translation opens a fresh ephemeral kirocrew-lite session per line (tool-less, REJECT_ALL), sends a ~546-char one-line prompt through stream_and_collect, then destroys the session; calls are sequential per meeting with a 40-line backlog that drops the oldest; there is no batching (deliberate, documented for latency) and no viewer check (the docstring says it runs 'whether or not anyone has the panel open'); stream_and_collect persists no usage row. Overstated in the source: each call is a small lite call (no persona, no tool schemas), not a full-context turn, and the feature is opt-in; the 500-1500 calls/meeting-hour figure is modelled from an assumed speech rate (the real ceiling is wall-clock: one call in flight at a time).
 - **Evidence (at `397f4be`):**
@@ -570,6 +600,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:EVT-8, REVIEW_FINDINGS:Part6/EVT-8
 
 ### LOOP-17 [30, armed, effort S] Work-ledger wake turn has neither banner nor item id, only the standing loop message — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): src/kiro_crew/ledger_wake.py:470 "[work-ledger wake] item=<id> status=..." brief; autonudge.py:817 carries it
 - **Original claim:** Work-ledger wake carries only a banner, forcing a ledger read (corrected below)
 - **Verified claim:** Worse than claimed: the wake turn does not even carry the banner. The irq kernel builds '[work-ledger wake] item=<id> status=<status>' plus the footer 'this text names what changed', but the gated prompt-loop path keeps only a claim (_pending_monitor_wake) and discards verdict.body; _fire_dashboard_nudge composes nudge_cycle_header + compose_nudge_body(loop.message), whose snapshot is the session_ledger's, not the work ledger's. Measured: delivered text == the standing loop message only, with no brief and no item id. So the conductor's first act on every wake is a work_ledger_read of the whole board (goal-conductor SKILL.md mandates work_ledger_read compact=true first every cycle anyway).
 - **Evidence (at `397f4be`):**
@@ -595,6 +627,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G6(#17574), verification_needed:Part3(#17574)
 
 ### LOOP-18 [30, armed, effort S] Conductor 20-items-per-goal cap is prompt-only; code caps 32 open / 256 stored items — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): item budget enforced in ledger store (commit 146cb5784); builtin_skills/goal-conductor/SKILL.md:253-263 documents item_budget_exceeded refusal
 - **Original claim:** Conductor spend cap is prompt-only (corrected below)
 - **Verified claim:** The 20-item-per-goal cap is prompt-only (agent.py conductor prompt and goal-conductor SKILL.md), but the claim's 'no code-side ledger cap (no patrol_budget.py)' is wrong: the store refuses a 33rd OPEN item per conductor (MAX_ITEMS_PER_CONDUCTOR = 32) and a 257th create over a board's life (WORK_STORED_ITEM_LIMIT = 256); and goal-conductor/scripts/patrol_budget.py exists -- it bounds the loop's interval, cycles and runtime, not items. The compaction-miscount risk is mitigated in prose only ('Count both from work_ledger_read, not from memory'). Net: a conductor that ignores the prose can dispatch up to 32 concurrent / 256 lifetime items per board (and nested conductors at depth <= 2 each hold their own board).
 - **Evidence (at `397f4be`):**
@@ -619,6 +653,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:Part3(#17076)
 
 ### LOOP-27 [30, armed, effort S] Auto-Improvement disable race restarts the driver — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): start() re-checks stop after _build_driver (commit 160945ba2); auto_improvement/tests/test_runner.py exists
 - **Verified claim:** RunSupervisor.start() checks _in_flight() under the lock, RELEASES the lock for the seconds-long _build_driver (git checkout + profile build under the clone lock), then re-takes it, sets _stop_requested = False and launches the worker thread. A stop() — which is what the disable hook (on_shutdown -> get_supervisor().stop()) calls — that lands during _build_driver sees no live thread, returns 'no active run' without recording anything, and the start then launches anyway, so a run started just before disable keeps spending after the app is disabled. stop() also ignores the _reserved flag, so the short assigned-but-unstarted window has the same hole.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/apps/builtins/auto_improvement/backend/runner.py:695-697 — first `with self._lock: if self._in_flight(): raise`; lock released
@@ -641,6 +677,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G40(#16936)
 
 ### UI-2 [30, armed, effort S] Mochi keeps planning while the pet is hidden — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): hidden pet pauses plan and freestyle spawns (commit b66cf9157); test/test_mochi_hidden_pet_gate.py exists
 - **Verified claim:** A hidden Mochi pet keeps POSTing presence beats every 30 s with visible=false; presence_beat() refreshes the shell timestamp on every beat but the pet timestamp only when visible, and the owner loop gates poller.poll() (watch checks, missed-notify recovery, plan/replan, freestyle agent tasks) and reminders on shell_present() alone, while pet_present() gates only the companion-time clock — so planning and agent-task spawns continue for as long as the desktop shell runs, whether or not anyone can see the pet. This is a deliberate parity choice written into both sides ('polling continues (the original polled while hidden too)'), so changing it is a take-away/product decision. The 24-96 runs per 8 h estimate is modelled, and its 96 ceiling (12/h balanced tier) does not hold: the hourly budget is enforced only on watch-check spawns, not on plan, replan or freestyle spawns.
 - **Evidence (at `397f4be`):**
   - website/src/apps/mochi/pet/main.tsx:70-86 — PRESENCE_BEAT_MS = 30_000; body {visible: document.visibilityState === 'visible'}; 'a hidden pet keeps beating with visible=false — polling continues (the original polled while hidden too), only the companionship clock stops'
@@ -663,6 +701,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:UI-2, REVIEW_FINDINGS:Part6/UI-2
 
 ### UI-5 [30, armed, effort S] Mochi QueuePoller retries a refused freestyle-task spawn every 1 s, no backoff (~400/min) — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): exponential backoff on refused freestyle spawn, src/kiro_crew/apps/builtins/mochi/queue_poller.py (commit 0bac927b0); test/test_mochi_freestyle_backoff.py exists
 - **Original claim:** Mochi background poller retries spawn_run ~400/min with no backoff (corrected below)
 - **Verified claim:** Mochi's QueuePoller retries a REFUSED freestyle-task spawn on the very next 1 s poll with no backoff, no failure count and no hourly-budget check: one due freestyle task whose spawn raises costs 60 spawn attempts per minute, and 7 due tasks cost 420/min (the issue's ~400/min). Watch checks and plans do back off (a failed watch spawn keeps the full 5-min lock; plans use a 10-min lock plus exponential retry). At HEAD, however, a start that fails the memory floor is QUEUED by admission (should_queue=True, SubagentInfo queued=True, no error), so SpawnSDK returns an id and the poller then waits up to SPAWN_TIMEOUT_MS (2 attempts per 10 min) — the deferred_low_memory deferral itself no longer drives the tight loop; what still does is any refusal that reaches SpawnSDK as an error (memory wait past agent.subagent_queue_max_wait_secs, task store unable to record the wait, profile/agent-scope denial, a missing app agent). The skill-view alias side effect was not re-measured here.
 - **Evidence (at `397f4be`):**
@@ -685,6 +725,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G33(#13129), verify_needed:G37
 
 ### EVT-11 [25, default, effort S] Messages queued before a subagent is flagged stalled wait for the next send — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): parked messages drain when subagent hold lifts (commit 6c6819e75)
 - **Verified claim:** While a dashboard parent's background children run, user messages are parked in the slot queue (subagents_hold_user_messages). Once the reaper flags the last live child 'stalled' the hold condition becomes false, but flagging only emits a subagent_stalled UI event — nothing starts a queue drain — so the parked messages sit until the user sends another message (which joins the queue behind them and drains it), clicks Run-now on a card, or the child completes/is reaped at the wall-clock timeout. The code states this as accepted behaviour. This is latency, not token spend.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/dashboard/chat_runner.py:6515-6528 — subagents_hold_user_messages: a child flagged 'stalled' does not hold the queue ('The flag clears when the child streams again, and the hold with it')
@@ -726,6 +768,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G39(#14610)
 
 ### LOOP-24 [25, armed, effort S] Cron auto-pause threshold not configurable; expired-credential failures count toward it — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): auth failures do not count toward auto-pause (commit 074cf8892)
 - **Verified claim:** The cron auto-pause threshold is a module constant (`_AUTO_PAUSE_THRESHOLD = 5`) with no config key and no per-job field, and nothing classifies an authentication failure: an AcpAuthRequired (expired kiro-cli sign-in) is non-transient, so it skips the transient retry ladder and reaches record_failure(), and five such fires auto-pause the job. record_success() is the only automatic un-pause, and a paused job never fires, so every LLM cron that fired during an expired-credential window stays paused until the user re-enables each one. Exemptions that do exist: transient backend errors (3 retries), governance denials, starvation/never-started runs and shared-runtime deaths (substitute bound) are not charged.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/cron_service/model.py:26 — `_AUTO_PAUSE_THRESHOLD = 5 # consecutive failures before a script/command cron auto-pauses`
@@ -748,6 +792,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G25(#15906), verify_needed:G37
 
 ### LOOP-32 [25, armed, effort M] Cron misses a boundary the host slept through — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): slept-through cron boundary fires once on wake (commits 86df94054, 40d79a29b)
 - **Verified claim:** Only cron-EXPRESSION jobs miss a boundary the host slept through (or the gateway was down for): `is_due` for kind 'cron' is true only while the expression matches the current minute, so a host that wakes at 09:01 or later never fires a '0 9 * * *' job that day and re-arms for the next boundary. `every` and `at` jobs do catch up (they are due whenever now >= last_run + interval / at_ts, firing once). The timer is capped at 30 s, but the matching minute is gone by then. No persisted catch-up marker exists; the code comment calls one 'a possible follow-up'.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/cron_service/schedule.py:535-560 — `is_due`: kind 'cron' -> `if not seams.cron_expr_matches(job.schedule.cron_expr, dt): return False`; every/at compare against last_run/at_ts
@@ -861,6 +907,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G37(#14592/#16480)
 
 ### LOOP-11 [15, armed, effort S] Channel auto-title has no attempt limit — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): src/kiro_crew/messaging/auto_title.py:114 TITLE_MAX_ATTEMPTS=3 (commit 004bf5a59)
 - **Verified claim:** Channel auto-title (Slack native + transport paths, Telegram) has no per-key attempt cap: a SKIP verdict, a 30 s timeout or any exception calls release_claim, so the NEXT exchange in the same untitled conversation claims again and spends another background turn, indefinitely. It is per exchange (one extra call per user message in an untitled thread), not a timer loop, and each attempt is a small tool-free kirocrew-lite background turn (prompt <= ~682 chars), so the waste is low. The dashboard's own titler already stops after _TITLE_MAX_ATTEMPTS = 5 and falls back to the first message; the channel module has no equivalent.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/messaging/auto_title.py:494-498 — `title = clean_title(raw)` / `if not title: release_claim(session_key) # allow retry on the next exchange`
@@ -883,6 +931,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:LOOP-11, REVIEW_FINDINGS:H6
 
 ### LOOP-22 [15, armed, effort S] Monitoring supplemental retry burns budget on permanent failures — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): non-retryable supplemental provider error decided by the primary rule (commit f0914dec7)
 - **Verified claim:** The structured-monitor decision retries a SUPPLEMENTAL provider error of any kind (authentication, authorization, not_found, setup included) until the consecutive-error streak reaches max_provider_errors, while a PRIMARY provider error of a non-retryable kind stops on the first tick via _RETRYABLE_PROVIDER_ERRORS. Measured with the real decide_monitor: every non-retryable kind stops at tick 1 as primary and at tick 3 as supplemental (2 RETRY_PROVIDER rounds) on the default budget of 3, and at tick 20 (19 retries) on the maximum budget of 20. What it burns is provider API calls and the provider-error budget, NOT model turns: RETRY_PROVIDER only re-arms the probe deadline (15 s doubling, capped at 300 s and at the cadence). It ends the same way either way: the watch is retired as STOP_BLOCKED once the streak trips.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/monitoring/decision.py:35-37 — _RETRYABLE_PROVIDER_ERRORS = frozenset({TRANSIENT, RATE_LIMITED})

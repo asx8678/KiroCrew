@@ -5,6 +5,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 ## 4. Context window, compaction, memory and sessions
 
 ### CTX-3 [50, default, effort S] Preferences block has no startup cap — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): ec941f2b1 "cap the startup preferences block at the pref.* rows' allowance"; src/kiro_crew/context_assembly/budget.py:63 (_PREFS_STARTUP_CAP), :195; src/kiro_crew/context_assembly/turn.py:135-144; src/kiro_crew/memory.py:427-431
 - **Verified claim:** Confirmed and re-measured at HEAD. At session start, MemoryStore.get_context(include_activity=False) returns the whole preferences.md. The only bound is the model-safe protected ceiling (caps.protected_context, 500K chars on the 1M reference), and past it the head is kept with a notice. Re-measured on throwaway homes with 200 lessons: 50 prefs give a 6,264 B block; 400 prefs give 47,656 B (first turn 122,211 B); 1,500 prefs give 178,412 B (first turn 252,977 B). Two corrections. (1) add_preference has no production caller. The file actually grows through history consolidation's whole-file 'preferences_update', which runs by default on V1 because memory.migrated defaults to False, and through the dashboard Save. (2) The missing cap is a documented invariant, not an oversight: context-management.md:93 says 'injected complete, not capped', and memory-skills-hooks.md:5820 says 'Preferences are never trimmed to make room for anything else'. The pref.* semantic twin already has the 12,700-char _PREFS_STARTUP_CAP; budget.py:59-62 records a 47.7K block measured on one real store. Capping the markdown file is therefore a take-away change.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/memory.py:974-979 — '{_cap_text(prefs, prefs_cap) if include_activity else prefs}' (startup passes include_activity=False -> raw file)
@@ -29,6 +31,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:CTX-3, REVIEW_FINDINGS:M1
 
 ### CTX-7 [50, default, effort M] Default subagents and workflow steps pay the full main-agent first turn — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): b84a14a30 "run unnamed spawns and workflow steps as kirocrew-step" (merged 61503d4b3); subagent_manager/run.py `_runs_as_step`; workflows/service.py default_agent=WORKFLOW_STEP_AGENT
 - **Verified claim:** Re-measured at HEAD, and the mechanism is confirmed. A spawn with no agent= runs as agent = info.agent or execution.template_id. The template comes from the parent's execution record, or from get_agent_selection(parent) when no record exists, so a default dashboard chat's child gets the default (kirocrew) contract. build_message then assembles the full new-session context. Measured on an empty home: 49,325 chars for agent=None, against 4,721 for kirocrew-worker and 4,719 for kirocrew-lite. Turning off every context group saves only 395 chars, because the roughly 40 KB agent prompt is not in a switchable group. Workflow pool workers re-arm _is_new = True in reset() before new_conversation(). Every reused step therefore rebuilds the full session start through workflow_memory.prompt → build_message(is_new), using default_agent=None, which is the default spec and its full tool set. One sub-claim (N10) is overstated: chat-thread replies cold-start a new kiro-cli session on every reply under a read-only derivative of the base spec, which keeps tools, mcpServers, resources and prompt. Crew injects only the short build_thread_message envelope, not the 40 KB session context, so the fixed cost per reply is the base spec's tool schemas plus its prompt.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/subagent_manager/run.py:2105 — agent = info.agent or execution.template_id
@@ -54,6 +58,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:CTX-7, REVIEW_FINDINGS:C4, REVIEW_FINDINGS:W5, REVIEW_FINDINGS:H-P8, REVIEW_FINDINGS:M8, REVIEW_FINDINGS:N10, verify_needed:O4, verify_needed:corr-W5, verify_needed:X14, verify_needed:design-rec-3, verify_needed:delta-3
 
 ### CTX-1 [45, pinned, effort S] Compaction triggers only at 70% of the window; ~700k tokens only on sessions served at 1M — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 65e947e6a "cap compaction at an absolute token floor"; src/kiro_crew/session_compaction.py:586 (autocompact_max_tokens arm); src/kiro_crew/config/sections.py:186-197 (DEFAULT_AUTOCOMPACT_MAX_TOKENS = 200_000)
 - **Original claim:** Compaction is percentage-only (fires ~700k tokens on a 1M window) (corrected below)
 - **Verified claim:** Confirmed in code: the automatic compaction trigger checks only a percentage. _compaction_gate_decision returns 'below_threshold' when pct < effective_autocompact_pct(key), whose default is DEFAULT_AUTOCOMPACT_PCT = 70.0. No absolute-token ceiling exists anywhere. The same gate serves check_context_usage and compact_if_needed, and the CLI REPL has its own percentage-only copy. pct is kiro-cli's own percentage of the window it serves, so compaction fires at 0.7 x that window: about 700k tokens on any session served at 1M. The registry lists claude-opus-4.6, claude-sonnet-4.6 and claude-opus-4.8 at 1M. model_registry.py:105-108 notes that kiro actually serves the sonnet/haiku aliases at 200K, so the registry-1M figure is reliable only for opus-4.6 and opus-4.8. Not established: that the DEFAULT model=auto runs at 1M (CTX-20 needs a live check). If auto is served at 200k, the trigger already fires at about 140k and the cap changes nothing on the default path. Two corrections to FIX_PLAN's fix. (a) autocompact_pct is not forwarded to kiro-cli: the sections.py:3670 comment describes Crew's own trigger, and no code writes a kiro-cli compaction setting. (b) provider.context_used_tokens() is not an independent count on kiro-cli 2.10+, which sends only a percentage. It is backfilled as pct x the registry window of the resolved id, and an unresolved 'auto' resolves to 200k. A cap built on it would therefore read 140k at 70% of a real 1M window and never fire. A per-slot override (slot.autocompact_pct) also exists, and the cap has to combine with it.
 - **Evidence (at `397f4be`):**
@@ -105,6 +111,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** REVIEW_FINDINGS:X1, verify_needed:X1, verify_needed:design-rec-5, verify_needed:delta-5, verify_needed:G44
 
 ### CTX-14 [40, default, effort S] Lessons are not re-injected after compaction — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): d61b19773 "re-inject standing rules, preferences and lessons after compaction"; src/kiro_crew/context_assembly/turn.py (+110 lines); context_blocks.py "Learned corrections" render
 - **Verified claim:** Confirmed and measured, and the gap is wider than claimed. After a confirmed compaction, post_compaction_parts calls _forget_shown_lessons but adds no lessons block. With memory.inject_lessons_per_turn off by default, no lessons reach the session again until a new session starts. The same seeded-home build also shows that the re-injection turn lacks three other blocks the first turn had: '## User Preferences' (the memory preferences file), '[CRITICAL RULES' (diff, path and [OPTIONS:] rules), and the [CURRENT DATE]/[CURRENT AGENT] identity. Those are the user's standing rules and the runtime contract, and context-management.md says kiro-cli's compaction drops session-start blocks. A channel turn's per-turn [RUNTIME] refresh partly re-asserts the diff mandate (context-management.md §2); dashboard turns get no such refresh.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/context_assembly/turn.py:63-64 — builder._forget_shown_lessons(session_key) — no lessons render follows in post_compaction_parts (:33-163)
@@ -126,6 +134,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G22(#15399), verify_needed:delta-6
 
 ### CTX-2 [40, default, effort S] Compaction can repeat with no attempt cap — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 17c0a4680 "cap repeated no-landing compactions with an episode backoff"; src/kiro_crew/session_compaction.py:63-80 (episode constants, exhausted notice)
 - **Verified claim:** Confirmed and measured. A compaction is judged ineffective when it frees less than 5 points. That arms a flat 60 s cooldown, with no backoff. One that frees 5 points or more clears the cooldown even when the reading is still at or above the threshold, so the same reading triggers again. No per-episode attempt counter exists. The only escalation is the reset when an immediate verdict is at least 95%. That escalation is unreachable on kiro-cli: a 'completed' compaction status resets the meter to unknown, so every verdict is deferred, and deferred verdicts are damping-only by design. Measured with the real SessionManager and the compact_if_needed ladder, a fake kiro-style provider and a fake clock: a session whose post-compaction floor sits at 80% (threshold 70%) compacted 11 times in 20 turns at 61 s or 120 s per turn, and 8 times at 30 s per turn. That is every second turn, indefinitely. A healthy landing at 40% compacted once. Each pass is a kiro-cli summarization of a context above the threshold, followed by the CTX-10 re-injection. The trigger needs a compacted floor that stays above the threshold, for example a small window, a low per-slot autocompact_pct override, or large pinned skills or tool sets. That condition is uncommon on a default install.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/session.py:700 — _COMPACT_FAILURE_COOLDOWN_SECS = 60.0 (flat; wired at session.py:2020)
@@ -150,6 +160,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:CTX-2, REVIEW_FINDINGS:S2
 
 ### CTX-8 [40, default, effort M] Whole 39 KB prompt.md reaches every session; diff rule is repeated but not contradictory — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 18d2aec65 "gate prompt.md sections by session capability and surface" (merged 4694ac520); src/kiro_crew/context.py (+158 lines); not re-measured per-surface byte counts
 - **Original claim:** Whole 39 KB prompt.md goes to every session; diff rules stated twice and contradictory (corrected below)
 - **Verified claim:** Confirmed and measured: config/prompt.md (38,989 B) reaches every non-slim-resume session whole, whatever the surface or capability. That includes cron minimal-context runs: 39,632 B, nearly all persona. Section sizes: Computer Use 2,914 B (L165), Subagent Orchestration 7,888 B (L33), Browser 6,299 B (L141), Wait & Webhook 711 + Iterative pattern 5,406 + Webhook sessions 797 = 6,914 B (L96-140). _resolve_prompt_templates gates nothing but {{WIDGET_BLOCK}} and {{MAX_SUBAGENTS}}, and _computer_use_spec_gate only controls MCP server emission. The diff rule is stated twice, but 'contradictory' is overstated. prompt.md:5 says to show a ```diff block 'unless the latest injected critical rule or [RUNTIME] surface note relaxes it'. The runtime-selected critical rule (_DIFF_RULE_DASHBOARD) relaxes it on the dashboard, and _DIFF_RULE_CHANNEL restates it elsewhere. So it is a layered duplicate with explicit precedence, about 1.5 KB repeated, and the model must resolve two texts. Side check: subagent.py:7 'No spawn recursion: subagents cannot spawn other subagents' is stale. spawn.py:1298 waits on a 'subagent:<id>' parent's lane slot, and admission reasons about 'depth-0' spawns (fairness.py:340).
 - **Evidence (at `397f4be`):**
@@ -176,6 +188,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:CTX-8, REVIEW_FINDINGS:H-P2, REVIEW_FINDINGS:H-P6, verify_needed:G19(#16108), verify_needed:G37
 
 ### CTX-6 [40, armed, effort S] Slack thread fallback re-sends the buffered thread and duplicates the current message — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): b4912105d "send each Slack thread message to a session exactly once"; src/kiro_crew/context.py:3968-3991 (since_ts watermark, exclude_ts=current_msg_ts, absolute HH:MM in channel_history.py)
 - **Verified claim:** Re-measured at HEAD. On a Slack thread turn with no new third-party replies, thread_replies_text is None, so build_message injects channel_history.context_for(channel, thread_ts). That re-sends the thread's whole buffered tail every turn. In the 20-message thread fixture, the channel block grows from 4,014 B to 4,704 B over turns 2-10, of which 3,818-4,466 B (about 95%) was already sent the turn before. The owner's own text appears in the block on every turn, because slack/events.py pushes the incoming message into the buffer before the prompt is built, and the turn text carries it again as the request. When there are new replies, the fenced replies path replaces this leg and injects no channel block. Worst case per turn: 50 entries are 16,033 B by default; observe mode holds 200 entries (63,883 B) for 1 week. Only Slack writes channel_history; Discord, Telegram and other messaging transports never push. The whole-channel branch (old C1/T8) stays unreachable, because Slack always passes thread_ts.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/context.py:3456-3460 — 'if channel_id and self.channel_history and not (thread_ts and thread_replies_text): ch_ctx = self.channel_history.context_for(channel_id, thread_ts=thread_ts)'
@@ -199,6 +213,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:CTX-6, REVIEW_FINDINGS:M4, REVIEW_FINDINGS:C1, FIX_PLAN-old:T8
 
 ### TOOL-19 [40, armed, effort S] Image paths in injected text are re-attached as images every nudge cycle — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 44b9f424e "stop the work-ledger snapshot re-attaching artifact images every cycle"; src/kiro_crew/session_ledger.py:2419-2426 (image_refs guard)
 - **Verified claim:** Re-measured end to end at HEAD. When a monitor or auto-nudge loop's session has a non-terminal work ledger, the cycle message is prefixed with session_ledger.render_snapshot. The snapshot renders each artifact as 'artifact <k>: <path>' verbatim. The whole outgoing message then goes through build_prompt_blocks at the ACP send seam (acp/client.py:12563, acp/session_handle.py:1503), which inlines every readable image path it finds. A snapshot naming a real PNG produced blocks ['text', 'image'], with the text rewritten to 'artifact chart: [image: chart.png]'. So the artifact image is re-attached on every cycle, and each attachment then stays in native history. strip_image_refs is applied only to replay text (replay.py:311), consolidation (history_consolidation.py:441) and background prompts (llm_helpers.py:1714). No injected-message builder calls it. Not checked: other injected blocks that might carry image paths, such as cron notifications, subagent completion envelopes and rails.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/dashboard/handlers/autonudge.py:97-105 — snapshot = render_snapshot(ledger_key(slot_key)); return f"{snapshot}\n\n{body}"
@@ -242,6 +258,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:TOOL-9, REVIEW_FINDINGS:U8, verify_needed:corr-U8, verify_needed:A8, verify_needed:G21(#16143), verification_needed:P1-1, verification_needed:sink#2, verification_needed:opt(image-ledger), verification_needed:refactor(image-ledger), verify_needed:G36, verify_needed:G38, verify_needed:G41, verify_needed:G43, verify_needed:G44
 
 ### CTX-5 [35, default, effort S] Per-turn reminders re-sent identically every follow-up turn — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 23e36245f "deduplicate unchanged per-turn rail blocks per session" (rail_block_fresh digest, [PROJECT]/[RUNTIME] one-line pointer); also 73267ec51
 - **Verified claim:** Re-measured at HEAD. Dashboard follow-up turns 2-10 each inject 1,915 B, of which 1,902 B are byte-identical to the previous turn: the guidance paragraphs are 1,352 B, [PROJECT] is 373 B (it carries the project path, so its size varies), [RUNTIME] is 175 B, and the [REPLY FORMAT RULES] header is 21 B. The source measured 1,899 B. Heartbeat turns call build_message without interactive=False, so they get the default interactive=True. With no session key and therefore no dashboard surface, that adds only the ~430 B [OPTIONS:] paragraph, not the ask_question or suggest_followup paragraphs. The guidance is deliberately placed just before the request header (context-management.md §2), so a fix must keep a pointer there.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/context_assembly/turn.py:412-474 — interactive_guidance: [OPTIONS:] paragraph always when interactive; ask_question/suggest_followup (+ dynamic cards) when has_dashboard_surface
@@ -265,6 +283,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:CTX-5, REVIEW_FINDINGS:C2, REVIEW_FINDINGS:M5
 
 ### SES-1 [35, default, effort M] One config save recycles every session including in-flight turns — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 9f8b81c86 "config saves recycle only the affected sessions and defer busy ones"; src/kiro_crew/dashboard/handlers/sessions.py (+116/-) and agent_admin/agent_config.py
 - **Verified claim:** Every dashboard save that ends in `_reset_all_sessions` (agent-config PUT for ONE agent, computer-use enable, the MCP restart endpoint, MCP enable/disable when hot reload is not active) calls `reload_provider_factory()`, which clears the whole session registry and shuts down every provider with no semaphore/idle check and no scoping to the edited agent, then drains the warm pool. A turn in flight is killed mid-stream; on the dashboard the process-death ladder usually re-queues it (a cold resend with full session-start context), other surfaces just lose the turn.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/dashboard/handlers/sessions.py:5038 — `async def _reset_all_sessions(request)` docstring: 'Reset all active sessions so they pick up config changes'
@@ -289,6 +309,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SES-1, REVIEW_FINDINGS:S4, verify_needed:A6, FIX_PLAN-old:A-9
 
 ### SES-5 [35, default, effort M] A throttle refusal on the empty continue turn fails a long subagent run — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 9f8b81c86 "subagent throttles park without spending the post-activity continue"; src/kiro_crew/subagent_manager/run.py:2937-2939
 - **Verified claim:** In a subagent run, once any activity has been observed (text, a completed turn, or a tool call), a transient error gets exactly ONE continue turn (`_TRANSIENT_CONTINUE_MSG`). A second transient error, including a capacity throttle that the durable-queue dependency coordinator could park, raises out of `_stream_with_transient_retry`. The run's generic exception arm then records `info.error`, sets `done` and writes an 'error' tombstone, so the run ends `failed`. That arm, unlike the cancel, reap and context-overflow arms, does not promote `info.streaming_text` into `info.result`. Tool side effects stay, but the run's streamed answer is not delivered as its result. The only keep-output escape is the narrow 'failed to generate a response' text match.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/subagent_manager/run.py:2682 — `async def _stream_with_transient_retry()`; :2704 `post_activity_attempts = 0` ('post-activity recovery gets exactly ONE attempt')
@@ -338,6 +360,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G25(#12443)
 
 ### CTX-31 [30, default, effort S] Conversation rows uncapped in the non-native replay path — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 2d2acfb3c "clip every replay row so one huge row cannot exceed the budget" (merged 900dc6c5a); test/test_replay_row_caps.py
 - **Verified claim:** Confirmed, measured, and worse than claimed. The provider-agnostic session replay (build_session_replay → replay_text) applies no per-row cap to conversation rows, as the code comment itself says: 'Conversation rows are uncapped here'. Only inject rows are clipped, at 2,000 chars. Its budget loop admits a line only while 'total + len(line) <= replay_budget', but the guard is 'and lines', so the NEWEST row is always admitted whole whatever its size. Measured: a 300,000-char newest row gives a 300,006-char replay against an 80,000 budget. On a 200k window the budget is 16,000 and the same 300,006 chars still go out. A 100,000-char older row behind three small rows stops the scan, so the replay keeps only those 3 rows and loses all history before it. This output is placed OUTSIDE admit_background as '[CONVERSATION HISTORY …]' ('inject OUTSIDE the capped session context so it doesn't get truncated'). The dashboard uses it on every cold start without native history: a provider switch, a failed or Tool-Search resume, process death, or a reset after stop. The conflict is resolved this way. REVIEW_FINDINGS §5.2's per-message caps (8K/4K) belong to different paths: build_interrupted_turn_preamble (user_cap 8000, assist_cap 4000) and the fallback thread_history_text (per_message 8,000 x window factor; measured 20,668 chars for the same 300K row). 'Replayed rows uncapped' is therefore wrong for those paths and right for replay_text.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/context_assembly/replay.py:199-207 — _REPLAY_BUDGET_CHARS = 80_000; 'Per-row ceiling for inject content … Conversation rows are uncapped here'
@@ -359,6 +383,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:sink#7, verification_needed:opt(replay-row-cap), verification_needed:refactor(replay-row-cap), verify_needed:A-pass2-correction(replayed-tool-outputs)
 
 ### CTX-4 [30, default, effort M] Volatile values early in the prompt break the cross-session shared prefix — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): d2a3d364e "keep the live subagent cap out of the shared prefix" and a2fbdc509 "put the clock and runtime after the stable prefix"; src/kiro_crew/context.py:3020 (_volatile_tail built after admission)
 - **Verified claim:** Re-measured at HEAD, and the numbers hold. Two first turns built 7 minutes apart in separate processes, with different hash seeds and session ids, share a byte-identical prefix only up to the minute in [CURRENT DATE]. That is 44,614 B: 85.3% of 52,310 B on an empty home and 49.4% of 90,315 B on a seeded home. When the adaptive subagent cap changes from 8 to 6, the shared prefix collapses to 6,105 B (11.7%) at prompt.md:41 {{MAX_SUBAGENTS}}. On a seeded home with the same clock, two different first messages diverge at 59,887 B, where the query-ranked [Learned corrections] block starts. What this is worth depends on two things this machine cannot observe. (1) Whether the provider caches a prefix across sessions (FIX_PLAN §0.4(b)). (2) Where cache boundaries fall. On Anthropic-style prompt caching, a hit needs an identical prefix up to a content-block boundary that carries a breakpoint. Crew sends the whole first turn as one ACP text block (plus images), so bytes shared inside that block earn nothing unless the stable part becomes its own block and kiro-cli keeps the boundary. Separately, query-ordered lessons are a documented design choice: the order decides which rows survive an overflow, and the header says 'relevant ones first'.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/context.py:2589 — append_required(f"[CURRENT DATE] {now.strftime('%A, %Y-%m-%d %H:%M %Z')}") (minimal/cron path: :2521)
@@ -430,6 +456,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SES-2, REVIEW_FINDINGS:S5, verify_needed:A7, FIX_PLAN-old:A-10
 
 ### CTX-12 [30, armed, effort S] Non-dashboard turn loops never arm reinjection after a backend compaction — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 1fa80431b "arm reinjection on backend compactions in every turn loop"; src/kiro_crew/messaging/driver.py (compaction_completed flag, settled at turn seam); slack/gateway.py:6503-6504
 - **Verified claim:** Confirmed by code, and the code documents it as a known soft failure. needs_reinjection is armed in four situations: by a fresh session; by Crew's own session_compaction (session_compaction.py:1307, for every surface, because Crew triggered it); by the dashboard runner when the backend reports a completed compaction mid-turn (chat_runner.py:8285, called at :14590/:15701/:15719); and by the heartbeat (slack/gateway.py:6347-6348). The shared messaging TurnDriver receives EVENT_COMPACTION_STATUS and only renders a notice (messaging/driver.py:961-963). The Slack, Telegram, Discord, Teams, WeCom, Feishu, Webex, WhatsApp, iMessage and Weixin dispatchers, the task runner and cron therefore never arm the flag after a BACKEND self-compaction, such as kiro-cli compacting mid-turn or the claude/codex equivalents. Because the managed spec prompt is a stub (turn.py:65-67), such a session then runs on without its [AGENT SYSTEM PROMPT] contract, memory index, skills index, reply-style preferences and folder steering until a new session starts. The skill-body dedup record also goes stale. REVIEW_FINDINGS §5.3 ('degrades to a pointer, never to silence') is true but describes only the skill-body side effect. test/test_reinjection_gate.py pins that compacting loops consume and re-arm the flag; it does not pin that they arm it on a backend report.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/context.py:3542-3555 — 'SOFT FAILURE (known, bounded): the flag is armed by a fresh session, by Kiro Crew's own session_compaction, and by the dashboard runner and the heartbeat … Other turn loops do not watch for that report … deliberately out of scope here.'
@@ -477,6 +505,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G40(#15513)
 
 ### CTX-9 [25, default, effort S] Protected-content ceiling scales with the 1M auto/unknown window — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 3539809f8 "make the protected-content ceiling a fixed absolute cap"; src/kiro_crew/context_assembly/budget.py:214-217 (min of 99K floor and window-scaled value)
 - **Verified claim:** Confirmed and measured. The model-safe ceiling for protected content is protected_context = max(_PROTECTED_CONTEXT_FLOOR = 99,000, window x 4.0 x 0.125). The window comes from _effective_window(resolve_model_window(model)), and auto, empty and unregistered ids all resolve to the 1M reference, so the ceiling is 500,000 chars. Registry 200k models get 100,000. In practice the ceiling binds only protected blocks that lack their own cap. Pinned skill bodies have a 99K capacity and fail closed. Lessons have the 37K startup tier and pref.* rows the 12.7K cap. The preferences file (CTX-3) is the main block that can grow toward 500K. On a session whose live window is 200k but whose id resolves to the reference (auto if served at 200k, or an unknown id), 500K chars (about 125k tokens) of protected text could alone exceed the 70% compaction point.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/context_assembly/budget.py:121-124 — _PROTECTED_CONTEXT_CHARS_PER_TOKEN = 4.0, _PROTECTED_CONTEXT_WINDOW_FRACTION = 0.125, _PROTECTED_CONTEXT_FLOOR = _CONTEXT_BUDGET_BASE * 3
@@ -497,6 +527,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:CTX-9, REVIEW_FINDINGS:C5
 
 ### SES-10 [25, default, effort S] Effort/env lost on a compaction restart — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 0d55b3c8a "carry effort and env through restart successors" (test/test_compaction_failure_pause.py added in 9f8b81c86 cluster)
 - **Verified claim:** When a kiro-cli in-place /compact fails or times out, `_restart_held` starts the successor from `allocation_identity`. The recycling reset successor (session_lifecycle.py:1604) is built the same way. That identity carries agent, approval policy, cwd, channel, the requested model and the crew member, but no reasoning-effort override and no extra_env; the helper's docstring admits extra_env 'cannot be carried'. The successor's factory therefore resolves effort from `resolve_session_effort` (crew pin or role default) instead of the dashboard slot's or sub-agent's override. A later turn claims the live successor as-is and does not re-push effort; effort is re-pushed only on pool claims or a user change. Env is lost for every caller that passes it: a cron's job.env plus KIROCREW_APPROVAL_MODE (so the cron's spawn_run children can fall back to interactive approval with no responder), workflow pool env, and app env. On kiro-cli the effort can survive by accident, because the predecessor's level is still in the workspace cli.json overlay keyed by (work_dir, model). Adapter harnesses that take effort as a live set_config_option push lose it.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/session_lifecycle.py:404-420 — `allocation_identity`: returns agent, approval_policy, cwd, channel_id, model, crew_agent; docstring 'A caller's extra_env is not recorded on a session, so it cannot be carried.'
@@ -520,6 +552,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G25(#14442)
 
 ### SES-9 [25, default, effort S] Dashboard turns fail during short network drops — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 4d5b7cced "give connection drops a wall-clock retry budget" (test/test_llm_helpers.py +60)
 - **Verified claim:** A connection-class error on a dashboard turn (dispatch failure, connection reset, ECONNRESET), arriving before any token or tool call, is re-prompted on the live session at most TRANSIENT_RETRIES = 3 times. The backoff is 2/4/8 s plus up to 25% jitter: 14.2-17.4 s in total, unless the dependency coordinator's shared cooldown floors it longer. Then the turn ends with 'Connection unstable — please try again.' On the default fallback_model 'auto' with an 'auto' slot model, the fallback swap has no other candidate, so a network drop longer than about 15 s fails the turn. 'operation timed out' is not classified transient at all.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/dashboard/chat_runner.py:17617-17620 — `elif (not _turn_emitted and acp_error_is_transient(exc) and slot._transient_5xx_retries < TRANSIENT_RETRIES)`
@@ -542,6 +576,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G35(#15231), verify_needed:G38, verify_needed:G41
 
 ### CTX-10 [20, default, effort M] Post-compaction reinjection re-sends the full agent prompt and pinned skill bodies — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 516048c8c "deliver a custom agent's prompt once on kiro-cli and kas"; src/kiro_crew/context_assembly/turn.py:97 and src/kiro_crew/context.py:3700-3730 (native_agent_prompt gate)
 - **Verified claim:** Confirmed and measured. After a confirmed compaction, post_compaction_parts re-injects five things in full: the agent prompt (about 40.3 KB), the memory activity index plus the [Memory tools] line (about 1.8 KB), the skills index together with every pinned always:true body (bounded by the 99,000-byte pinned capacity), the reply-style preferences, and folder steering. The member section goes through the caller. No digest or pointer is used for blocks that have not changed. Measured with the real builder on a seeded home (no pinned bodies): a follow-up turn is 1,933 B, and the re-injection turn is 49,054 B, so each compaction pass adds about 47 KB (about 12k tokens). Pinned bodies add up to 99K more (about 25k tokens), which gives the 11-35k-token range. The original C6 claim ('whole session-start context') is wrong, and X3 has the correct subset. Memory preferences, lessons, [CRITICAL RULES], [CURRENT DATE]/identity, the user profile and thread history are all NOT re-injected (see CTX-14). Two constraints limit the fix. The agent prompt cannot be replaced by a pointer: the managed spec prompt is a stub, so without the block the session has no contract, and the real fix is SPEC-2, which puts the prompt where kiro-cli keeps it. Pinned bodies are 'required instructions' by contract, so turning them into pointers is a take-away change.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/context_assembly/turn.py:33-163 — post_compaction_parts: _resolve_agent_prompt(session_start=False) → '[AGENT SYSTEM PROMPT]…'; activity_index + [Memory tools]; skill_parts(required_skills + skills_ctx); response preferences; folder steering
@@ -564,6 +600,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:CTX-10, REVIEW_FINDINGS:C6, REVIEW_FINDINGS:X3, verify_needed:X3
 
 ### CTX-11 [20, default, effort S] Memory dict/list values escape non-ASCII via json.dumps (4.3x for CJK); strings fine — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): be56e0149 "render non-ascii semantic values unescaped"; src/kiro_crew/vector_memory_runtime/semantic.py
 - **Original claim:** Semantic memory values injected with JSON escapes (~6x) (corrected below)
 - **Verified claim:** The escape overhead is real but narrower than '~6x'. get_semantic_context renders dict and list values with json.dumps(val), whose default ensure_ascii=True turns every non-ASCII character into a 6-character \uXXXX escape. Plain string values go through str(val) and get no escapes. The startup pref.* block (get_preferences_context) already uses ensure_ascii=False. Measured with the same expressions: a CJK dict renders at 4.30x its content, a mixed-accent list at 2.46x, and ASCII strings, ASCII dicts and CJK strings at 1.00x. The path is reached on the default install, because memory.inject_activity defaults to True ([Memory activity] task facts). memory_recall reuses it through recall.py:84. The impact is limited to non-ASCII content in structured fact values.
 - **Evidence (at `397f4be`):**
@@ -607,6 +645,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G29(#15722)
 
 ### LOOP-12 [20, default, effort S] Idle history consolidation fires on a single new prompt row — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 0f54c3077 "require a minimum span for idle history consolidation" (merged 5e5b42544); src/kiro_crew/history.py
 - **Verified claim:** Confirmed by code. check_idle_sessions starts a full history consolidation (_consolidate(key, include_history=True)), which is one LLM call, for any session idle at least memory.history_idle_hours (default 3 h) that has at least one unconsolidated row (the 'unconsolidated < 1' gate). _consolidate then skips the model only when the span has no prompt rows at all. So one new user or assistant row after an idle window bills a whole consolidation pass. That pass carries the fixed prompt (current preferences and projects files plus instructions) no matter how small the span is. Seeded sessions after a restart are forced eligible ((0, 1)), bounded by _SEEDED_PER_SWEEP. The in-memory throttle and the durable retry backoff only stop a repeat within the same idle window.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/history_consolidation.py:1150-1176 — 'if now - last < self._history_idle_secs: continue' … 'unconsolidated < 1 or …' → asyncio.create_task(self._consolidate(key, include_history=True))
@@ -666,6 +706,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** REVIEW_FINDINGS:X6, verify_needed:X6
 
 ### CTX-30 [20, armed, effort S] Pending-context drain evicts entries over the ceiling — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 0a3d1616e "refuse context appends past the queue ceiling"; src/kiro_crew/dashboard/slot_buffers.py:695, src/kiro_crew/dashboard/chat_handlers.py:10569-10600 (429 capacity_reached)
 - **Verified claim:** At HEAD a slot's pending-context queue (app-kit /context inject, /note, artifact companion, Slack thread backfill share it) is a 50-entry FIFO, and appending to a full queue silently evicts the OLDEST live entries (pop(0)) - no refusal, no log, no notice to the producer or the model. The eviction happens at enqueue (SlotBuffers.append_pending_context), not at the drain; the drain concatenates whatever survived, with no total cap (that is CTX-15). Named sources are refused with 429 at 10 live entries each, but sourceless entries bypass that cap, so one sourceless producer can push out every other source's entries. The app-kit API reference does not document the 50-entry eviction. PR #16818 (refuse over the ceiling instead of evicting) is the upstream proposal.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/dashboard/state.py:1791-1793 — '# FIFO ceiling on a slot's pending-context queue (app-kit context inject + Slack thread backfill)'; _MAX_PENDING_CONTEXT = 50
@@ -689,6 +731,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G37(#16817)
 
 ### SES-14 [20, armed, effort S] Webhook runs don't report MCP servers that failed to start; same servers as chat — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 47f79e600 "surface failed MCP servers in webhook runs"; src/kiro_crew/dashboard/handlers/hooks.py (problem_summary(include_reasons=False) notice, +66 lines)
 - **Original claim:** Webhook sessions silently start without MCP servers (corrected below)
 - **Verified claim:** The silence half is confirmed. The webhook runner never reads the session's MCP report, so a hook run whose MCP servers failed to initialize records a normal outcome, and neither the run history nor the delivered result says a server was missing. Sub-agents log the problem and prepend a spawn notice to the run's first turn; the dashboard renders the report. The 'webhook sessions start without the servers chat sessions have' half is not a Crew-side difference. A hook session is allocated through the same `get_or_create(session_key, agent=agent)` and agent spec as a chat session, and the `hook:` prefix is only a caller label in the MCP gateway. A gateway-managed instance failure such as the missing keytar binary would remove the server from chat and sub-agent sessions too; only the surfacing differs. The keytar trigger itself needs a live install.
 - **Evidence (at `397f4be`):**
@@ -710,6 +754,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:Part3(#17148)
 
 ### CTX-18 [15, default, effort S] Unknown model ids get 1M caps on the first turn only, unwarned (deliberate fallback) — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 477ad4af5 "log once when an unknown model falls back to reference budgets"; src/kiro_crew/context_assembly/budget.py:225-231 (_UNKNOWN_WINDOW_WARNED); test/test_context_dynamic_budget.py:107-115. Dashboard model-chip part of Required outcome not checked
 - **Original claim:** Unknown model ids silently get 1M-window budgets (corrected below)
 - **Verified claim:** The fallback exists, and it is deliberate. resolve_model_window returns None for '', 'auto' and any id that model_window cannot place. model_window looks the id up in this order: kiro-list cache, then registry, then the supplementary map, then the [1m] heuristic. _effective_window(None) then yields the 1M reference. Measured: 'some-new-model-x' and 'gpt-5' get history_fallback 34,650, per_message 8,000, compressed_history 44,550 and protected_context 500,000 chars. A registry 200k id gets 6,930 / 1,600 / 8,910 / 100,000. No warning is logged for an unknown window. Two parts of the claim are overstated. (1) 'No re-resolution after the first turn' is wrong. window_for_provider_client prefers the provider's live context_window_tokens() whenever it is greater than 0 (a usage_update size, or a kiro-list or registry backfill), so later rebuilds such as post-compaction re-injection use the real window. The kiro-list cache (refresh_kiro_catalog, fed by dashboard/handlers/agents.py:1181) learns windows from 'kiro-cli chat --list-models'. The supplementary map pins the currently served non-Anthropic kiro ids. Only the first-turn build of a session on a genuinely unlisted model uses the reference. (2) The design states the trade-off on purpose: 'an unresolved window never silently shrinks the default deployment' (budget.py:162-170, model_registry.py:955-962). The affected caps are small: thread replay at most about 45K chars, plus the protected ceiling (CTX-9).
 - **Evidence (at `397f4be`):**
@@ -732,6 +778,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:P1-3, verification_needed:refactor(unknown-model-budgets)
 
 ### CTX-24 [15, default, effort S] Preference-only consolidation advances _prefs_offset on an empty answer — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 6a22a27fa "hold prefs offset on empty consolidation" (merged); src/kiro_crew/history_consolidation.py; test/test_history_consolidation_bounds.py
 - **Verified claim:** A preference-only consolidation pass (maybe_consolidate -> _consolidate(include_history=False)) whose LLM answer is empty returns None, and maybe_consolidate's done-callback treats any non-refused, non-exception result as a completed pass and advances _prefs_offset to the message count, so the next prefs pass waits for another _CONSOLIDATION_THRESHOLD (30) messages. The same advance happens when nothing was dispatched at all (_ConsolidationNotDispatched also returns None). The history path (include_history=True) charges the attempt via _note_failed_attempt and leaves the durable marker unwritten; the prefs path has neither. Impact is a delay, not a permanent loss: the idle/session-end history pass re-reads the same unconsolidated span and also asks for preferences_update/semantic facts.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/history_consolidation.py:1108-1110 — prefs_off = self._prefs_offset.get(key, 0); if total - prefs_off < _CONSOLIDATION_THRESHOLD: return
@@ -754,6 +802,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G29(#15539), verify_needed:G37
 
 ### CTX-16 [15, armed, effort S] Operator prompt.md override has no size budget or warning below the 50 MiB read guard — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 0c68fd2b2 "warn once on oversized prompt overrides"; src/kiro_crew/context.py:1750-1763 (_PROMPT_OVERRIDE_WARN_CHARS = 100_000, warn-once set); test/test_prompt_override_encoding.py
 - **Original claim:** Operator prompt override read with no size cap (corrected below)
 - **Verified claim:** _read_prompt_file reads the operator override (~/.kiro/crew/prompt.md, which _prompt_path prefers over the shipped prompt) through safe_read_file. That read is not unbounded at HEAD: safe_read_file passes max_bytes=MAX_FILE_BYTES, which is 50 MiB, the same ceiling safe_read_file_bytes uses. The docstring X5 cited no longer contrasts the two helpers. The substance holds, though. Below that 50 MiB allocation guard there is no prompt-size budget and no warning, so an override of any realistic size is injected whole as [AGENT SYSTEM PROMPT] at every session start, and again after every compaction (CTX-10). The shipped prompt is 38,989 B.
 - **Evidence (at `397f4be`):**
@@ -772,6 +822,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** REVIEW_FINDINGS:X5, verify_needed:X5
 
 ### CTX-32 [10, default, effort S] context-management.md has no Crew-vs-harness token ownership section; only fragments — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 6a22a27fa "add token-ownership docs"; docs/architecture/context-management.md:716 ("What Crew budgets vs what the harness owns")
 - **Original claim:** No documented Crew-vs-harness token ownership boundary (corrected below)
 - **Verified claim:** docs/architecture/context-management.md has no section that names the boundary between what Crew's budgets bound and what the harness owns. A search for 'cost ownership' or 'token ownership' across docs/ finds nothing. The boundary is stated only in fragments. context-management.md:201-203 says 'After the first turn build_message injects no transcript — the ACP session carries its history natively'. budget.py:29-32 says the base 'is NOT a bound on the provider's full model input or a token estimate'. memory-skills-hooks.md:5820 says the 33,000 allowance 'is not falsely reported as a full-input ceiling'. No single place tells a contributor what Crew does not control and therefore cannot budget on the kiro-cli path: native history replay, tool schemas, tool results, and the image bytes in history (TOOL-9). The tradeoff FIX_PLAN §0.2 spells out (levers Crew has and does not have) is absent from the owned doc.
 - **Evidence (at `397f4be`):**

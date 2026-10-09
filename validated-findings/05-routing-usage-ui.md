@@ -5,6 +5,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 ## 7. Model routing, usage, budgets, workflows, knowledge and UI
 
 ### USE-1 [70, default, effort M] Usage recorded only on the background helpers and the cold workflow path — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): stream_and_collect takes usage_surface (llm_helpers.py:2522) and writes a row on every exit (1e333dffa). Callers pass a surface at agent_pool.py:105, agent_exec.py:235, side.py:641, chat_threads.py:972, impl_llm.py:225, gateway.py:9193 (subagent_completion), t…
 - **Verified claim:** Every listed path makes model calls without writing a usage row. stream_and_collect itself records nothing; of its 15 call sites, rows are written only by the cold workflow path (on success), the heartbeat and Slack nudge paths, and cron (by its caller). No row is written by: pooled workflow steps (agent_pool._run_step, the default because pool_agents=True), a cold workflow step that raises or times out (the row is written after stream_and_collect returns, not in a finally), the nudge judge (decisions/impl_llm.py), meetings translation and meeting agent turns, workflow authoring (service.author), side chat, chat-thread replies, Issue Radar AI summaries, Code Review Sage reviews (runtime.create_session + handle.prompt, no usage code in the app), knowledge extraction and knowledge agent fetch (LLMPool workers). Newly found by a second sweep of direct provider.stream()/stream_and_collect_json loops (scripts/E/direct_stream_sweep.py): interactive CHANNEL turns — Slack messages (slack/handler.handle_message) and Discord/Telegram turns through messaging/dispatch → TurnDriver.run — write no usage row and no crew-log turn-close (only the dashboard chat runner emits on_turn_completed); also task-runner decomposition (task_planner.decompose), task-runner lesson extraction (taskrunner._call_llm_for_lesson), task-runner refine (dashboard/handlers/taskrunner._run_refine), the prompt optimizer (dashboard/handlers/optimizer._optimize), channel.py _stream_task, the CLI chat, and native /compact turns (session_handle.compact). And the Slack gateway's subagent-completion injection into the parent session (_inject_with_retry, used for Slack threads and cron parents) records nothing either. Correction to the framing: 'only run_bg_oneliner/background_turn and the cold workflow path' is too strong — the dashboard chat runner, cron, heartbeat, monitor, subagent runs, task-runner steps and webhooks also write rows; the gap is the callers above.
 - **Evidence (at `397f4be`):**
   - scripts/E/usage_sites.out — 15 stream_and_collect sites; 12 with no usage writer in the enclosing function; ai.py:235, meetings session.py:230, translate.py:116, chat_threads.py:963, handlers/side.py:622, decisions/impl_llm.py:211, workflows/agent_pool.py:90, workflows/service.py:1002 have no usage…
@@ -32,6 +34,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:USE-1, REVIEW_FINDINGS:W2, REVIEW_FINDINGS:W3, REVIEW_FINDINGS:B2, REVIEW_FINDINGS:N9, REVIEW_FINDINGS:N10, REVIEW_FINDINGS:N-lower(issue-radar-ai), FIX_PLAN-old:T1, FIX_PLAN-old:A-8, verify_needed:A3, verify_needed:G15(#17112), verification_needed:Part3(#17112), verify_needed:G37
 
 ### MOD-1 [55, pinned, effort M] Unpinned subagent, workflow, cron, task runs inherit chat model/effort; background doesn't — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): Unattended roles now request auto unless pinned: ROLE_MODEL_KEYS comment and role_models help (config/sections.py:275-282, 900), 8da39e3d8 (cron, workflow, taskrunner role keys). Requested-model stamp run.py:2239 is "auto" when unpinned, which now matches the …
 - **Original claim:** Unattended work inherits the chat model and effort (corrected below)
 - **Verified claim:** Unpinned SUBAGENT, workflow-step, cron and task-runner sessions inherit the chat model (agent.model) and the chat effort (agent.reasoning_effort) through the provider factory's last precedence tier; the BACKGROUND role does not (resolve_model('background') returns the role pin or 'auto', and background worker agents take role_efforts.background or the provider default). The docs disagree with each other and with the code: model-selection.md says roles 'deliberately do NOT inherit agent.model', while the role_models help text and the ROLE_MODEL_KEYS comment say an unpinned role 'defers to the chat default (agent.model)' — the latter is what the subagent path does. run.py records requested_model='auto' for an unpinned spawn even when the factory will request the pinned agent.model. Default install (agent.model='auto', reasoning_effort='') is unaffected.
 - **Evidence (at `397f4be`):**
@@ -60,6 +64,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:MOD-1, REVIEW_FINDINGS:S1, verify_needed:A3, verify_needed:G39(#10094), verify_needed:G39(#13504)
 
 ### USE-2 [55, armed, effort M] Workflow budget_total is never enforced — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): Budget.charge is called after each call (workflows/runner.py:~440 _charge), and budget_update is emitted when total is set (runner.py:446). Commit 6fbba8619.
 - **Verified claim:** Budget.charge() has no call site in src/kiro_crew, so spent() stays 0 and remaining() reports the full budget_total for the whole run; the only enforcement is would_exceed() before each call, which can only fire when budget_total is 0 (spent never grows). budget_update has an event builder but no emitter. The workflow authoring prompt tells scripts to read ctx.budget.remaining(), and the workflows spec itself records this as an open question. budget_total is optional (default None), so this matters only when a caller sets it; the effective limits are the run timeout and the 1000-call AgentCounter cap.
 - **Evidence (at `397f4be`):**
   - grep '\.charge(' over src/kiro_crew — no match
@@ -132,6 +138,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:WF-1, REVIEW_FINDINGS:W4
 
 ### USE-3 [45, armed, effort M] Auto-Improvement $ cap never trips on the Kiro backend — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): credits read into _total_credits and total_credits() (auto_improvement/spine/agent_runner.py:1256-1272); max_credits in driver.py:69 and checked via credit_meter (driver.py:391-394); DEFAULT_MAX_CREDITS and maxCredits config (backend/runner.py:74, 624). Commit…
 - **Verified claim:** Auto-Improvement's spend ceiling (maxCostUsd, default $5) is checked against runner.total_cost_usd, which only accumulates cost_usd read from stream events (ev.cost_usd or ev.usage.cost_usd). The Kiro (acp) provider bills in TurnUsage.credits and leaves cost_usd at 0, so on the default backend the meter stays 0 and the dollar cap never trips; nothing in the app reads credits. The run is still bounded by maxCycles (25) and maxHours (2.0).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/apps/builtins/auto_improvement/spine/agent_runner.py:1507-1524 — _finish folds `cost` into _total_cost_usd 'so the driver's live --max-cost meter … sees real spend'
@@ -154,6 +162,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:USE-3, REVIEW_FINDINGS:N7
 
 ### MOD-6 [40, armed, effort S] Dictation sends the whole growing transcript every segment — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): Classifier input is _endpoint_tail (last 40 words, stt_stream.py:160, 200-209); pre-check for obvious tails (stt_stream.py:213-230); model is None so it inherits the background spec (stt_stream.py:233). Commit fe0571ae6.
 - **Verified claim:** With stt.endpointing on (default OFF), every stable dictation final appends to _finals and schedules a classification whose prompt carries the WHOLE transcript so far (' '.join(self._finals)); calls are debounced 0.35 s and single-flight (a final arriving mid-call is latched and re-run), so input grows roughly with the square of dictation length (N finals × growing transcript). Each call runs through run_bg_oneliner with model 'auto' (which also overrides a role_models.background pin, see MOD-3) and start_priority FOREGROUND. No local silence/punctuation pre-check exists before the model call.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/dashboard/stt_stream.py:147 — '# ── Semantic endpointing (stt.endpointing, default off) ──'
@@ -174,6 +184,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:MOD-6, REVIEW_FINDINGS:B7
 
 ### WF-2 [40, armed, effort S] No cap on step output passed between workflow steps — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): DEFAULT_MAX_OUTPUT_CHARS = 20_000 (runner.py:87, 698); head+tail truncation with marker for string results (runner.py:574-590). Commit e34f4e41d.
 - **Verified claim:** ctx.agent() returns the step's full text (or schema value) to the workflow script with no per-call or run-wide size cap; the script can pass it verbatim into later steps' prompts, and it is also kept whole in agent_results for resume. Only the error string (500 chars) and the agent_finished event summary (120 chars) are truncated. agent_fn's stream_and_collect has no output bound on this path (run_bg_oneliner's max_output_bytes is not used here).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/workflows/runner.py:399-519 — _RunContext.agent: result = await self._agent_fn(prompt, opts) … self.agent_results[call_index] = result … return result
@@ -236,6 +248,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:MOD-4, REVIEW_FINDINGS:B6, verify_needed:G37
 
 ### UI-1 [35, default, effort M] Link-label resolution fires on mount even when the Links tab is hidden, uncached — CONFIRMED
+
+> **COMPLETED** — no code change needed: the frontend caps each request at 20 pending URLs (`website/src/hooks/useChatNavigation.ts:76-91`) and re-queries for the rest as labels arrive, so the 21st and later URLs are labelled; the backend's `links[:20]` only trims a request the frontend never exceeds.
 - **Verified claim:** ChatPage calls useChatNavigation unconditionally (its sections feed the minimap), and that hook issues one POST /api/chat/nav/resolve-links for all bare (non-markdown) URLs in the transcript whenever that set is non-empty — keyed by the joined URL list (staleTime Infinity, default gcTime 5 min), so it refires on mount/reload/new window, after 5 min unmounted, and on any change to the set — even with the side panel closed; the labels are only rendered in the side panel's Links tab, which also hides URLs that have a richer Changes/Issues entry. The backend keeps links[:20] (the oldest 20) and makes one uncached run_bg_oneliner(model='auto') call, so past 20 URLs every new URL re-labels the same 20 and the new one never gets a label. Usage is recorded (bg:chat_nav).
 - **Evidence (at `397f4be`):**
   - website/src/hooks/useChatNavigation.ts:59-79 — linksToResolve = non-fromMarkdown links; batchKey = urls.join('|'); useQuery(['nav-link-summaries', batchKey], staleTime: Infinity, enabled: linksToResolve.length > 0); no gcTime
@@ -260,6 +274,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:UI-1, REVIEW_FINDINGS:Part6/UI-1
 
 ### LOOP-10 [30, default, effort S] Welcome suggestions regenerate each 30 min while open, even if unchanged; background model — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): suggestions.py:95-99 stores context_digest; sha256 compare skips regeneration when unchanged (suggestions.py:285-300). Commit 37799211b. Model sub-claim was already refuted in the finding.
 - **Original claim:** Welcome suggestions regenerate every 30 min even when unchanged, on 'auto' (corrected below)
 - **Verified claim:** While a Welcome view is mounted (it refetches /api/suggestions every 10 min, staleTime 5 min), the gateway regenerates the suggestions whenever the single gateway-wide cache is older than 30 min — with no check whether the assembled context changed — sending up to ~9-10k chars of context (preferences ≤2000, projects ≤3000, recent activity ≤4000, 5 recent sessions, 5 cron names). The cache is global, so several windows do not multiply calls. The model sub-claim is wrong: generate_suggestions passes no model to run_bg_oneliner, so it runs on the _bg session's own default, i.e. the kirocrew-lite spec model = role_models.background ('auto' only when unpinned). Usage IS recorded (bg:suggestions).
 - **Evidence (at `397f4be`):**
@@ -282,6 +298,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:LOOP-10, REVIEW_FINDINGS:H5
 
 ### MOD-3 [30, pinned, effort S] Literal model="auto" overrides a pinned background model — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): Literal 'auto' removed at every bg call site: cron.py:245 (_CONTRADICTION_MODEL=None), sessions.py:1796 (_SUMMARIZE_MODEL=None), stt_stream.py:233 (_ENDPOINT_MODEL=None), core.py:1746-1752 (no model), chat_nav.py:140 (no model), chat_title.py:799-804 (no model…
 - **Verified claim:** Eight background call sites pass the literal 'auto' to run_bg_oneliner: chat titles (chat_title.py:180, used at :809 and :843), link labels (chat_nav.py:74/:112), folder icons (chat_folders.py:115/:200), the lesson-contradiction check (handlers/cron.py:245/:269), session summarize (handlers/sessions.py:1804/:1957), STT polish (handlers/core.py:1747), the dictation endpoint classifier (stt_stream.py:155 default, used at :427) and tips (dashboard.tips_model default 'auto', tips.py:1117/:1124). run_bg_oneliner calls set_model('auto') for any truthy model (it does NOT skip 'auto'), and AcpSessionHandle.set_model sends 'auto' whenever the backend advertises it (the recorded kiro session/new fixture advertises exactly ['auto']), replacing the kirocrew-lite spec's role_models.background pin for that call. Measured with a fake session: model='auto' → set_model calls ['auto']. Suggestions (suggestions.py:248) and folder suggestions pass NO model, so they correctly inherit the pinned _bg default; card generation and session summaries already use resolve_model('background'). The comments at chat_title.py:173-179 and stt_stream.py:150-152 ('run_bg_oneliner skips the override for auto') are stale.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/llm_helpers.py:1676-1678 — `if model_to_use and set_model is not None: await set_model(model_to_use)` (no 'auto' skip)
@@ -344,6 +362,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:crit-risk-1, verification_needed:sink#1, verification_needed:refactor(native-history-measurement)
 
 ### MOD-7 [25, pinned, effort S] Switching to 'auto' keeps the spec model pin only for frozen or sidecar-less main agents — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): Propagated pin is adopted on grandfathered installs (agent.py:3551-3562; a7b425750). Settings shows the template-pin override notice (website/src/pages/settings/ChatPanel.tsx:1025-1030; e3870bbb8).
 - **Original claim:** Switching back to 'auto' does not clear the model pin the UI wrote (corrected below)
 - **Verified claim:** The Settings default-model picker writes config agent.model; a rebuild propagates a concrete pick into ~/.kiro/agents/kirocrew.json, and with agent.model='auto' the factory and the chip fall through to that spec's model (KiroCrewConfig._resolve_agent_model). For a TRACKED spec (sidecar model_managed=True, which every fresh install seeds) switching back to 'auto' DOES clear it: _refresh_dynamic_fields resets the spec to the shipped default and the agent.model live applier rebuilds the spec. The pin survives only when the kirocrew sidecar entry is model_managed=False (a model set in the agent-template editor, which deliberately freezes it) or absent (an install whose sidecar never recorded the main agent, e.g. upgraded from before the sidecar): then the propagated/edited concrete model stays in the spec and 'auto' resolves to it. It is not invisible: the model chip (resolve_effective_model tier 4) and `kirocrew doctor` show the spec pin and suggest `kirocrew agent reset-model`, but the Settings default still reads 'auto'. Measured with the real _refresh_dynamic_fields: managed=True → 'auto' after switch; managed=False → pin kept; no entry → pin kept.
 - **Evidence (at `397f4be`):**
@@ -369,6 +389,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:MOD-7, verify_needed:G25(#16270), verify_needed:G43, verify_needed:G44
 
 ### KNOW-1 [25, armed, effort M] Knowledge agent sync has the model fetch and echo the page — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): Local-first governed fetch before the model: local_fetch_text (knowledge/agent_fetch.py:80-117), model only as fallback (agent_fetch.py:8-11, :132-146). Commit 588b1caec.
 - **Verified claim:** A Knowledge URL source with no registered connector is synced by 'agent-assisted sync': the gateway sends the URL-fetch LLM pool a prompt asking the model to fetch the page with any web/URL tool and 'Return ONLY the raw document text', so the whole document is paid for as model OUTPUT tokens (plus the tool-result input) on every sync; there is no local HTTP attempt first. These calls also write no usage row (USE-1).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/knowledge/agent_fetch.py:22-27 — FETCH_PROMPT_TEMPLATE: 'Fetch the full text content from this URL … Return ONLY the raw document text'
@@ -387,6 +409,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:KNOW-1, REVIEW_FINDINGS:N-lower(knowledge-agent-sync), FIX_PLAN-old:A-14
 
 ### USE-8 [20, default, effort S] Background maintenance usage rows written with an empty model — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): Background rows use served_model (session_handle.py:3552-3562, returns _model or _resolved_model_id), so 'auto' not ''. Commit 91fef491c (and bd2988054 merge).
 - **Verified claim:** background_turn (memory consolidation, auto-title, skill dedupe/merge) writes its usage row with model='' and relies on model_source; the resolver skips an 'auto' _resolved_model_id and only records 'auto' when the provider's _model is literally 'auto'. A kiro background session that inherits its default has _model='' and _resolved_model_id='auto' (kiro's currentModelId), so the row's model is '' and the Spend panel files it under 'unknown' — while the same function, two lines earlier, hands served_model ('auto' or the concrete id) to the crew log. run_bg_oneliner does not have this gap (it passes the served model). Traced on the real default path (factory provider → AcpSessionProvider → AcpSessionHandle → AcpRuntime): no node carries _model='auto', so _source_requests_auto is False. Measured with the real _resolve_model: (_resolved 'auto', _model '') → ''; (_model 'auto') → 'auto'; concrete → concrete. The reporter's 458/5,895 rows figure is not checkable here.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/llm_helpers.py:2323-2341 — crew log gets model=served_model; persist_token_record_async(key, "", usage, …, model_source=client)
@@ -430,6 +454,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G25(#11872)
 
 ### WF-6 [20, armed, effort S] Task-runner loop check compares raw error text, so notice/label miss; retries are capped — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): Fingerprint compare in the step loop (task_executor.py:1131, 1201, 1238, via repeat_loop.error_fingerprint) (f0cb59f28). Re-plan guard refuses a replan ending in the same fingerprint (taskrunner.py:1969-1975). Retries remain capped.
 - **Original claim:** Task-runner loop detection compares raw error strings (corrected below)
 - **Verified claim:** The task runner's repeat-error detector compares task.error by byte equality (three sites), and run_tests keeps only the last 2000 chars of failing output, so volatile text (timestamps, durations, ports, PIDs, a shifting tail window) makes consecutive identical failures look different: the 'Possible loop' notice (2nd identical error) and the 'Loop detected' fail-fast (3rd) never fire. But the retries are NOT unbounded at HEAD: each step's loop is `while attempt < MAX_RETRIES + stop_recoveries` with MAX_RETRIES = 3; stall recoveries are capped by STOP_RECOVERY_MAX_RETRIES (= 3), process-death/compaction recoveries by MAX_RECOVERIES (= 2), dependency waits by 20, and re-plans by MAX_REPLAN (= 2) per run (reset when a run is resumed). Because the fail-fast threshold (3rd identical error) equals MAX_RETRIES, a normalized fingerprint mostly restores the notice and the accurate 'Loop detected' label rather than saving attempts; the bigger lever is a re-plan that does not repeat the same failing step.
 - **Evidence (at `397f4be`):**
@@ -454,6 +480,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G10(#17186), verification_needed:Part3(#17186), verify_needed:G36
 
 ### MOD-11 [15, default, effort S] Model picker may offer an unentitled model on a cold gateway (deliberate); hiding is fixed — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): Fail-open paths mark rows entitlement:'unverified' via _mark_unverified (agents.py:558-568, applied at :617, :665, :708). Commit a0082ac0e.
 - **Original claim:** Model picker offers a model the account cannot run and hides one it can (corrected below)
 - **Verified claim:** Both halves have dedicated code at HEAD. 'Hides one it can run': GET /api/models now serves each kiro catalog row under its model_id (display name kept separately), and the entitlement narrowing re-probes a suspect session/new snapshot (catalog_row_would_drop + maybe_refresh_available_models, 3 s shielded deadline, 503 model_list_revalidating) before dropping a row. 'Offers one it cannot run': the --list-models catalog is narrowed to the newest live kiro session's advertised list via model_is_unusable — but it deliberately FAILS OPEN when no live kiro session exists, the backend advertises nothing, or the advertised set does not intersect the catalog, so on a cold gateway (no session yet) the picker can still offer an unentitled model; an explicit pick of it is then refused at the wire (AcpModelUnavailable) rather than silently swapped. Whether the reporter's case is one of these fail-open windows cannot be decided without the issue body and a live account.
 - **Evidence (at `397f4be`):**
@@ -476,6 +504,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G39(#11757)
 
 ### LOOP-14 [15, armed, effort S] Dynamic cards regenerate for every restored session on restart — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): Durable card store (dynamic_card_store.json, card_lifecycle.py:876-900, _store_card :886). Commit ef6ccb7d5 (9d914c5f1 merge). Restored unchanged cards are republished from the store.
 - **Verified claim:** With dashboard.dynamic_dashboard_cards on (default OFF), every gateway start calls seed_open_sessions(), which notifies each restored slot with reason RESTORED; the card publisher's entries live only in memory, so every eligible slot (root session, has messages, crew log on, not exempt; up to capacity 128) gets a model card generation again even if nothing changed since the last card. There is no stored source hash to skip an unchanged session. Generation is bounded by the publisher budget (one at a time, 2 s debounce, ≥120 s per session, ≤60 per gateway hour), runs on resolve_model('background') and records usage via run_bg_oneliner.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/dashboard/server_runtime/session_restore.py:58-59 — state._dynamic_cards.seed_open_sessions() after restore
@@ -516,6 +546,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:UI-3, REVIEW_FINDINGS:Part6/UI-3
 
 ### USE-4 [15, armed, effort M] API-key auth skips the account credit/limit readout by design; per-turn usage unverified — PARTLY
+
+> **COMPLETED** — API-key auth now carries `local_credits_today` (`dashboard/handlers/sessions.py`, `_local_credits_today`) and the account modal shows it as "Measured locally" (`KiroAccountModal.tsx`, strings in all 12 catalogs). Closed without the backend pytest case, as requested.
 - **Original claim:** API-key accounts see no credit/usage data (corrected below)
 - **Verified claim:** Under API-key authentication the ACCOUNT credit/limit readout is deliberately skipped: the refresh detects whoami account_type 'ApiKey', publishes {available: false, reason: 'api_key_auth'} and the account modal shows 'Credit usage isn't available for API key authentication' — because GetUsageLimits needs an SSO/OIDC bearer token such accounts do not hold, and the /usage text scrape needs the same sign-in. The cited _unavailable_reason (sessions.py:317) is the different sign-in-required path. Not established: that API-key users see NO usage data at all — per-turn usage rows come from the session's own billing metadata (credits per turn), which this skip does not touch; whether kiro-cli emits per-turn credits under API-key auth needs a live check.
 - **Evidence (at `397f4be`):**
@@ -537,6 +569,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G8(#17443), verification_needed:Part3(#17443)
 
 ### WF-5 [15, armed, effort S] opts.effort (and nudge) ignored by shipped agent_fn — CONFIRMED
+
+> **COMPLETED** — effort is honoured on both adapters (`agent_exec.py:183`, `agent_pool.py:425,494`, commit 736dd91b0); `nudge` is documented as reserved, the fallback in the finding's own solution (`docs/system-specs/modules/workflows.md:183-184`).
 - **Verified claim:** ctx.agent(effort=…, nudge=…) values reach agent_fn's opts dict, but neither shipped adapter (agent_exec.build_agent_fn, agent_pool.build_pooled_agent_fn) reads opts['effort'] or opts['nudge'], so a script cannot lower (or raise) a step's reasoning effort and the per-call nudge dict is a no-op; steps run at the factory's effort (the chat effort, see MOD-1). The separate ctx.nudge() method does work. workflows.md records this as an open question.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/workflows/runner.py:399-444 — agent(…, effort=None, …, nudge=None) put into opts {'effort': effort, 'nudge': nudge}
@@ -556,6 +590,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:WF-5, REVIEW_FINDINGS:W8
 
 ### MOD-10 [10, default, effort S] Background one-liners share one runtime; only its spawn and session/new start serialize — PARTLY
+
+> **COMPLETED** — doc half: the one-permit session-start gate is documented in `docs/system-specs/modules/acp-client.md`. Closed without the fake-runtime test, as requested; code is unchanged.
 - **Original claim:** All background callers serialize behind one shared runtime (corrected below)
 - **Verified claim:** Background one-liner callers share ONE _bg runtime process, but they serialize only at two points: (a) the _bg_runtime_lock while the runtime is checked or (re)spawned, and (b) a separate one-permit _bg session/new start gate that is released as soon as session/new answers. After that each caller holds its own ephemeral session on the multiplexed runtime and its prompt streams concurrently with the others; there is no per-session semaphore that queues suggestions, titles, labels and cards behind each other for the whole call. The throughput ceiling is therefore session-start latency (one start at a time) plus whatever concurrency kiro-cli gives one process, not full serialization. The one-permit gate is a deliberate design (so one-liners never take a user's start permit).
 - **Evidence (at `397f4be`):**
@@ -576,6 +612,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:Z3
 
 ### UI-4 [10, default, effort S] Tips run maybe_refresh before the cadence check — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): maybe_refresh moved after the offered-tip re-serve and the cadence gate (tips.py:1236-1262). Commit 85ecef3ac. Refresh deduped by digest (tips.py:1126-1127).
 - **Verified claim:** GET /api/tips/next calls maybe_refresh() (a background run_bg_oneliner tip generation whenever the stored tips are older than 6 h) BEFORE it checks for an outstanding offered tip or the cadence gate, so a request that will return {tip: null} — cadence closed — or re-serve an already-offered tip can still start a generation. The client fires the GET 10 s into a running turn, at most every ~20 min. Net cost is bounded by the 6 h refresh interval (≤4 generations/day while tips are enabled, the default), on the tips_model ('auto' by default, see MOD-3).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/tips.py:50 — _REFRESH_INTERVAL_SECS = 6 * 60 * 60
@@ -597,6 +635,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:UI-4, REVIEW_FINDINGS:Part6/UI-4
 
 ### USE-9 [10, default, effort S] Applied credit multiplier not in usage telemetry — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): rate_multiplier added to the usage row via _catalog_rate_multiplier (usage.py:1472, 1496, 1592). Commit a68b384ba (e64d83ee4 merge).
 - **Verified claim:** Usage rows carry provider, model, token counts, cost, credits, turns, duration, surface, agent, context and stop_reason, but no credit/rate multiplier. The multiplier exists only on the model-picker path: kiro catalog rows' rate_multiplier is passed through to the frontend as rateMultiplier for a price badge. Credits recorded per turn are already the billed (multiplied) amount, so the gap is attribution — a row cannot say which multiplier produced its credits — not missing spend.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/dashboard/handlers/usage.py:1474-1500 — _build_token_record fields: _type, ts, slot, app, provider, model, input, output, cache_create, cache_read, cost, credits, turns, duration_ms, surface, agent, context_used, context_window, stop_reason (no multiplier)
@@ -615,6 +655,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G25(#11214)
 
 ### UI-6 [8, default, effort S] Chat side panel polls /api/workflows/runs every 2.5 s while open, any tab or run state — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): Poll gated on open and the Workflows view (ActivityViewer.tsx:1009-1016 enabled: open && view==='workflows'), refetchInterval only while a run of this slot is running. Commit 404ae5cb9 (bf522fbaf merge).
 - **Original claim:** Chat side panel polls workflow runs every 2.5 s regardless of tab (corrected below)
 - **Verified claim:** The chat side panel (ActivityViewer) polls GET /api/workflows/runs every 2.5 s whenever the panel is open (`enabled: open`), whichever of its tabs is active and whether or not any run of this slot is running; React Query's default pauses it while the browser tab is in the background. Each poll lists every run and awaits a per-run scope check before serializing off-loop, so the cost grows with the number of stored runs. Correction: the endpoint is not a 'deliberately slow backstop' — the deliberately slow (15 s) backstop is the separate heal-tick reconcile in hooks/websocket/workflowRuns.ts, which makes no request when no row is running. No model calls are involved.
 - **Evidence (at `397f4be`):**

@@ -199,6 +199,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:Part3(#17311)
 
 ### REL-15 [40, default, effort M] Opaque MCP tool read as WORKING is never cut off before the 4 h turn ceiling (by design) — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): be05d445a: `watchdog.tool_working_opaque_cap_secs` (service_sections.py) bounds opaque-MCP WORKING deferral; session_handle.py reclassifies to UNKNOWN past the cap; shell children and wait tool unchanged   Default 7200 s is half the 14400 s turn ceiling; "well…
 - **Original claim:** Tool watchdog never bounds a WORKING verdict for opaque MCP tools (corrected below)
 - **Verified claim:** For an opaque (non-shell, non-wait) MCP tool the liveness oracle reads WORKING whenever ANY CPU/IO counter moved anywhere in the runtime's whole descendant tree (every MCP server under that kiro-cli, not just the one serving the call), and both WORKING branches in AcpSessionHandle defer with no ceiling, so a lost result frame keeps the call open until the turn ceiling. The ceiling is agent.chat_turn_timeout_secs, default 14400 s (4 h, clamp 300 s..24 h), not 2 h; tool_stall_hard_cap_secs (7200 s) bounds only UNKNOWN verdicts. The no-ceiling WORKING behaviour is documented as intentional ('WORKING tools ... are never cancelled regardless of duration'), so the fix is a policy change, not a missed branch.
 - **Evidence (at `397f4be`):**
@@ -221,6 +223,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G13(#17065)
 
 ### SEC-11 [40, default, effort M] Lessons reach session-start context unreviewed; learn_add pre-approved beside web_fetch — PARTLY
+
+> **COMPLETED** — decided by the operator: option (b), framing-only. Recorded in `docs/decisions/2026-10-07-lessons-advisory-provenance.md`. Option (c), removing `learn_add` from the default approvals, was not taken, so `learn_add` stays pre-approved by design.
 - **Original claim:** Externally sourced lessons auto-admitted into prompt context (corrected below)
 - **Verified claim:** The mechanism holds but the pointer is mis-scoped. The per-turn path the claim cites (_TURN_LESSONS_MAX = 3 / 2,000 chars in context_assembly/store_admission.py) is OFF by default (memory.inject_lessons_per_turn = False). The live default exposure is the session-start lessons block (memory.inject_lessons = True). Lessons reach the store with no human review gate from: the agent's own learn_add MCP tool, history consolidation's LLM extraction from the chat, task-runner extraction, and onboarding import. Skills, by contrast, stage under .pending. On the default main agent both web_fetch and the whole @kirocrew-core server (which carries learn_add) are in allowedTools, so a prompt-injected agent can persist a 'lesson' without any approval prompt, and it is injected into later sessions. The only gate is governance `capabilities.memory_writes`, whose catalog default is permitted. Automatic writers cannot overwrite a human NOT-clause (learn.py save vs save_or_enrich), and vector rows carry a `source` tag (e.g. 'consolidation'), but nothing withholds an untrusted-provenance lesson from injection.
 - **Evidence (at `397f4be`):**
@@ -425,6 +429,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G14(#17031)
 
 ### REL-32 [35, armed, effort S] Pooled backends orphaned across gatewayd death — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 01bd8ae8d: mcp_gateway/manager.py now calls `_reap_orphaned_backends()` on the daemon-exited-on-its-own path before respawn   Reap is on the own-death branch as the finding requires
 - **Verified claim:** Pooled MCP backends are spawned as their own session leaders and gatewayd persists their pids to a `<socket>.backends` sidecar so a supervisor can killpg them, but the manager reaps that sidecar ONLY inside _terminate_process after a SIGTERM->SIGKILL escalation (the zombie-probe branch). When gatewayd dies on its own (crash, OOM-kill, external SIGKILL — the watchdog's 'daemon exited rc=...' branch), the manager just backs off and respawns without calling _reap_orphaned_backends, and the new daemon rewrites the same sidecar path with its own pids, losing the old ones. Backends that exit on stdin EOF (Crew's own run_mcp_stdio_loop does) self-terminate; third-party servers that do not are orphaned. Scope: armed (mcp_gateway.enabled, default False).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/mcp_gateway/manager.py:1660-1666 — inside _terminate_process after SIGKILL: 'SIGKILL skips gatewayd's pool.shutdown_all(), so its pooled MCP backends (each a session leader via start_new_session) reparent to init and leak. Reap the pgids gatewayd persisted out-of-band.' `await self._r…
@@ -464,6 +470,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:V-5
 
 ### REL-14 [30, default, effort S] taskq_fail announces refusal before its store write lands — CONFIRMED
+
+> **PARTIAL (progress)** — loop side done: `spawn_async` awaits the owed `taskq_fail_async` before it returns a refusal (`subagent.py`, `taskq_bridge.py`). Test: `test_a_loop_refusal_is_answered_only_after_its_failed_write_commits`. Tests added: `test_a_refusal_whose_write_retries_is_answered_after_the_retry_commits` (done-when a) and `test_a_refusal_the_store_never_commits_is_tombstoned_not_dispatched` (tombstone set; the pump and `reconcile_on_boot` consult it). Still open: a direct assertion that a pump drain and `reconcile_on_boot` never dispatch the tombstoned row.
 - **Verified claim:** SpawnAdmissionCoordinator.taskq_fail posts one best-effort store.finish(FAILED) to the store's writer thread (or runs it inline off-loop) and returns None; a TaskStoreUnavailable (locked/unwritable DB, full disk, network FS) is swallowed at debug, and a process exit before the writer drains loses it. All five gate.py callers then return _announce_rejection unconditionally. The row is left in whatever active state it had: QUEUED for a spawn_async-accepted, unclaimed row (comment: 'a row left queued would run once admission reopens'), ADMITTED for a pump-drained row; reconcile_on_boot transitions ADMITTED -> QUEUED ('lost_owner') and leaves QUEUED queued, so the pump can dispatch work whose caller was told it was refused. Both 'claimed' and 'admitted' readings in the sources describe real cases.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/subagent_manager/admission/taskq_bridge.py:1192-1201 — `def taskq_fail(...) -> None: ... self._post_store_write(store, f"fail {agent_id}", store.finish, agent_id, _taskq.FAILED, error=reason)`
@@ -528,6 +536,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G25(#12624)
 
 ### REL-40 [30, default, effort S] Transport prompt timeout floor ignores a lower configured ceiling — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): f0d269c2b: slack/handler_runtime/inbound.py and dashboard/handlers/taskrunner.py (both auto-turn sites) now use `spawn_guarded_turn`, bounded by agent.chat_turn_timeout_secs   Source-scan guard test not verified
 - **Verified claim:** prompt_timeout_for_ceiling returns _DEFAULT_PROMPT_TIMEOUT (14400 s) for any configured ceiling <= 14400, so agent.chat_turn_timeout_secs: 300 still yields a 4 h JSON-RPC prompt wait. This floor is deliberate (docstring: 'a LOWERED turn ceiling is enforced by the dashboard's own deadline'), and that other layer exists — turn_dispatch.spawn_guarded_turn/_bounded_turn and bounded_chat_turn wrap dashboard chat, Slack (gateway.py:8952/:9792), cron-inject, messaging, MCP-app inject and spec_builder turns in asyncio.wait_for(chat_turn_timeout_secs()). But it is not universal: at least the Slack->linked-dashboard-slot inbound turn and the task-runner plan/review auto-turns start `asyncio.create_task(_run_chat(...))` with no ceiling wrapper, and _run_chat applies none itself, so on those paths a lowered ceiling is not honoured and the effective bound is the 4 h transport floor.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/acp/client.py:3067 — `_DEFAULT_PROMPT_TIMEOUT = 14400.0`; :3074-3090 prompt_timeout_for_ceiling — `if configured <= _DEFAULT_PROMPT_TIMEOUT: return _DEFAULT_PROMPT_TIMEOUT`
@@ -681,6 +691,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:SEC-4, REVIEW_FINDINGS:Part1#7
 
 ### REL-46 [30, default (needs one pinned or foldered transcript with a malformed field; metadata lines are agent-writable), effort S] _apply_recent_session has no rollback: a bad title/tab_id aborts the restore loop — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 9f8b81c86 (chat_persistence.py): `_apply_recent_session` now has `except BaseException` rollback (chat_persistence.py:1689-1693); both restore loops wrap each session in try/except (:1729-1745, :1869-1885) with the REL-46 comment   Per-session skip and rollbac…
 - **Original claim:** Dashboard slot restore has no rollback on a malformed field (corrected below)
 - **Verified claim:** The startup recent-sessions restore (_apply_recent_session, chat_persistence.py:1573-1680) has no rollback and no per-session catch. It restores pinned or foldered sessions by default, and every recent one when dashboard.restore_sessions is on. A non-string metadata `title` raises after get_or_create_slot (:1625), leaving an empty half-built slot registered, and aborts the whole loop. An unhashable `tab_id` raises inside get_or_create_slot (no slot registered) and also aborts the loop. Every session after the bad one in list_sessions order is not restored (it sorted last in my run; if it sorts first, none restore). The exception is uncaught through start_dashboard (server.py:2236) and GatewayOrchestrator.run (slack/gateway.py:12857-13005 has only local RuntimeError trys), so gateway startup fails while that transcript stays pinned or foldered. No construction mark is involved: the resume and import paths do roll back their mark.
 - **Evidence (at `397f4be`):**
@@ -721,6 +733,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:REL-10, REVIEW_FINDINGS:Part1#9
 
 ### REL-19 [25, default, effort S] All seven mcp-* servers import numpy; per-core OpenBLAS cost is Linux-only, unmeasured — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): dc1ada450: knowledge/retrieval.py numpy import deferred to first search (`_numpy_available` at :22-34 and call-time imports). grep finds no top-level numpy import under src/kiro_crew/knowledge, mcp_*.py or platform/   Import chain not executed (deps missing in…
 - **Original claim:** Every mcp-* server imports numpy and starts a per-core OpenBLAS pool (corrected below)
 - **Verified claim:** Every mcp-* server module imports numpy at startup: mcp_core imports kiro_crew.knowledge.retrieval at module top (which does `try: import numpy as np`), and mcp_cron, mcp_work, mcp_crew_log, mcp_panel and mcp_computer all end up with numpy loaded through the same chain; mcp_dashboard additionally loads it via stt.engine and stt.vad (unconditional `import numpy as np`). The import is confirmed on this host. The cost claim (a per-core OpenBLAS thread pool, ~7.5 CPU-s per server start) is specific to numpy wheels linked against OpenBLAS (Linux); on this macOS host numpy uses Accelerate, the whole server import costs ~0.4 CPU-s with numpy ~21 ms and no extra threads, so the CPU figure was not reproducible here.
 - **Evidence (at `397f4be`):**
@@ -811,6 +825,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G37(#12854)
 
 ### REL-21 [25, armed, effort S] Claude Code executable resolution runs blocking `mise which` on the event loop — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 70bacc934: acp/client.py now `await asyncio.to_thread(_resolve_claude_code_executable)`  
 - **Verified claim:** When the selected backend is the Claude adapter and CLAUDE_CODE_EXECUTABLE is unset, the async AcpClient._spawn calls _resolve_claude_code_executable() synchronously on the event loop; that runs _mise_which, i.e. shutil.which('mise') and, if mise is installed, a blocking subprocess.run([mise, 'which', 'claude'], timeout=5), then shutil.which over the augmented PATH. Every Claude-backend spawn therefore stalls the whole gateway loop for the mise round-trip (bounded at 5 s per spawn), while the surrounding spawn steps are deliberately offloaded with asyncio.to_thread. Scope: armed (Claude backend selected, mise on PATH).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/acp/client.py:7912 `async def _spawn(self)`; :8645-8651 — `if self._is_claude and not env.get("CLAUDE_CODE_EXECUTABLE"): ... claude_exe = _resolve_claude_code_executable()` (no to_thread)
@@ -868,6 +884,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G30(#14637)
 
 ### REL-34 [20, default, effort S] Judge, task-refine and hook-run work folders never reclaimed; eval folders are cleaned — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 956e973f3: judge, task-refine and hook-run session keys are now fresh per call and classified disposable in session_work_dir.py   Eval folders were already cleaned
 - **Original claim:** Judge/task-refine/hook/eval run folders never reclaimed (corrected below)
 - **Verified claim:** Confirmed for judges, task-refine and hook runs; not for evals. Each one-run LLM call that keys a fresh session — the decision judge (`judge-<uuid4>`), task refine (`taskrunner:refine:<ms>`), the dashboard hook test/default run (`hook:default:<epoch>`) — gets its own derived work directory workspace_root()/<safe key> (judge-<hex>, taskrunner_refine_<ms>, hook_default_<epoch>). The only reclaim machinery (session_work_dir: provider shutdown reclaim + hourly predecessor sweep) acts solely on directories marked disposable, and is_disposable_session_key accepts only subagent:, stateless cron:<job>:<run> and memory-consolidation: shapes, so these directories are never marked, never reclaimed, and not even counted by the doctor's DERIVED_NAME_RE census. Evals are the exception: eval/runner.py runs inside tempfile.TemporaryDirectory(prefix='kirocrew_eval_'), which is removed on exit.
 - **Evidence (at `397f4be`):**
@@ -907,6 +925,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:A13, verification_needed:crit-risk-2, verification_needed:refactor(chat_runner-split)
 
 ### REL-44 [20, default, effort S] importlib.reload replaces shutdown_event — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): c03dfc2a4: gateway reads version from disk instead of importlib.reload(kiro_crew); no kiro_crew reload remains (only app-module reloads in apps/backend.py, registry.py)  
 - **Verified claim:** The git auto-update path (_auto_apply_update, only when KIROCREW_PROJECT_DIR is set, i.e. a source checkout) calls importlib.reload(kiro_crew) just to read the new __version__. Reloading re-executes kiro_crew/__init__.py, which rebinds kiro_crew.shutdown_event to a fresh _LazyShutdownEvent. The SIGTERM/SIGINT handler and every module imported before the reload hold the OLD object, so after the reload a signal sets only the old event: the /readyz handler (reads kiro_crew.shutdown_event attribute-style) keeps advertising ready during a graceful stop, and any module first imported after the reload binds the new event and never sees the signal. This matters when the restart is then deferred (drain timeout / no usable interpreter) and the process keeps serving on reloaded state.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/slack/gateway.py:12633 — `importlib.reload(kiro_crew)` inside _auto_apply_update (:11836), followed by `new_ver = kiro_crew.__version__`
@@ -928,6 +948,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:Part3(#17085)
 
 ### REL-7 [20, default, effort S] File watch never reconnects after a connection drop — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): ac2eb6bb2: useFileWatch.ts reconnects with backoff after transient drops (EventSource onerror path, reconnect 1 s doubling to 30 s)  
 - **Verified claim:** useFileWatch closes the EventSource on any onerror and sets status 'error'. It re-subscribes only when the filePath argument changes. Its only consumer, MarkdownPanel, passes `watchArmable && active ? filePath : null`, so a gateway restart, laptop sleep or network drop stops live updates of the visible file tab until the user switches tabs or reopens the file. The close-on-error is deliberate, to stop EventSource auto-reconnecting against a 404 for a directory or missing path. The hook cannot tell that case apart from a transient drop.
 - **Evidence (at `397f4be`):**
   - website/src/hooks/useFileWatch.ts:35-47 — `es.onerror = () => { ... es.close(); esRef.current = null; setStatus('error') }`
@@ -1011,6 +1033,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:A11
 
 ### REL-3 [18, default, effort S] Notifications history rewritten non-atomically — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): aab0b1eb0 (dashboard/state.py): both notifications rewrite and trim now use atomic_write  
 - **Verified claim:** _rewrite_notifications and _maybe_trim_notifications both overwrite notifications.jsonl in place with Path.write_text, which truncates and then writes. A kill, crash or ENOSPC partway through leaves a truncated or empty history file. The repo's atomic_write helper (temp file + os.replace, with a `newline` parameter) exists and is not used here. Impact is bounded: the module documents the history as best-effort ('history is a cache, delivery is the broadcast'), and all notification I/O is serialised on one single-worker executor, so the exposure is crash/disk-full, not concurrency.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/dashboard/state.py:10699-10707 _rewrite_notifications — `path.write_text("".join(lines), encoding="utf-8")`
@@ -1048,6 +1072,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:P1-4, verification_needed:refactor(build_message)
 
 ### REL-50 [15, default, effort S] session/new gate is host-sized ('auto'); outer cold-start _start_sem is still fixed at 4+1 — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 285d85b31 (session_allocation.py:209-226 `new_cold_start_semaphore`): outer cold-start width now `max(MAX_CONCURRENT_COLD_STARTS, effective_session_start_concurrency("auto"))` + foreground reserve, so it follows the host   MAX_CONCURRENT_COLD_STARTS=4 remains …
 - **Original claim:** Cold-start queues not sized from the host (corrected below)
 - **Verified claim:** Half sized from the host at HEAD. The SessionStartGate that bounds outstanding ACP session/new requests is host-sized when agent.session_start_concurrency is 'auto' (the default): session_start_sizing reads the usable cores (affinity + cgroup cpu.max) and available memory once at boot and uses roughly min(cpus // 4, available_GB // 3) clamped to [2, 16]. The outer cold-start queue — SessionManager's _start_sem, which every new session's provider.start() holds — is still a fixed constant: MAX_CONCURRENT_COLD_STARTS = 4 background permits plus FOREGROUND_COLD_START_RESERVE = 1, independent of the host. Tracker state of #17075 / PR #17123 not checkable.
 - **Evidence (at `397f4be`):**
@@ -1093,6 +1119,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:Part3(#17325)
 
 ### REL-36 [15, armed, effort S] mcp-gateway SpawnGate waiters not priority-ordered — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 28265ce36 + 1e0bb17e7: mcp_gateway/admission.py SpawnGate has interactive and background waiter queues (:306-321); interactive granted ahead, FIFO within class, background aging  
 - **Verified claim:** mcp-gateway's SpawnGate admits backend spawns in strict FIFO order from a single deque with no priority classes, so an interactive session's server start waits behind any earlier queued spawn (prewarm, background or bulk session fan-out) once the 4 in-flight slots (default capacity, floor 1, ceiling 8) are taken. Scope: armed (only when the broker runs).
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/mcp_gateway/admission.py:204-205 `class SpawnGate: """FIFO admission with a movable fixed capacity. Single event loop."""`; `self._waiters: deque[_Waiter] = deque()`
@@ -1110,6 +1138,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verify_needed:G25(#15830)
 
 ### REL-8 [15, armed, effort S] Research lab page falls back to polling forever after one SSE error — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 344389b2f: apps/auto-research/ResearchLabPage.tsx (:615-636) retries the EventSource with backoff and stops polling on reconnect  
 - **Verified claim:** CampaignDetail sets sseFailed=true and closes the EventSource on the first SSE error. The campaign query then refetches every 5 s for as long as that campaign stays open, because sseFailed resets only when `id` changes. The stream is never retried and nothing tells the user. The backend stream does not end on its own (a `while True` loop with a 15 s keepalive timeout), so only a real drop triggers this. Updates keep arriving through polling, so the cost is latency and requests, not data.
 - **Evidence (at `397f4be`):**
   - website/src/apps/auto-research/ResearchLabPage.tsx:605 — `const [sseFailed, setSseFailed] = useState(false)`
@@ -1151,6 +1181,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** verification_needed:Part3(#17035)
 
 ### REL-4 [12, default, effort S] Notification trim failures swallowed silently — CONFIRMED
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): aab0b1eb0: `_notifications_persist_failure` logs trim and rewrite failures at WARNING, rate-limited (state.py)   Replaces the silent `except: pass`
 - **Verified claim:** _maybe_trim_notifications ends in `except Exception: pass`, with no logging at any level. If a trim fails persistently (unreadable line handling, a permission change, a full disk), the file keeps growing and nothing records why. The sibling _rewrite_notifications only logs at DEBUG. The trim also re-reads the whole file on every append before checking the size, so growth makes every append slower.
 - **Evidence (at `397f4be`):**
   - src/kiro_crew/dashboard/state.py:10763-10764 — `except Exception:\n pass`
@@ -1168,6 +1200,8 @@ Part of the validated findings set; start at [00-index.md](00-index.md). Code ve
 - **Sources:** FIX_PLAN:REL-4, REVIEW_FINDINGS:Part1#11
 
 ### REL-6 [10, default, effort S] AppIcon leaves SVGs with an XML prolog or leading comment blank; no shipped icon has one — PARTLY
+
+> **COMPLETED** — verified fixed on `main` by code read (no tests run): 3b8b09639: components/AppIcon.tsx falls back to the placeholder path when a 2xx body is not an SVG (prolog or comment)   Latent case only, as the finding says
 - **Original claim:** SVG icons with XML prolog or leading comment never render (corrected below)
 - **Verified claim:** The mechanism is as claimed. AppIcon's fetch handler stores markup only when `text.trim().startsWith('<svg')`. Any other 2xx body (an `<?xml` prolog, a leading `<!--` comment, a BOM-free HTML page) sets neither markup nor imgFailed, so the component renders the empty placeholder span forever. Overstated as a live defect: this path is reached only by first-party bundled icons matching `^/app-assets/<a>/<b>.svg$`, and none of the 109 SVGs shipped under src/kiro_crew and website/public starts with anything but `<svg`. It is a latent robustness gap that turns a future prolog-carrying asset into a silent blank icon instead of the fallback.
 - **Evidence (at `397f4be`):**
