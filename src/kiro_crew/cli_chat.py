@@ -1084,7 +1084,9 @@ async def _send_and_print(
                     await _answer_permission(provider, event, interactive=interactive, gate=gate)
                 elif event.kind == EVENT_COMPLETE:
                     break
-        print()  # final newline
+            # Final newline before metered_turn exits: its usage-row write can
+            # log to stderr, which would otherwise land on the reply's last line.
+            print()
     except AcpTimeoutError as e:
         if e.partial_output:
             print(e.partial_output)
