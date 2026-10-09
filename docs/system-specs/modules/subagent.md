@@ -2448,7 +2448,9 @@ Specified in [taskq.md](taskq.md); this section is the manager's side of it.
   already exists -- a committed `_store_accepted` row not yet claimed, or a
   drained row -- marks it `failed` in the store in the same step
   (`_refuse_row` -> `taskq_fail`), so the caller's verdict and the store's
-  agree and no refused work stays executable. Capacity is never a refusal for a
+  agree and no refused work stays executable. On the loop (`spawn_async`) that
+  write is deferred and awaited before the refusal is returned (REL-14), so the
+  caller is told "refused" only after the store committed the failure. Capacity is never a refusal for a
   committed row: a prevalidated app spawn (`_agent_prevalidated`, the SpawnSDK)
   that finds no slot queues like any other row, with the flag CLEARED in its
   queue entry so the drain re-validates the agent and re-proves app ownership

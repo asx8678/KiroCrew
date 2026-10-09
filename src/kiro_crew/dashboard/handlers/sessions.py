@@ -681,6 +681,21 @@ def _redact_strings(value: object) -> object:
     return value
 
 
+def _local_credits_today() -> float | None:
+    """Credits the local usage store recorded today, or ``None`` if unreadable.
+
+    Used under API-key auth, where the account limit is not reported: the
+    local rows are the only usage figure the dashboard can still show.
+    """
+    from kiro_crew.dashboard.handlers import usage as _usage
+
+    try:
+        day = time.strftime("%Y-%m-%d", time.localtime())
+        return round(sum(_usage.surface_daily_credits(day).values()), 6)
+    except (OSError, ValueError):
+        return None
+
+
 def _publish_usage(payload: dict[str, object]) -> None:
     """Atomically replace the cache served by ``/api/sessions/usage``."""
     global _usage_cache, _usage_cache_ts
@@ -1022,7 +1037,13 @@ async def _fetch_usage_bg() -> str | None:
             isinstance(account_type, str)
             and re.sub(r"[^a-z0-9]", "", account_type.lower()) == "apikey"
         ):
-            _publish_usage({"available": False, "reason": "api_key_auth"})
+            _publish_usage(
+                {
+                    "available": False,
+                    "reason": "api_key_auth",
+                    "local_credits_today": _local_credits_today(),
+                }
+            )
             logger.info("Kiro usage: not available under API key auth; skipping fetch")
             return None
         raw_arn = identity.get("_profile_arn")

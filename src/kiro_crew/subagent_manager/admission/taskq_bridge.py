@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio as _asyncio
+import contextvars as _contextvars
 import functools as _functools
 import logging as _logging
 import time as _time
@@ -30,6 +31,14 @@ from .types import (
 )
 
 _glue_logger = _logging.getLogger("kiro_crew.subagent_manager.admission")
+
+# Set by ``SubagentManager.spawn_async`` for the duration of one loop-side spawn.
+# While it is set, a refusal's terminal ``failed`` write is recorded here instead
+# of being posted, so ``spawn_async`` can AWAIT the commit before it answers the
+# caller (the announce-after-commit ordering REL-14 requires on the loop).
+_OWED_STORE_FAILS: "_contextvars.ContextVar[dict[str, str] | None]" = _contextvars.ContextVar(
+    "owed_store_fails", default=None
+)
 
 
 def _refused_rows_path() -> Path:
@@ -1266,6 +1275,10 @@ class _TaskqBridgeMixin(ManagerComponent):
         """
         from kiro_crew import taskq as _taskq
 
+        owed = _OWED_STORE_FAILS.get()
+        if owed is not None:
+            owed[agent_id] = reason
+            return
         store = self.taskq_store()
         if store is None:
             return

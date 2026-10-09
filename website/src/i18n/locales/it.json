@@ -5784,6 +5784,8 @@
       "checking_account": "Verifica dell’account…",
       "checking_credit_usage": "Verifica dell’utilizzo dei crediti",
       "credit_usage_api_key_auth": "L’utilizzo dei crediti non è disponibile con l’autenticazione tramite chiave API",
+      "credit_usage_local_today_label": "Misurato localmente",
+      "credit_usage_local_today": "{{credits}} crediti misurati localmente oggi. Il limite dell’account non è disponibile con l’autenticazione tramite chiave API.",
       "credit_usage_no_reading": "Nessuna lettura del saldo è ancora disponibile per questo account.",
       "credit_usage_config_unreadable": "Impossibile caricare le impostazioni, quindi il tuo saldo non può essere mostrato.",
       "credit_usage_signin_required": "L’utilizzo dei crediti in tempo reale non è disponibile: non è stato possibile leggere alcuna credenziale di accesso Kiro attiva, quindi l’API di utilizzo gratuita non è mai stata interrogata. Accedi di nuovo a Kiro (per esempio eseguendo kiro-cli login) per ripristinarlo.",

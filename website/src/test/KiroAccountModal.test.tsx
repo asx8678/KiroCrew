@@ -5,7 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import KiroAccountModal, { type KiroAccountUsage } from '../components/KiroAccountModal'
 import { api } from '../api/client'
 import type { KiroCreditUsage } from '../api/client'
-import type { KiroUsageState } from '../api/kiroUsage'
+import type { KiroApiKeyUsage, KiroUsageState } from '../api/kiroUsage'
+
+const API_KEY_USAGE: KiroApiKeyUsage = { kind: 'api-key', localCreditsToday: null }
 import { installSoftNavigate, __resetNavSeamForTests } from '../utils/errorReport'
 import { renderWithProviders } from './helpers'
 
@@ -199,11 +201,20 @@ describe('KiroAccountModal', () => {
     expect(screen.queryByText('Account details unavailable')).not.toBeInTheDocument()
   })
 
+  it('shows today’s locally measured credits under API-key auth', async () => {
+    renderWithProviders(
+      <KiroAccountModal open onClose={vi.fn()} usage={{ kind: 'api-key', localCreditsToday: 3.5 }} />,
+    )
+
+    expect(await screen.findByText('Measured locally')).toBeInTheDocument()
+    expect(screen.getByText(/3\.50 credits measured locally today/)).toBeInTheDocument()
+  })
+
   it('explains API-key auth instead of spinning or claiming a generic failure', async () => {
     // 'api-key' is terminal by construction: the usage API needs an SSO/OIDC
     // token that auth type never has (#5728). The panel must say so — not spin,
     // and not show the generic unavailable line that reads as a transient error.
-    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage="api-key" />)
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={API_KEY_USAGE} />)
 
     expect(
       await screen.findByText('Credit usage isn’t available for API key authentication'),
@@ -250,7 +261,7 @@ describe('KiroAccountModal', () => {
     // agent to act on, so it keeps the passive notice. This pins the split — a
     // blanket migration would put a recovery button next to a line that needs
     // no recovery.
-    for (const usage of ['api-key'] as const) {
+    for (const usage of [API_KEY_USAGE] as const) {
       const { unmount } = renderWithProviders(
         <KiroAccountModal open onClose={vi.fn()} usage={usage} />,
       )
@@ -366,7 +377,7 @@ describe('KiroAccountModal refresh', () => {
     }
     // API-key auth has no credit readout to refresh; an expired sign-in would
     // fail again; a loading cache has nothing to refresh yet.
-    for (const usage of ['api-key', 'signin-required', null] as const) {
+    for (const usage of [API_KEY_USAGE, 'signin-required', null] as const) {
       const { unmount } = renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
       expect(screen.queryByRole('button', REFRESH)).not.toBeInTheDocument()
       unmount()

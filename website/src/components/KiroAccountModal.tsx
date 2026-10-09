@@ -4,8 +4,8 @@ import { AlertCircle, Coins, ExternalLink, Eye, EyeOff, Gift, Loader2, RefreshCw
 
 import { api } from '../api/client'
 import type { KiroBonusCreditGrant, KiroCreditUsage, KiroUsageRefreshResponse } from '../api/client'
-import { parseKiroUsagePayload } from '../api/kiroUsage'
-import { fmtCurrency, fmtDateFields, fmtNumber, fmtPercent, fmtTime } from '../i18n/format'
+import { isApiKeyUsage, type KiroApiKeyUsage, parseKiroUsagePayload } from '../api/kiroUsage'
+import { fmtCredits, fmtCurrency, fmtDateFields, fmtNumber, fmtPercent, fmtTime } from '../i18n/format'
 import { i18nT } from '../i18n/t'
 import { safeGetItem, safeSetItem } from '../utils/safeStorage'
 import Clickable from './Clickable'
@@ -36,13 +36,13 @@ export type KiroAccountUsage =
   | null
   | 'none'
   | 'failed'
-  | 'api-key'
+  | KiroApiKeyUsage
   | 'signin-required'
   | 'config-unreadable'
 
 /** True only for an actual reading, so the sentinels cannot reach a field access. */
 const isUsageReading = (usage: KiroAccountUsage): usage is KiroCreditUsage =>
-  typeof usage === 'object' && usage !== null
+  typeof usage === 'object' && usage !== null && !isApiKeyUsage(usage)
 
 /**
  * The no-reading states a refresh can fill. `'api-key'` is excluded because that
@@ -510,11 +510,21 @@ function CreditUsage({ usage, onClose }: { usage: KiroAccountUsage; onClose: () 
               {/* `none` reports that no reading exists yet, not that a read failed
                   (`failed`, above, says that), so its copy names the absence and
                   the Refresh under it is the way to fill it. */}
-              {i18nT(usage === 'api-key'
+              {i18nT(isApiKeyUsage(usage)
                 ? 'components.kiroAccountModal.credit_usage_api_key_auth'
                 : 'components.kiroAccountModal.credit_usage_no_reading')}
             </div>
           )}
+        {/* API-key auth: the account limit is unknown, but today's local rows are
+            measured here, so the total is shown and labelled as local. */}
+        {!outcomeReplacesNotice && isApiKeyUsage(usage) && usage.localCreditsToday !== null && (
+          <DetailRow
+            label={i18nT('components.kiroAccountModal.credit_usage_local_today_label')}
+            value={i18nT('components.kiroAccountModal.credit_usage_local_today', {
+              credits: fmtCredits(usage.localCreditsToday),
+            })}
+          />
+        )}
         {/* Refresh sits directly under the notice that says there is no reading. */}
         {canRefreshUsage(usage) && refreshButton(false)}
       </div>

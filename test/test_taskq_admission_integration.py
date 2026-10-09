@@ -1771,3 +1771,93 @@ async def test_task_queue_disabled_keeps_legacy_queue(
         q = mgr.spawn("b", parent_session_key="dash:1")
     assert q.queued and len(mgr._queue) == 1
     assert not (Path(os.environ["KIROCREW_HOME"]) / "tasks").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_loop_refusal_is_answered_only_after_its_failed_write_commits(quiet) -> None:
+    """REL-14: the loop-side caller hears "refused" only after the store agrees.
+
+    The sync gates owe a terminal ``failed`` write for a row ``spawn_async``
+    already committed. ``spawn_async`` must await that write before it returns
+    the refusal, so the announce-after-commit ordering holds on the loop, and the
+    sync gate must not post the write itself.
+    """
+    mgr = await _manager(max_concurrent=2)
+    order: list[str] = []
+
+    async def body(task, **kwargs):
+        mgr._admission.taskq_fail("row-1", "refused")
+        order.append("gate-refused")
+        return None
+
+    async def commit(agent_id, reason):
+        order.append(f"commit {agent_id}")
+        return True
+
+    with (
+        patch.object(mgr, "_spawn_async_body", new=body),
+        patch.object(type(mgr._admission), "taskq_fail_async", new=AsyncMock(side_effect=commit)),
+    ):
+        result = await mgr.spawn_async("t", parent_session_key="dash:x")
+    order.append("answered")
+    assert result is None
+    assert order == ["gate-refused", "commit row-1", "answered"]
+    await mgr.cancel_all()
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_whose_write_retries_is_answered_after_the_retry_commits(quiet) -> None:
+    """REL-14 done-when (a): a locked store is retried once before the refusal lands.
+
+    The first ``finish`` raises ``TaskStoreUnavailable``; the retry commits. The
+    caller must be answered only after the second attempt, and no tombstone is
+    left behind.
+    """
+    mgr = await _manager(max_concurrent=2)
+    store: TaskStore = mgr._taskq
+    attempts: list[str] = []
+
+    def finish(agent_id, state, **kw):
+        attempts.append(f"finish {agent_id}")
+        if len(attempts) == 1:
+            raise TaskStoreUnavailable("locked")
+        return True
+
+    async def body(task, **kwargs):
+        mgr._admission.taskq_fail("row-r", "refused")
+        return None
+
+    with (
+        patch.object(mgr, "_spawn_async_body", new=body),
+        patch.object(store, "finish", side_effect=finish),
+    ):
+        result = await mgr.spawn_async("t", parent_session_key="dash:x")
+    attempts.append("answered")
+    assert result is None
+    assert attempts == ["finish row-r", "finish row-r", "answered"]
+    assert mgr._admission.refused_row_reason("row-r") == ""
+    await mgr.cancel_all()
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_the_store_never_commits_is_tombstoned_not_dispatched(quiet) -> None:
+    """REL-14 done-when (b): a permanently failing write leaves a tombstone.
+
+    Both attempts fail. The caller is still answered (the refusal stands), and the
+    row is tombstoned so the pump and the boot reconciler will not dispatch it.
+    """
+    mgr = await _manager(max_concurrent=2)
+    store: TaskStore = mgr._taskq
+
+    async def body(task, **kwargs):
+        mgr._admission.taskq_fail("row-p", "refused")
+        return None
+
+    with (
+        patch.object(mgr, "_spawn_async_body", new=body),
+        patch.object(store, "finish", side_effect=TaskStoreUnavailable("disk full")),
+    ):
+        result = await mgr.spawn_async("t", parent_session_key="dash:x")
+    assert result is None
+    assert mgr._admission.refused_row_reason("row-p") == "refused"
+    await mgr.cancel_all()

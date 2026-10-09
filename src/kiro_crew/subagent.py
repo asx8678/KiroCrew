@@ -5093,6 +5093,26 @@ class SubagentManager:
     async def spawn_async(self, task: str, **kwargs: Any) -> SubagentInfo | None:
         """:meth:`spawn` for event-loop callers (``/api/spawn``).
 
+        A refusal of a row this call already committed owes a terminal
+        ``failed`` write. The sync gates record that debt instead of posting it,
+        and it is awaited here before the refusal is returned, so the caller is
+        told "refused" only once the store agrees (REL-14).
+        """
+        from kiro_crew.subagent_manager.admission.taskq_bridge import _OWED_STORE_FAILS
+
+        owed: dict[str, str] = {}
+        token = _OWED_STORE_FAILS.set(owed)
+        try:
+            info = await self._spawn_async_body(task, **kwargs)
+        finally:
+            _OWED_STORE_FAILS.reset(token)
+        for agent_id, reason in owed.items():
+            await self._admission.taskq_fail_async(agent_id, reason)
+        return info
+
+    async def _spawn_async_body(self, task: str, **kwargs: Any) -> SubagentInfo | None:
+        """:meth:`spawn` for event-loop callers (``/api/spawn``).
+
         Write-before-ack with the write OFF the loop: the policy gates run
         first (``prepare_spawn``), the row is written on the store's dedicated
         writer thread (``TaskStore.run``), and only then does the sync

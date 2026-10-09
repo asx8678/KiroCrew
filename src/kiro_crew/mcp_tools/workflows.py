@@ -299,7 +299,7 @@ def workflow_run(name: str, args: dict[str, Any]) -> str:
             f"Started workflow run `{d.get('run_id')}`. It is authoring the workflow "
             "from your request now (watch the Authoring phase in the Workflows tab / "
             "chat activity), then runs in the background. Its result will be injected "
-            f"here on completion — or check progress with workflow_status('{d.get('run_id')}').",
+            "here on completion; end your turn and do not poll for it.",
         )
     wf_body["source"] = source
     d = mcp_core._post("/api/workflows/run", wf_body, session_key=session_key)
@@ -308,9 +308,9 @@ def workflow_run(name: str, args: dict[str, Any]) -> str:
     return _wf_return(
         "workflow_run",
         f"Started workflow run `{d.get('run_id')}` (name: {d.get('name') or '—'}). "
-        "It runs in the background — monitor with workflow_status, and its result "
-        "will be injected here on completion. You can keep working; check back with "
-        f"workflow_status('{d.get('run_id')}').",
+        "It runs in the background, and its result will be injected here on "
+        "completion. End your turn; do not poll workflow_status for it "
+        f"(run `{d.get('run_id')}`).",
     )
 
 

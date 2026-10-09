@@ -21,9 +21,23 @@ const MAX_KIRO_BONUS_DAYS_LEFT = 3_650
 export type KiroUsageState =
   | KiroCreditUsage
   | 'none'
-  | 'api-key'
+  | KiroApiKeyUsage
   | 'signin-required'
   | null
+
+/**
+ * API-key auth: the account limit is never reported, but the local usage store
+ * still holds today's rows. `localCreditsToday` is `null` when the gateway did not
+ * send a figure, so the modal shows the plain notice alone.
+ */
+export interface KiroApiKeyUsage {
+  readonly kind: 'api-key'
+  readonly localCreditsToday: number | null
+}
+
+/** True for the API-key sentinel, so callers never compare the object by identity. */
+export const isApiKeyUsage = (usage: unknown): usage is KiroApiKeyUsage =>
+  typeof usage === 'object' && usage !== null && (usage as { kind?: unknown }).kind === 'api-key'
 
 export function parseKiroUsagePayload(d: { usage?: KiroUsagePayload } | undefined): KiroUsageState {
   const u: KiroUsagePayload = d?.usage || {}
@@ -101,7 +115,11 @@ export function parseKiroUsagePayload(d: { usage?: KiroUsagePayload } | undefine
   // credential -> also terminal, with its remedy named: sign in again. Empty
   // cache (Kiro warming) -> spinner.
   if (u.available === false) {
-    if (u.reason === 'api_key_auth') return 'api-key' as const
+    if (u.reason === 'api_key_auth') {
+      const local = u.local_credits_today
+      const localCreditsToday = typeof local === 'number' && Number.isFinite(local) ? local : null
+      return { kind: 'api-key', localCreditsToday } satisfies KiroApiKeyUsage
+    }
     if (u.reason === 'signin_required') return 'signin-required' as const
     return 'none' as const
   }

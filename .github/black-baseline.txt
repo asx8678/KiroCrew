@@ -551,7 +551,6 @@ test/test_handlers_files_upload.py
 test/test_handlers_mcp_coverage.py
 test/test_heartbeat_atomic_merge.py
 test/test_heartbeat_prompt_deliver.py
-test/test_heartbeat_retention.py
 test/test_heartbeat_sel_prune_offload.py
 test/test_history.py
 test/test_history_atomic_rewrite.py
@@ -658,7 +657,6 @@ test/test_meetings_dictionary.py
 test/test_meetings_providers.py
 test/test_memory_benchmark_workflow.py
 test/test_memory_selfheal.py
-test/test_merge_queued_messages.py
 test/test_message_provenance.py
 test/test_message_queue.py
 test/test_messaging_link.py

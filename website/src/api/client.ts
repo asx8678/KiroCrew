@@ -1076,6 +1076,8 @@ export interface KiroUsagePayload {
   email?: string
   account_type?: string
   start_url?: string
+  /** Credits the local usage store recorded today; set when `reason` is `api_key_auth`. */
+  local_credits_today?: number | null
 }
 
 /** `POST /api/sessions/usage/refresh` — the GET envelope plus the declined-scrape marker. */

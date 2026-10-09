@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Coins, Loader2 } from 'lucide-react'
 import { api } from '../../api/client'
-import { parseKiroUsagePayload, type KiroUsageState } from '../../api/kiroUsage'
+import { isApiKeyUsage, parseKiroUsagePayload, type KiroUsageState } from '../../api/kiroUsage'
 import { isKiroBackend, type AcpBackendConfig } from '../../api/acpBackend'
 import type { KiroAccountUsage } from '../../components/KiroAccountModal'
 import { fmtCompact } from '../../i18n/format'
@@ -128,7 +128,7 @@ export function kiroUsageSegment({ kiroUsageState, kiroCreditSurface, setKiroUsa
       // spinner are both dropped: without it the failed and warming
       // states are one coin glyph apart in opacity alone.
       node = (<button key="usage" className={`${seg} text-muted opacity-60`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_unavailable')} aria-label={i18nT('app.kiro_credit_usage_unavailable')}><Coins size={12} /> <span className="font-mono text-[11px] tabular-nums">—</span></button>)
-    } else if (kiroUsageState === 'api-key') {
+    } else if (isApiKeyUsage(kiroUsageState)) {
       // API-key auth: the usage API needs an SSO/OIDC token this
       // account type never has, so this is a PERMANENT state, not a
       // failure. Same terminal dash as 'failed' (nothing is in

@@ -440,7 +440,6 @@ from kiro_crew.dashboard.handlers.session_storage import (  # noqa: E402, F401
     api_session_storage_restore,
 )
 from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
-    _SHUTDOWN_TIMEOUT_SECS,
     _fetch_usage_bg,
     _parse_usage,
     _remove_slot_for_history_key,

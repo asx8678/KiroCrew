@@ -1541,7 +1541,11 @@ theirs, not the class's:
 - `taskq_fail`'s posted `finish` (`admission/taskq_bridge.py`): a row refused before
   it registered, so `queued → failed` and `admitted → failed` are both edges and
   there is no generation to fence against. A refusal leaves a claimable row the
-  sweeps settle, never work replayed.
+  sweeps settle, never work replayed. Inside `SubagentManager.spawn_async` (REL-14)
+  the write is not posted: `taskq_fail` records the owed failure in a context
+  variable, and `spawn_async` awaits `taskq_fail_async` for each one before it
+  returns the refusal, so the loop-side caller hears "refused" only after the store
+  committed it (or the tombstone holds it).
 - `taskq_mark`'s posted `taskq_advance`: best-effort BY CONTRACT — nothing awaits
   it, so it may not raise into the spawn path or the run loop — and a lost mark is
   recovered by `TaskStore.advance` replaying the missed step at the NEXT mark

@@ -5879,6 +5879,8 @@
       "checking_account": "アカウントを確認中…",
       "checking_credit_usage": "クレジット使用量を確認中",
       "credit_usage_api_key_auth": "API キー認証ではクレジット使用量を確認できません",
+      "credit_usage_local_today_label": "ローカルで計測",
+      "credit_usage_local_today": "本日ローカルで計測された {{credits}} クレジット。API キー認証ではアカウントの上限を確認できません。",
       "credit_usage_no_reading": "このアカウントの残高はまだ読み取れていません。",
       "credit_usage_config_unreadable": "設定を読み込めなかったため、残高を表示できません。",
       "credit_usage_signin_required": "ライブのクレジット使用量を利用できません: 有効な Kiro のサインイン資格情報を読み取れなかったため、無料の使用量 API は呼び出されていません。Kiro に再度サインインしてください (例: kiro-cli login を実行)。",

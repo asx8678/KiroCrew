@@ -5784,6 +5784,8 @@
       "checking_account": "Vérification du compte…",
       "checking_credit_usage": "Vérification de l’utilisation des crédits",
       "credit_usage_api_key_auth": "L’utilisation des crédits n’est pas disponible avec l’authentification par clé d’API",
+      "credit_usage_local_today_label": "Mesuré localement",
+      "credit_usage_local_today": "{{credits}} crédits mesurés localement aujourd’hui. La limite du compte n’est pas disponible avec l’authentification par clé API.",
       "credit_usage_no_reading": "Aucune lecture du solde n’est encore disponible pour ce compte.",
       "credit_usage_config_unreadable": "Impossible de charger les réglages, ton solde ne peut donc pas être affiché.",
       "credit_usage_signin_required": "L’utilisation des crédits en direct n’est pas disponible : aucune information de connexion Kiro active n’a pu être lue, l’API d’utilisation gratuite n’a donc jamais été interrogée. Reconnecte-toi à Kiro (par exemple en exécutant kiro-cli login) pour la rétablir.",
