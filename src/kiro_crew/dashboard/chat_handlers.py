@@ -10327,6 +10327,12 @@ async def api_chat_slot_color(request: web.Request) -> web.Response:
 
 _MAX_CONTEXT_PER_SOURCE = 10
 _MAX_CONTEXT_CONTENT = 40000
+# Byte cap on a /context request body: the content limit at its worst JSON
+# encoding (an ensure_ascii astral char is a 12-byte surrogate-pair escape, which
+# our own kirocrew-client-py sends via aiohttp ``json=``) plus room for source,
+# maxAge and ephemeral, so every body whose content passes the char limit fits.
+# A larger body is a 413.
+_MAX_CONTEXT_BODY_BYTES = _MAX_CONTEXT_CONTENT * 12 + 4096
 # Default expiry for a note's context half: if the user never sends a follow-up
 # within 24h, the stale entry is dropped at drain rather than attaching itself to
 # some far-future unrelated message. The visible transcript line has no maxAge.
@@ -10632,6 +10638,10 @@ async def api_chat_slot_context(request: web.Request) -> web.Response:
             "ephemeral": true,         // optional, default true
             "maxAge": 300              // optional, seconds
         }
+
+    A body over ``_MAX_CONTEXT_BODY_BYTES`` is refused 413 before it is parsed.
+    One turn's drain prepends at most ``_MAX_DRAINED_CONTEXT_CHARS`` of frames,
+    newest entries first; older ones are named in an omission notice and logged.
     """
 
     state: DashboardState = request.app["state"]
@@ -10647,7 +10657,9 @@ async def api_chat_slot_context(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
 
-    body, body_err = await read_bounded_json(request, max_bytes=None)
+    # The body carries one entry of at most _MAX_CONTEXT_CONTENT chars, so cap the
+    # read just above it rather than relying on the app-wide 60 MB limit.
+    body, body_err = await read_bounded_json(request, max_bytes=_MAX_CONTEXT_BODY_BYTES)
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success

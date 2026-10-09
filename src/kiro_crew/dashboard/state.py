@@ -1792,6 +1792,11 @@ _NON_DURABLE_SOURCE_LINK_ROLES = frozenset({"chunk", "done", "streaming", "queue
 # FIFO ceiling on a slot's pending-context queue (app-kit context inject +
 # Slack thread backfill). Shared so the two eviction sites cannot drift.
 _MAX_PENDING_CONTEXT = 50
+# Total characters one drain may prepend to a turn. The queue ceiling bounds the
+# entry COUNT, not their size: 50 entries of up to 40K chars each would put ~2M
+# chars into one user turn, outside every context budget. The drain keeps the
+# newest whole entries up to this total and names the rest in an omission notice.
+_MAX_DRAINED_CONTEXT_CHARS = 64_000
 
 
 def context_entry_expired(entry: dict, now: float) -> bool:

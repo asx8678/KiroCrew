@@ -126,14 +126,27 @@ def drain_pending_context(slot: "_ChatSlot") -> str:
     shared by every producer (app-kit context inject, Slack thread backfill),
     rather than duplicated inline where a key rename could silently break a
     consumer while its producer's own tests stay green.
+
+    One drain prepends at most ``_MAX_DRAINED_CONTEXT_CHARS`` of
+    frames. The queue ceiling bounds the entry count, not their size, and the
+    prefix is part of the user's turn, outside every background budget. Live
+    entries are walked newest first and kept WHOLE until the next one would cross
+    the total; the newest live entry is always kept. The kept entries are emitted
+    in their original chronological order, and the rest are named in one
+    ``[Background context omitted: N entries from ...]`` line and logged, never
+    dropped silently.
     """
+    # Imported here, not at module level: an owner reads its names from the
+    # runner's namespace at call time, and the runner does not re-export this one.
+    from kiro_crew.dashboard.state import _MAX_DRAINED_CONTEXT_CHARS as max_chars
+
     # A note's halves resolve their destination here, not at the POST, so a slot
     # rebound since the write must not hand its content to the new session.
     slot.drop_foreign_authorized_notes()
     if not slot._pending_context:
         return ""
     now = time.time()
-    ctx_parts: list[str] = []
+    framed: list[tuple[str, str]] = []
     for entry in slot._pending_context:
         if context_entry_expired(entry, now):
             continue  # expired — silently discard
@@ -142,14 +155,46 @@ def drain_pending_context(slot: "_ChatSlot") -> str:
         # never fires and the header would render [Background context from ""],
         # an unattributed block under a "not authored by the user" claim.
         source = entry.get("source") or "app"
-        ctx_parts.append(
-            f'[Background context from "{source}"]\n'
-            f"{_CONTEXT_FRAME_CONTRACT}\n"
-            f'{entry["content"]}\n'
-            f"[End of background context]\n"
+        framed.append(
+            (
+                source,
+                f'[Background context from "{source}"]\n'
+                f"{_CONTEXT_FRAME_CONTRACT}\n"
+                f'{entry["content"]}\n'
+                f"[End of background context]\n",
+            )
         )
     slot._pending_context.clear()
-    return "\n".join(ctx_parts) + "\n" if ctx_parts else ""
+    if not framed:
+        return ""
+    # Newest first, whole entries only: the walk stops at the first entry that
+    # would cross the total, so every older one goes too and the kept set stays
+    # one contiguous, most-recent run. Each part costs its frame plus the "\n"
+    # separator the join below adds.
+    kept_from = len(framed) - 1
+    total = len(framed[-1][1]) + 1
+    while kept_from > 0 and total + len(framed[kept_from - 1][1]) + 1 <= max_chars:
+        kept_from -= 1
+        total += len(framed[kept_from][1]) + 1
+    ctx_parts = [frame for _source, frame in framed[kept_from:]]
+    omitted = framed[:kept_from]
+    if omitted:
+        sources = list(dict.fromkeys(source for source, _frame in omitted))
+        omitted_chars = sum(len(frame) for _source, frame in omitted)
+        logger.warning(
+            "pending context drain over %d chars on slot %s: omitted %d older "
+            "entries (%d chars) from sources %s; kept %d newest",
+            max_chars,
+            getattr(slot, "key", "?"),
+            len(omitted),
+            omitted_chars,
+            sources,
+            len(ctx_parts),
+        )
+        named = ", ".join(f'"{source}"' for source in sources)
+        noun = "entry" if len(omitted) == 1 else "entries"
+        ctx_parts.append(f"[Background context omitted: {len(omitted)} {noun} from {named}]\n")
+    return "\n".join(ctx_parts) + "\n"
 
 
 def _detach_appended_context(original: str, expanded: str) -> tuple[str, str]:

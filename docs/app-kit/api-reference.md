@@ -813,6 +813,10 @@ Options: `{ source?: string, ephemeral?: boolean, maxAge?: number }`
 - `maxAge`: must be a finite positive number (rejects boolean, NaN, Infinity, ≤0); omit or pass null for no expiry
 - `content`: must be a non-empty string, ≤40,000 chars
 
+**Body size** (413): the request body is capped at 484,096 bytes, checked before it is parsed: the content limit at its worst JSON encoding (12 bytes per character, an emoji escaped as a `\uXXXX\uXXXX` pair, as Python's `json.dumps` and aiohttp's `json=` do by default) plus 4 KiB for the other fields. Any body whose `content` is within the 40,000-character limit fits.
+
+**Per-turn drain cap**: the next turn prepends at most 64,000 characters of injected context, counted over the framed entries. Entries are taken newest first and kept whole until the next one would cross the total (the newest is always kept), then emitted in their original order. Older entries that did not fit are dropped from that turn and replaced by one `[Background context omitted: N entries from "<source>", ...]` line naming their sources; the omission is logged on the gateway. Keep injected context small and recent: queuing more than fits does not reach the model.
+
 **Capacity** (429 `capacity_reached`): a slot holds at most 50 pending context entries (expired ones are dropped first). A full queue refuses the new entry rather than evicting an older one, so one app's burst cannot push out another producer's queued context; retry after the slot's next turn drains it.
 
 **Ownership** (404 on refusal; applies to app callers — a dashboard caller is unrestricted):
