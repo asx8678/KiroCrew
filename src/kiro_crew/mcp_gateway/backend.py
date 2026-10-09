@@ -24,7 +24,7 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Awaitable, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Mapping, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.constants import (
@@ -86,7 +86,7 @@ from kiro_crew.sandbox import (
 from kiro_crew.security import redact
 from kiro_crew.sel import SecurityEventLog
 
-if False:  # typing-only import guard
+if TYPE_CHECKING:
     from kiro_crew.mcp_gateway.pool import PoolKey
 
 logger = logging.getLogger(__name__)

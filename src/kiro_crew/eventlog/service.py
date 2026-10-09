@@ -1476,7 +1476,6 @@ class MemberEventLogService:
                 type,
             )
             raise CloserTailContention(slug, type)
-            return None
 
     def _fold_gap_locked(self, slug: str, log: MemberLog, *, below: int | None = None) -> None:
         """Fold events on disk that this process has not folded; caller holds the lock.
