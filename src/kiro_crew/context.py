@@ -4217,7 +4217,9 @@ class ContextBuilder:
             self._dedup_triggered_bodies(skill_bodies_session, agent, reset=True, candidates=[])
 
         # Triggered skills (on-demand, any message) — skip for custom agents.
-        # A match injects the skill's full body by DEFAULT, unchanged. A skill
+        # A CONFIDENT match (a phrase of two or more content words matched in
+        # full) injects the skill's full body by DEFAULT; a weaker one earns
+        # only the pointer line (SKL-1). A skill
         # unconfined skill that declares itself an offer rather than a mandate
         # opts out with `inject_on_trigger: false` and contributes a pointer line
         # instead. Confined project skills always take the body path so every
@@ -4277,7 +4279,22 @@ class ContextBuilder:
                     history_source=prior_turns,
                 )
 
-            triggered = self.skills.get_triggered_skills(text, project_dir=project, select=select)
+            # SKL-1: score only what the user typed (or a transform hook's
+            # rewrite of it), exactly as the per-turn lessons path below does.
+            # The turn `text` also carries attachments and dispatcher context,
+            # and a pasted log is full of the common words one-word triggers
+            # are made of. `user_text_range` already defaults to the whole text
+            # when the caller gave no span. `weak_trigger` collects matches too
+            # weak to earn a body; they are delivered as pointers below.
+            trigger_text = (
+                hook_result.text
+                if hook_result.action == HOOK_MODIFY
+                else text[user_text_range[0] : user_text_range[1]]
+            )
+            weak_trigger: set[str] = set()
+            triggered = self.skills.get_triggered_skills(
+                trigger_text, project_dir=project, select=select, weak_out=weak_trigger
+            )
             mapped = agent_skill_globs(agent, project_dir=project) if agent else []
             if mapped:
                 allowed = {
@@ -4287,7 +4304,9 @@ class ContextBuilder:
                 triggered = [key for key in triggered if key in allowed]
 
             if triggered:
-                enforced, pointer_only = self.skills.split_triggered(triggered, project)
+                enforced, pointer_only = self.skills.split_triggered(
+                    triggered, project, weak=weak_trigger
+                )
                 # Log the split, not just the match: a pointed-at skill the
                 # agent declines to read leaves no other trace, so without this
                 # "the skill stopped being followed" is indistinguishable from
@@ -4384,7 +4403,9 @@ class ContextBuilder:
                 # gets a NAME-ONLY line instead — the match signal survives
                 # and nothing behind the confinement boundary is named beyond
                 # the skill's own key (SKL-6).
-                confined = set(self.skills.confined_triggered(enforced, project))
+                # Over pointer_only too: a WEAK confined match lands there
+                # (SKL-1) and, with no pointer form, needs the name-only line.
+                confined = set(self.skills.confined_triggered(enforced + pointer_only, project))
                 pointered = demoted + over_budget + too_big + pointer_only
                 hint = self.skills.trigger_hint(
                     [name for name in pointered if name not in confined], project
@@ -4392,7 +4413,13 @@ class ContextBuilder:
                 if hint:
                     parts.append(_neutralize_structural_markers(hint))
                 for name in pointered:
-                    if name in confined:
+                    if name in confined and name in weak_trigger:
+                        safe = _neutralize_structural_markers(name)
+                        parts.append(
+                            f"[Skill: {safe}] may apply to this message; read it "
+                            "with the skill tool if it does.\n\n"
+                        )
+                    elif name in confined:
                         safe = _neutralize_structural_markers(name)
                         parts.append(
                             f"[Skill: {safe}] Its body is already in this "

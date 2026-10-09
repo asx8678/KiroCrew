@@ -4430,7 +4430,15 @@ the installed-skill count, so it does not grow with the corpus this section is a
 **Trigger matching (`get_triggered_skills`) — per-message hot path.** Runs on
 every non-custom-agent message via the context builder, scoring word-overlap of
 the message against each skill's `triggers` (negative `!`-prefixed triggers
-exclude). To keep it off the per-message filesystem/config hot path:
+exclude). The message scored is the **user's typed span only** (SKL-1): the
+context builder passes `text[user_text_range[0]:user_text_range[1]]`, or a
+transform hook's rewrite when one ran, exactly as the per-turn lessons path
+does, so attachment text and dispatcher-prefixed context never fire a trigger
+(a 400 KB pasted Slack log alone fired two skills, 43,853 chars of bodies).
+With no span given, `user_text_range` defaults to the whole turn text, so a
+caller that never separated its text keeps its behavior. The audit row's
+`text_hash` therefore hashes that span. The Jev `select` pick still receives the
+whole turn text. To keep it off the per-message filesystem/config hot path:
 - the discovered skill-file list is served from the **catalog snapshot** rather
   than a walk (`_iter`; see *The catalog snapshot* above). Expiry of
   `_ITER_CACHE_TTL_SECS` SCHEDULES a re-walk and keeps serving the previous list,
@@ -4474,8 +4482,28 @@ exclude). To keep it off the per-message filesystem/config hot path:
 - exactly **one** SEL audit event is emitted for the matched set (skipped
   entirely when nothing matched, the common case), not one per skill scanned.
 
-A match injects the skill's **full body, by default and unchanged.** What is new
-is a per-skill way out: `inject_on_trigger: false` in a skill's frontmatter
+A match is not automatically a body (SKL-1). Every match still clears the shared
+`MIN_TRIGGER_OVERLAP` bar, but only a **strong** match earns the body:
+`trigger_match.strong_trigger_match` is true when some positive phrase carries
+at least `MIN_STRONG_CONTENT_WORDS` (2) content words (function words such as
+"the" or "for" do not count) and every word of it appears in the message, i.e.
+the phrase scores 1.0. A one-word phrase (score 1.0 on any message that merely
+uses the word) or a partial overlap that passes 0.7 (three words of four) is a
+**weak** match: `get_triggered_skills(weak_out=...)` reports it in a
+caller-owned set and `split_triggered(..., weak=...)` routes it to the pointer
+partition, so it contributes the `trigger_hint()` line at most. A weak
+*confined* project skill has no pointer form, so it gets a name-only
+`[Skill: name] may apply …` line instead of its body. Strong matches sort
+ahead of weak ones before the `max_triggered` cap, so a one-word hit cannot
+crowd a confident match out. A Jev `select` pick replaces the match and is never
+weak. Measured before the change on a 96-message corpus at cap 3: 50.1% of
+injected body bytes were false positives, and one-word phrases won 67% of the
+false-positive matches. The strictness lives in a predicate BESIDE
+`trigger_score`, not in it: crew routing (`rank_triggered`) shares the overlap
+score and keeps its semantics unchanged.
+
+A strong match injects the skill's **full body, by default.** Beyond that,
+there is a per-skill way out: `inject_on_trigger: false` in a skill's frontmatter
 reduces its contribution to a single `[Relevant skills for this message]` line —
 name, truncated description, `SKILL.md` path, containing dir — rendered by
 `trigger_hint()`, and the agent reads the file if the skill applies, the same
@@ -4515,7 +4543,8 @@ always goes through full-body injection even if its frontmatter says
 the pointer would invite the agent to reopen a mutable checkout path directly after the
 descriptor-confined metadata read, letting a link swap bypass the confined reader.
 `split_triggered()` therefore forces every row with a confinement root into the body
-partition, and `trigger_hint()` independently refuses to render confined paths.
+partition (except a weak match, which gets the name-only line described above), and
+`trigger_hint()` independently refuses to render confined paths.
 
 Why the knob is worth having: a body is 8k–34k chars, and word-overlap matching
 pulls in large unrelated skills often enough that body price per match makes

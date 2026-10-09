@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import islice, zip_longest
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Callable, Iterable, Iterator, Literal, NamedTuple
+from typing import Callable, Collection, Iterable, Iterator, Literal, NamedTuple
 
 from kiro_crew import hooks as hooks_module
 from kiro_crew import pinned_fs, skill_trust
@@ -125,7 +125,12 @@ from kiro_crew.skill_search_index import (  # noqa: F401
 from kiro_crew.skill_usage import names_skill_file  # noqa: F401  (read_credit reads it via sk)
 from kiro_crew.skill_usage import SKILL_USAGE_FILENAME, SkillUsageLedger
 from kiro_crew.skills_script_validator import MAX_SCRIPT_BYTES, validate_scripts
-from kiro_crew.trigger_match import MIN_TRIGGER_OVERLAP, trigger_score, words_of
+from kiro_crew.trigger_match import (
+    MIN_TRIGGER_OVERLAP,
+    strong_trigger_match,
+    trigger_score,
+    words_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -5406,6 +5411,7 @@ class SkillsLoader:
         project_dir: str | Path | None = None,
         *,
         select: Callable[[], list[str] | None] | None = None,
+        weak_out: set[str] | None = None,
     ) -> list[str]:
         """Return names of skills whose triggers match the given text.
 
@@ -5427,8 +5433,21 @@ class SkillsLoader:
         them as given. A cap of zero (the shipped default) is the matcher
         switched off: no skill is scanned or scored and no trigger audit row is
         written; only *select* can still name skills.
+
+        *weak_out*, when given, is a caller-owned set this call fills with the
+        returned names whose match is WEAK (SKL-1): no positive phrase of at
+        least two content words matched in full
+        (``trigger_match.strong_trigger_match``). A one-word phrase or a
+        partial overlap still matches, but earns at most a pointer line, never
+        a body -- pass the set to :meth:`split_triggered` as ``weak=``. Strong
+        matches sort ahead of weak ones before the cap, so a one-word hit
+        cannot crowd a confident match out of a slot. A list *select* returns
+        replaces the match and is never weak. An out-parameter, not loader
+        state: concurrent turns share this loader.
         """
-        scored: list[tuple[str, float]] = []
+        # (name, score, strong) -- `strong` only orders and partitions delivery;
+        # whether an entry matches at all is still the shared overlap bar.
+        scored: list[tuple[str, float, bool]] = []
         # Skills a negative trigger actively excluded — a permission DENY that
         # must still be audited (see the audit event below).
         negated_skills: list[str] = []
@@ -5475,10 +5494,12 @@ class SkillsLoader:
             if negated and best_overlap >= _MIN_TRIGGER_OVERLAP:
                 negated_skills.append(name)
             elif not negated and best_overlap >= _MIN_TRIGGER_OVERLAP:
-                scored.append((name, best_overlap))
+                scored.append((name, best_overlap, strong_trigger_match(triggers, text_words)))
 
-        scored.sort(key=lambda x: x[1], reverse=True)
-        triggered = [name for name, _ in scored[:cap]]
+        scored.sort(key=lambda x: (x[2], x[1]), reverse=True)
+        kept = scored[:cap]
+        triggered = [name for name, _score, _strong in kept]
+        weak = {name for name, _score, strong in kept if not strong}
 
         # An external *select* runs BEFORE the audit below so the one row records
         # what is actually injected. Its three readings: a list replaces the
@@ -5492,6 +5513,10 @@ class SkillsLoader:
                 logger.debug("skills.select: selection failed (%s)", type(exc).__name__)
             if selected is not None:
                 triggered = list(selected)
+                # A selection is a deliberate pick, not a word overlap.
+                weak = set()
+        if weak_out is not None:
+            weak_out.update(weak)
 
         # Emit ONE audit event for the matched + denied sets rather than one per
         # skill. A SEL entry per skill (incl. every non-match) on every message
@@ -5509,7 +5534,7 @@ class SkillsLoader:
                 # A pointer is an offer the agent may decline, so an auditor
                 # reconstructing "was this procedure actually in the prompt?"
                 # needs the split — the skill list alone does not answer it.
-                bodies, pointers = self.split_triggered(triggered, project_dir)
+                bodies, pointers = self.split_triggered(triggered, project_dir, weak=weak)
                 metadata["bodies"] = ",".join(bodies)
                 metadata["pointers"] = ",".join(pointers)
             if selected is not None:
@@ -5528,13 +5553,17 @@ class SkillsLoader:
         return triggered
 
     def split_triggered(
-        self, names: list[str], project_dir: str | Path | None = None
+        self,
+        names: list[str],
+        project_dir: str | Path | None = None,
+        *,
+        weak: Collection[str] = (),
     ) -> tuple[list[str], list[str]]:
         """Split matched *names* into (inject-body, pointer-only), order preserved.
 
         Contract and rationale: ``skill_runtime.delivery.split_triggered``.
         """
-        return _delivery.split_triggered(self, names, project_dir)
+        return _delivery.split_triggered(self, names, project_dir, weak=weak)
 
     def confined_triggered(
         self, names: list[str], project_dir: str | Path | None = None

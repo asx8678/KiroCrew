@@ -270,15 +270,25 @@ word-overlap matching entirely; discovery then runs through the skill index,
 The mechanism, when on:
 
 - `skills.py` → `get_triggered_skills` scores each visible skill's comma-separated
-  `triggers` through `trigger_match.py` → `trigger_score`. A phrase's score is the
+  `triggers` through `trigger_match.py` → `trigger_score`, against the **user's
+  typed span only** (`user_text_range`, or a transform hook's rewrite), the same
+  slice the per-turn lessons path uses, so attachment text never fires a
+  trigger. A phrase's score is the
   fraction of *its* words present in the message; an entry's score is its best
   phrase; a `!`-prefixed phrase whose words all appear is a veto evaluated after
   every positive, so phrase order cannot change the outcome.
 - The bar is `MIN_TRIGGER_OVERLAP = 0.7`. `always: true` skills are excluded (already
   pinned) and a `repo_scope` mismatch suppresses mechanically. Matches are then
-  truncated to `max_triggered`, highest score first.
-- `skill_runtime/delivery.py` → `split_triggered` decides delivery. **A matched
-  skill's full body lands in the prompt as `[Skill: name]` the first time it
+  truncated to `max_triggered`, strong matches first, then highest score.
+- Only a **strong** match earns a body (SKL-1): `trigger_match.py` →
+  `strong_trigger_match` requires some positive phrase of at least two content
+  words (function words do not count) matched in full. A one-word phrase, or a
+  partial overlap that clears the bar, is **weak**: `get_triggered_skills` reports
+  it through its `weak_out` set and `split_triggered(..., weak=...)` gives it the
+  pointer line at most (a weak confined project skill gets a name-only line). Crew
+  routing's `rank_triggered` shares the overlap score but not this predicate.
+- `skill_runtime/delivery.py` → `split_triggered` decides delivery. **A strongly
+  matched skill's full body lands in the prompt as `[Skill: name]` the first time it
   matches in a provider session**; a later match of the same unconfined skill in
   that same session demotes to the one-line pointer in `[Relevant skills for this
   message]` instead, because the provider replays the body from native history
@@ -287,9 +297,10 @@ The mechanism, when on:
   on a real session: the heartbeat names its `_hb` session there, so a skill two
   tasks of one cycle match reaches it once. An unconfined skill opts out entirely
   with `inject_on_trigger: false` and contributes only that pointer line from
-  `skill_runtime/delivery.py` → `trigger_hint`. A confined project skill always
-  takes the body path on every match (never demoted), because handing out a live
-  path would bypass the descriptor-pinned reader.
+  `skill_runtime/delivery.py` → `trigger_hint`. A confined project skill never
+  gets a pointer, because handing out a live path would bypass the
+  descriptor-pinned reader: a strong match takes the body path, and a weak match
+  or a repeat gets a name-only line instead.
 - The matcher emits one SEL audit row recording the matched set, the
   frontmatter-level body/pointer split, and any negative-trigger deny. When the
   per-session dedup demotes a body the matcher counted as delivered, a second

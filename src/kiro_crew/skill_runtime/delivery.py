@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Collection
 
 from kiro_crew.skill_runtime import listing as _listing
 
@@ -128,7 +128,11 @@ def _family_line(skills: list[dict]) -> str:
 
 
 def split_triggered(
-    loader: SkillsLoader, names: list[str], project_dir: str | Path | None = None
+    loader: SkillsLoader,
+    names: list[str],
+    project_dir: str | Path | None = None,
+    *,
+    weak: Collection[str] = (),
 ) -> tuple[list[str], list[str]]:
     """Split matched *names* into (inject-body, pointer-only), order preserved.
 
@@ -147,7 +151,17 @@ def split_triggered(
     signal to catch it. Defaulting the other way would make forgetting the
     field fail open. Opting out is a per-skill statement that the skill is
     an offer rather than a mandate, which only its author can make.
+
+    The mandate is earned by a CONFIDENT match, though (SKL-1). A name in
+    *weak* -- the matcher's verdict that no phrase of two or more content words
+    matched in full (``SkillsLoader.get_triggered_skills(weak_out=...)``) --
+    always lands in the pointer partition, confined or not: a one-word trigger
+    scores 1.0 on any message that uses the word, and half of all injected
+    body bytes were measured to be such false positives. A weak CONFINED name
+    has no pointer form (:func:`trigger_hint` omits it), so its caller renders
+    the name-only line it already uses for a demoted confined body.
     """
+    weak_names = set(weak)
     enforced: list[str] = []
     pointer_only: list[str] = []
     for name in names:
@@ -164,7 +178,9 @@ def split_triggered(
         meta = loader._readable_frontmatter(skill_file, within=within)
         if meta is None:
             continue
-        if within is not None:
+        if name in weak_names:
+            pointer_only.append(name)
+        elif within is not None:
             enforced.append(name)
         elif meta.get("inject_on_trigger", "").strip().lower() == "false":
             pointer_only.append(name)
@@ -204,8 +220,9 @@ def trigger_hint(
     """Return a pointer block naming *names* and where to read each one.
 
     The counterpart to :meth:`get_triggered_skills` for an unconfined skill
-    that opted out of full-body injection with ``inject_on_trigger: false``:
-    the matcher decides which skills look relevant, and this renders that
+    that opted out of full-body injection with ``inject_on_trigger: false``,
+    or whose match was too weak to earn a body (SKL-1, see
+    :func:`split_triggered`): the matcher decides which skills look relevant, and this renders that
     verdict as one line per skill instead of the skill's body. A body costs
     8k-34k chars and is charged again on every turn the match repeats; a line
     costs ~150. Confined project skills are omitted defensively because the
