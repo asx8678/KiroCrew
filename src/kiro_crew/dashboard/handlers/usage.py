@@ -1406,12 +1406,17 @@ def _source_requests_auto(source: object) -> bool:
     is not a resolved model id, but it is useful attribution when a completed
     turn has no more specific id from the backend. A blank request does not
     prove Auto was selected, so it remains blank in the row store.
+
+    ``_resolved_model_id`` counts too: a session started without an explicit
+    request (the CLI's) leaves every ``_model`` blank, and the handle's
+    backend-reported ``currentModelId`` is then the only place Auto shows.
     """
     try:
         return any(
-            isinstance(candidate := getattr(node, "_model", ""), str)
+            isinstance(candidate := getattr(node, attr, ""), str)
             and candidate.strip().lower() == "auto"
             for node in _wrapper_chain(source)
+            for attr in ("_model", "_resolved_model_id")
         )
     except Exception:
         return False
