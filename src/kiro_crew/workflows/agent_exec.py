@@ -15,8 +15,10 @@ Execution model (matches the frozen contract in workflows/__init__.py):
   chain of steps shares context.
 
 Structured output (``schema=``) is handled upstream by the runner via
-``schema.run_with_schema`` — which calls this ``agent_fn`` as its text producer —
-so this module only needs to return the model's text.
+``schema.run_with_schema`` — which calls this ``agent_fn`` ONCE as its text
+producer — so this module only needs to return the model's text. A reply that
+fails the schema is repaired by the tool-free reformat producer
+``build_reformat_fn`` builds, never by calling ``agent_fn`` again (WF-1).
 
 Kept out of the hot import path: ``SessionManager`` etc. are passed IN (the
 gateway wires them at startup), so this module imports only ``llm_helpers`` types
@@ -33,7 +35,7 @@ import logging
 from typing import Any, Callable, Optional
 
 from kiro_crew.effort import is_valid_effort
-from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect
+from kiro_crew.llm_helpers import ToolApprovalPolicy, run_bg_oneliner, stream_and_collect
 from kiro_crew.security import redact
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,13 @@ AgentFn = Callable[[str, dict], Any]
 # Per-step tool-call ceiling. Generous enough for any realistic agent step,
 # but prevents infinite tool loops from prompt injection.
 _MAX_TURNS_PER_STEP = 200
+
+# The schema reformat call (WF-1): ``sel_source`` names its SEL audit source and
+# its usage row's surface (``bg:<source>``); the timeout bounds its drive and the
+# byte cap bounds the JSON it may return.
+_REFORMAT_SEL_SOURCE = "workflow_schema_reformat"
+_REFORMAT_TIMEOUT_SECS = 120.0
+_REFORMAT_MAX_OUTPUT_BYTES = 1_000_000
 
 
 class WorkflowSpawnRefused(Exception):
@@ -260,3 +269,33 @@ def build_agent_fn(
                 logger.warning("workflow session lease release failed", exc_info=True)
 
     return agent_fn
+
+
+def build_reformat_fn(sessions: Any) -> Callable[[str], Any]:
+    """Return the tool-free producer that repairs a schema-invalid step reply (WF-1).
+
+    One background one-liner per call (``run_bg_oneliner``): no tools, a fresh
+    ``_bg`` session, the model the ``background`` role resolves to (never a
+    literal; ``resolve_usable_model`` vets it at the wire). ``run_bg_oneliner``
+    writes the usage row (surface ``bg:workflow_schema_reformat``) and feeds the
+    runner's token sink, which charges the run budget. The reactive
+    rejected-model retry is off, so one reformat is exactly one model call. The
+    reply is redacted like a step's.
+    """
+
+    async def reformat(prompt: str) -> str:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        model = KiroCrewConfig.load().agent.resolve_model("background")
+        text = await run_bg_oneliner(
+            sessions,
+            prompt,
+            model=model,
+            sel_source=_REFORMAT_SEL_SOURCE,
+            timeout=_REFORMAT_TIMEOUT_SECS,
+            max_output_bytes=_REFORMAT_MAX_OUTPUT_BYTES,
+            retry_rejected_model=False,
+        )
+        return redact(text)
+
+    return reformat

@@ -142,7 +142,8 @@ Semantics, from `runner._RunContext.agent`:
 - `phase` defaults to whatever the last `ctx.phase()` set.
 - `label` defaults to `prompt[:40]`.
 - With `schema=`, the call goes through `schema.run_with_schema` and resolves to a
-  **validated** value, or `None` after bounded re-asks.
+  **validated** value, or `None` when one tool-free reformat of an invalid reply
+  also fails (the step itself runs once).
 - **`BudgetExceeded` is the only exception `agent()` raises.** Every other failure
   is caught per call and resolves to `None`, with a bounded, redacted reason
   recorded in `agent_errors[call_index]` and on the `agent_finished` event's
@@ -150,7 +151,8 @@ Semantics, from `runner._RunContext.agent`:
   (`test_workflows_runner.py::test_failed_agent_resolves_to_none_not_run_failure`).
 - Three distinguishable `None` reasons are recorded, because "no payload" alone
   makes a post-mortem impossible: `"agent returned no result"`, `"no schema-valid
-  result after bounded re-asks"`, and an exception rendered by
+  result after bounded re-asks"` (the string predates the single reformat and is
+  kept as is), and an exception rendered by
   `describe_agent_error` (type + message, redacted then truncated to
   `MAX_AGENT_ERROR_CHARS` = 500, no traceback).
 
@@ -314,13 +316,14 @@ class Budget(Protocol):
 same terminal path. `parallel` and `pipeline` let it through for that reason
 (`dsl._gather_or_stop`); every other task failure still resolves to `None`.
 
-**Charging (USE-2).** The runner's `_invoke` wraps every `agent_fn` call, including
-each schema re-ask and each retry, in a fresh `turn_tokens.TURN_TOKEN_SINK`. Every
-terminal `stream_and_collect` turn under the call appends its cost
+**Charging (USE-2).** The runner's `_metered` wraps every model call, both each
+`agent_fn` call (`_invoke`) and a schema failure's one reformat call (`_reformat`,
+WF-1), in a fresh `turn_tokens.TURN_TOKEN_SINK`. Every terminal `stream_and_collect`
+turn under the call, and every billed `run_bg_oneliner` turn, appends its cost
 (`turn_tokens.count_turn`): input plus output tokens, or the turn's credits when the
 backend reports no token counts (kiro). That mixes units for those turns, so a
-kiro-only run's budget is in credits. `_invoke` calls `budget.would_exceed()` before
-each call, so a re-ask cannot start once the ceiling is reached. After the call,
+kiro-only run's budget is in credits. `_metered` calls `budget.would_exceed()` before
+each call, so a reformat cannot start once the ceiling is reached. After the call,
 `_charge` calls `charge()`, ignores the `BudgetExceeded` it raises (the call
 completed, and the next call is refused), and emits `budget_update` with `spent` and
 `remaining` whenever a `budget_total` is set. A stub `agent_fn` that does not drive
@@ -558,27 +561,37 @@ corrupts recovery, and a prose-wrapped array still yields the outer array, not a
 inner object. `coerce_and_validate` derives a prefer predicate from the schema's
 container `type`, so an object schema selects the object even when stray prose
 parses as an array first (and vice versa); two *different* candidates of the
-preferred shape refuse the guess and count as a parse failure, feeding the retry
+preferred shape refuse the guess and count as a parse failure, feeding the reformat
 loop. It never `eval`s.
 
-`run_with_schema(produce, prompt, schema, retries=DEFAULT_SCHEMA_RETRIES)` drives
-the loop: the prompt is augmented with the serialized schema and a JSON-only
-instruction, and on malformed or invalid output the model is re-asked up to
-`retries` more times (default 2, so 3 attempts total) with the validation errors
-appended so it can self-correct.
+`run_with_schema(produce, prompt, schema, *, reformat=None)` drives it: the prompt
+is augmented with the serialized schema and a JSON-only instruction, and `produce`
+(the step, through `_invoke` to `agent_fn`) runs **once**. A malformed or invalid
+reply never re-runs the step (WF-1). Instead `reformat` gets one tool-free prompt
+carrying only the schema, the validation errors and the previous reply, never the
+original task, and asks for only the corrected JSON. At most one reformat call is
+made; if its reply is still invalid, the call gives up with `None`. It also gives up
+without a reformat when none is wired (a stub host, such as the workflows app's
+standalone runner) or when the previous reply exceeds
+`schema.MAX_REFORMAT_INPUT_CHARS` (100000). Both producers are injected, so
+`run_with_schema` stays testable against stubs, and the `agent_fn` session contract
+is unchanged.
 
-Each re-ask is a whole new step: it goes through `_invoke` to a fresh `agent_fn`
-call, which opens a new session (cold path) or resets a reused pool worker, and
-re-sends the full original prompt plus the errors (WF-1). That is deliberately
-unchanged for now. A same-session follow-up would need the pool to hold one worker
-across the whole schema loop, which changes the `agent_fn` contract; a single
-tool-free reformat call would change the attempt count the C2 tests pin. Both are
-maintainer decisions. What bounds the cost today is the budget: with `budget_total`
-set, every re-ask is charged like any other call (USE-2).
+The production reformat producer is `agent_exec.build_reformat_fn(sessions)`, wired
+by `WorkflowService` as `WorkflowRunner(reformat_fn=...)`. Each call is one
+`run_bg_oneliner` on a fresh `_bg` session: tool-free by contract, on the model
+`agent.resolve_model("background")` names (never a literal; the wire resolves it
+through `resolve_usable_model`), with the reactive rejected-model retry off so one
+reformat is exactly one model call, bounded by `_REFORMAT_TIMEOUT_SECS` and
+`_REFORMAT_MAX_OUTPUT_BYTES`, and its reply redacted like a step's.
+`run_bg_oneliner` writes its usage row under surface `bg:workflow_schema_reformat`
+and feeds the token sink, so the runner's `_reformat` charges it to the run budget
+like any step (USE-2). A `BudgetExceeded` or a cancellation propagates; any other
+reformat failure is logged and reads as a still-invalid reply.
 
 An edited rerun replays nothing, deliberately: replaying unchanged steps keyed on a content hash would be new rerun semantics, and "replays nothing" is the safe direction (WF-4, left as decided).
 
-**A schema violation is not a run failure.** After the bounded retries,
+**A schema violation is not a run failure.** After the failed reformat,
 `run_with_schema` returns `None`, `ctx.agent()` returns `None`, and
 `agent_errors[call_index]` records `"no schema-valid result after bounded
 re-asks"` while `agent_finished.ok` is `False`. Distinguishing that from an
@@ -596,7 +609,7 @@ None-guard, and `validate` rejects the inline unguarded dereference.
 | Tool calls per agent step | `agent_exec._MAX_TURNS_PER_STEP` | 200 | `stream_and_collect` stops the step; prevents an infinite tool loop from prompt injection |
 | Token budget | `budget_total` per run | caller-set, `None` = unbounded | `BudgetExceeded` -> `run_failed`, `where="ceiling"` |
 | Script size | `validate.MAX_SCRIPT_BYTES` | 262144 | validation error |
-| Schema re-asks | `schema.DEFAULT_SCHEMA_RETRIES` | 2 | result is `None` |
+| Schema reformat calls | none (fixed at one, WF-1); input capped by `schema.MAX_REFORMAT_INPUT_CHARS` | 1 call; 100000 chars | result is `None` |
 | Tracked runs in memory | `registry.DEFAULT_MAX_RUNS` | 200 | oldest **terminal** run evicted; a running run is never evicted |
 | Persisted agent-error text | `runner.MAX_AGENT_ERROR_CHARS` | 500 | truncated after redaction |
 | Step output handed to the script | `runner.DEFAULT_MAX_OUTPUT_CHARS` (WorkflowRunner `max_output_chars`) | 20000 | head+tail kept, `[… N chars truncated …]` marker; the resume record (`agent_results`) keeps the WHOLE value; `None` disables. The frozen `ctx.agent` signature does not grow a per-call kwarg — the bound is run-wide |
@@ -1579,7 +1592,7 @@ subset has to get right.
 | Gate | Guarantees | Pinned by | Constrains |
 |---|---|---|---|
 | C1 | A conforming object validates clean (empty error list) and is returned to the script. | `test_workflows_schema.py::test_c1_valid_object_passes` | `schema.py` (`validate_against_schema`) |
-| C2 | Malformed or invalid model output triggers a *bounded* retry (`DEFAULT_SCHEMA_RETRIES = 2`, so at most initial plus 2 attempts), then returns `None` rather than raising or looping. | `test_workflows_schema.py::test_c2_retry_then_success`, `::test_c2_all_malformed_returns_none`, `::test_c2_schema_violation_retried_then_none` | `schema.py` (`run_with_schema`) |
+| C2 | Malformed or invalid model output gets at most ONE tool-free reformat call on the previous reply (never a re-run of the step, WF-1), then returns `None` rather than raising or looping. | `test_workflows_schema.py::test_c2_retry_then_success`, `::test_c2_all_malformed_returns_none`, `::test_c2_schema_violation_retried_then_none` | `schema.py` (`run_with_schema`) |
 | C3 | An object that parses as JSON but violates the schema is rejected, not returned: missing `required` key, wrong type, `enum` violation, and `bool` not counting as `integer`. | `test_workflows_schema.py::test_c3_missing_required_rejected`, `::test_c3_wrong_type_rejected`, `::test_c3_enum_violation_rejected`, `::test_c3_bool_is_not_integer` | `schema.py` |
 
 ### Group D: Kiro Crew's own `ctx` primitives

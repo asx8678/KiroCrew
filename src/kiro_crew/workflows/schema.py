@@ -1,7 +1,7 @@
-"""Structured-output validation + bounded retry for ``ctx.agent(schema=...)`` (GATES C1–C3).
+"""Structured-output validation + one reformat for ``ctx.agent(schema=...)`` (GATES C1–C3).
 
 The frozen contract says ``ctx.agent(prompt, schema=<JSON Schema>)`` returns a
-*validated dict* (or ``None`` after retries). KiroCrew's provider layer has no
+*validated dict* (or ``None`` after one failed reformat). KiroCrew's provider layer has no
 native schema enforcement, and the runtime ships neither ``jsonschema`` nor a
 JSON-Schema-consuming pydantic path — so this module is a small, dependency-free
 validator for the JSON-Schema **subset** the workflow DSL actually uses
@@ -18,10 +18,11 @@ recovery is delegated to the shared ``kiro_crew.llm_helpers`` extractor — an
 external import, like the optional adapters' — the same scanner the spine and
 task-planner call sites use (a few bespoke span-scans remain elsewhere, e.g.
 dashboard/chat_summary and knowledge/extractor; consolidating them is tracked
-separately). Pure functions + one async retry helper, all unit-testable against
-a stub text producer (never a real agent).
+separately). Pure functions + one async helper, all unit-testable against stub
+text producers (never a real agent): the step producer and the reformat producer
+are both injected.
 
-Gates: C1 valid object returned · C2 malformed→retry→success, all-malformed→None ·
+Gates: C1 valid object returned · C2 malformed→reformat→success, still malformed→None ·
 C3 schema-violating object rejected. See ``docs/system-specs/modules/workflows.md``.
 """
 
@@ -32,9 +33,11 @@ from typing import Any, Awaitable, Callable, Optional
 
 from kiro_crew.llm_helpers import _extract_json_of_type
 
-# Bounded retries before ``ctx.agent(schema=)`` gives up and returns None
-# (matches ``_SCHEMA_RETRIES`` in the module spec).
-DEFAULT_SCHEMA_RETRIES = 2
+# A schema failure gets ONE tool-free reformat call on the previous reply, never
+# a re-run of the step (WF-1). A reply longer than this is not handed to it: the
+# reformat call would re-send the whole thing, and a reply that large is a
+# prompt/schema problem a reformat will not fix, so the call gives up instead.
+MAX_REFORMAT_INPUT_CHARS = 100_000
 
 _JSON_TYPES: dict[str, type | tuple[type, ...]] = {
     "object": dict,
@@ -198,28 +201,39 @@ async def run_with_schema(
     prompt: str,
     schema: dict,
     *,
-    retries: int = DEFAULT_SCHEMA_RETRIES,
+    reformat: Optional[Callable[[str], Awaitable[str]]] = None,
 ) -> Optional[Any]:
-    """Drive an agent text-producer until it yields schema-valid JSON, or give up.
+    """Run the step once, then repair its reply's JSON at most once (WF-1).
 
-    ``produce(prompt)`` returns the agent's text for a prompt. On malformed/invalid
-    output we re-ask up to ``retries`` more times, appending the validation errors
-    to the prompt so the model can self-correct. Returns the validated value, or
-    ``None`` after ``retries`` failures (the contract's "None on give-up").
+    ``produce(prompt)`` runs the step (the agent, with its tools) and returns its
+    text; it is called exactly ONCE. On malformed or schema-invalid output the
+    step is never re-run: ``reformat(p)`` gets a tool-free prompt carrying only
+    the schema, the validation errors and the previous reply -- never the
+    original task -- and asks for only the corrected JSON. At most one reformat
+    call is made. Returns the validated value, or ``None`` when the reformat also
+    fails, when no ``reformat`` is wired, or when the previous reply is too large
+    to hand to it (the contract's "None on give-up").
     """
-    attempt_prompt = _augment_prompt(prompt, schema)
-    last_errors: list[str] = []
-    for _attempt in range(retries + 1):
-        text = await produce(attempt_prompt)
-        value, errors = coerce_and_validate(text, schema)
-        if not errors:
-            return value
-        last_errors = errors
-        attempt_prompt = (
-            f"{_augment_prompt(prompt, schema)}\n\nYour previous reply was invalid: "
-            f"{'; '.join(last_errors)}. Reply ONLY with corrected JSON."
-        )
-    return None
+    text = await produce(_augment_prompt(prompt, schema))
+    value, errors = coerce_and_validate(text, schema)
+    if not errors:
+        return value
+    if reformat is None or len(text) > MAX_REFORMAT_INPUT_CHARS:
+        return None
+    fixed = await reformat(_reformat_prompt(schema, errors, text))
+    value, errors = coerce_and_validate(fixed, schema)
+    return None if errors else value
+
+
+def _reformat_prompt(schema: dict, errors: list[str], previous: str) -> str:
+    """The one reformat call's prompt: schema, errors and the previous reply only."""
+    return (
+        "A previous reply was supposed to be a single JSON value matching this JSON "
+        f"Schema:\n{json.dumps(schema)}\n\nIt failed validation: {'; '.join(errors)}.\n\n"
+        "Rewrite it as the corrected JSON. Use only the information in the previous "
+        "reply; do not use tools. Reply ONLY with the JSON value (no prose, no code "
+        f"fence).\n\nPrevious reply:\n{previous}"
+    )
 
 
 def _augment_prompt(prompt: str, schema: dict) -> str:

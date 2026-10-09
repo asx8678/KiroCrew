@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -54,6 +55,8 @@ from .registry import (
 )
 from .schema import run_with_schema
 from .validate import CORE_CTX_SURFACE, check_ctx_surface, validate
+
+logger = logging.getLogger(__name__)
 
 # Optional dependency (gate F1): the SEL security event log lives in the app
 # layer, and the workflows engine must stay importable as a standalone unit
@@ -185,6 +188,8 @@ async def _optional_slot(sem: Optional["asyncio.Semaphore"]) -> AsyncIterator[No
 
 # Signature of the injected agent executor: (prompt, options) -> result string/dict.
 AgentFn = Callable[[str, dict], Awaitable[Any]]
+# WF-1: async (prompt) -> text, the tool-free schema reformat producer.
+ReformatFn = Callable[[str], Awaitable[str]]
 
 # Signature of the injected SEL audit sink (GATE B10). Defaults to the real
 # ``kiro_crew.sel`` security event log; tests inject a capturing stub. Kept as a
@@ -332,6 +337,7 @@ class _RunContext:
         replay_before: int = 0,
         on_agent_result: Optional[AgentResultFn] = None,
         max_output_chars: Optional[int] = None,
+        reformat_fn: Optional[ReformatFn] = None,
     ) -> None:
         self.args = args
         self.now = now
@@ -367,6 +373,9 @@ class _RunContext:
         self._stream = stream
         self._counter = counter
         self._agent_fn = agent_fn
+        # WF-1: the tool-free producer a schema failure's one reformat call goes
+        # through. None (a stub host) gives up on the first schema failure.
+        self._reformat_fn = reformat_fn
         self._concurrency = concurrency
         self._current_phase = ""
         self._events: list[WorkflowEvent] = []
@@ -411,21 +420,45 @@ class _RunContext:
 
     # --- agent execution ---
     async def _invoke(self, prompt: str, opts: dict) -> Any:
-        """One ``agent_fn`` call, charged to the budget (USE-2).
+        """One ``agent_fn`` call, charged to the budget (USE-2)."""
+        return await self._metered(lambda: self._agent_fn(prompt, opts))
+
+    async def _metered(self, start: Callable[[], Awaitable[Any]]) -> Any:
+        """Await one model call, charged to the budget (USE-2).
 
         Every model turn the call drives is counted into a fresh sink, so a
-        schema re-ask or a retry is its own charge. The ceiling is checked before
-        the call starts, so a re-ask cannot begin once the budget is spent.
+        retry or a schema reformat is its own charge. The ceiling is checked
+        before the call starts, so a reformat cannot begin once the budget is
+        spent.
         """
         if self.budget.would_exceed():
             raise BudgetExceeded("budget exhausted before agent call")
         sink: list[int] = []
         token = TURN_TOKEN_SINK.set(sink)
         try:
-            return await self._agent_fn(prompt, opts)
+            return await start()
         finally:
             TURN_TOKEN_SINK.reset(token)
             self._charge(sum(sink))
+
+    async def _reformat(self, prompt: str) -> str:
+        """The schema loop's one tool-free reformat call, charged to the budget (WF-1).
+
+        A budget ceiling or a cancellation propagates; any other failure of the
+        reformat call is logged and reads as "still invalid", so the step gives
+        up the same way a second invalid reply does.
+        """
+        reformat_fn = self._reformat_fn
+        if reformat_fn is None:
+            return ""
+        try:
+            out = await self._metered(lambda: reformat_fn(prompt))
+        except BudgetExceeded:
+            raise
+        except Exception:  # noqa: BLE001 - a failed reformat is a give-up, not a crash
+            logger.warning("workflow schema reformat call failed", exc_info=True)
+            return ""
+        return out if isinstance(out, str) else ""
 
     def _charge(self, cost: int) -> None:
         """Charge one completed call's spend, and report the budget (USE-2).
@@ -509,15 +542,16 @@ class _RunContext:
                 if not ok:
                     error = "replayed a call that had already failed in the prior run"
             elif schema is not None:
-                # Structured output (C1–C3): re-ask until the model yields
-                # schema-valid JSON, or None after bounded retries. The producer
-                # is the same injected agent_fn (so prod/stub both flow through).
+                # Structured output (C1–C3): the step runs ONCE through the
+                # injected agent_fn; an invalid reply gets at most one tool-free
+                # reformat call on its text, never a re-run of the step (WF-1).
                 async def _produce(p: str) -> str:
                     out = await self._invoke(p, opts)
                     return out if isinstance(out, str) else json.dumps(out)
 
+                reformat = self._reformat if self._reformat_fn is not None else None
                 async with _optional_slot(self._agent_slots):
-                    result = await run_with_schema(_produce, prompt, schema)
+                    result = await run_with_schema(_produce, prompt, schema, reformat=reformat)
                 ok = result is not None
                 if not ok:
                     # Distinguishing this from an exception matters: it means the
@@ -696,8 +730,12 @@ class WorkflowRunner:
         pre_terminal: Optional[Callable[[], Awaitable[None]]] = None,
         execution_guard: Optional[Callable[[], Awaitable[None]]] = None,
         max_output_chars: Optional[int] = DEFAULT_MAX_OUTPUT_CHARS,
+        reformat_fn: Optional[ReformatFn] = None,
     ) -> None:
         self._agent_fn = agent_fn
+        # WF-1: tool-free producer for a schema failure's one reformat call
+        # (production: ``agent_exec.build_reformat_fn``). None gives up instead.
+        self._reformat_fn = reformat_fn
         self._timeout_secs = timeout_secs
         self._max_agents = max_agents_per_run
         self._concurrency = concurrency
@@ -973,6 +1011,7 @@ class WorkflowRunner:
             replay_before=replay_before,
             on_agent_result=on_agent_result,
             max_output_chars=self._max_output_chars,
+            reformat_fn=self._reformat_fn,
         )
         ctx._execution_guard = self._execution_guard
         ctx._events = events  # share the sink so phase/log/agent events land in order

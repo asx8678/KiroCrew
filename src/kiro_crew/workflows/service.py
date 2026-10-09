@@ -46,7 +46,7 @@ from kiro_crew.workflow_memory import (
     admission_errors,
 )
 
-from .agent_exec import build_agent_fn
+from .agent_exec import build_agent_fn, build_reformat_fn
 from .agent_pool import admitted_agent_fn, build_pooled_agent_fn
 from .events import EventStream
 from .library import (
@@ -100,7 +100,7 @@ def _workflow_step_agent(run_id: str) -> Optional[str]:
 #: on this path.
 WORKFLOW_NUDGE_DEFAULT_MAX_CYCLES = 50
 
-# Bounded attempts to coax a valid script out of the model (mirrors schema retry).
+# Bounded attempts to coax a valid script out of the model.
 _AUTHOR_RETRIES = 2
 # A failed run's error is stored and served verbatim (runner joins ``errors``),
 # so what is RETAINED per attempt is bounded: this many errors, each cut to
@@ -173,7 +173,7 @@ ASYNC vs SYNC — get this right or the script crashes at runtime:
           ...                     # (no-op: phase is NOT auto-ended on block exit)
 
 RESULTS CAN BE None — always guard before use: ctx.agent(...) returns None when
-the agent dies or its output fails schema validation (after retries); a failed
+the agent dies or its output fails schema validation (after one reformat); a failed
 thunk inside ctx.parallel(...) resolves to None. So NEVER subscript, ``.get()``,
 or attribute-access an awaited result inline. Bind it first and guard:
   BAD:  url = (await ctx.agent("cut cr")).get("cr_url")        # crashes if None
@@ -885,6 +885,9 @@ class WorkflowService:
 
         return WorkflowRunner(
             agent_fn=agent_fn,
+            # WF-1: a schema failure's one tool-free reformat call, on the
+            # background role's model, charged to this run's budget.
+            reformat_fn=build_reformat_fn(self._sessions),
             concurrency=self._concurrency,
             timeout_secs=ceiling,
             ports=ports,

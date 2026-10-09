@@ -1892,6 +1892,10 @@ async def run_bg_oneliner(
                 # cache tokens with zero credits AND zero fresh token counts;
                 # a gate testing only the kiro dimensions silently drops it.
                 if usage_has_billing(usage):
+                    # A workflow run's budget (USE-2): a no-op unless the caller
+                    # installed a token sink, as the schema reformat call does.
+                    # First, so a failed log or row write cannot skip it.
+                    count_turn(usage)
                     _served = str(getattr(session, "served_model", "") or "").strip()
                     _elapsed_ms = int((time.monotonic() - turn_started) * 1000)
                     # Same numbers, second destination: the usage store answers
