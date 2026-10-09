@@ -144,6 +144,8 @@ import { usePanelTabDescriptors } from '../../hooks/panelTabRegistry'
 import CrewWakeSection from '../../components/CrewWakeSection'
 import { crewWakeQueryKey, wakesCrew } from '../../components/crew/wakesCrew'
 import { usePanelDocumentActions } from '../../hooks/usePanelDocumentActions'
+import { useRunInTerminalBridge, useRunInTerminalRefs } from '../../hooks/useRunInTerminalBridge'
+import { RunInTerminalScope } from '../../components/runInTerminalScope'
 import ResizeHandle from '../../components/ResizeHandle'
 import { cn } from '../../lib/utils'
 import { LIST_SHELL_CLS, LIST_HEADER_CLS, LIST_TITLE_CLS, LIST_BODY_CLS, ROW_BOX_CLS, ROW_IDLE_CLS, ROW_ACTIVE_CLS, ROW_TITLE_CLS, ROW_STATUS_CLS } from '../../components/listShell'
@@ -2132,6 +2134,22 @@ export default function MembersPage() {
     showActionError,
     onOpened: revealPanelAfterOpen,
   })
+  // "Run in terminal" from a crewmate chat's code blocks. Without a host here
+  // the request had no receiver and the button timed out. The shell starts in
+  // the member slot's project — the cwd this page's own Terminal tab spawns in
+  // — and only once the slot record carrying it has arrived (slotRecordPresent).
+  const runInTerminalCwdRef = useRef<string | undefined>(projectDir)
+  runInTerminalCwdRef.current = projectDir
+  const runInTerminalReadyRef = useRef(slotRecordPresent)
+  runInTerminalReadyRef.current = slotRecordPresent
+  const runInTerminalRefs = useRunInTerminalRefs()
+  const runInTerminalScope = useRunInTerminalBridge({
+    queryClient,
+    showActionError,
+    cwdRef: runInTerminalCwdRef,
+    readyRef: runInTerminalReadyRef,
+    ...runInTerminalRefs,
+  })
   // Transcript file links focus a side-panel tab, but the schedule draft now
   // lives in the separate Profile card. Opening a file leaves that card mounted,
   // so this compatibility wrapper deliberately does not invoke the draft guard.
@@ -3061,6 +3079,7 @@ export default function MembersPage() {
     // This page has no bottom row for the side panel, so every panel glyph
     // in its transcripts draws the right-dock pane.
     <SidePanelDockHost value={false}>
+    <RunInTerminalScope.Provider value={runInTerminalScope}>
     <div className="flex h-full min-h-0" data-testid="members-page">
       {/* Card columns (roster + thread) keep the page's original insets. */}
       <div className="flex flex-1 min-w-0 gap-2 pr-2 pb-2">
@@ -4525,6 +4544,7 @@ export default function MembersPage() {
         <CrewEditorDialog ctl={crewEditor} />
       </Suspense>
     </div>
+    </RunInTerminalScope.Provider>
     </SidePanelDockHost>
   )
 }
