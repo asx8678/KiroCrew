@@ -9180,9 +9180,21 @@ class GatewayOrchestrator:
                 """Retry stream_and_collect up to 3 times on AcpError.
 
                 Cancels any orphaned prompt between attempts so the next
-                retry doesn't hit 'Prompt already in progress'.
+                retry doesn't hit 'Prompt already in progress'. Only an attempt
+                that produced nothing is resent: once text streamed or a tool
+                ran, the parent's window already holds the completion, so a
+                resend would pay its whole context again and could run the same
+                tools twice. Streamed text is delivered as the reply; a turn that
+                only ran tools ends as a failed injection.
                 """
                 for attempt in range(3):
+                    streamed: list[str] = []
+                    tools_ran: list[str] = []
+
+                    def _on_tool_gate(title: str, approved: bool, _blocked: bool) -> None:
+                        if approved:
+                            tools_ran.append(title)
+
                     try:
                         # USE-1: the completion turn is real spend on the parent
                         # session; one row per attempt, filed under the parent.
@@ -9190,6 +9202,8 @@ class GatewayOrchestrator:
                             client,
                             msg,
                             retry_transient=False,
+                            on_chunk=streamed.append,
+                            on_tool_gate=_on_tool_gate,
                             usage_surface="subagent_completion",
                             usage_session_key=parent_key,
                         )
@@ -9266,7 +9280,18 @@ class GatewayOrchestrator:
                             )
                         return None
                     except AcpError:
-                        if attempt == 2:
+                        if streamed:
+                            logger.warning(
+                                "Subagent %s %s injection attempt %d failed after "
+                                "streaming %d chunks; delivering the partial reply, "
+                                "not resending",
+                                info.id,
+                                label,
+                                attempt + 1,
+                                len(streamed),
+                            )
+                            return "".join(streamed)
+                        if attempt == 2 or tools_ran:
                             raise
                         logger.warning(
                             "Subagent %s %s injection attempt %d failed, retrying",
