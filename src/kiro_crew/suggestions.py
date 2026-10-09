@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 # current suggestions were built from skips the model call and only bumps the
 # stamp, so an unchanged Welcome view stops re-billing the background role.
 _REFRESH_INTERVAL_SECS = 30 * 60
+# How long one /api/suggestions request waits for a generation it started or
+# joined. Shorter than the model call's own 60 s timeout on purpose: the request
+# returns the current set and the shielded refresh finishes into the cache.
+_REQUEST_WAIT_SECS = 45
 
 # The fixed vocabulary the dashboard maps to an icon. Anything else the model
 # returns collapses to "general", so a new kind is a change here AND in the
@@ -235,15 +239,6 @@ def _redact_suggestions(suggestions: list[Suggestion]) -> list[Suggestion]:
     return result
 
 
-async def generate_suggestions(state: DashboardState) -> list[Suggestion]:
-    """Generate suggestions using the background kiro-cli session."""
-    # _build_context() calls list_sessions() + recent() — O(all sessions) disk IO.
-    # Offload to keep the event loop responsive (same pattern as this PR's other
-    # two offload sites in sessions.py).
-    context = await asyncio.to_thread(_build_context, state)
-    return await _generate_from_context(context, state.sessions)
-
-
 async def _generate_from_context(context: str, sessions: Any = None) -> list[Suggestion]:
     """One model call over an already-built context (LOOP-10 split).
 
@@ -294,12 +289,37 @@ async def refresh_suggestions(
             if not force and digest == cache.context_digest:
                 cache.generated_at = time.time()
                 return
-            suggestions = await _generate_from_context(context)
+            # The session manager is required: without it the model call fails at
+            # once and every refresh silently fell back to the static set.
+            suggestions = await _generate_from_context(context, getattr(state, "sessions", None))
             cache.suggestions = suggestions
             cache.generated_at = time.time()
             cache.context_digest = digest
         except Exception:
             logger.warning("Suggestions generation failed", exc_info=True)
+
+
+def _start_refresh(
+    state: DashboardState, cache: SuggestionsCache, *, force: bool = False
+) -> "asyncio.Task[None]":
+    """Run a refresh as a tracked background task.
+
+    A task, not an inline await, so a request that stops waiting does not cancel
+    the generation: the result still lands in the cache for the next request.
+    """
+    task = asyncio.create_task(refresh_suggestions(state, cache, force=force))
+    cache._task = task
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+    return task
+
+
+async def _wait_for_refresh(task: "asyncio.Task[None]") -> None:
+    """Wait up to the request budget for *task*; on timeout it keeps running."""
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=_REQUEST_WAIT_SECS)
+    except (asyncio.TimeoutError, Exception):
+        pass
 
 
 async def maybe_refresh(state: DashboardState, cache: SuggestionsCache) -> None:
@@ -311,10 +331,7 @@ async def maybe_refresh(state: DashboardState, cache: SuggestionsCache) -> None:
         return
 
     # Fire and forget
-    task = asyncio.create_task(refresh_suggestions(state, cache))
-    cache._task = task
-    state._background_tasks.add(task)
-    task.add_done_callback(state._background_tasks.discard)
+    _start_refresh(state, cache)
 
 
 def get_suggestions_cache(state: DashboardState) -> SuggestionsCache:
@@ -337,23 +354,17 @@ async def api_suggestions(request: web.Request) -> web.Response:
     cache = get_suggestions_cache(state)
     force = request.query.get("force") == "1"
 
+    # The generation may take up to its 60 s model timeout, longer than this
+    # request waits; the refresh runs as a shielded task so a slow model still
+    # fills the cache instead of being cancelled and retried on every refetch.
     if force:
-        try:
-            await asyncio.wait_for(refresh_suggestions(state, cache, force=True), timeout=45)
-        except (asyncio.TimeoutError, Exception):
-            pass
+        await _wait_for_refresh(_start_refresh(state, cache, force=True))
     elif cache.generated_at == 0:
         # Never generated yet — wait for result
         if cache._lock.locked() and cache._task is not None:
-            try:
-                await asyncio.wait_for(asyncio.shield(cache._task), timeout=45)
-            except (asyncio.TimeoutError, Exception):
-                pass
+            await _wait_for_refresh(cache._task)
         if cache.generated_at == 0 and not cache._lock.locked():
-            try:
-                await asyncio.wait_for(refresh_suggestions(state, cache), timeout=45)
-            except (asyncio.TimeoutError, Exception):
-                pass
+            await _wait_for_refresh(_start_refresh(state, cache))
     else:
         await maybe_refresh(state, cache)
 
