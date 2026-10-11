@@ -67,6 +67,7 @@ function reopenCrewCompanionAfterUpdate() {
 const { createGatewaySupervisor } = require("./gateway-supervisor");
 const { createWindowLifecycle } = require("./window-lifecycle");
 const { createIpcRegistrar } = require("./ipc-registrar");
+const { createDownloadExpectations } = require("./download-expectations");
 const { installEarlyBootGuard } = require("./early-boot-guard");
 
 // Everything from here to `app.whenReady()` runs synchronously at module load,
@@ -404,6 +405,12 @@ const gateway = createGatewaySupervisor({
   predictLocalPort: () => fallbackLocalPort(store, glog),
 });
 
+// Shared single-use registry of downloads the renderer explicitly asked for.
+// The ipc bridge registers an expectation when the export path announces a
+// download; the will-download handler consumes it, so only announced downloads
+// auto-save to Downloads (everything else keeps Chromium's default handling).
+const downloadExpectations = createDownloadExpectations();
+
 windows = createWindowLifecycle({
   electron,
   store,
@@ -417,6 +424,7 @@ windows = createWindowLifecycle({
   requestQuit,
   connectWindow: (...args) => gateway.connect(...args),
   syncTunnel: () => gateway.syncTunnel(),
+  downloadExpectations,
 });
 
 const ipcRegistrar = createIpcRegistrar({
@@ -430,6 +438,7 @@ const ipcRegistrar = createIpcRegistrar({
   closeCrewCompanionForUpdate,
   reopenCrewCompanionAfterUpdate,
   crashScan: scanCrashArtifacts,
+  downloadExpectations,
 });
 
 /**
