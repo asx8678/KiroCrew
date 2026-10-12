@@ -177,6 +177,7 @@ function ChatInput({
   onTreeEntryDrop,
   clampDropOffset,
   onMentionKey,
+  optimizerMentionGuard,
   onFileOpen,
   project,
   projectBranch,
@@ -513,7 +514,7 @@ function ChatInput({
   }, [setTextareaRef, attachListContinuation])
   const { optimizeError, setOptimizeError, optimizePending, optimizing, optimizePrompt } = usePromptOptimizer({
     slotId, chatStore, valueRef, pasteBlocks, onChange, onOptimizeResult, lexicalComposer, lexicalLoadFailed, composerControl, inputRef,
-    valueFromUserRef, optimizingRef, appendUndoBoundary: appendBoundary, terminalCommands,
+    valueFromUserRef, optimizingRef, appendUndoBoundary: appendBoundary, terminalCommands, optimizerMentionGuard,
   })
   // A file-tree row dropped here goes to the host's "Add to chat" handler;
   // OS file and text drags fall through to the host's handlers.
