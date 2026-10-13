@@ -65,7 +65,8 @@ def post_compaction_parts(
     steering. The member section is re-injected by the caller, through the
     member lifecycle chokepoint, so member sessions re-inject none of the
     memory half here. Also starts the session's shown-lesson record again,
-    since the compaction dropped those blocks too.
+    since the compaction dropped those blocks too. A minimal-context turn gets
+    back only what its minimal session start carried (see the early return).
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
 
@@ -105,6 +106,19 @@ def post_compaction_parts(
         _rules = ctx._critical_rules_for(session_key, runtime_source)
         if _rules:
             parts.append(_rules)
+    # A minimal-context turn (shared and guest channel turns, minimal crons) gets
+    # back only what its minimal session start carried: the contract, the
+    # critical rules and the reply-style preferences. The operator's memory,
+    # skills and folder steering stay out of a prompt other people read.
+    if minimal_context:
+        _min_prefs = (
+            _sections._build_response_preferences_section(ctx.KiroCrewConfig.load())
+            if _sections._response_preferences_apply(session_key or "", runtime_source)
+            else ""
+        )
+        if _min_prefs:
+            parts.append("[REINJECTED AFTER COMPACTION — response preferences]\n" + _min_prefs)
+        return parts
     # The stored-memory half routes through the same config intersection
     # as the session-start build: this path restores a block that build
     # withheld, so reading the caller scope alone would hand back the

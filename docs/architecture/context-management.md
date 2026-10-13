@@ -349,8 +349,9 @@ on its next match, never drops the skill.
   that settle their own turn instead of using the bracket do the same through
   `turn_bracket.arm_reinjection_after_backend_compaction`, in their `finally`
   before `rearm_reinjection`: the Slack and Telegram transport dispatchers read
-  the driver's `compaction_completed`, and the native Slack handler and the task
-  runner watch `EVENT_COMPACTION_STATUS` `completed` in their own stream loops. After compaction the skills INDEX is re-sent in full, deliberately: the compaction dropped the model's copy, and re-sending it is what keeps skill awareness, at one index per compaction (CTX-10, left as decided). An oversized `prompt.md` override is still named only in the log (once per path and size); surfacing it on the dashboard needs a health surface `context.py` cannot reach today, and adding one is a new surface (CTX-16, left as decided).
+  the driver's `compaction_completed`, and the native Slack handler, the task
+  runner and both cron turns (single-agent and each sequence step) watch
+  `EVENT_COMPACTION_STATUS` `completed` in their own stream loops. After compaction the skills INDEX is re-sent in full, deliberately: the compaction dropped the model's copy, and re-sending it is what keeps skill awareness, at one index per compaction (CTX-10, left as decided). An oversized `prompt.md` override is still named only in the log (once per path and size); surfacing it on the dashboard needs a health surface `context.py` cannot reach today, and adding one is a new surface (CTX-16, left as decided).
 
 ### What comes back after compaction
 
@@ -393,6 +394,10 @@ re-adds, once:
    call as session start (the caller forwards `minimal_context` and the runtime),
    and its `{{DIFF_RULE}}` is always the pointer, because item 1 re-sends the
    critical rules here even for a minimal-context session.
+
+A minimal-context turn (shared and guest channel turns, minimal crons) gets back
+only what its minimal session start carried: items 1, 6 and 8. The operator's
+memory, skills index and folder steering stay out of a prompt other people read.
 
 Member sessions skip items 2 and 3: their essentials envelope is re-injected by
 the caller, through the member lifecycle chokepoint, so the member's own store

@@ -5019,6 +5019,15 @@ class GatewayOrchestrator:
                         # None until a completion is observed: a stream that ends
                         # without one is not landed.
                         _seq_stop: dict[str, str | None] = {"reason": None}
+                        # Whether the backend reported a completed compaction during
+                        # the step's stream, which drops the session-start context.
+                        _seq_compaction: dict[str, bool] = {"completed": False}
+
+                        def _seq_note_compaction(
+                            ev: Any, _box: dict[str, bool] = _seq_compaction
+                        ) -> None:
+                            if getattr(ev, "text", "") == "completed":
+                                _box["completed"] = True
 
                         def _seq_note_complete(
                             ev: Any, _box: dict[str, str | None] = _seq_stop
@@ -5102,6 +5111,7 @@ class GatewayOrchestrator:
                                     ),
                                     on_tool_gate=_gate.note,
                                     on_complete=_seq_note_complete,
+                                    on_compaction=_seq_note_compaction,
                                     fallback_models=configured_fallback_chain(),
                                 )
                             except BaseException as _stream_exc:
@@ -5159,6 +5169,8 @@ class GatewayOrchestrator:
                             # Before the reset below: a turn that consumed the
                             # post-compaction flag but never landed puts it back so
                             # a session that survives (deferred reset) re-injects.
+                            if _seq_compaction["completed"]:
+                                self.sessions.mark_needs_reinjection(agent_session_key)
                             rearm_reinjection(
                                 self.sessions,
                                 agent_session_key,
@@ -5265,6 +5277,14 @@ class GatewayOrchestrator:
 
             def _note_complete(ev: Any, _box: dict[str, str | None] = _turn_stop) -> None:
                 _box["reason"] = str(getattr(ev, "stop_reason", "") or "")
+
+            # Whether the backend reported a completed compaction during the
+            # turn's stream, which drops the session-start context.
+            _turn_compaction: dict[str, bool] = {"completed": False}
+
+            def _note_compaction(ev: Any, _box: dict[str, bool] = _turn_compaction) -> None:
+                if getattr(ev, "text", "") == "completed":
+                    _box["completed"] = True
 
             try:
                 assert self.sessions is not None
@@ -5417,6 +5437,7 @@ class GatewayOrchestrator:
                         ),
                         on_tool_gate=_gate.note,
                         on_complete=_note_complete,
+                        on_compaction=_note_compaction,
                         fallback_models=configured_fallback_chain(),
                     )
                 except BaseException as _stream_exc:
@@ -5896,8 +5917,10 @@ class GatewayOrchestrator:
                         # the transient arm does, or the finally below would
                         # re-arm the REPLACEMENT after the retry lands and keeps
                         # it (deferred reset for pending sub-agents) -- one
-                        # duplicated re-injection on its next turn.
+                        # duplicated re-injection on its next turn. A compaction
+                        # the destroyed session reported goes with it.
                         _needs_reinjection = False
+                        _turn_compaction["completed"] = False
                         _acp_retry_attempted = True
                         return await _cron_callback(job)
                     except Exception:
@@ -6414,8 +6437,11 @@ class GatewayOrchestrator:
             finally:
                 assert self.sessions is not None
                 # Before the reset below: a turn that consumed the post-compaction
-                # flag but never landed puts it back so a session that survives
-                # (deferred reset) re-injects on its next turn.
+                # flag but never landed, or whose backend compacted the session,
+                # sets the flag so a session that survives (deferred reset)
+                # re-injects on its next turn.
+                if _turn_compaction["completed"]:
+                    self.sessions.mark_needs_reinjection(session_key)
                 rearm_reinjection(
                     self.sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
                 )

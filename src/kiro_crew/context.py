@@ -4198,20 +4198,17 @@ class ContextBuilder:
         # rebuilt window never received. Clearing the record here, under the
         # same lock, keeps that impossible.
         #
-        # SOFT FAILURE (known, bounded): the flag is armed by a fresh session
-        # (is_new_session), by Kiro Crew's own session_compaction, and by the
-        # dashboard runner and the heartbeat when the backend reports a
-        # completed compaction to them (needs_reinjection). Other turn loops do
-        # not watch for that report, so when the BACKEND trims or auto-compacts
-        # its own window under them (kiro-cli's _kiro.dev/compaction
-        # completing, the claude/codex twins) the record still names bodies the
-        # rebuilt backend window does not hold, and the next match of such a
-        # skill demotes it to its POINTER line, not to silence: the agent still
-        # learns the skill applies and can re-read it, it just does not get the
-        # body re-pasted that turn. Long monitor loops are where backend
-        # self-compaction is most likely. Hooking the three backend compaction
-        # chokepoints to arm this flag is a correctness refinement, not a
-        # safety fix, and is deliberately out of scope here.
+        # The flag is armed by a fresh session (is_new_session), by Kiro Crew's
+        # own session_compaction, and by every turn loop that consumes it when
+        # the BACKEND reports a completed compaction of its own window during the
+        # turn (CTX-12; see docs/architecture/context-management.md).
+        #
+        # SOFT FAILURE (known, bounded): a turn path that never consumes the flag
+        # does not arm it either, so when the backend compacts under such a turn
+        # the record still names bodies the rebuilt backend window does not
+        # hold, and the next match of such a skill demotes it to its POINTER
+        # line, not to silence: the agent still learns the skill applies and can
+        # re-read it, it just does not get the body re-pasted that turn.
         skill_bodies_session = skill_bodies_session or session_key
         if skill_bodies_session and _reset_sent_records:
             self._dedup_triggered_bodies(skill_bodies_session, agent, reset=True, candidates=[])
