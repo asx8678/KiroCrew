@@ -2637,6 +2637,19 @@ class SessionManager:
         ``model_role`` names the unattended task role a session with no explicit
         ``model`` resolves under (see :func:`_session_model`).
         """
+        if (
+            key == BACKGROUND_KEY
+            # Consolidation and the skill judges name the background agent
+            # explicitly; they must take the same creation path as a bare call.
+            and agent in (None, BACKGROUND_AGENT)
+            and key not in self._sessions
+            and self._bg_backend_supports_runtime()
+        ):
+            # The persistent background session is created on first use rather
+            # than at boot when the backend serves one-liners from the shared
+            # runtime (``start_pool``). Created through the same path the boot
+            # used, so it keeps the background agent and its start stamping.
+            await self._ensure_background(start_priority=start_priority)
         return await self._allocation_boundary().get_or_create(
             key,
             agent=agent,
