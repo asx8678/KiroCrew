@@ -1677,6 +1677,30 @@ def build_cancelled_turn_preamble(
 # ── Provider-Agnostic Session Replay ──
 
 
+def _replay_source_rows(
+    conversation_log: "ConversationLog | None",
+    session_key: str,
+    *,
+    exclude_last_n: int = 0,
+    pending_messages: list[dict] | None = None,
+    current_message: dict | None = None,
+) -> list[dict]:
+    """Every transcript row a session replay draws on, in chronological order.
+
+    The chained read, reconciled with the live window by delivery identity with
+    *current_message* excluded -- or, without a live snapshot, the legacy trailing
+    *exclude_last_n* dropped -- before any quota or budget is applied. Whole rows,
+    ``meta`` included, because the replay's overview of the rows its tail drops reads
+    their typed fields.
+    """
+    messages = conversation_log.read_messages_chained(session_key) if conversation_log else []
+    if pending_messages is not None or current_message is not None:
+        return _merge_replay_rows(messages, pending_messages or [], current_message)
+    if exclude_last_n > 0:
+        return messages[:-exclude_last_n]
+    return messages
+
+
 def _replay_rows(
     conversation_log: "ConversationLog | None",
     session_key: str,
@@ -1690,14 +1714,32 @@ def _replay_rows(
     Conversation rows get the full quota whatever the inject volume, which a
     single bounded query cannot guarantee.
     """
-    messages = conversation_log.read_messages_chained(session_key) if conversation_log else []
-    if pending_messages is not None or current_message is not None:
-        messages = _merge_replay_rows(messages, pending_messages or [], current_message)
-    elif exclude_last_n > 0:
-        messages = messages[:-exclude_last_n]
+    messages = _replay_source_rows(
+        conversation_log,
+        session_key,
+        exclude_last_n=exclude_last_n,
+        pending_messages=pending_messages,
+        current_message=current_message,
+    )
     return _replay._quota_tail(
         messages, conv_max=_REPLAY_CONVERSATION_MAX_ROWS, inject_max=_REPLAY_INJECT_MAX_ROWS
     )
+
+
+def _session_ledger_snapshot(session_key: str) -> str:
+    """The session's work-ledger snapshot for the replay overview, or ``""``.
+
+    Best-effort like every ledger read: a missing or unreadable ledger leaves the
+    overview without that section rather than failing the replay. It reads files,
+    so it runs only where the replay itself runs -- on a worker thread.
+    """
+    try:
+        from kiro_crew.session_ledger import ledger_key, render_snapshot
+
+        return render_snapshot(ledger_key(session_key))
+    except Exception:
+        logger.debug("session replay: no work ledger for %s", session_key, exc_info=True)
+        return ""
 
 
 def _recall_rows(
@@ -1760,18 +1802,27 @@ def build_session_replay(
     smaller model just like the capped sections do, or it would dominate a 200K
     window). ``None`` ⇒ the 1M reference (unchanged default). The budget is
     scaled by the same factor as the section caps and floored to one message.
+
+    When the history no longer fits, the replay opens with a deterministic overview
+    of the older rows its tail drops -- the work ledger, the last requests quoted
+    with the replies they answered, earlier requests one line each, the files
+    changed and read, and the harness's newest compaction summary, labelled as such
+    -- and the verbatim tail keeps the rest of the same budget
+    (``context_assembly.replay.session_replay_text``). System notices never enter the
+    tail. A history that fits, with no compaction summary, replays exactly as before.
     """
-    messages = _replay_rows(
+    rows = _replay_source_rows(
         conversation_log,
         session_key,
         exclude_last_n=exclude_last_n,
         pending_messages=pending_messages,
         current_message=current_message,
     )
-    if not messages:
+    replay = _replay.session_replay_text(
+        rows, model_window, ledger=lambda: _session_ledger_snapshot(session_key)
+    )
+    if replay is None:
         return None
-
-    replay = _replay.replay_text(messages, model_window)
     replay, _ = redact_exfiltration_urls(replay)
     replay, _ = redact_credentials(replay)
     return replay.translate(_MULTIBYTE_TABLE)

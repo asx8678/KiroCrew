@@ -48,6 +48,7 @@ from kiro_crew.dashboard.state import (
     append_and_surface,
     parse_cls_meta,
 )
+from kiro_crew.dashboard.system_notices import COMPACTION_SUMMARY_PREFIX
 from kiro_crew.execution_context import (
     ExecutionContext,
     canonical_memory_mode,
@@ -690,7 +691,7 @@ def _broadcast_compaction_result(
         summary, _ = redact_credentials(event.title)
         summary, _ = redact_exfiltration_urls(summary)
         msg_text = (
-            f"✅ Conversation compacted: {summary}" if summary else "✅ Conversation compacted."
+            f"{COMPACTION_SUMMARY_PREFIX}{summary}" if summary else "✅ Conversation compacted."
         )
         # Reset the context meter — the provider dropped its stale counts when
         # the completed status arrived (AcpPromptStats.reset_after_compaction),

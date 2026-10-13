@@ -35,6 +35,30 @@ def is_system_notice(role: object, meta: object) -> bool:
     )
 
 
+#: The completed-compaction notice that carries the harness's own summary, as both
+#: producers write it (``chat_utils._broadcast_compaction_result`` and the deferred
+#: arm in ``chat_runner``). Named beside the predicate because the session replay
+#: reads the summary back out of the row (:func:`compaction_notice_summary`), and a
+#: reader matching a hand-copied literal would silently stop finding it the day the
+#: wording changed.
+COMPACTION_SUMMARY_PREFIX = "✅ Conversation compacted: "
+
+
+def compaction_notice_summary(role: object, content: object, meta: object) -> str:
+    """The harness's summary on a completed-compaction notice row, else ``""``.
+
+    Only a row :func:`is_system_notice` classifies as a ``compaction`` notice counts,
+    so a user who types the prefix has said something, not reported a compaction.
+    """
+    if not is_system_notice(role, meta) or not isinstance(meta, dict):
+        return ""
+    if meta.get("kind") != "compaction" or not isinstance(content, str):
+        return ""
+    if not content.startswith(COMPACTION_SUMMARY_PREFIX):
+        return ""
+    return content[len(COMPACTION_SUMMARY_PREFIX) :].strip()
+
+
 #: The injected workflow-completion envelope (``workflow_inject.py``) is written
 #: under the assistant role, like the system notices above, and is likewise
 #: status rather than speech -- but only when its HEADER parses. The frontend

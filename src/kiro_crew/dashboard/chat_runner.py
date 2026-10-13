@@ -422,6 +422,7 @@ from kiro_crew.dashboard.state import (  # noqa: F401
     should_queue_refusal_recovery,
 )
 from kiro_crew.dashboard.steer_settle import settle_consumed_steers
+from kiro_crew.dashboard.system_notices import COMPACTION_SUMMARY_PREFIX
 from kiro_crew.dashboard.turn_dispatch import (
     format_approval_no_budget_card,
     format_approval_timeout_card,
@@ -16103,7 +16104,7 @@ async def _run_chat(
                     summary, _ = redact_credentials(compaction_result.get("summary", ""))
                     summary, _ = redact_exfiltration_urls(summary)
                     msg = (
-                        f"✅ Conversation compacted: {summary}"
+                        f"{COMPACTION_SUMMARY_PREFIX}{summary}"
                         if summary
                         else "✅ Conversation compacted."
                     )

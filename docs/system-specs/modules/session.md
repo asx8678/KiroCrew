@@ -2500,6 +2500,19 @@ path, a `Screen Shot 2024.png` a person typed alone on its line included: it
 stays as text, which the inliner can still pick up on a replayed turn while the
 file is there — the deliberate cost of not deleting the sentence around it.
 
+The overview `build_session_replay` opens with once a history overflows its budget
+(`context_assembly.replay.session_replay_text`; see
+[context-management](../../architecture/context-management.md#what-a-fresh-sessions-replay-carries))
+keeps the same guarantee for the rows the verbatim tail drops: every request and
+reply it quotes, and the harness compaction summary it shows, goes through
+`strip_image_refs` first, and a path it lists is glued to `file:` when it names an
+image — the form `session_ledger.render_snapshot` gives its artifacts — so the
+listing stays readable and the inliner's grammar cannot match it. Its sources are
+typed row fields and its rules are lexical, so it makes no filesystem call either;
+the one read it triggers, the work-ledger snapshot, happens in
+`context._session_ledger_snapshot` on the worker thread both callers already run the
+replay on.
+
 A background one-liner (`llm_helpers.run_bg_oneliner`: titles, summaries,
 suggestions, status cards, folder picks) never inlines at all. Its prompt is
 text ABOUT a session, so a path in it is quoted history, and the turn goes out

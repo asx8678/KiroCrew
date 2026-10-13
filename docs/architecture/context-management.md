@@ -59,14 +59,14 @@ begin on its own line; the assembly newline-terminates the caller's
 | 10 | `[WORKSPACE IDENTITY]` | `workspace_dir_for` | `kirocrew` agent only |
 | 11 | `[DOCUMENTATION]` | `_build_docs_section`, the packaged docs dir | `kirocrew` agent, `project` group |
 | 12 | `[Steering resources]` | `_load_steering_resources` → `file://*.md` in `~/.kiro/agents/kirocrew.json` | **Claude Code backend**, `kirocrew` agent, `project` group |
-| 13 | `[THREAD CONVERSATION HISTORY]` | `build_session_replay` (newest first; each row clipped to a window-scaled per-row cap with a `…[truncated]` marker, so one huge row cannot exceed the replay budget or end the scan), else `_recall_rows` truncation | new, non-resumed session |
+| 13 | `[THREAD CONVERSATION HISTORY]` | `build_session_replay` (newest first; each row clipped to a window-scaled per-row cap with a `…[truncated]` marker, so one huge row cannot exceed the replay budget or end the scan; a history that overflows opens with the deterministic overview of the dropped rows, see [What a fresh session's replay carries](#what-a-fresh-sessions-replay-carries)), else `_recall_rows` truncation | new, non-resumed session |
 | 14 | `[PREVIOUS TURN WAS CANCELLED …]` | `_build_stop_event_notes` | recent user stop |
 | 15 | `[Memory …]` + `[Memory activity index]` + `[Memory activity]` + `[Memory tools]` | `memory.py` → `get_context`, `activity_index`, `get_activity_context` | not temporary, `memory` group; the activity block also needs `memory.inject_activity` |
 | 16 | `[Skills:]` (pinned bodies, then discovery) | `skill_runtime/delivery.py` → `get_context` | see §4 |
 | 17 | `[Learned corrections …]` | vector `get_lessons_context`, else `lessons.jsonl` | `lessons` group |
 | 18 | `## Recent Session Context` | `conversation_log.recent_with_provenance` | `memory` group |
 | 19 | `[RESPONSE PREFERENCES]` | `_build_response_preferences_section` | reply-style level set |
-| 20 | `[CONVERSATION HISTORY …]` | outer replay, `build_session_replay` | compressed history passed |
+| 20 | `[CONVERSATION HISTORY …]` | outer replay, `build_session_replay` (overview + verbatim tail once the history overflows) | compressed history passed |
 
 **A Memory V2 member is the one exception to this order.** Its essentials
 envelope (`_build_v2_essentials`) is not a row in the table: the last step of
@@ -408,12 +408,13 @@ the flag back, so the context is never lost to a failed turn.
 
 ### The `[work ledger]` snapshot
 
-Not part of `build_message`. `session_ledger.py` → `render_snapshot` renders a
-compact block (`goal`, `phase`, `next`, the last three `tried`, artifacts, bounded
-by `_SNAPSHOT_MAX_CHARS`) and `dashboard/handlers/autonudge.py` prepends it to a
-**monitor /
+Not one of `build_message`'s own blocks. `session_ledger.py` → `render_snapshot`
+renders a compact block (`goal`, `phase`, `next`, the last three `tried`, artifacts,
+bounded by `_SNAPSHOT_MAX_CHARS`) and `dashboard/handlers/autonudge.py` prepends it
+to a **monitor /
 auto-nudge cycle message**, so each cycle starts from durable state rather than
-transcript memory. An artifact value that looks like an image path is prefixed
+transcript memory. The same snapshot also opens the session replay's overview when
+a fresh session's replay drops older conversation (next section). An artifact value that looks like an image path is prefixed
 with a glued `file:` — the attachment grammar cannot match that form, so a
 snapshot naming a picture re-attaches it zero times instead of on every cycle,
 while the path stays readable. It is empty when the session has no ledger or its
@@ -424,6 +425,55 @@ message for image paths, so another host-injected block naming a readable image
 to the user's typed span needs that range carried from context assembly through
 `LLMProvider.stream` to the ACP send seam, a signature change on every provider,
 left until it can be tested. See [Session Ledger](../../src/kiro_crew/docs/session-ledger.md), [Monitor Loops](../../src/kiro_crew/docs/monitor-loops.md).
+
+### What a fresh session's replay carries
+
+A harness session that starts fresh on a conversation Crew already holds — after
+a context recycle (always on an `ACP_BACKENDS_CONTEXT_RECYCLE` backend, and whenever
+an in-place `/compact` fails), a provider switch, or a process death — is seeded
+from Crew's own transcript by `build_session_replay`
+(`context_assembly/replay.session_replay_text`). This is the one place Crew writes
+what the model sees after a compaction: the harness's in-place `/compact` happens
+inside the harness, and `LLMProvider` has no call that replaces its message list.
+
+The newest rows go in verbatim, newest first within the window-scaled budget, as
+they always have. When the history fits, and holds no compaction summary, the
+replay is byte-identical to what it was before the overview existed. When it does
+not fit, the replay spends a quarter of its budget (`_OVERVIEW_SHARE`) on a
+deterministic overview of the rows the tail drops and gives the verbatim tail the
+rest, under a `MOST RECENT MESSAGES (verbatim, oldest first):` heading, so the
+replay never grows. The overview's shape is borrowed from pi-fabric's
+deterministic compactor:
+
+- **No model call.** A pure function of the rows: the same rows render the same
+  text, with no cost and no latency.
+- **Rebuilt from the transcript every time**, never from an earlier overview, so
+  errors cannot compound across recycles.
+- **Typed fields only.** Row roles; `meta.kind`, `meta.tool_name` and
+  `meta.tool_call_id` on tool rows (folded by call id, as `compaction.keep` folds
+  them); the `path` of `meta.file_changes` entries; and the target paths of a read
+  or edit/delete/move call's JSON arguments, through the gate's own
+  `platform.tool_paths.target_paths`. No prose is interpreted. Quoted text is the
+  original wording, clipped, with its image references stripped; a listed path
+  that names an image is glued to `file:` as the ledger does, so the prompt
+  builder cannot attach it. No tool input or output is carried verbatim.
+- **Bounded.** Sections in priority order — the work-ledger snapshot (only when
+  the overview covers dropped conversation, because it reads files), the last
+  three requests quoted with the reply each answered and the tools used for it,
+  earlier requests one line each (the earliest three and the latest nine, the gap
+  counted), the files changed, the harness's newest compaction summary, the files
+  read — each go in whole while they fit; the first that does not is cut at a
+  line boundary and nothing follows it.
+
+System notices (`dashboard/system_notices.is_system_notice`: the compaction
+notices and the session-reload confirmation) are status, not speech, so none of
+them enters the verbatim tail. The newest completed-compaction notice's summary
+(`compaction_notice_summary`, read past `COMPACTION_SUMMARY_PREFIX`) is shown in
+the overview as a section labelled as the harness's, and is kept rather than
+dropped: Crew's own log is not complete the way the harness's was (tool output is
+capped, and channel transcripts carry no tool rows), so it may be the only
+account of what came before. Channel sessions get the text-only sections: their
+transcripts hold user and assistant rows only.
 
 ## 3. Sub-agent sessions (`spawn_run`)
 
