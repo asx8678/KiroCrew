@@ -1491,6 +1491,73 @@ def run_mcp_stdio_loop(
         sys.exit(INSTALL_PRUNED_EXIT_CODE)
 
 
+#: Backstop wait while only a worker runs. Not a latency: the wake pipe ends
+#: the wait as soon as the worker finishes (see :class:`_WakePipe`).
+_WORKER_WAIT_SECS = 1.0
+#: Poll interval when no wake pipe could be made, and while parked calls are
+#: waiting for their next ``due_at`` (their schedule is still polled).
+_POLL_SECS = 0.1
+
+
+class _WakePipe:
+    """A self-pipe that wakes the read loop's ``select`` when work finishes.
+
+    The tool worker and the deferred-step pool write one byte when they finish;
+    the loop selects on stdin AND :attr:`read_fd`, so a finished call is
+    answered at once instead of at the next poll tick. POSIX only: Windows
+    ``select`` cannot take a pipe, so its stdin-pump loop keeps the
+    _POLL_SECS tick.
+
+    Writes and close share one lock, so a worker still running after the loop
+    exits (EOF joins it with a timeout) never writes into a closed -- or
+    reused -- descriptor.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.read_fd: int | None = None
+        self._write_fd: int | None = None
+        if not platform_compat.IS_POSIX:
+            return
+        try:
+            r, w = os.pipe()
+        except OSError:
+            return
+        try:
+            os.set_blocking(r, False)
+            os.set_blocking(w, False)
+        except OSError:
+            os.close(r)
+            os.close(w)
+            return
+        self.read_fd, self._write_fd = r, w
+
+    def wake(self, *_args: Any) -> None:
+        """Never raises: a full pipe already wakes the loop. Accepts and ignores
+        a future, so it doubles as a ``Future.add_done_callback`` hook."""
+        with self._lock:
+            if self._write_fd is None:
+                return
+            with contextlib.suppress(OSError):
+                os.write(self._write_fd, b"\0")
+
+    def drain(self) -> None:
+        with self._lock:
+            if self.read_fd is None:
+                return
+            with contextlib.suppress(OSError):
+                while os.read(self.read_fd, 4096):
+                    pass
+
+    def close(self) -> None:
+        with self._lock:
+            for fd in (self.read_fd, self._write_fd):
+                if fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+            self.read_fd = self._write_fd = None
+
+
 def _run_stdio_dispatch_loop(
     server_name: str,
     server_version: str,
@@ -1691,6 +1758,7 @@ def _run_stdio_dispatch_loop(
             set_current_caller(None)
             set_current_tenant_nonce("")
             _result_ready.set()
+            _wake.wake()
             return
         except Exception as exc:
             result_text = f"Error: {neutralize_markers(str(exc))}"  # not a directive: see call_tool_with_logging
@@ -1729,6 +1797,7 @@ def _run_stdio_dispatch_loop(
                 )
                 _worker_audited[0] = True
         _result_ready.set()
+        _wake.wake()
 
     def _refuse_from_pruned_install(first_req_id: Any, tool_name: str) -> None:
         """Answer this call and every queued one, so none is left waiting.
@@ -2232,102 +2301,130 @@ def _run_stdio_dispatch_loop(
         _cancel_event = None
         _result_ready.clear()
 
-    while True:
-        # If a worker is running, poll for completion while also reading stdin
-        if _worker_thread is not None and _worker_thread.is_alive():
-            # Non-blocking stdin read with short timeout to interleave. A line
-            # already buffered is read first: select cannot see it.
-            readable = _stdin_holds_a_line(sys.stdin) or select.select([sys.stdin], [], [], 0.1)[0]
-            if not readable:
+    def _stdin_readable(timeout: float) -> bool:
+        """Wait for stdin while a worker runs. A line already buffered is read
+        first: select cannot see it. On POSIX the wait also ends the moment the
+        wake pipe fires (the worker finished), so its result is answered at
+        once and the timeout is only a backstop. Windows has no wake pipe and
+        keeps the _POLL_SECS tick."""
+        if _stdin_holds_a_line(sys.stdin):
+            return True
+        wake_fd = _wake.read_fd
+        waits: list[Any] = [sys.stdin] if wake_fd is None else [sys.stdin, wake_fd]
+        ready = select.select(waits, [], [], timeout)[0]
+        if wake_fd is not None and wake_fd in ready:
+            _wake.drain()
+        return any(r is sys.stdin for r in ready)
+
+    # Made here, right before the ``try`` that closes it, so no exit path leaks
+    # the two descriptors. The worker reads it late, only once it is running.
+    _wake = _WakePipe()
+    try:
+        while True:
+            # If a worker is running, poll for completion while also reading stdin
+            if _worker_thread is not None and _worker_thread.is_alive():
                 if _result_ready.is_set():
+                    # Deliver a finished result before reading on: an EOF read
+                    # next would end the loop with it unsent.
                     _deliver_finished_worker(1.0)
+                    continue
+                readable = _stdin_readable(
+                    _WORKER_WAIT_SECS if _wake.read_fd is not None else _POLL_SECS
+                )
+                if not readable:
+                    if _result_ready.is_set():
+                        _deliver_finished_worker(1.0)
+                    continue
+                req = _read_message(sys.stdin)
+                if req is None:
+                    # EOF: wait for worker then exit
+                    if _worker_thread:
+                        _worker_thread.join(timeout=5.0)
+                    break
+                if isinstance(req, _Skipped):
+                    # One iteration per dropped frame, so a finished worker's
+                    # result is delivered before the next blocking read.
+                    continue
+                envelope = _servable(req)
+                if envelope is None:
+                    continue
+                method, req_id, params = envelope
+                # Process only cancel notifications while tool is running
+                try:
+                    if method == "notifications/cancelled":
+                        cancelled_rid = params.get("requestId")
+                        if cancelled_rid is not None:
+                            _remember_cancelled_id(
+                                _cancelled_ids,
+                                _cancelled_order,
+                                str(cancelled_rid),
+                                protected=_live_request_ids(),
+                            )
+                            if str(cancelled_rid) == str(_current_req_id) and _cancel_event:
+                                _cancel_event.set()
+                                logger.info(
+                                    "cancel received for in-flight request %s", cancelled_rid
+                                )
+                    # Answer gateway pings even while a tool is in-flight so the
+                    # ping-gated wedge detector sees the backend as responsive.
+                    elif method == "ping" and req_id is not None:
+                        respond(req_id, {})
+                    # Buffer tools/call requests that arrive while busy so they get a
+                    # response when the worker frees (dropping them left the
+                    # client waiting forever). Cancels against queued ids are honored
+                    # at dispatch time via _cancelled_ids.
+                    elif method == "tools/call" and req_id is not None:
+                        if len(_pending_calls) >= PENDING_CALLS_MAX:
+                            # Rejection is a tool-invocation decision -- audit it
+                            # (security-controls: all invocation decisions emit SEL).
+                            _sel_audit(
+                                "rejected_busy",
+                                params.get("name", ""),
+                                req_id,
+                                _req_caller_key(params),
+                            )
+                            respond(
+                                req_id,
+                                None,
+                                error={
+                                    "code": -32000,
+                                    "message": "Server busy: pending tool-call queue is full; retry",
+                                },
+                            )
+                        else:
+                            _pending_calls.append(req)
+                    # Other messages while busy: drop gracefully. Notifications are
+                    # fine to drop; initialize/initialized never arrive mid-tool.
+                    elif method == "tools/list" and req_id is not None:
+                        respond(req_id, {"tools": _listable_tools(_req_caller(params))})
+                except Exception:  # noqa: BLE001 - one message must not end the server
+                    _answer_internal_error(method, req_id)
                 continue
-            req = _read_message(sys.stdin)
-            if req is None:
-                # EOF: wait for worker then exit
-                if _worker_thread:
-                    _worker_thread.join(timeout=5.0)
-                break
-            if isinstance(req, _Skipped):
-                # One iteration per dropped frame, so a finished worker's
-                # result is delivered before the next blocking read.
-                continue
+
+            # Check if worker just finished
+            if _worker_thread is not None:
+                _deliver_finished_worker(0.1)
+
+            # Dispatch a queued tools/call (FIFO) before reading new input.
+            if _pending_calls:
+                req = _pending_calls.popleft()
+            else:
+                req = _read_message(sys.stdin)
+                if req is None:
+                    break
+                if isinstance(req, _Skipped):
+                    continue
+
             envelope = _servable(req)
             if envelope is None:
                 continue
             method, req_id, params = envelope
-            # Process only cancel notifications while tool is running
             try:
-                if method == "notifications/cancelled":
-                    cancelled_rid = params.get("requestId")
-                    if cancelled_rid is not None:
-                        _remember_cancelled_id(
-                            _cancelled_ids,
-                            _cancelled_order,
-                            str(cancelled_rid),
-                            protected=_live_request_ids(),
-                        )
-                        if str(cancelled_rid) == str(_current_req_id) and _cancel_event:
-                            _cancel_event.set()
-                            logger.info("cancel received for in-flight request %s", cancelled_rid)
-                # Answer gateway pings even while a tool is in-flight so the
-                # ping-gated wedge detector sees the backend as responsive.
-                elif method == "ping" and req_id is not None:
-                    respond(req_id, {})
-                # Buffer tools/call requests that arrive while busy so they get a
-                # response when the worker frees (dropping them left the
-                # client waiting forever). Cancels against queued ids are honored
-                # at dispatch time via _cancelled_ids.
-                elif method == "tools/call" and req_id is not None:
-                    if len(_pending_calls) >= PENDING_CALLS_MAX:
-                        # Rejection is a tool-invocation decision -- audit it
-                        # (security-controls: all invocation decisions emit SEL).
-                        _sel_audit(
-                            "rejected_busy",
-                            params.get("name", ""),
-                            req_id,
-                            _req_caller_key(params),
-                        )
-                        respond(
-                            req_id,
-                            None,
-                            error={
-                                "code": -32000,
-                                "message": "Server busy: pending tool-call queue is full; retry",
-                            },
-                        )
-                    else:
-                        _pending_calls.append(req)
-                # Other messages while busy: drop gracefully. Notifications are
-                # fine to drop; initialize/initialized never arrive mid-tool.
-                elif method == "tools/list" and req_id is not None:
-                    respond(req_id, {"tools": _listable_tools(_req_caller(params))})
+                _dispatch(method, req_id, params)
             except Exception:  # noqa: BLE001 - one message must not end the server
                 _answer_internal_error(method, req_id)
-            continue
-
-        # Check if worker just finished
-        if _worker_thread is not None:
-            _deliver_finished_worker(0.1)
-
-        # Dispatch a queued tools/call (FIFO) before reading new input.
-        if _pending_calls:
-            req = _pending_calls.popleft()
-        else:
-            req = _read_message(sys.stdin)
-            if req is None:
-                break
-            if isinstance(req, _Skipped):
-                continue
-
-        envelope = _servable(req)
-        if envelope is None:
-            continue
-        method, req_id, params = envelope
-        try:
-            _dispatch(method, req_id, params)
-        except Exception:  # noqa: BLE001 - one message must not end the server
-            _answer_internal_error(method, req_id)
-        if _pruned_exit:
-            return True
-    return False
+            if _pruned_exit:
+                return True
+        return False
+    finally:
+        _wake.close()

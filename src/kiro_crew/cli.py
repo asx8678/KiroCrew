@@ -46,6 +46,11 @@ from typing import NoReturn
 from kiro_crew import __version__, cli_help, platform_compat
 from kiro_crew.apps import builtins as _builtins_pkg
 from kiro_crew.apps.builtins import BUILTIN_NAMES as _BUILTIN_NAMES
+from kiro_crew.cli_log_files import (  # noqa: F401 -- re-exported for existing callers
+    _AppendOnlyLogFileHandler,
+    _open_owner_only,
+    _OwnerOnlyRotatingFileHandler,
+)
 from kiro_crew.config import KiroCrewConfig, config_dir, ensure_data_home
 from kiro_crew.config.loader import (
     DASHBOARD_PORT,
@@ -75,6 +80,7 @@ from kiro_crew.platform import (
     current_context,
 )
 from kiro_crew.preflight import run_preflight_checks
+from kiro_crew.project_dir import PROJECT_MARKERS, detect_project_dir
 from kiro_crew.seed import seed_cmd
 from kiro_crew.sel import sel
 from kiro_crew.service.live_target import maybe_reexec
@@ -83,12 +89,8 @@ from kiro_crew.skills import SkillsLoader
 
 logger = logging.getLogger(__name__)
 
-# Markers that uniquely identify the KiroCrew repo root for project-dir
-# auto-detection. ``skills/`` + ``src/kiro_crew/`` is the stable signature:
-# ``skills/`` is editable-at-root and ``src/kiro_crew/`` pins this to the
-# KiroCrew package repo (not just any directory that happens to contain a
-# ``skills/`` folder).
-_PROJECT_MARKERS = ("skills", "src/kiro_crew")
+# The project-root signature lives in kiro_crew.project_dir; kept here by name.
+_PROJECT_MARKERS = PROJECT_MARKERS
 
 # Commands that run agent work in-process and so are candidates for the
 # process-isolation jail (CPP JailProvider seam).  The RULE: every command that
@@ -357,17 +359,7 @@ def _detect_project_dir() -> str | None:
     1. Walk up from CWD
     2. Read saved path from config_dir()/project_dir (respects KIROCREW_HOME)
     """
-    cur = Path.cwd().resolve()
-    for d in (cur, *cur.parents):
-        if all((d / m).is_dir() for m in _PROJECT_MARKERS):
-            return str(d)
-    pdf = _project_dir_file()
-    if pdf.is_file():
-        saved = pdf.read_text(encoding="utf-8").strip()
-        p = Path(saved)
-        if p.is_dir() and all((p / m).is_dir() for m in _PROJECT_MARKERS):
-            return saved
-    return None
+    return detect_project_dir(_project_dir_file)
 
 
 def _install_child_watcher() -> None:
@@ -3234,6 +3226,13 @@ env var overrides it.
     # thread per core. Cap both at one before anything below imports the
     # server; an operator's own value wins. Set in-process rather than in the
     # managed MCP spec env so every spec writer and builtin app server gets it.
+    #
+    # The gateway's own servers (bare ``kirocrew mcp-<name>``, valid port,
+    # stderr not gateway.log) start through kiro_crew.mcp_entry.slim_server,
+    # not here. A start-up step added to this function for mcp-* commands must
+    # be added there too. test_mcp_slim_entry compares the two paths' steps it
+    # spies on and the environment each leaves; a new step that is neither of
+    # those needs a spy added there.
     if (args.command or "").startswith("mcp-"):
         for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS"):
             os.environ.setdefault(_var, "1")
