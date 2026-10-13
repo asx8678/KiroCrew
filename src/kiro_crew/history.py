@@ -38,6 +38,7 @@ from kiro_crew.frontmatter import (  # noqa: F401 - facade re-exports
 )
 from kiro_crew.history_cache import (
     _METADATA_CACHE_MAX,
+    _TRANSCRIPT_CACHE_IDLE_TTL,
     _TRANSCRIPT_CACHE_MAX,
     HistoryCacheCoordinator,
     _FileChangeCacheEntry,
@@ -1653,7 +1654,7 @@ class ConversationLog:
         # least-recently-used and deterministic; writes invalidate per-key via
         # _invalidate_cache so a stale entry can never outlive a file change.
         self._msg_cache: _LRUCache[tuple[tuple[int, int, int], int, list[dict]]] = _LRUCache(
-            cache_max
+            cache_max, idle_ttl=_TRANSCRIPT_CACHE_IDLE_TTL
         )
         #: ``(identity, gen, meta)`` — like the search memos, entries record the
         #: invalidation generation and a warm hit requires both fields to
@@ -1679,7 +1680,7 @@ class ConversationLog:
         #: staleness even when a housekeeping write preserves mtime. Own
         #: ``_LRUCache`` → own internal lock.
         self._recent_cache: _LRUCache[tuple[tuple[int, int, int], int, list[dict]]] = _LRUCache(
-            cache_max
+            cache_max, idle_ttl=_TRANSCRIPT_CACHE_IDLE_TTL
         )
         #: Bounded memo of lightweight message projections containing only
         #: ``ts`` and ``meta.file_changes``. The Artifacts "All" view scans
@@ -3198,10 +3199,14 @@ class ConversationLog:
             self._invalidate_cache(key)
 
     def unconsolidated_count(self, key: str) -> int:
-        """Count messages not yet processed by the consolidator."""
-        messages = self._read_messages(key)
+        """Count messages not yet processed by the consolidator.
+
+        Counts without materializing the transcript (see :meth:`_count_messages`):
+        the startup idle-seed scan calls this for every recent transcript.
+        """
+        total = self._count_messages(key)
         offset = self._read_metadata(key).get("last_consolidated", 0)
-        return max(0, len(messages) - offset)
+        return max(0, total - offset)
 
     def consolidation_counts(self, key: str) -> tuple[int, int]:
         """Return ``(total_messages, unconsolidated)`` from a SINGLE read.
@@ -3211,6 +3216,11 @@ class ConversationLog:
         :meth:`consolidation_retry_state` compares the charged span against. Both
         come from one ``_read_messages`` call so the eligibility check costs no
         additional transcript read on the event loop.
+
+        This reads through the message cache on purpose, unlike
+        :meth:`unconsolidated_count`: the idle sweep calls it on the event loop
+        every tick for each tracked session, so a warm entry keeps that a cache
+        hit instead of a full stream of the file per tick.
         """
         total, unconsolidated, _prompt_rows = self.consolidation_idle_counts(key)
         return total, unconsolidated
@@ -3754,6 +3764,9 @@ class ConversationLog:
 
     def _read_messages(self, key: str) -> list[dict]:
         return self._read_projection._read_messages(key)
+
+    def _count_messages(self, key: str) -> int:
+        return self._read_projection._count_messages(key)
 
     @contextlib.contextmanager
     def _cache_fill_lock(self, key: str) -> Iterator[bool]:
