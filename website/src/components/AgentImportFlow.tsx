@@ -162,10 +162,15 @@ function ImportingLabel() {
 
 export default function AgentImportFlow({
   initialOpen,
+  keepOpenWhenEmpty = false,
   onComplete,
   onSkipAll,
 }: {
   initialOpen: boolean
+  // First run finishes this chapter by itself when the scan finds nothing to
+  // import. A replay the user asked for keeps the empty result on screen, or the
+  // click is answered by a dialog that closes before it shows anything.
+  keepOpenWhenEmpty?: boolean
   onComplete: () => void
   // "Skip all" abandons the whole first-run flow (import + onboarding tour) and
   // drops the user straight into the product. Falls back to onComplete when the
@@ -279,6 +284,7 @@ export default function AgentImportFlow({
   useEffect(() => {
     if (
       !open
+      || keepOpenWhenEmpty
       || !scanQuery.data
       || scanQuery.isError
       || sources.length > 0
@@ -290,6 +296,7 @@ export default function AgentImportFlow({
     completionMutation.mutate()
   }, [
     completionMutation,
+    keepOpenWhenEmpty,
     open,
     scanQuery.data,
     scanQuery.isError,
