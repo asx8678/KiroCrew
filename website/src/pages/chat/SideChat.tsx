@@ -72,7 +72,18 @@ function relativeTime(iso: string): string | null {  const diff = Date.now() - n
   return `${Math.floor(diff / (24 * 3600_000))}d`
 }
 
-export default function SideChat({ slot }: { slot: string }) {
+export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
+  slot: string
+  /** Open a path named in a side reply as a Files tab of the panel this chat
+   *  sits in — the same opener the host hands the main transcript. Capability
+   *  by omission: absent, a path chip falls back to `MarkdownRenderer`'s own
+   *  OS reveal (a clipboard copy on a remote dashboard), a path link stays a
+   *  plain link. */
+  onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
+  /** Open an artifact link as an artifact tab of the same panel; absent, the
+   *  link navigates away from the chat. */
+  onArtifactOpen?: (slug: string) => void
+}) {
   const connected = useConnected()
   const dispatch = useAppDispatch()
   // The footer describes what the backend enforces, so it follows the selected
@@ -720,6 +731,10 @@ export default function SideChat({ slot }: { slot: string }) {
       <ChatMessageList
         messages={transcript}
         running={isBusy}
+        // The host's own openers, so a path or artifact named in a side reply
+        // opens where the main transcript opens it: a tab of this panel.
+        onFileOpen={onFileOpen}
+        onArtifactOpen={onArtifactOpen}
         transcript={{
           sessionId: `side:${slot}`,
           scrollerStyle: { paddingLeft: 12, paddingRight: 12, paddingTop: 8, paddingBottom: 8 },

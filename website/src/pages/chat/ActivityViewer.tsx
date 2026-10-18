@@ -1308,7 +1308,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
         </div>
       )}
 
-      {effectiveTab === 'side' && <SideChat slot={slot} />}
+      {effectiveTab === 'side' && <SideChat slot={slot} onFileOpen={onFileOpen} onArtifactOpen={onArtifactOpen} />}
 
       {/* Scroll to bottom button (tools tab only) */}
     </div>
