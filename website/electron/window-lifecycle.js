@@ -15,7 +15,7 @@ const {
   watchFullScreenTransitions,
   repairStalledFullScreenExit,
 } = require("./fullscreen-transition-watch");
-const { createNavigationGuard, createWindowOpenHandler } = require("./external-scheme");
+const { createNavigationGuard, createRedirectGuard, createWindowOpenHandler } = require("./external-scheme");
 const { sanitizeWindowState, captureWindowState } = require("./window-state");
 const { stepZoomFactor } = require("./zoom");
 const { registerCaptureSurface } = require("./capture-trust");
@@ -567,9 +567,14 @@ function createWindowLifecycle(options) {
       getAppOrigin: () => windowBackendUrl,
       log: glog,
     });
+    const redirectGuard = createRedirectGuard({
+      getAppOrigin: () => windowBackendUrl,
+      log: glog,
+    });
     const armWindowOpen = (contents) => {
       contents.setWindowOpenHandler(windowOpenHandler);
       contents.on("will-navigate", navigationGuard);
+      contents.on("will-redirect", redirectGuard);
       contents.on("did-create-window", (child) => armWindowOpen(child.webContents));
     };
     armWindowOpen(view.webContents);
