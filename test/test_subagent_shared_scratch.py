@@ -606,6 +606,7 @@ class TestAnInheritingRuntimeJoinsTheMarkerOnceLive:
         calls: list[tuple[str, Path, int]] = []
         fake_scratch = SimpleNamespace(
             allocate_scratch=lambda _label: None,
+            drop_inherited_scratch_env=lambda env: (),
             shared_scratch_window=lambda path: path,
             record_owner=lambda path, pid: calls.append(("record", path, pid)) or "recorded",
             adopt_owner=lambda path, pid: calls.append(("adopt", path, pid)) or adopt_outcome,
@@ -1240,16 +1241,16 @@ class TestEveryProcessSpawnSeamIsAccountedFor:
         the parent-side collectors that feed the dedicated and pooled arms
         name the key too."""
         from kiro_crew import session_allocation
-        from kiro_crew.config import loader
+        from kiro_crew.config import loader_config
         from kiro_crew.providers import acp as acp_provider
-        from kiro_crew.subagent_manager import run as sub_run
+        from kiro_crew.subagent_manager import run_turn as sub_run
 
         assert '"shared_scratch": shared_scratch' in inspect.getsource(acp_provider.AcpProvider)
         assert 'kwargs["shared_scratch"]' in inspect.getsource(
             session_allocation._collect_parent_runtime_kwargs
         )
         assert 'extra_kwargs["shared_scratch"]' in inspect.getsource(sub_run)
-        assert "shared_scratch=shared_scratch" in inspect.getsource(loader)
+        assert "shared_scratch=shared_scratch" in inspect.getsource(loader_config)
 
     def test_the_standalone_list_names_only_files_that_still_construct(self) -> None:
         rels = {rel for rel, _ in self._constructions()}

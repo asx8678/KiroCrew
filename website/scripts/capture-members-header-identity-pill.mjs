@@ -14,8 +14,8 @@
  *     back button sits at the left edge;
  *   - hovering the pill changes nothing but the cursor (the Glass material has
  *     no hover state), and clicking it opens this crewmate's full editor;
- *   - with Reduce glass transparency on, the pill solidifies with the rest of
- *     the glass instead of staying translucent.
+ *   - with Translucent panels off (the default), the pill solidifies with the
+ *     rest of the glass instead of staying translucent.
  *
  * Usage:
  *   kirocrew pod up <worktree> --json | tail -1 > "$KIROCREW_SCRATCH/pod-info.json"
@@ -57,9 +57,9 @@ async function stills(browser, theme) {
   const pill = await openMember(page)
 
   check(`[${theme}] the pill is a Glass pane`, await pill.evaluate(el => el.classList.contains('liquid-glass')))
-  check(`[${theme}] the pill is a button named by the crewmate, described "Edit crewmate"`,
+  check(`[${theme}] the pill is a button named by the mate, described "Edit mate"`,
     (await pill.evaluate(el => el.tagName)) === 'BUTTON' && (await pill.getAttribute('aria-label')) === null
-      && (await pill.innerText()).includes(CREW) && (await pill.getAttribute('title')) === 'Edit crewmate')
+      && (await pill.innerText()).includes(CREW) && (await pill.getAttribute('title')) === 'Edit mate')
   check(`[${theme}] the pill holds the face and the name`,
     await pill.evaluate(el => !!el.querySelector('img') && !!el.querySelector('[data-testid="member-title-row"]')))
   check(`[${theme}] no pencil anywhere in the header`, (await page.getByTestId('member-edit-name-button').count()) === 0)
@@ -101,7 +101,7 @@ async function stills(browser, theme) {
   await page.getByTestId('member-identity-pill').waitFor({ state: 'visible', timeout: 10000 })
   await page.waitForTimeout(500)
 
-  // 4: Reduce glass transparency → the pill is a solid card, no glass layers.
+  // 4: Translucent panels off → the pill is a solid card, no glass layers.
   await page.evaluate(() => document.documentElement.setAttribute('data-reduce-transparency', 'on'))
   await page.mouse.move(5, 5)
   await page.waitForTimeout(300)

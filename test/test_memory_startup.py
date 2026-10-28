@@ -4,9 +4,9 @@ import ast
 import asyncio
 import inspect
 import json
+import sqlite3
 import textwrap
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,6 +26,7 @@ from kiro_crew.memory_startup import (
     wait_for_memory_preparation,
 )
 from kiro_crew.slack.gateway import GatewayOrchestrator
+from kiro_crew.testing.wait import async_wait_until, await_until, wait_until
 from kiro_crew.vector_memory import VectorMemoryStore
 
 env = _member_env
@@ -90,6 +91,68 @@ def _gateway(monkeypatch):
     gateway._repair_member_memory = AsyncMock()
     monkeypatch.setattr("kiro_crew.context.reset_memory_caches", lambda memory: None)
     return gateway
+
+
+@pytest.mark.asyncio
+async def test_a_damaged_global_memory_db_is_named_and_left_untouched(monkeypatch, tmp_path):
+    """A damaged memory.db: startup completes, the file stays, and the advice fits.
+
+    The default advice ("cancel this store's pending restore") names a restore
+    that does not exist. The file is the store's only copy, so it is not moved.
+    """
+    gateway = _gateway(monkeypatch)
+    _stub_preparation_steps(monkeypatch)
+    db = tmp_path / "memory.db"
+    db.write_bytes(b"this is not a sqlite database" * 64)
+    before = db.read_bytes()
+    gateway.vector_memory = VectorMemoryStore(db_path=db)
+    try:
+        assert await gateway._wait_for_memory_preparation() is True
+        with pytest.raises(MemoryStartupUnavailable) as caught:
+            require_memory_ready()
+        message = str(caught.value)
+        assert "is damaged; it was left untouched" in message
+        assert str(db) in message
+        assert "Do not delete it" in message
+        assert "pending restore" not in message
+        assert db.read_bytes() == before
+        assert [p.name for p in tmp_path.iterdir() if "corrupt" in p.name] == []
+    finally:
+        await asyncio.to_thread(gateway._stop_memory_startup)
+
+
+@pytest.mark.asyncio
+async def test_a_non_damage_global_failure_keeps_the_restore_advice(monkeypatch):
+    gateway = _gateway(monkeypatch)
+    _stub_preparation_steps(monkeypatch)
+    gateway.vector_memory.init.side_effect = ValueError("restore staging is incomplete")
+    try:
+        assert await gateway._wait_for_memory_preparation() is True
+        with pytest.raises(MemoryStartupUnavailable) as caught:
+            require_memory_ready()
+        assert "Inspect or cancel this store's pending restore" in str(caught.value)
+    finally:
+        await asyncio.to_thread(gateway._stop_memory_startup)
+
+
+@pytest.mark.asyncio
+async def test_damage_outside_the_vector_open_does_not_name_memory_db(monkeypatch, tmp_path):
+    """The remedy names memory.db, so a damaged index file must not earn it."""
+    gateway = _gateway(monkeypatch)
+    _stub_preparation_steps(monkeypatch)
+    gateway.vector_memory._db_path = tmp_path / "memory.db"
+    gateway.ctx_builder.memory.rebuild_index.side_effect = sqlite3.DatabaseError(
+        "database disk image is malformed"
+    )
+    try:
+        assert await gateway._wait_for_memory_preparation() is True
+        with pytest.raises(MemoryStartupUnavailable) as caught:
+            require_memory_ready()
+        message = str(caught.value)
+        assert "Inspect or cancel this store's pending restore" in message
+        assert "memory.db" not in message
+    finally:
+        await asyncio.to_thread(gateway._stop_memory_startup)
 
 
 @pytest.mark.asyncio
@@ -213,7 +276,22 @@ def test_the_crew_log_child_liveness_probe_is_registered_after_ready():
     dashboard_workers = source.index("self._start_dashboard_workers_after_memory_ready()")
     assert ready < register < dashboard_workers
 
-    boot = inspect.getsource(GatewayOrchestrator._init_subagents)
+    # ``_init_subagents`` and the completion consumer's phases it calls, which the
+    # facade composes from its sub-agent owners.
+    from kiro_crew.slack.gateway import _compose_subagent_completion
+
+    boot = "\n".join(
+        inspect.getsource(fn)
+        for fn in (
+            GatewayOrchestrator._init_subagents,
+            _compose_subagent_completion,
+            GatewayOrchestrator._subagent_wave_digest,
+            GatewayOrchestrator._route_subagent_to_tab,
+            GatewayOrchestrator._inject_subagent_into_channel_parent,
+            GatewayOrchestrator._finish_subagent_cron_or_notify,
+            GatewayOrchestrator._inject_with_retry,
+        )
+    )
     assert "crew_log_emit" not in boot, (
         "the emitter import belongs off the boot path: _init_subagents is an "
         "_init_* reached from run() before the readiness print"
@@ -311,7 +389,7 @@ async def test_preparation_does_not_queue_behind_a_saturated_default_executor(mo
     hold = threading.Event()
     busy = [loop.run_in_executor(None, hold.wait, 30) for _ in range(workers * 2)]
     try:
-        assert await asyncio.wait_for(gateway._wait_for_memory_preparation(), timeout=5)
+        assert await await_until(asyncio.ensure_future(gateway._wait_for_memory_preparation()))
         require_memory_ready()
         assert ran_on == ["mc-memprep_0"]
         # The default executor stayed full the whole time.
@@ -363,14 +441,11 @@ async def test_cancelled_preparation_still_stops_and_closes_its_own_worker(monke
 
 
 def _begin_when_released(timeout=5.0):
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            return MemoryStartup.begin()
-        except MemoryStartupUnavailable:
-            if time.monotonic() > deadline:
-                raise
-            time.sleep(0.01)
+    return wait_until(
+        MemoryStartup.begin,
+        timeout=timeout,
+        ignoring=(MemoryStartupUnavailable,),
+    )
 
 
 def test_invalid_declared_store_is_scoped_without_failing_global_startup(monkeypatch):
@@ -498,9 +573,9 @@ async def test_owner_shutdown_wins_while_restore_worker_remains_fenced(monkeypat
     monkeypatch.setattr(memory_backup, "apply_pending_member_restores", restore)
     supervisor = asyncio.create_task(gateway._wait_for_memory_preparation())
     try:
-        await asyncio.wait_for(started.wait(), 5)
+        await await_until(started)
         stopping.set()
-        assert await asyncio.wait_for(supervisor, 1) is False
+        assert await await_until(supervisor, timeout=1) is False
         assert gateway._memory_startup.stopped
         assert not gateway._memory_startup_task.done()
         assert not gateway._memory_startup_task.cancelled()
@@ -515,6 +590,57 @@ async def test_owner_shutdown_wins_while_restore_worker_remains_fenced(monkeypat
         gateway.vector_memory.init.assert_not_called()
         gateway.vector_memory.close.assert_called_once()
     finally:
+        release.set()
+        await asyncio.gather(supervisor, gateway._memory_startup_task, return_exceptions=True)
+        await asyncio.to_thread(gateway._stop_memory_startup)
+
+
+@pytest.mark.asyncio
+async def test_stuck_preparation_past_deadline_fails_instead_of_blocking_forever(monkeypatch):
+    # A wedged restore that never returns must not leave the fence preparing
+    # forever: past the outer deadline the supervisor flips it to a terminal
+    # failure, so turns get an actionable restart error rather than endlessly
+    # answering that recovery is still running.
+    gateway = _gateway(monkeypatch)
+    stopping = asyncio.Event()
+    monkeypatch.setattr("kiro_crew.slack.gateway.shutdown_event", stopping)
+    monkeypatch.setattr("kiro_crew.memory_startup.MEMORY_PREPARATION_DEADLINE_SECONDS", 0.05)
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def restore(**kwargs):
+        loop.call_soon_threadsafe(started.set)
+        # Block well past the (patched) deadline; the supervisor must not wait.
+        assert release.wait(5)
+        return {}
+
+    monkeypatch.setattr(memory_backup, "apply_pending_member_restores", restore)
+    supervisor = asyncio.create_task(gateway._wait_for_memory_preparation())
+    try:
+        await await_until(started)
+        startup = gateway._memory_startup
+        # The deadline elapses while the worker is still blocked in restore, so
+        # the fence flips to a terminal failure rather than staying preparing.
+        assert await async_wait_until(lambda: bool(startup.error), timeout=2)
+        assert "did not finish" in startup.error
+        assert not startup.ready
+        # The supervisor keeps the recovery shell reachable (like any failed
+        # pass) until the owner shuts down; it has not returned yet.
+        assert not supervisor.done()
+        # The user-facing paths now surface the terminal error with a restart
+        # directive, never the transient "still running" message again.
+        with pytest.raises(MemoryStartupUnavailable, match="restart the gateway"):
+            require_memory_ready()
+        with pytest.raises(MemoryStartupUnavailable, match="did not finish"):
+            await wait_for_memory_preparation(gateway._memory_startup_task)
+        # Owner shutdown lets the supervisor unwind; consumers never started.
+        stopping.set()
+        assert await await_until(supervisor, timeout=2) is False
+        gateway.vector_memory.init.assert_not_called()
+        gateway._auto_migrate_memory.assert_not_awaited()
+    finally:
+        stopping.set()
         release.set()
         await asyncio.gather(supervisor, gateway._memory_startup_task, return_exceptions=True)
         await asyncio.to_thread(gateway._stop_memory_startup)
@@ -638,7 +764,9 @@ async def test_a_subagent_run_fails_on_a_closed_memory_fence_instead_of_running_
     try:
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
             with pytest.raises(MemoryStartupUnavailable, match="restored and prepared"):
-                await asyncio.wait_for(manager._run_inner(info, "subagent:fenced01"), 10)
+                await await_until(
+                    asyncio.ensure_future(manager._run_inner(info, "subagent:fenced01"))
+                )
         prepare.assert_awaited_once()
         provider = sessions.get_or_create.return_value[0]
         provider.stream.assert_not_called()
@@ -661,7 +789,7 @@ async def test_stopped_worker_cannot_open_or_release_a_successors_barrier(monkey
     monkeypatch.setattr(memory_backup, "apply_pending_member_restores", restore)
     task = asyncio.create_task(gateway._wait_for_memory_preparation())
     try:
-        await asyncio.wait_for(started.wait(), 5)
+        await await_until(started)
         await asyncio.to_thread(gateway._stop_memory_startup)
         with pytest.raises(MemoryStartupUnavailable):
             require_memory_ready()

@@ -26,6 +26,9 @@ from kiro_crew.messaging.approval import (
 from kiro_crew.messaging.commands import (
     compact_refusal_plain_text,
     compact_unsupported_backend,
+    context_recycle_warning,
+    recycle_backend,
+    recycle_warning_should_send,
 )
 from kiro_crew.messaging.conversation import (
     ConversationState,
@@ -480,6 +483,7 @@ class WhatsAppDispatcher:
             # Resolved at delivery time: the shared pipeline acquires the
             # provider inside the turn, so its cwd is not known here yet.
             upload_root=lambda: self._provider_cwd(session_key),
+            scratch_root=lambda: self._provider_scratch_dir(session_key),
         )
         user_text = inbound.text
         if unprompted:
@@ -605,6 +609,18 @@ class WhatsAppDispatcher:
             return ""
         return str(getattr(provider, "cwd", "") or "")
 
+    def _provider_scratch_dir(self, session_key: str) -> str:
+        """The acquired provider's runtime ``$KIROCREW_SCRATCH``, or "" when unknown.
+
+        Where the agent is told to stage screenshots; admitted only beside the
+        cwd root, so empty just leaves the cwd as the one tree.
+        """
+        try:
+            provider = self.sessions.get_provider(session_key)
+        except Exception:  # noqa: BLE001
+            return ""
+        return str(getattr(provider, "work_scratch_dir", None) or "")
+
     async def _handle_busy(self, inbound: InboundMessage, session_key: str) -> None:
         if not self.sessions.is_busy(session_key):
             await self.handle_message(inbound)
@@ -654,6 +670,14 @@ class WhatsAppDispatcher:
         pct = self.sessions.check_context_usage(session_key, provider)
         may_speak = not unprompted and not delivery_is_muted(self.sessions, session_key, "whatsapp")
         soft, hard = self._thresholds()
+        if recycle_backend(provider):
+            # Crew restarts this backend's session at the threshold; warn once
+            # before it, offering a fresh start instead of a compaction.
+            if recycle_warning_should_send(
+                self.sessions, self._conv, scope, session_key, pct, may_speak=may_speak
+            ):
+                await self._say(scope, context_recycle_warning())
+            return
         if pct >= soft:
             # Capability gate: no forced compaction to run and the
             # soft nudge's /compact advice cannot work — the backend compacts

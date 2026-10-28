@@ -167,6 +167,9 @@ cross-home flake three tests later.
      store read. Within that window the next boot would serve the previous
      home's counts; past it, whether the next boot refreshes depends on how
      long the boots took.
+   * ``mcp_gateway.overlay_refresh._refresher`` -- the running broker's
+     overlay-refresh hook, bound to that boot's orchestrator; the broker stop
+     clears it, and this covers a boot whose teardown did not reach the stop.
    * ``metrics.inventory_gauges`` TTL cache, loader singletons and
      install-reporter claim, through its own ``reset_for_testing()`` -- the
      cached counts are the home's, and each boot claims the reporter role
@@ -176,6 +179,11 @@ cross-home flake three tests later.
      sample (``DEFAULT_SAMPLE_SECS``) and ``debug_threads mode=now`` takes one
      on request, so whether a boot leaves entries depends on how long it ran;
      a fresh process has none.
+   * ``platform.governance._CONFIRM_PATTERNS_MEMO`` -- the ``hooks.confirm_tools``
+     patterns read from the home's config files, keyed on their fingerprint.
+     Grant writers and gate checks fill it whenever no live snapshot is up,
+     so whether a boot leaves one, and from which home, depends on timing; a
+     fresh process has none.
 
 2. **Snapshot and restore** around the boot by ``booted_gateway``, on every
    exit: the SIGINT/SIGTERM handlers ``run()`` installs; the event loop's
@@ -245,7 +253,6 @@ import re
 import secrets
 import signal
 import sys
-import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -282,11 +289,14 @@ from kiro_crew.dashboard import (
 from kiro_crew.dashboard.handlers import kiro_usage_api
 from kiro_crew.dashboard.handlers import updates as dashboard_updates
 from kiro_crew.diag import threads as diag_threads
+from kiro_crew.mcp_gateway import overlay_refresh
 from kiro_crew.metrics import inventory_gauges
 from kiro_crew.platform import bootstrap as platform_bootstrap
 from kiro_crew.platform import context as platform_context
+from kiro_crew.platform import governance
 from kiro_crew.security import paths as security_paths
 from kiro_crew.testing import fake_acp_backend
+from kiro_crew.testing.wait import async_wait_until, finished
 
 try:  # POSIX only; the layer is Linux-only in CI, but keep the import honest.
     import resource as _resource
@@ -776,6 +786,7 @@ def _reset_home_bound_globals() -> None:
     config_loader._MATERIALIZED_SEEN.clear()
     config_loader._MATERIALIZED_COMPLETE = False
     config_loader._MATERIALIZED_AGENTS_READY = False
+    governance._CONFIRM_PATTERNS_MEMO = None
     dashboard_updates._auto_effect = None
     dashboard_updates._auto_effect_task = None
     dashboard_updates._shape_effect = None
@@ -791,6 +802,7 @@ def _reset_home_bound_globals() -> None:
     status_counts._counts_cache_ts = float("-inf")
     status_counts._counts_cache_failures = 0
     status_counts._counts_refresh_inflight = False
+    overlay_refresh.set_overlay_refresher(None)
     status_counts._last_counts_warn_monotonic = None
     inventory_gauges.reset_for_testing()
     with diag_threads._prev_lock:
@@ -823,6 +835,7 @@ def home_bound_globals_are_clear() -> bool:
         and not config_loader._MATERIALIZED_SEEN
         and not config_loader._MATERIALIZED_COMPLETE
         and not config_loader._MATERIALIZED_AGENTS_READY
+        and governance._CONFIRM_PATTERNS_MEMO is None
         and dashboard_updates._auto_effect is None
         and not browser_launch._warned_lifecycle_losses
     )
@@ -845,15 +858,18 @@ async def _drain_memory_fence() -> None:
     boot on this worker would be refused with "Another gateway is still
     preparing memory" -- rather than being left to surface as that refusal.
     """
-    deadline = time.monotonic() + MEMORY_FENCE_DRAIN_SECS
-    while memory_fence_held() and time.monotonic() < deadline:
-        await asyncio.sleep(0.05)
-    if memory_fence_held():
+    try:
+        await async_wait_until(
+            lambda: not memory_fence_held(),
+            timeout=MEMORY_FENCE_DRAIN_SECS,
+            interval=0.05,
+        )
+    except AssertionError as exc:
         raise RuntimeError(
             "the memory-preparation worker still held its fence "
             f"{MEMORY_FENCE_DRAIN_SECS}s after shutdown; it may still be writing "
             "to the discarded home"
-        )
+        ) from exc
 
 
 def _live_tasks() -> set["asyncio.Task[Any]"]:
@@ -940,7 +956,7 @@ async def _teardown_boot(
     runner = getattr(orchestrator, "_dashboard_runner", None)
     if runner is not None:
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(runner.cleanup(), timeout=15)
+            await finished(runner.cleanup(), "the dashboard runner's cleanup", timeout=15)
     try:
         await _drain_memory_fence()
     except BaseException as exc:  # noqa: BLE001 -- re-raised below, after the reset
@@ -983,26 +999,28 @@ async def _boot(home: Path, *, boot_secs: float) -> IntegrationGateway:
     )
     run_task = asyncio.create_task(orchestrator.run(), name="integration-gateway-run")
 
-    deadline = time.monotonic() + boot_secs
     client = ClientSession()
+
+    async def _serving_http() -> bool:
+        if run_task.done():
+            exc = run_task.exception() if not run_task.cancelled() else None
+            raise RuntimeError(f"gateway run() ended during boot: {exc!r}")
+        port = getattr(orchestrator, "_dashboard_port", 0)
+        if not (port and orchestrator.dashboard_state is not None):
+            return False
+        try:
+            async with client.get(
+                f"http://127.0.0.1:{port}/api/health", timeout=ClientTimeout(total=2)
+            ) as resp:
+                return resp.status < 500
+        except Exception:
+            return False
+
     try:
-        while True:
-            if run_task.done():
-                exc = run_task.exception() if not run_task.cancelled() else None
-                raise RuntimeError(f"gateway run() ended during boot: {exc!r}")
-            port = getattr(orchestrator, "_dashboard_port", 0)
-            if port and orchestrator.dashboard_state is not None:
-                try:
-                    async with client.get(
-                        f"http://127.0.0.1:{port}/api/health", timeout=ClientTimeout(total=2)
-                    ) as resp:
-                        if resp.status < 500:
-                            break
-                except Exception:
-                    pass
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"gateway did not serve HTTP within {boot_secs}s")
-            await asyncio.sleep(0.05)
+        try:
+            await async_wait_until(_serving_http, timeout=boot_secs, interval=0.05)
+        except AssertionError as exc:
+            raise RuntimeError(f"gateway did not serve HTTP within {boot_secs}s") from exc
     except BaseException:
         await client.close()
         await _teardown_boot(orchestrator, run_task, tasks_before)

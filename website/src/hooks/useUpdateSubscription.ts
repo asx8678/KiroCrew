@@ -1,10 +1,22 @@
 import { useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { useAppDispatch } from '../store'
-import { setDesktopUpdateAvailable } from '../store/dashboardSlice'
+import { useAppDispatch, useAppSelector } from '../store'
+import { setDesktopUpdateAvailable, selectPolicyGoverned } from '../store/dashboardSlice'
 import { updateInfoQuery } from '../api/updateInfoQuery'
 
 export type UpdateState = globalThis.UpdateState
+
+/**
+ * The stop command an install refused with `gateway-still-running` names, or
+ * null for any other state. Both refusal surfaces (UpdateModal and the About
+ * card) render it verbatim after the catalog sentence that points at it, and
+ * fall back to their generic install-failure copy when no command came with
+ * the refusal.
+ */
+export function gatewayStopCommand(st: UpdateState | null | undefined): string | null {
+  if (st?.state !== 'error' || st.code !== 'gateway-still-running') return null
+  return typeof st.stopCommand === 'string' && st.stopCommand.trim() ? st.stopCommand : null
+}
 
 /**
  * The update lifecycle payload pushed by the Electron main process.
@@ -18,7 +30,7 @@ export type UpdateState = globalThis.UpdateState
  * Subscribes to the Electron main process's update lifecycle events and mirrors
  * each one into the shared ['update-state'] React Query cache.
  *
- * Must be mounted exactly once at the app root (App.tsx) so update events are
+ * Must be mounted exactly once at the app root (shell/appShell.tsx) so update events are
  * captured regardless of which page is visible. Both UpdateModal and the
  * Settings > About panel read from this cache — if the subscription lived only
  * inside About, the modal would never fire unless the user opened About first.
@@ -41,6 +53,28 @@ export type UpdateState = globalThis.UpdateState
  *
  * No-ops in the browser (window.updateAPI is only defined by the Electron preload).
  */
+/**
+ * Keeps the Electron main process informed when the gateway's security policy
+ * provider governs this install's updates, so the feed lane stands down and
+ * the Electron auto-updater does not compete with the provider.
+ *
+ * No-ops in the browser (window.updateAPI is only defined by the Electron
+ * preload). Also no-ops when the shell is too old to expose
+ * `notifyPolicyGoverned` (the field is optional; absent on older shells).
+ */
+export function usePolicyGovernedNotification() {
+  const governed = useAppSelector(selectPolicyGoverned)
+  // Do not send `false` before the gateway status has loaded: on a window
+  // reload Redux resets to null and selectPolicyGoverned returns false before
+  // the status arrives, which would transiently clear governance and let the
+  // Electron feed lane fire while the policy provider still owns the install.
+  const statusLoaded = useAppSelector(s => s.dashboard.status !== null)
+  useEffect(() => {
+    if (!statusLoaded && !governed) return
+    window.updateAPI?.notifyPolicyGoverned?.(governed)
+  }, [governed, statusLoaded])
+}
+
 export function useUpdateSubscription() {
   const queryClient = useQueryClient()
   const dispatch = useAppDispatch()

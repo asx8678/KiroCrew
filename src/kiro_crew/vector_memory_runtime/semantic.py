@@ -4,8 +4,8 @@ Validation (key shape, allowlist, confidence, decoded emptiness, size, encoding
 and injection screening), the reject audit, the insert-if-absent and delete
 writes, facet stamping, and every reader that ranks or renders facts and
 preferences for a prompt. The conflict-resolving write transaction,
-``VectorMemoryStore._write_semantic``, stays on the store because member
-consolidation joins it; ``write_value`` validates and routes into it.
+``VectorMemoryStore._write_semantic``, lives in ``vector_memory_semantic_write`` because
+member consolidation joins it; ``write_value`` validates and routes into it.
 """
 
 from __future__ import annotations
@@ -19,10 +19,12 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew import context_omissions
 from kiro_crew import memory_record_metadata as record_meta
 from kiro_crew import memory_schema, memory_v2
 from kiro_crew.embeddings import PRIORITY_BULK, PRIORITY_INTERACTIVE
 from kiro_crew.lesson_validation import order_by_request_relevance
+from kiro_crew.user_json import strict_json_equal
 from kiro_crew.validation import ALLOWED_LESSON_CATEGORIES
 from kiro_crew.vector_memory_runtime import lessons as _lessons
 from kiro_crew.vector_memory_runtime import text_scoring as _text_scoring
@@ -169,24 +171,13 @@ def _scoring_cosines(scoring: _SemanticScoringSet, query_embedding: list[float] 
     return sims
 
 
-def _strict_json_equal(a: object, b: object) -> bool:
-    """Type-strict equality over decoded JSON: 1 != True, 1 != 1.0.
-
-    Python's == conflates bool with int (and int with float), so a decoded
-    compare alone would treat an existing ``1`` and a submitted ``true`` as
-    unchanged and silently retain the stale value. Requiring identical types
-    errs toward "changed", which routes to an update or conflict proposal --
-    never a silent skip.
-    """
-    if type(a) is not type(b):
-        return False
-    if isinstance(a, dict):
-        assert isinstance(b, dict)
-        return a.keys() == b.keys() and all(_strict_json_equal(a[k], b[k]) for k in a)
-    if isinstance(a, list):
-        assert isinstance(b, list)
-        return len(a) == len(b) and all(map(_strict_json_equal, a, b))
-    return a == b
+#: Type-strict equality over decoded JSON: 1 != True, 1 != 1.0. The shared
+#: comparator in :mod:`kiro_crew.user_json`, bound here under the name this
+#: module always exported. A decoded compare with ``==`` alone would treat an
+#: existing ``1`` and a submitted ``true`` as unchanged and silently retain the
+#: stale value; requiring identical types errs toward "changed", which routes to
+#: an update or conflict proposal -- never a silent skip.
+_strict_json_equal = strict_json_equal
 
 
 def _json_value_equal(a: str, b: str) -> bool:
@@ -199,9 +190,10 @@ def _json_value_equal(a: str, b: str) -> bool:
     """
     if a == b:
         return True
-    # A deeply nested value can exhaust the recursion limit in the decoded
-    # compare; treating that as "changed" routes it to an update or conflict
-    # proposal rather than aborting the write, which errs on the safe side.
+    # The compare itself walks an explicit stack, but ``json.loads`` can still
+    # exhaust the recursion limit on a value nested past it; treating that as
+    # "changed" routes it to an update or conflict proposal rather than
+    # aborting the write, which errs on the safe side.
     try:
         return _strict_json_equal(json.loads(a), json.loads(b))
     except (TypeError, ValueError, RecursionError):
@@ -395,8 +387,21 @@ def log_reject_event(
     store._log_event(code.value, "semantic", key, None, snippet, source)
 
 
+#: The ``semantic_memory`` view's columns on the crew schema, in its order
+#: (``memory_schema.CREW_SCHEMA_SQL``), for a keyed read of the table under it.
+_V1_SEMANTIC_COLUMNS = (
+    "key, value_json, confidence, source, created_at, updated_at, is_deleted, embedding"
+)
+
+
 def get_all_semantic(
-    store: VectorMemoryStore, limit: int | None = None, offset: int = 0, *, q: str = ""
+    store: VectorMemoryStore,
+    limit: int | None = None,
+    offset: int = 0,
+    *,
+    q: str = "",
+    after_key: str | None = None,
+    exclude_lessons: bool = False,
 ) -> list[dict]:
     """Get active semantic memory entries.
 
@@ -408,17 +413,45 @@ def get_all_semantic(
 
     Optional ``q`` matches literal Unicode text in keys and decoded values
     before pagination. Omitting it keeps the existing unfiltered read path.
+
+    ``after_key`` returns only rows whose key sorts after it, so a caller can
+    walk the table in key order one bounded page at a time (keyset paging).
+    ``exclude_lessons`` leaves out ``lesson.*`` rows, for a reader that draws
+    lessons from :func:`get_lessons` and would otherwise spend its window on
+    them. Either one asks for a read in KEY-INDEX order: the liveness and kind
+    tests are written ``+is_deleted`` / ``+kind`` so SQLite walks the unique key
+    index and stops at ``limit``, instead of collecting every live row through
+    the ``is_deleted`` or ``kind`` index and sorting them all to keep a page
+    The rows and their order are the same either way.
     """
     query = _text_scoring._normalize_memory_search_query(q)
-    sql = "SELECT * FROM semantic_memory WHERE is_deleted = 0"
-    if store.algorithm_version == "v2":
+    keyed = after_key is not None or exclude_lessons
+    live = "+is_deleted = 0" if keyed else "is_deleted = 0"
+    sql = f"SELECT * FROM semantic_memory WHERE {live}"
+    if keyed and store.algorithm_version != "v2" and store._sem_rel != "semantic_memory":
+        # A v1 store on the crew schema reads ``semantic_memory`` as a VIEW over
+        # ``memory_items`` whose ``kind IN (...)`` test steers the plan onto the kind
+        # index. Read the table itself, in the view's columns, with that test unindexed.
+        sql = (
+            f"SELECT {_V1_SEMANTIC_COLUMNS} FROM {store._sem_rel} WHERE {live}{store._sem_guard}"
+        ).replace(" AND kind ", " AND +kind ")
+    elif store.algorithm_version == "v2":
         # Compatibility views intentionally omit facets. Private lifecycle readers
         # need the canonical row so an explicit copy keeps its visible provenance.
-        sql = f"SELECT * FROM {store._sem_rel} WHERE is_deleted = 0" f"{store._sem_guard}"
+        sql = f"SELECT * FROM {store._sem_rel} WHERE {live}{store._sem_guard}"
+        if keyed:
+            # The kind guard is an IN test too, and would steer the plan onto the
+            # kind index the same way the liveness test does.
+            sql = sql.replace(" AND kind ", " AND +kind ")
     params: tuple = ()
     if query:
         sql += " AND (memory_text_contains(key, ?, 0) OR memory_text_contains(value_json, ?, 1))"
         params = (query, query)
+    if exclude_lessons:
+        sql += " AND key NOT LIKE 'lesson.%'"
+    if after_key is not None:
+        sql += " AND key > ?"
+        params += (after_key,)
     sql += " ORDER BY key"
     if limit is not None:
         sql += " LIMIT ? OFFSET ?"
@@ -559,15 +592,8 @@ def write_value(
         metadata = record_meta.normalize_metadata(metadata) if metadata is not None else None
     except ValueError as exc:
         return (vm.SemanticRejectCode.CONFLICT, str(exc))
-    if metadata and metadata.get("subject") and metadata.get("predicate"):
-        with store._db_lock:
-            identity = store.db.execute(
-                "SELECT record_id FROM memory_record_meta WHERE scope=? AND subject=? "
-                "AND predicate=? AND status='active' AND kind IN ('fact','directive')",
-                (metadata.get("scope", ""), metadata["subject"], metadata["predicate"]),
-            ).fetchone()
-        if identity:
-            key = identity[0].removeprefix("key:")
+    with store._db_lock:
+        key = record_meta.identity_key(store.db, key, metadata)
     conflict = store._write_semantic(
         key,
         value_json,
@@ -792,8 +818,8 @@ def delete_semantic(
         # A forget writes its audit event best-effort AFTER committing the
         # tombstone, through the shared helper -- an unavailable event table
         # must not fail a forget. Only the supersede branch inlines the INSERT
-        # inside the transaction, where losing the winner/reason is the data
-        # loss this change exists to prevent.
+        # inside the transaction, where losing the winner/reason is data
+        # loss.
         store._log_event("delete", "semantic", key, row["value_json"], new_value, source)
     return True
 
@@ -1005,6 +1031,13 @@ def get_preferences_context(store: VectorMemoryStore, query_text: str = "", cap:
         spent += cost
     omitted = total - len(kept)
     notice = _PREFS_OMISSION_NOTICE.format(count=omitted, total=total, limit=cap)
+    context_omissions.record(
+        context_omissions.PREFERENCE_FACTS,
+        "budget",
+        omitted=omitted,
+        total=total,
+        budget_chars=cap,
+    )
     body = "\n".join(kept)
     return header + body + ("\n" if kept else "") + notice + footer
 
@@ -1124,7 +1157,7 @@ def get_semantic_context(
         # query path above.
         rows = store._fetch_all_locked(
             "SELECT key, value_json FROM semantic_memory WHERE is_deleted = 0 "
-            "AND key NOT LIKE 'lesson.%' ORDER BY updated_at DESC LIMIT ?",
+            "AND key NOT LIKE 'lesson.%' ORDER BY updated_at DESC, key LIMIT ?",
             (max_rows,),
         )
     if facts_only:
@@ -1146,9 +1179,8 @@ def get_semantic_context(
         val_str = json.dumps(val, ensure_ascii=False) if isinstance(val, (dict, list)) else str(val)
         line = f"{store._fact_label(dict(r))}: {val_str}"
         if total + len(line) > cap:
-            if store.algorithm_version == "v2":
-                continue
-            break
+            # Skip a line that does not fit; a shorter, lower-ranked one may.
+            continue
         lines.append(line)
         total += len(line) + 1
     if not lines:

@@ -26,43 +26,60 @@ def _owner_caller(monkeypatch):
         "kiro_crew.dashboard.handlers.source_providers.is_owner_dashboard_request",
         lambda request: True,
     )
-    pass  # Member routing does not depend on OS isolation.
 
 
 class TestAcpIdCorrection:
-    def test_corrects_a_bedrock_flavoured_spelling(self):
-        """The registry lists each model's prefix-stripped Bedrock id as an alias.
-
-        ``claude-opus-4-8`` therefore resolves to a canonical key while being
-        nothing kiro-cli serves, and the registry already knows the id that is.
-        """
-        assert acp_id_correction("claude-opus-4-8") == "claude-opus-4.5"
-
-    def test_corrects_a_registered_full_bedrock_id(self):
-        """The id the alias was stripped FROM must correct too.
-
-        ``_build_indices`` puts aliases into every provider's index but each
-        provider's own id only into its own, so an ``acp``-only lookup silently
-        passed these through — the likelier spelling for someone copying from
-        Bedrock, and the one that actually reaches the child and kills it.
-        """
-        assert acp_id_correction("global.anthropic.claude-opus-4-8") == "claude-opus-4.5"
-
-    def test_corrects_the_1m_bedrock_variant_to_its_own_kiro_id(self):
-        """The 1M entry is a DISTINCT model, so it must not collapse onto the other."""
-        assert acp_id_correction("global.anthropic.claude-opus-4-8[1m]") == "claude-opus-4.8"
+    @pytest.mark.parametrize(
+        ("pin", "want"),
+        [
+            # The registry lists each model's prefix-stripped Bedrock id as an
+            # alias, so ``claude-opus-4-8`` resolves to a canonical key while being
+            # nothing kiro-cli serves, and the registry already knows the id that is.
+            pytest.param(
+                "claude-opus-4-8",
+                "claude-opus-4.5",
+                id="test_corrects_a_bedrock_flavoured_spelling",
+            ),
+            # The id the alias was stripped FROM must correct too. ``_build_indices``
+            # puts aliases into every provider's index but each provider's own id
+            # only into its own, so an ``acp``-only lookup silently passed these
+            # through -- the likelier spelling for someone copying from Bedrock,
+            # and the one that actually reaches the child and kills it.
+            pytest.param(
+                "global.anthropic.claude-opus-4-8",
+                "claude-opus-4.5",
+                id="test_corrects_a_registered_full_bedrock_id",
+            ),
+            # The 1M entry is a DISTINCT model, so it must not collapse onto the other.
+            pytest.param(
+                "global.anthropic.claude-opus-4-8[1m]",
+                "claude-opus-4.8",
+                id="test_corrects_the_1m_bedrock_variant_to_its_own_kiro_id",
+            ),
+        ],
+    )
+    def test_corrects_a_bedrock_id_to_its_kiro_id(self, pin: str, want: str):
+        assert acp_id_correction(pin) == want
 
     def test_every_registered_claude_code_id_is_correctable(self):
-        """Class-level guard: no registered non-acp id may bypass the correction.
+        """Class-level guard: every unserved id is either corrected or known to lack a kiro id.
 
         Pins the rule rather than the three instances above, so a registry entry
         added later cannot reintroduce the bypass silently.
         """
-        from kiro_crew.model_registry import available_models
+        from kiro_crew.model_registry import (
+            available_models,
+            from_provider_id,
+            lacks_acp_id,
+            to_acp_id,
+        )
 
         served = set(available_models("acp"))
         for pid in available_models("claude_code"):
             if pid in served:
+                continue
+            if not to_acp_id(from_provider_id(pid, "claude_code")):
+                assert lacks_acp_id(pid), f"{pid!r} has no kiro id yet is not refused"
                 continue
             assert acp_id_correction(pid), f"{pid!r} bypassed the correction"
 
@@ -128,6 +145,34 @@ class TestDoctorFlagsSpecPins:
         assert any(
             name == "proj-reviewer" for name, _pin, _fix in problems
         ), f"project-scoped pin was not audited: {problems}"
+
+    def test_the_declared_name_labels_the_problem_in_either_scope(self, tmp_path):
+        """A row names the agent its spec declares, not the file that holds it.
+
+        A spec's filename and its ``name`` are not required to agree; a
+        ``name`` that is a non-empty string labels the row in the global and
+        the project scope alike.
+        """
+        from kiro_crew import cli_doctor
+
+        global_dir = tmp_path / "agents"
+        global_dir.mkdir()
+        (global_dir / "global-file.json").write_text(
+            json.dumps({"name": "global-reviewer", "model": "claude-opus-4-8"}),
+            encoding="utf-8",
+        )
+        project = tmp_path / "proj"
+        project_dir = project / ".kiro" / "agents"
+        project_dir.mkdir(parents=True)
+        (project_dir / "project-file.json").write_text(
+            json.dumps({"name": "proj-reviewer", "model": "claude-opus-4-8"}),
+            encoding="utf-8",
+        )
+
+        problems = cli_doctor._agent_spec_model_problems(agents_dir=global_dir, project_dir=project)
+
+        assert problems is not None, "the check must have run"
+        assert sorted(name for name, _pin, _fix in problems) == ["global-reviewer", "proj-reviewer"]
 
     def test_unreadable_specs_report_unchecked_not_clean(self, tmp_path):
         """A diagnostic must not print green for a check it never performed."""
@@ -235,28 +280,65 @@ class TestNoRedundantConfigLoad:
         monkeypatch.setattr(KiroCrewConfig, "load", staticmethod(counting))
         return calls
 
-    def test_supplied_provider_skips_the_load(self, monkeypatch):
+    @staticmethod
+    def _canonical_key() -> str:
+        from kiro_crew import model_registry
+
+        return next(
+            e["model_name"]
+            for e in model_registry.display_list("claude_code")
+            if model_registry.is_canonical_key(e["model_name"]) and e["model_name"] != "auto"
+        )
+
+    def test_supplied_backend_skips_the_load(self, monkeypatch):
         from kiro_crew.dashboard.chat_handlers import _model_rejected_reason
 
+        key = self._canonical_key()
         calls = self._counting_load(monkeypatch)
-        _model_rejected_reason("claude-opus-4-8", provider="acp")
+        _model_rejected_reason(key, "")
         assert calls == []
 
-    def test_omitted_provider_still_resolves_it(self, monkeypatch):
-        """The default must preserve the original behaviour for existing callers."""
+    def test_omitted_backend_still_resolves_it(self, monkeypatch):
+        """A canonical key with no backend supplied resolves the configured one."""
         from kiro_crew.dashboard.chat_handlers import _model_rejected_reason
 
+        key = self._canonical_key()
         calls = self._counting_load(monkeypatch)
-        _model_rejected_reason("claude-opus-4-8")
+        _model_rejected_reason(key)
         assert len(calls) == 1
 
-    def test_validator_forwards_the_provider(self, monkeypatch):
-        from kiro_crew.dashboard.handlers.core import _validate_role_model
+    def test_a_non_canonical_id_never_loads(self, monkeypatch):
+        """Only a canonical key's answer depends on the harness, so only it pays a read."""
+        from kiro_crew.dashboard.chat_handlers import _model_rejected_reason
 
         calls = self._counting_load(monkeypatch)
-        request = SimpleNamespace(app={})
-        _validate_role_model("claude-opus-4-8", request, provider="acp")
+        assert _model_rejected_reason("claude-opus-4-8") is None
         assert calls == []
+
+    def test_validator_forwards_the_backend(self, monkeypatch):
+        from kiro_crew.dashboard.handlers.core import _validate_role_model
+
+        key = self._canonical_key()
+        calls = self._counting_load(monkeypatch)
+        request = SimpleNamespace(app={})
+        _validate_role_model(key, request, provider="acp", backend="")
+        assert calls == []
+
+    def test_a_namespace_with_no_id_for_the_key_still_refuses_it(self):
+        """A provider namespace passes a canonical key only when the registry gives
+        it an id there -- the translation ``_wire_model_id`` would send."""
+        from kiro_crew import model_registry
+        from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX
+        from kiro_crew.agent_sdk.capabilities import capabilities_for
+        from kiro_crew.dashboard.chat_handlers import _model_rejected_reason
+
+        key = self._canonical_key()
+        codex = capabilities_for(ACP_BACKEND_CODEX).model_id_namespace
+        assert not (model_registry.get_entry(key) or {}).get("providers", {}).get(codex)
+
+        assert _model_rejected_reason(key, ACP_BACKEND_CLAUDE) is None
+        reason = _model_rejected_reason(key, ACP_BACKEND_CODEX)
+        assert reason is not None and ACP_BACKEND_CODEX in reason
 
     def test_live_entitlements_preserve_the_registry_correction(self, monkeypatch):
         """A live advertised set must not replace the actionable spelling hint."""
@@ -270,6 +352,18 @@ class TestNoRedundantConfigLoad:
 
         assert reason is not None
         assert "registry maps that spelling to 'claude-opus-4.5'" in reason
+
+    @pytest.mark.parametrize(
+        "spelling, target",
+        [("claude-opus-5-5", "claude-opus-5.5"), ("claude-sonnet-5-5", "claude-sonnet-5.5")],
+    )
+    def test_correction_lists_the_id_it_maps_to(self, spelling, target):
+        from kiro_crew.dashboard.handlers import agents
+
+        reason = agents._model_pin_rejected(spelling, SimpleNamespace(app={}), provider="acp")
+
+        assert reason is not None
+        assert target in reason.split("pick one of: ", 1)[1].split(", ")
 
     def test_claude_code_provider_keeps_its_wire_id(self, monkeypatch):
         from kiro_crew.dashboard.handlers import agents, core
@@ -510,6 +604,26 @@ class TestSavePathRefusesAnUnusablePin:
         assert KiroCrewConfig.load().agents[seeded_agent].model != "claude-opus-4-8"
 
     @pytest.mark.asyncio
+    async def test_update_refuses_a_pin_kiro_has_no_id_for_without_a_catalog(self, seeded_agent):
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg = KiroCrewConfig.load()
+        cfg.agent.acp_backend = ACP_BACKEND_KIRO
+        cfg.save()
+        before = cfg.agents[seeded_agent].model
+        app = _crud_app()
+        app["state"] = SimpleNamespace(sessions=SimpleNamespace(active_providers=lambda: []))
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.put(
+                f"/api/agents/{seeded_agent}", json={"model": "claude-fable-5-1"}
+            )
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "invalid_model"
+
+        assert KiroCrewConfig.load().agents[seeded_agent].model == before
+
+    @pytest.mark.asyncio
     async def test_a_usable_pin_is_accepted(self, seeded_agent):
         async with TestClient(TestServer(_crud_app())) as client:
             resp = await client.post(
@@ -604,3 +718,37 @@ class TestSavePathRefusesAnUnusablePin:
         cfg = KiroCrewConfig.load()
         assert "pending" not in cfg.agents
         assert cfg.agents[seeded_agent].model != "pending-model"
+
+
+class TestNoCatalogRefusesAPinKiroHasNoIdFor:
+    def test_names_the_spelling_and_suggests_no_other_id(self):
+        from kiro_crew.dashboard.handlers.core import _validate_role_model
+
+        reason = _validate_role_model("claude-fable-5-1", SimpleNamespace(app={}), backend="")
+
+        assert reason is not None and "'claude-fable-5-1'" in reason
+        assert "claude-" not in reason.replace("'claude-fable-5-1'", "")
+
+    def test_a_live_kiro_catalog_that_serves_it_is_asked_first(self):
+        from kiro_crew.dashboard.handlers.core import _validate_role_model
+
+        provider = _catalog_provider(ACP_BACKEND_KIRO, "claude-fable-5.1")
+        request = SimpleNamespace(
+            app={
+                "state": SimpleNamespace(
+                    sessions=SimpleNamespace(active_providers=lambda: [provider])
+                )
+            }
+        )
+
+        assert _validate_role_model("claude-fable-5.1", request, backend=ACP_BACKEND_KIRO) is None
+
+    def test_the_claude_backend_serves_it_without_a_catalog(self):
+        from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
+        from kiro_crew.dashboard.handlers.core import _validate_role_model
+
+        reason = _validate_role_model(
+            "claude-fable-5-1", SimpleNamespace(app={}), backend=ACP_BACKEND_CLAUDE
+        )
+
+        assert reason is None

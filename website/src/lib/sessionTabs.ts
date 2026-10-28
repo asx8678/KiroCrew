@@ -21,12 +21,64 @@
 export const TAB_TITLE_MAX = 24
 
 /**
+ * Session tab geometry, Chrome's model: every tab takes the same width whatever
+ * its title, starting at `TAB_MAX_WIDTH` and shrinking uniformly as the strip
+ * fills. Past `TAB_MIN_WIDTH` they stop shrinking and the strip scrolls, so a
+ * tab never gets too narrow to read or hit.
+ */
+export const TAB_MAX_WIDTH = 200
+export const TAB_MIN_WIDTH = 96
+/** Space between tabs. One constant, because the close arithmetic needs it. */
+export const TAB_GAP = 4
+
+/**
+ * The pointer-close freeze. While the pointer stays in the strip after a
+ * close, every tab keeps one fixed width and a trailing spacer keeps the
+ * strip's content width, so the tab after the closed one slides left by exactly
+ * one slot and its close button lands where the pointer already is. Leaving
+ * the strip drops the freeze and the tabs reflow.
+ */
+export interface TabFreeze {
+  /** Width every tab is held at, in px. */
+  width: number
+  /** Width of the tabs closed so far in this sequence, gaps included, in px. */
+  spacer: number
+}
+
+/**
+ * The freeze after a pointer close.
+ *
+ * Closing any tab except the last one keeps the width and adds the closed
+ * slot to the spacer. Closing the LAST tab has no next tab to slide in, so the
+ * remaining tabs widen until the new last tab ends where the closed one ended
+ * and its close button lands under the pointer. That widening is capped at
+ * `TAB_MAX_WIDTH`, so a strip with only a few tabs left cannot keep it up.
+ *
+ * `firstLeft` and `closedRight` are the first tab's left edge and the closed
+ * tab's right edge in one coordinate space. `count` is the tab count BEFORE
+ * the close.
+ */
+export function freezeAfterPointerClose(
+  prev: TabFreeze | null,
+  closed: { width: number; isLast: boolean },
+  geometry: { firstLeft: number; closedRight: number; count: number },
+): TabFreeze {
+  const base = prev ?? { width: closed.width, spacer: 0 }
+  if (!closed.isLast) return { width: base.width, spacer: base.spacer + closed.width + TAB_GAP }
+  const remaining = geometry.count - 1
+  if (remaining < 1) return base
+  const fill = (geometry.closedRight - geometry.firstLeft - TAB_GAP * (remaining - 1)) / remaining
+  return { width: Math.max(base.width, Math.min(TAB_MAX_WIDTH, fill)), spacer: base.spacer }
+}
+
+/**
  * There is deliberately NO ceiling on the working set.
  *
  * An earlier revision capped it at 12 and dropped the oldest tab past that, on
  * the stated grounds that more tabs make each one too narrow to read. That harm
- * cannot occur here: tabs are `shrink-0` inside an `overflow-x-auto` scroller
- * with edge gradients, so a tab's width never depends on how many there are.
+ * cannot occur here: tabs stop shrinking at `TAB_MIN_WIDTH` and the
+ * `overflow-x-auto` scroller with edge gradients takes over, so a tab never
+ * becomes too narrow to read.
  * The cap was therefore paying a real cost — silently evicting a tab the user
  * placed, which is the exact promise this feature exists to make — to prevent
  * nothing. The set is still bounded, by pruning to sessions that actually
@@ -223,5 +275,10 @@ export function tabStatusPulses(status: TabStatus): boolean {
 
 /** Ellipsize a tab label. Returns the input untouched when it already fits. */
 export function truncateTabTitle(title: string, max: number = TAB_TITLE_MAX): string {
-  return title.length > max ? title.slice(0, max) + '…' : title
+  if (title.length <= max) return title
+  // Cut on a code-point boundary: a UTF-16 slice through an emoji would leave
+  // its lone high surrogate, which renders as a replacement glyph.
+  const head = title.slice(0, max)
+  const last = head.charCodeAt(head.length - 1)
+  return (last >= 0xd800 && last <= 0xdbff ? head.slice(0, -1) : head) + '…'
 }

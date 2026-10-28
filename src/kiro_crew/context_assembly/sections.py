@@ -3,19 +3,21 @@
 These renderers produce the deterministic blocks every session carries whatever its
 memory holds -- the critical-rules contract, the runtime identity, the user profile,
 the reply-style preferences, the workspace identity, the runtime refresh a follow-up
-turn needs and the widget pointer an agent prompt's ``{{WIDGET_BLOCK}}`` resolves
-to. Each takes its inputs as arguments and reads no transcript, store or file, so a
-render is a pure function of config and the trusted dispatcher metadata.
+turn needs, the widget pointer an agent prompt's ``{{WIDGET_BLOCK}}`` resolves to,
+the section its ``{{COMPUTER_USE_BLOCK}}`` resolves to and what its marked Browser
+section becomes. Each takes its inputs as arguments and reads no transcript, store or
+file, so a render is a pure function of config and the trusted dispatcher metadata.
 
-The critical-rules contract and the UI-language renderers stay on
-:mod:`kiro_crew.context`: the contract's text is pinned in place there, and the
-UI-language catalog mirror is where its drift test names it.
+The critical-rules contract and the UI-language renderers live in
+:mod:`kiro_crew.context_assembly.output_contract`, the output contract a session
+starts with.
 
 New conduct blocks belong here; a block that reads memory or a transcript does not.
 """
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import TYPE_CHECKING
 
@@ -256,50 +258,11 @@ def _reply_style_rules(level: str) -> str:
 
     ``""`` for ``default`` and for any value the enum does not know, so a
     config edited by hand to an unrecognised level injects nothing rather
-    than a half-formed block.
+    than a half-formed block. A retired level is read as its replacement.
     """
-    if level == "ultra":
-        return (
-            "## Reply style: Ultra-Brief (ADHD reader)\n\n"
-            "Before responding, simulate the reader: they will read the "
-            "first 2 sentences, scan for bold text and code blocks, then "
-            "close the tab. Anything they won't reach is wasted tokens. "
-            "Structure for THAT reader, not an attentive one.\n\n"
-            "You have a strong bias toward completeness. Override it. The "
-            "reader's time costs more than your thoroughness. An answer "
-            "that's 80% complete in 2 lines beats 100% complete in 20 "
-            "lines. Missing a caveat is acceptable. Missing an edge case "
-            "is acceptable.\n\n"
-            "Rules:\n"
-            "- Open with THE answer in 1–2 sentences. Bold the single most "
-            "critical point.\n"
-            "- Supporting bullets only if the reader would be STUCK without "
-            "them. Max 3. Each bullet is one short sentence.\n"
-            '- Take a position. Name your pick. Resolve "it depends" '
-            "immediately.\n"
-            "- Do NOT add: tables, headers, numbered lists > 3 items, "
-            '"common pitfalls", "also consider", multi-section layouts, '
-            'or any content that fails the test: "would the reader be '
-            'stuck without this line?"\n'
-            "- Code blocks and commands are the answer — never cut them.\n"
-            "- Stakes change what you must not omit, never the length: "
-            "security warnings and irreversible-action confirmations "
-            "always appear, each as one line naming the call, the risk, "
-            "and whether it can be undone; the mechanism and the failure "
-            "modes are not required. Ordered multi-step instructions "
-            "where a dropped step causes a mistake stay complete, and "
-            "code, commands, paths, identifiers and error strings stay "
-            "verbatim.\n"
-            "- When the user ASKS for something long (design doc, tutorial, "
-            "full implementation), ignore these constraints and deliver "
-            "what was asked.\n"
-            "- Required output formats are sacred and never cut: "
-            "[OPTIONS:] lines, diff blocks for file changes, full PR/MR "
-            "URLs, and any format the rendering surface "
-            "needs. These go in their required position regardless of "
-            "brevity.\n"
-            "- Preserve the user's language."
-        )
+    from kiro_crew.config.sections import normalize_verbosity
+
+    level = normalize_verbosity(level)
     if level == "concise":
         return (
             "## Reply style: Concise\n\n"
@@ -382,7 +345,7 @@ def _response_preferences_apply(session_key: str, runtime_source: str | None = N
     every session whose final message a person reads — dashboard, every
     messaging channel, a cron digest. A ``subagent:`` session is the one kind
     whose final message is read by its PARENT agent instead: the parent needs
-    the caveats and edge cases the ``ultra`` and ``answer_only`` levels tell
+    the caveats and edge cases the ``answer_only`` level tells
     the writer to drop, so the block is withheld there. Resolved through the
     same runtime-source seam as ``[RUNTIME]``, so a sub-agent is recognised the
     way every other transport is.
@@ -401,16 +364,16 @@ def _build_response_preferences_section(cfg: "KiroCrewConfig") -> str:
     ``build_message`` must mint this trusted frame only after it scrubs session
     context. Both frame markers are structural markers, so placing the genuine
     frame inside the scrubbed context would neutralize it along with forgeries.
-    The earlier ``{{VERBOSITY_BLOCK}}`` token reached 7 of the 84 agent specs on
-    one real install; the 77 others ran with the setting silently ignored.
+    It is built here rather than substituted for a ``{{VERBOSITY_BLOCK}}`` token
+    in the agent prompt, because a token reaches only the specs that carry it;
+    every other spec would run with the setting silently ignored.
 
     The wrapper is deliberately loud (a bracketed MANDATORY header, an explicit
     precedence sentence) because the block competes with a long agent prompt
     that carries its own style guidance; a bare ``##`` heading in the middle of
     the context would have no stated rank against it.
 
-    Returns ``""`` when the level is ``default`` or unrecognised, so installs
-    that never touched the setting see byte-identical context.
+    Returns ``""`` when the level is ``default`` or unrecognised.
     """
     level = getattr(getattr(cfg, "dashboard", None), "verbosity", "default")
     rules = _reply_style_rules(level if isinstance(level, str) else "default")
@@ -549,3 +512,82 @@ def widget_block(density: str) -> str:
         "`@kirocrew-core/artifact_save` one you rendered. Load the "
         "`artifacts` skill to save other content, iterate or list."
     )
+
+
+# The same slot while the spec withholds the server (the feature is off, or the OS
+# has no driver), so the session has no ``computer_*`` tool. It keeps a user who
+# asks to drive a desktop app pointed at the setting. Its last sentence covers a
+# session that stays open across the switch: enabling Computer Use resets every
+# session, a reset session resumes its own transcript, and the agent prompt is not
+# re-sent on a resume, so this text is what such a session holds once the tools
+# arrive.
+_COMPUTER_USE_UNAVAILABLE = (
+    "## Computer Use (native desktop apps)\n"
+    "\n"
+    "Not available in this session: Computer Use is off or this OS has no driver, so\n"
+    "no `computer_*` tools are mounted. If the user asks you to drive a desktop app,\n"
+    "point them to Settings → Computer Use. If `computer_*` tools are in your tool list\n"
+    "anyway, it was turned on after this session started: read the `computer-use` skill\n"
+    "before your first call."
+)
+
+
+def computer_use_block(mounted: bool) -> str:
+    """What an agent prompt's ``{{COMPUTER_USE_BLOCK}}`` resolves to.
+
+    ``mounted`` is the session's reading of the spec gate that decides whether
+    ``kirocrew-computer`` is in its agent spec. A mounted server carries its own
+    usage text as MCP ``instructions`` (``kiro_crew.mcp_instructions.COMPUTER``),
+    which the harness puts in its system prompt, so the slot is empty. Only the
+    absent server needs the prompt: the short pointer to the setting.
+    """
+    return "" if mounted else _COMPUTER_USE_UNAVAILABLE
+
+
+# The shipped prompt marks its Browser section in place, each marker on a line of its
+# own, so the section is edited and pinned (``test/test_prompt_compact_contract.py``)
+# in ``config/prompt.md`` like every other section.
+BROWSER_BEGIN = "{{BROWSER_BEGIN}}"
+BROWSER_END = "{{BROWSER_END}}"
+# A marked span, each marker taking its own line break with it, or a marker left
+# without its partner, which is dropped alone so the text around it stays.
+_BROWSER_SPAN = re.compile(
+    r"\{\{BROWSER_BEGIN\}\}\r?\n?(?P<section>.*?)\r?\n?\{\{BROWSER_END\}\}"
+    r"|\{\{BROWSER_(?:BEGIN|END)\}\}",
+    re.DOTALL,
+)
+
+# What the marked section becomes while browsing is not set up on this host: no
+# vetted ``playwright-cli`` resolves, and the ``browser`` tool refuses every op. Its
+# last sentence covers a session that stays open across the install, which the tool
+# notices on its next call while this session's prompt keeps this text.
+_BROWSER_UNAVAILABLE = (
+    "## Browser\n"
+    "\n"
+    "Not available in this session: browsing is not set up on this host (no\n"
+    "`playwright-cli`), so the `browser` tool refuses every op. Read pages with\n"
+    "`web_fetch` / `web_search`, and tell a user who needs a real browser that they can\n"
+    "install it from Settings → Browser (one click). The `web-preview` marker still\n"
+    "shows a local dev server in the dashboard and needs no `playwright-cli`: read the\n"
+    "`web-preview` skill first. If a `browser` call works anyway,\n"
+    "browsing was set up after this session started: read the `web-browse` skill before\n"
+    "you drive a page."
+)
+
+
+def browser_section(prompt: str, available: bool) -> str:
+    """*prompt* with its marked Browser section resolved for one session.
+
+    ``available`` is the session's reading of the browse gate. While it holds, the
+    section stays word for word and only the markers go; while it does not, the short
+    pointer takes the section's place. An unpaired marker is dropped and the text
+    around it kept, so a hand-edited prompt can lose a marker, never its section.
+    """
+
+    def _resolve(match: re.Match[str]) -> str:
+        section = match.group("section")
+        if section is None:
+            return ""
+        return section if available else _BROWSER_UNAVAILABLE
+
+    return _BROWSER_SPAN.sub(_resolve, prompt)

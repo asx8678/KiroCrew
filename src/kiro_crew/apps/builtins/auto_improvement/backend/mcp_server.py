@@ -25,8 +25,6 @@ from typing import Any, Callable
 from kiro_crew.json_line import parse_json_object_line, recover_line_id
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
-from kiro_crew.tool_result_cap import tool_json
-from kiro_crew.validation import build_tool_response
 
 from . import deps, progress, runner
 
@@ -38,6 +36,10 @@ _INTERNAL_ERROR = -32603
 
 #: Protocol version echoed on initialize.
 _PROTOCOL_VERSION = "2024-11-05"
+
+#: Cap on a single tool result. An agent asking for a finding must not be able to
+#: pull an unbounded diff into its context and blow the window.
+_MAX_RESULT_CHARS = 60_000
 
 
 def _redact_result(text: str) -> str:
@@ -277,7 +279,7 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
         # (`get_finding` proved arguments echo back; the name is the same surface) would leak
         # through both on the reject paths below. Redact ONCE and use the safe value for every
         # audit/error mention; the RAW `name` is used only for the `TOOLS` allowlist lookup,
-        # which is an exact-match dict get and never emitted. Raised by the GPT review.
+        # which is an exact-match dict get and never emitted.
         safe_name = _redact_error(name)
         entry = TOOLS.get(name)
         if entry is None:
@@ -291,8 +293,7 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
         # coercion made a malformed call (`"arguments": [1,2]` or a bare string) succeed
         # with `result` for any no-required-arg tool instead of returning INVALID_PARAMS —
         # the schema validator only ran against the already-emptied dict, so it never saw
-        # the violation. Absent/None stays valid (arguments are optional). Raised by the
-        # GPT review of this branch.
+        # the violation. Absent/None stays valid (arguments are optional).
         if raw_args is not None and not isinstance(raw_args, dict):
             _audit(safe_name, outcome="denied", request_id=req_id, error="invalid_arguments")
             return _error(req_id, _INVALID_PARAMS, "invalid arguments: expected an object")
@@ -303,7 +304,6 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
         # and an unknown key was silently ignored instead of refused. The shared validator
         # is fail-closed for exactly this boundary (untrusted `tools/call`), so use it
         # rather than a local check that would drift from the schema in `_schema()`.
-        # Raised by review of this branch.
         # Stays function-local, unlike `redact`/`sel` which were hoisted: this one has an
         # explicit `except ImportError` fallback, which is the `top-level-imports` rule's
         # documented optional-dependency exemption. Hoisting it would make an absent
@@ -370,13 +370,9 @@ def handle(request: dict[str, Any]) -> dict[str, Any] | None:
         # ledger note comes back verbatim in `list_findings`.
         #
         # Order matters — truncating first could split a credential across the cut and
-        # leave a fragment the scanner does not recognize. The cut itself is the shared
-        # egress frame's (``build_tool_response``): hidden-character sanitization, then
-        # the one tool-result budget with head and tail kept and the full redacted text
-        # spilled to a file the note names — so an agent asking for a finding cannot
-        # pull an unbounded diff into its context, and loses no part of it either.
-        text = _redact_result(tool_json(payload))
-        return _result(req_id, build_tool_response(text, spill_label=f"auto-improvement-{req_id}"))
+        # leave a fragment the scanner does not recognize.
+        text = _redact_result(json.dumps(payload, default=str))[:_MAX_RESULT_CHARS]
+        return _result(req_id, {"content": [{"type": "text", "text": text}]})
     return _error(req_id, _METHOD_NOT_FOUND, f"unknown method: {method}")
 
 

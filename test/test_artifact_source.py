@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 
 import pytest
+from named_cases_helpers import named_cases
 
 from conftest import cap_project_root_walk, requires_symlinks
 from kiro_crew import artifact_source
@@ -197,7 +198,14 @@ class TestNonGitProjectsLink:
         (pkg / "package.json").write_text("{}", encoding="utf-8")
         assert classify_source(_file(pkg / "src" / "doc.md")) == (LINK, str(pkg))
 
-    def test_unmarked_directory_still_copies(
+    @pytest.mark.parametrize(
+        (),
+        [
+            *named_cases("test_unmarked_directory_still_copies"),
+            *named_cases("test_no_repo_no_project_is_copy"),
+        ],
+    )
+    def test_an_unmarked_directory_is_copied(
         self, narrow_tempdir, tmp_path: Path
     ) -> None:
         # No marker anywhere above it -> a snapshot, not a pointer.
@@ -255,6 +263,29 @@ class TestNonGitProjectsLink:
         # And a loose file directly in home is a COPY, not a link.
         assert classify_source(_file(fake_home / "notes.md")) == (COPY, "")
 
+    @requires_symlinks
+    def test_a_symlinked_home_is_never_a_project_root(
+        self, narrow_tempdir, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Home reached through a symlink is still home, under both spellings.
+
+        The walk runs on the resolved path, so the resolved home must be known
+        as home too, or its ``~/.kiro`` marker makes it a project root.
+        """
+        real_home = tmp_path / "local" / "home" / "user"
+        (real_home / ".kiro" / "crew").mkdir(parents=True)
+        link_home = tmp_path / "home-user"
+        link_home.symlink_to(real_home, target_is_directory=True)
+        monkeypatch.setattr(artifact_source, "_home", lambda: str(link_home))
+        monkeypatch.setenv("HOME", str(link_home))
+        monkeypatch.delenv("USERPROFILE", raising=False)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path(str(link_home))))
+        _file(real_home / "sub" / "notes.md")
+        for home in (link_home, real_home):
+            assert classify_source(str(home / "sub" / "notes.md")) == (COPY, "")
+            assert project_root_marker(str(home)) is None
+            assert is_verifiable_root(str(home)) is False
+
     def test_every_home_spelling_is_rejected(
         self, narrow_tempdir, fake_home: Path, tmp_path: Path, monkeypatch
     ) -> None:
@@ -308,9 +339,6 @@ class TestClassifySourceProjectWalk:
         (wt / ".git").write_text("gitdir: /workplace/user/KiroCrew/.git/worktrees/feature\n")
         target = _file(wt / "src" / "mod.md")
         assert classify_source(target) == (LINK, str(wt))
-
-    def test_no_repo_no_project_is_copy(self, narrow_tempdir, tmp_path: Path) -> None:
-        assert classify_source(_file(tmp_path / "loose" / "doc.md")) == (COPY, "")
 
     def test_walk_is_bounded(self, narrow_tempdir, tmp_path: Path, monkeypatch) -> None:
         # With a 1-level cap, a repo root two levels up must NOT be found —

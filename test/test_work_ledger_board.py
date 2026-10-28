@@ -163,7 +163,7 @@ async def test_a_row_is_the_conductor_item_shape_minus_the_masked_field():
     row = body["items"][0]
 
     item_keys = set(wl.WorkItem().to_dict()) - {"worker_session_key"}
-    derived = {"orphaned", "stale", "acceptance_concrete", "events"}
+    derived = {"orphaned", "stale", "acceptance_concrete", "report_undelivered", "events"}
     joined = {"alive", "outstanding", "terminal"}
     assert set(row) == item_keys | derived | joined
 
@@ -274,6 +274,30 @@ async def test_a_reported_worker_whose_session_closed_reads_stale_at_once():
 
 
 @pytest.mark.asyncio
+async def test_the_board_reads_a_looping_worker_through_the_gates_resolver(monkeypatch):
+    """The board badge asks the same looping question the stall wake asks."""
+    item_id = _item()
+    _bind(item_id)
+    _report(item_id, "progress")
+    state = _state({WORKER: _slot()})
+    seen: list[bool] = []
+    real = wl.is_stale
+
+    def _spy(item, **kwargs):
+        seen.append(kwargs.get("worker_looping", False))
+        return real(item, **{**kwargs, "window_secs": 0})
+
+    monkeypatch.setattr(board.work_ledger, "is_stale", _spy)
+    monkeypatch.setattr(wlh.ledger_wake, "worker_looping", lambda _svc, key: key == WORKER)
+    body, _ = await _call(state, CONDUCTOR)
+    assert body["items"][0]["stale"] is False
+    monkeypatch.setattr(wlh.ledger_wake, "worker_looping", lambda _svc, _key: False)
+    body, _ = await _call(state, CONDUCTOR)
+    assert body["items"][0]["stale"] is True
+    assert seen == [True, False]
+
+
+@pytest.mark.asyncio
 async def test_an_unbound_item_is_closed_not_running():
     """Nothing is running for an item that was never dispatched."""
     _item(title="never dispatched")
@@ -310,6 +334,20 @@ async def test_the_orphaned_flag_is_carried_through_to_the_page():
 
 
 # ── two conductors, two workers: isolation ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_report_the_harness_never_delivered_is_on_the_board_without_the_key():
+    """The board says "couldn't send its report" from this flag, and the flag carries
+    nothing but the tool and the time: no worker key, no harness text."""
+
+    item_id = _item()
+    _bind(item_id)
+    wl.note_undelivered(WORKER, "work_report")
+    body, response = await _call(_state({WORKER: _slot()}), CONDUCTOR)
+    flag = body["items"][0]["report_undelivered"]
+    assert set(flag) == {"tool", "at"} and flag["tool"] == "work_report"
+    assert WORKER not in response.body.decode()
 
 
 @pytest.mark.asyncio

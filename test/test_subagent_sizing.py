@@ -16,15 +16,19 @@ from io import StringIO
 from typing import Any
 
 import pytest
+from _clock_isolation import assert_clock_is_private
 from overload_fakes import settle_depth_emits
 
 import kiro_crew.subagent as subagent
 from conftest import absent_sysconf
+from kiro_crew.constants import DEFAULT_SUBAGENT_QUEUE_MAX_WAIT_SECS
 from kiro_crew.subagent import (
     compute_max_subagents,
     compute_memory_sized_parallel_cap,
     resolve_max_subagents,
 )
+from kiro_crew.testing.clock import ManualClock
+from kiro_crew.testing.wait import await_until
 
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
 # looks short of memory, which is the runner's state, not this test's input.
@@ -165,45 +169,85 @@ class TestMemoryIsTheOnlyHostTerm:
         assert "agent.subagent_cpu_cost_cores" not in SubagentManager.LIVE_CONFIG_PATHS
 
 
-# --- Worked examples from dynamic-subagent-sizing.md §3.3 -------------------
+# --- Worked examples from dynamic-subagent-sizing.md §3.3, then clamp edges --
 
 
-def test_example_a_hard_cap_binds(patch_host) -> None:
+_SIZING_CASES = [
     # 174.7 GB: mem_term=443, clamp(443,3,16) = 16
-    patch_host(174.7, 48)
-    cfg = _cfg(mem_cost=0.315, cpu_cost=0.8, hard_cap=16)
-    assert compute_memory_sized_parallel_cap(cfg) == 16
-
-
-def test_example_b_floor(patch_host) -> None:
+    pytest.param(
+        174.7,
+        48,
+        {"mem_cost": 0.315, "cpu_cost": 0.8, "hard_cap": 16},
+        16,
+        id="test_example_a_hard_cap_binds",
+    ),
     # 2 GB, fallback cost: mem_term = floor(2*0.8/0.5) = 3, floor = 3
-    patch_host(2.0, 4)
-    cfg = _cfg(mem_cost=0.5, cpu_cost=1.0, hard_cap=16)
-    assert compute_memory_sized_parallel_cap(cfg) == 3
-
-
-def test_example_c_pool_reservation_binds(patch_host) -> None:
+    pytest.param(
+        2.0,
+        4,
+        {"mem_cost": 0.5, "cpu_cost": 1.0, "hard_cap": 16},
+        3,
+        id="test_example_b_floor",
+    ),
     # 8 GB, pool=5: mem_term = floor((8*0.8 - 5*0.4)/0.4) = 11, clamp(11,3,16) = 11
-    patch_host(8.0, 12)
-    cfg = _cfg(mem_cost=0.4, cpu_cost=0.8, hard_cap=16, pool_size=5)
-    assert compute_memory_sized_parallel_cap(cfg) == 11
-
-
-def test_example_d_memory_binds(patch_host) -> None:
+    pytest.param(
+        8.0,
+        12,
+        {"mem_cost": 0.4, "cpu_cost": 0.8, "hard_cap": 16, "pool_size": 5},
+        11,
+        id="test_example_c_pool_reservation_binds",
+    ),
     # Effective 4 GB (cgroup headroom fed directly): mem_term=10
-    patch_host(4.0, 48)
-    cfg = _cfg(mem_cost=0.315, cpu_cost=0.8, hard_cap=16)
-    assert compute_memory_sized_parallel_cap(cfg) == 10
-
-
-def test_shared_marginal_cost_binds_on_provider_ceiling(patch_host) -> None:
-    # Stage 1: with the session-shared marginal memory cost (≈0.05 GB), even a
-    # modest 8 GB host is not RAM-bound — the cap rises to the provider ceiling
-    # (hard_cap) instead of the legacy floor of 3.
+    pytest.param(
+        4.0,
+        48,
+        {"mem_cost": 0.315, "cpu_cost": 0.8, "hard_cap": 16},
+        10,
+        id="test_example_d_memory_binds",
+    ),
+    # With the session-shared marginal memory cost (≈0.05 GB), even a modest
+    # 8 GB host is not RAM-bound: the cap rises to the provider ceiling
+    # (hard_cap) instead of the floor of 3.
     # mem_term = floor((8*0.8)/0.05) = 128; clamp(128, 3, 16) = 16.
-    patch_host(8.0, 4)
-    cfg = _cfg(mem_cost=0.05, cpu_cost=0.25, hard_cap=16)
-    assert compute_memory_sized_parallel_cap(cfg) == 16
+    pytest.param(
+        8.0,
+        4,
+        {"mem_cost": 0.05, "cpu_cost": 0.25, "hard_cap": 16},
+        16,
+        id="test_shared_marginal_cost_binds_on_provider_ceiling",
+    ),
+    pytest.param(
+        174.7,
+        48,
+        {"mem_cost": 0.315, "cpu_cost": 0.8, "hard_cap": 8},
+        8,
+        id="test_hard_cap_clamps_high",
+    ),
+    # Tiny host.
+    pytest.param(
+        1.0,
+        1,
+        {"mem_cost": 0.5, "cpu_cost": 1.0, "hard_cap": 16},
+        3,
+        id="test_floor_never_below_three",
+    ),
+    # A misconfigured subagent_auto_max < 3 does not drop the cap below 3:
+    # compute_max_subagents enforces a hard floor of 3 (the loader also clamps
+    # subagent_auto_max up to 3, but compute defends independently).
+    pytest.param(
+        174.7,
+        48,
+        {"hard_cap": 2},
+        3,
+        id="test_hard_cap_below_floor_is_raised_to_three",
+    ),
+]
+
+
+@pytest.mark.parametrize(("avail_gb", "cpu_count", "cfg_kwargs", "expected"), _SIZING_CASES)
+def test_memory_sized_parallel_cap(patch_host, avail_gb, cpu_count, cfg_kwargs, expected) -> None:
+    patch_host(avail_gb, cpu_count)
+    assert compute_memory_sized_parallel_cap(_cfg(**cfg_kwargs)) == expected
 
 
 # --- Edge cases ------------------------------------------------------------
@@ -221,27 +265,6 @@ def test_pool_reservation_reduces_memory_budget(patch_host) -> None:
     # no_pool: floor(20*0.8/0.5)=32 ; with_pool: floor((16-5)/0.5)=22
     assert no_pool == 32
     assert with_pool == 22
-
-
-def test_hard_cap_clamps_high(patch_host) -> None:
-    patch_host(174.7, 48)
-    cfg = _cfg(mem_cost=0.315, cpu_cost=0.8, hard_cap=8)
-    assert compute_memory_sized_parallel_cap(cfg) == 8
-
-
-def test_floor_never_below_three(patch_host) -> None:
-    patch_host(1.0, 1)  # tiny host
-    cfg = _cfg(mem_cost=0.5, cpu_cost=1.0, hard_cap=16)
-    assert compute_memory_sized_parallel_cap(cfg) == 3
-
-
-def test_hard_cap_below_floor_is_raised_to_three(patch_host) -> None:
-    # A misconfigured subagent_auto_max < 3 does not drop the cap below 3:
-    # compute_max_subagents enforces a hard floor of 3 (the loader also clamps
-    # subagent_auto_max up to 3, but compute defends independently).
-    patch_host(174.7, 48)
-    cfg = _cfg(hard_cap=2)
-    assert compute_memory_sized_parallel_cap(cfg) == 3
 
 
 def test_unreadable_memory_fails_open_to_legacy_default(patch_host) -> None:
@@ -738,6 +761,8 @@ class TestQueuedReasonOnTheEvent:
             "reason": "low_memory",
             "available_gb": 3.2,
             "required_gb": 4.5,
+            # A memory wait names its live bound (the default, on a fresh manager).
+            "max_wait_secs": DEFAULT_SUBAGENT_QUEUE_MAX_WAIT_SECS,
         }
         assert events[:3] == [low_memory, low_memory, {"queued": 0}]
         assert burst == [{"queued": 1, "reason": "posture_critical"}]
@@ -863,6 +888,12 @@ class TestSubtreeCpuJiffies:
         assert sub._subtree_cpu_jiffies(1) == 185
 
 
+def test_another_thread_keeps_the_real_sleep_and_clock(monkeypatch) -> None:
+    clock = ManualClock()
+    clock.install(monkeypatch, subagent)
+    assert_clock_is_private(clock, subagent)
+
+
 class TestSampleLiveCosts:
     """_sample_live_costs: high-water RSS/CPU tracking across polls."""
 
@@ -903,13 +934,12 @@ class TestSampleLiveCosts:
         m._agents = {"a1": info}
         monkeypatch.setattr(sub, "_CLK_TCK", 100)
 
-        # Control wall-clock: poll1 t=10, poll2 t=11 (dt=1s).
-        times = iter([10.0, 11.0])
-        # ``sub.time`` is the process-wide stdlib module, so asyncio and pytest
-        # also observe this patch during teardown. Keep returning the final
-        # timestamp after the two production calls instead of leaking a
-        # StopIteration into unrelated event-loop cleanup.
-        monkeypatch.setattr(sub.time, "monotonic", lambda: next(times, 11.0))
+        # Control the sampling clock: poll1 t=10, poll2 t=11 (dt=1s). On the
+        # subagent module's own ``time`` binding, which the sampler reads; that
+        # binding IS the stdlib module, so a stub on ``sub.time.monotonic`` was
+        # read by every other thread, asyncio and pytest included.
+        clock = ManualClock(monotonic_start=10.0)
+        clock.install(monkeypatch, sub)
         # jiffies: 1000 then 1100 → 100 jiffies / (100 tck * 1s) = 1.0 core.
         # RSS stays -1 so only the CPU half of the sample is under test.
         jiff = iter([1000, 1100])
@@ -919,6 +949,7 @@ class TestSampleLiveCosts:
 
         m._sample_live_costs()  # seeds baseline, no delta
         assert info.peak_cpu_cores == 0.0
+        clock.advance(1.0)
         m._sample_live_costs()  # delta → 1.0 core
         assert info.peak_cpu_cores == pytest.approx(1.0, abs=0.01)
 
@@ -1160,7 +1191,7 @@ class TestSettledRuntimeReading:
         await asyncio.create_task(_arm())
         recovery = mgr._tasks.get(f"{info.id}:recovery")
         assert recovery is not None, "recovery task was not registered"
-        await asyncio.wait_for(recovery, timeout=5)
+        await await_until(recovery, timeout=5, what="the recovery task")
 
         assert info._rss_generation == gen_before + 1
         assert info._rss_samples == 0
@@ -1215,6 +1246,77 @@ class TestSettledRuntimeReading:
         m._learned_settled_dirty = True
         m._refresh_learned_settled()
         assert m._learned_settled_gb == {"kirocrew": 0.7}, "a failed read keeps the map"
+
+    def test_a_stale_settled_figure_ages_out_without_a_new_run(self, monkeypatch, tmp_path) -> None:
+        """A bucket priced out by a figure learned under a heavier roster records
+        no new readings, so the figure must expire with time alone: the next
+        re-read drops it and the bucket is priced at the unlearned default."""
+        import json
+
+        from kiro_crew import subagent_cost as sc
+
+        log = tmp_path / "cost_samples.jsonl"
+        monkeypatch.setattr(sc, "_cost_log_path", lambda: log)
+        wall = [1_000_000_000.0]
+        mono = [5_000.0]
+        log.write_text(
+            "".join(
+                json.dumps({"agent": "kirocrew", "mem_gb": 3.0, "settled_gb": 1.9, "ts": wall[0]})
+                + "\n"
+                for _ in range(3)
+            ),
+            encoding="utf-8",
+        )
+        m = _mgr(running=0, max_concurrent=16, last_ts=0.0)
+        clock = types.SimpleNamespace(time=lambda: wall[0], monotonic=lambda: mono[0])
+        monkeypatch.setattr(subagent, "time", clock)
+        m._refresh_learned_settled()
+        assert m._learned_settled_gb == {"kirocrew": pytest.approx(1.9)}
+        assert subagent._dedicated_start_price_gb(0.5, m._learned_settled_gb, "") == (
+            pytest.approx(1.9)
+        )
+
+        # Eight days later nothing has run, so no reading was recorded; the map is
+        # re-read on time alone, hourly.
+        wall[0] += 8 * 24 * 3600
+        mono[0] += 3599
+        m._refresh_learned_settled()
+        assert m._learned_settled_gb == {"kirocrew": pytest.approx(1.9)}, "not re-read yet"
+        mono[0] += 2
+        m._refresh_learned_settled()
+        assert m._learned_settled_gb == {}
+        assert subagent._dedicated_start_price_gb(0.5, m._learned_settled_gb, "") == (
+            subagent._UNLEARNED_DEDICATED_START_GB
+        )
+
+    def test_an_incomplete_read_keeps_a_figure_only_within_the_horizon(self, monkeypatch) -> None:
+        """A log with an unreadable record makes every read incomplete, and an
+        incomplete read keeps what it could not confirm -- but not past the
+        horizon, or a figure it can never re-check would hold for good."""
+        m = _mgr(running=0, max_concurrent=16, last_ts=0.0)
+        m._learned_settled_gb = {"kirocrew": 1.9}
+        mono = [5_000.0]
+        clock = types.SimpleNamespace(time=lambda: 1_000_000_000.0, monotonic=lambda: mono[0])
+        monkeypatch.setattr(subagent, "time", clock)
+        monkeypatch.setattr(
+            subagent, "read_learned_costs_checked", lambda *a, **k: ({"light": 0.4}, False)
+        )
+        m._refresh_learned_settled()
+        assert m._learned_settled_gb == {"kirocrew": 1.9, "light": 0.4}
+        mono[0] += 6 * 24 * 3600
+        m._refresh_learned_settled()
+        assert m._learned_settled_gb == {"kirocrew": 1.9, "light": 0.4}, "inside the horizon"
+        mono[0] += 2 * 24 * 3600
+        m._refresh_learned_settled()
+        assert m._learned_settled_gb == {"light": 0.4}, "rebuilt from what the read saw"
+
+        def _boom(*_a, **_k):
+            raise OSError("unreadable")
+
+        monkeypatch.setattr(subagent, "read_learned_costs_checked", _boom)
+        mono[0] += 8 * 24 * 3600
+        m._refresh_learned_settled()
+        assert m._learned_settled_gb == {}, "a failed read keeps nothing past the horizon"
 
 
 # ---------------------------------------------------------------------------
@@ -1313,7 +1415,8 @@ class TestCgroupAvailable:
             f"anon {3 * gib}\nfile {12 * gib}\nactive_file {2 * gib}\n"
             f"inactive_file {10 * gib}\n"
         )
-        assert sub._cgroup_available_gb() == pytest.approx(11.0, abs=0.01)
+        # 16 - (15 - 10 - 2)
+        assert sub._cgroup_available_gb() == pytest.approx(13.0, abs=0.01)
 
     def test_v1_reads_the_hierarchical_inactive_cache(self, cgroup_files, monkeypatch) -> None:
         import kiro_crew.subagent as sub
@@ -1324,10 +1427,13 @@ class TestCgroupAvailable:
             "/sys/fs/cgroup/memory/memory.usage_in_bytes": 7 * gib,
         }
         monkeypatch.setattr(sub, "_read_int_file", lambda p: vals.get(p))
-        # v1's local ``inactive_file`` excludes children; only the total counts.
+        # v1's local keys exclude children; only the ``total_`` keys count.
         cgroup_files["/sys/fs/cgroup/memory/memory.stat"] = (
-            f"inactive_file {1 * gib}\ntotal_inactive_file {4 * gib}\n"
+            f"inactive_file {1 * gib}\nactive_file {1 * gib}\ndirty {1 * gib}\n"
+            f"total_inactive_file {3 * gib}\ntotal_active_file {2 * gib}\n"
+            f"total_dirty {1 * gib}\ntotal_writeback 0\n"
         )
+        # 8 - (7 - (3 + 2 - 1))
         assert sub._cgroup_available_gb() == pytest.approx(5.0, abs=0.01)
 
     @pytest.mark.parametrize("used_gb", [2, 3])
@@ -1600,24 +1706,21 @@ class TestMacosMemoryProbe:
         expected = round(200000 * 16384 / (1024**3), 2)
         assert sub._macos_available_memory_gb() == pytest.approx(expected, abs=0.01)
 
-    def test_none_page_count_fails_open(self, monkeypatch) -> None:
+    @pytest.mark.parametrize(
+        "pages",
+        [
+            pytest.param(None, id="test_none_page_count_fails_open"),
+            pytest.param(0, id="test_zero_page_count_fails_open"),
+        ],
+    )
+    def test_missing_page_count_fails_open(self, monkeypatch, pages) -> None:
         import kiro_crew.subagent as sub
 
         real_sysconf = getattr(sub.os, "sysconf", absent_sysconf)
         monkeypatch.setattr(
             sub.os, "sysconf", lambda n: 16384 if n == "SC_PAGE_SIZE" else real_sysconf(n)
         )
-        monkeypatch.setattr(sub, "_macos_vm_reclaimable_pages", lambda: None)
-        assert sub._macos_available_memory_gb() == -1.0
-
-    def test_zero_page_count_fails_open(self, monkeypatch) -> None:
-        import kiro_crew.subagent as sub
-
-        real_sysconf = getattr(sub.os, "sysconf", absent_sysconf)
-        monkeypatch.setattr(
-            sub.os, "sysconf", lambda n: 16384 if n == "SC_PAGE_SIZE" else real_sysconf(n)
-        )
-        monkeypatch.setattr(sub, "_macos_vm_reclaimable_pages", lambda: 0)
+        monkeypatch.setattr(sub, "_macos_vm_reclaimable_pages", lambda: pages)
         assert sub._macos_available_memory_gb() == -1.0
 
     def test_sysconf_error_fails_open(self, monkeypatch) -> None:

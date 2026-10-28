@@ -157,11 +157,12 @@ export interface DriveUsage {
 
 /**
  * Payload of `GET /drive/{account}`. Before the bucket is created the whole
- * body is `{exists:false}`; once created it also carries the bucket name, its
- * region and a (5-minute cached) usage report.
+ * body is `{exists:false, searched_region}` (the one region discovery looked
+ * in; absent from older backends); once created it also carries the bucket
+ * name, its region and a (5-minute cached) usage report.
  */
 export type DriveStatus =
-  | { exists: false }
+  | { exists: false; searched_region?: string }
   | {
       exists: true
       bucket: string
@@ -530,6 +531,8 @@ export interface BackupRunResult {
  * Result of `POST /backup/{account}/restore`. Nothing is hot-swapped: the
  * archive is downloaded to a local staging folder and `path` is where it landed.
  * `origin` and `install` echo whose archive was restored, resolved from the key.
+ * `recovered` is true when something else had written over the key and the
+ * bytes handed back are the version this install recorded uploading.
  */
 export interface BackupRestoreResult {
   downloaded: true
@@ -537,6 +540,7 @@ export interface BackupRestoreResult {
   bytes: number
   origin: BackupOrigin
   install: string
+  recovered: boolean
 }
 
 /** Payload of `GET /iam-policy` — the exact permissions to paste, as JSON text. */

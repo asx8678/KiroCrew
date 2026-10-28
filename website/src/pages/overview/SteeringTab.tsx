@@ -1,15 +1,17 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Compass, Link2, RefreshCw } from 'lucide-react'
 import { api } from '../../api/client'
 import { store } from '../../store'
 import { Card, Btn, SearchInput, EmptyState } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
+import ErrorNotice from '../../components/ErrorNotice'
 import Modal from '../../components/Modal'
 import SearchableSelect from '../../components/SearchableSelect'
 import MarkdownRenderer from '../../components/MarkdownRenderer'
 import ListDetailBack from '../../components/ListDetailBack'
 import { useListDetailView } from '../../hooks/useListDetailView'
+import { bestFilterMatch } from '../../utils/filterSelection'
 import type { SteeringFile, SteeringList } from '../../types'
 
 import { parseErrorCode } from '../../utils/errorReport'
@@ -131,7 +133,7 @@ function InclusionChip({ file, showDefault = false }: { file: SteeringFile; show
       aria-label={title}
       className={`text-[10px] px-1.5 py-[1px] rounded-full font-mono shrink-0 border max-w-[9rem] truncate ${
         unrecognized
-          ? 'bg-warn-subtle text-warn border-warn'
+          ? 'bg-warn-subtle text-warn-text border-warn'
           : 'bg-bg-elevated text-muted border-border'
       }`}
     >
@@ -447,6 +449,7 @@ export default function SteeringTab() {
       setNewName('')
       setNewBody(newTemplate())
       if (res?.key) {
+        userPickedRef.current = true
         setSelectedKey(res.key)
         // Drop any cached detail for this key: a file deleted and recreated
         // under the same name would otherwise populate the editor from the
@@ -576,12 +579,21 @@ export default function SteeringTab() {
   const { isMobile, showList, showDetail, openDetail, closeDetail } = useListDetailView()
 
   // Keep a valid selection; suspended while editing so an unsaved draft is
-  // never discarded by a background refetch reordering the list.
+  // never discarded by a background refetch reordering the list. A file the
+  // user opened stays open while the filter still shows it; one this effect
+  // opened by itself moves to the best match for what was typed.
+  const userPickedRef = useRef(false)
   useEffect(() => {
     if (editing) return
     if (filtered.length === 0) { if (selectedKey !== null) setSelectedKey(null); return }
-    if (!selectedKey || !filtered.some(f => f.key === selectedKey)) setSelectedKey(filtered[0].key)
-  }, [filtered, selectedKey, editing])
+    const visible = !!selectedKey && filtered.some(f => f.key === selectedKey)
+    if (visible && (userPickedRef.current || !filter.trim())) return
+    const best = bestFilterMatch(filtered, filter, f => [f.key, f.name])
+    if (best && best.key !== selectedKey) {
+      userPickedRef.current = false
+      setSelectedKey(best.key)
+    }
+  }, [filtered, selectedKey, editing, filter])
 
   // Default the create dialog to the scope that exists.
   useEffect(() => { setNewSource(hasProject ? 'workspace' : 'user') }, [hasProject])
@@ -614,7 +626,7 @@ export default function SteeringTab() {
     return Object.keys(out).length ? out : undefined
   }
 
-  const select = (f: SteeringFile) => { setSelectedKey(f.key); setEditing(false); openDetail() }
+  const select = (f: SteeringFile) => { userPickedRef.current = true; setSelectedKey(f.key); setEditing(false); openDetail() }
 
   const renderRow = (f: SteeringFile) => {
     const isSel = f.key === selectedKey
@@ -665,20 +677,18 @@ export default function SteeringTab() {
         {/* A failed create leaves this modal OPEN, so the page-level error banner
           * behind it is invisible — the refusal has to render here or the Create
           * button just appears inert. */}
+        {/* Same code-keyed substitution as the page banner. Without it this
+          * surface — the only verb with its own alert — printed the server's
+          * English diagnostic, which `steering.py` explicitly documents as a
+          * fallback for clients that cannot localize. A create conflict has
+          * already triggered the re-list, so it takes that copy. */}
+        {/* No hand-off: the new file's name and content in this modal are not saved yet. */}
         {createFile.error && (
-          <div
-            role="alert"
-            className="px-3 py-2 rounded-md bg-danger/10 border border-danger/20 text-[13px] text-danger"
-          >
-            {/* Same code-keyed substitution as the page banner. Without it this
-              * surface — the only verb with its own alert — printed the server's
-              * English diagnostic, which `steering.py` explicitly documents as a
-              * fallback for clients that cannot localize. A create conflict has
-              * already triggered the re-list, so it takes that copy. */}
-            {isProjectConflict(createFile.error)
+          <ErrorNotice
+            message={isProjectConflict(createFile.error)
               ? i18nT('pages.overview.steeringTab.conflict_list_refreshed')
               : (createFile.error as Error).message}
-          </div>
+          />
         )}
         <label className="flex flex-col gap-1" htmlFor="steering-new-name">
           <span className="text-[13px] text-muted">{i18nT('pages.overview.steeringTab.file_name')}</span>
@@ -781,14 +791,16 @@ export default function SteeringTab() {
         </div>
       </div>
 
+      {/* No hand-off: a failed save leaves the open file's unsaved edits in the editor. */}
       {mutError && !fieldErrorShown && (
-        <div className="mb-3 px-3 py-2 rounded-md bg-danger/10 border border-danger/20 text-[13px] text-danger">
-          {conflictError
+        <ErrorNotice
+          className="mb-3"
+          message={conflictError
             ? i18nT(savingConflict
               ? 'pages.overview.steeringTab.conflict_while_editing'
               : 'pages.overview.steeringTab.conflict_list_refreshed')
             : declarationErrorText(mutErrorCode) ?? mutError.message}
-        </div>
+        />
       )}
 
       {isLoading ? (
@@ -806,7 +818,7 @@ export default function SteeringTab() {
         />
       ) : (
         <div className={PANE_SHELL_CLASS}>
-          {showList && <div className={`${isMobile ? 'w-full' : 'w-[240px]'} shrink-0 overflow-y-auto scrollbar-overlay border border-border rounded-md p-2`} role="listbox" aria-label={i18nT('pages.overview.steeringTab.steering_files')}>
+          {showList && <div className={`${isMobile ? 'w-full' : 'w-[240px]'} shrink-0 overflow-y-auto border border-border rounded-md p-2`} role="listbox" aria-label={i18nT('pages.overview.steeringTab.steering_files')}>
             {filtered.map(renderRow)}
             {filtered.length === 0 && <div className="text-muted/70 text-[12px] italic px-2 py-2">{i18nT('pages.overview.steeringTab.no_files_match_query', { query: filter })}</div>}
           </div>}

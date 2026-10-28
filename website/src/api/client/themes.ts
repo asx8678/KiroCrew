@@ -5,8 +5,9 @@
  */
 
 import type { ClientTransport } from './transport'
+import type { TranslucentPanelsStored } from '../../utils/liquidGlass'
 
-export function createThemesEndpoints({ post, put, del, j }: ClientTransport) {
+export function createThemesEndpoints({ post, put, del, j, jfetch: fetch }: ClientTransport) {
   const branding = {
     branding: () => fetch('/api/dashboard/branding').then(j) as Promise<{ bot_name: string; avatar: string; direct_local?: boolean }>,
   }
@@ -30,12 +31,12 @@ export function createThemesEndpoints({ post, put, del, j }: ClientTransport) {
       color?: string
       /** BCP-47 UI language tag; '' means follow the browser. */
       language?: string
+      /** The Translucent panels switch; '' means never chosen on this workspace. */
+      translucent_panels?: TranslucentPanelsStored
       onboarded?: boolean
       import_onboarded?: boolean
       /** Gates the gateway's first heartbeat; see `beacon.telemetry_permitted`. */
       privacy_acked?: boolean
-      /** Set once the first-run Meet CrewMates flow was finished or dismissed. */
-      crewmates_onboarded?: boolean
     }) =>
       put('/api/config/theme', body).then(j),
   }

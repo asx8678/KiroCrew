@@ -4,15 +4,17 @@
  *  others for a stated reason below. */
 import type { QueryClient } from '@tanstack/react-query'
 import { store, type AppDispatch } from '../../store'
-import { sseConnected, fetchSlots } from '../../store/dashboardSlice'
+import { fetchSlots } from '../../store/dashboardSlice'
+import { markGatewayConnected } from './gatewayConnectivity'
 import { fetchNotifications, markBootNotificationsFetched } from '../../store/notificationsSlice'
-import { refreshSlot, warmSlotCache, clearSubagentsForSnapshot } from '../../store/chatSlice'
+import { refreshSlot, warmSlotCache, clearSubagentsForSnapshot, resyncWaitingSideConversations } from '../../store/chatSlice'
 import { anchorForSlot, loadLayout, sessionSlots } from '../splitLayoutStore'
 import { observedPaneSlots } from '../../api/slotMessagesQuery'
 import { consumeUpdateRestartLatch } from './bundleReload'
 import { refreshServerStateAfterReconnect } from './serverState'
 import type { SocketConnection } from './connection'
 import type { StreamBuffers } from './streamBuffers'
+import { replaySlotFrames, subagentReplaySlots } from '../../lib/subagentReplayScope'
 
 export interface CatchUpContext {
   dispatch: AppDispatch
@@ -23,6 +25,18 @@ export interface CatchUpContext {
   syncPendingApprovals: () => Promise<void>
   syncPendingQuestions: () => Promise<void>
   syncWorkflowRuns: () => Promise<void>
+  focusedSlot: () => string | null
+}
+
+/** `subscribe_subagents` naming the slots whose finished runs the gateway
+ *  rebuilds from the crew log; names past one frame's cap follow as
+ *  `subagent_replay` frames. */
+function sendSubagentSubscribe(ws: WebSocket, ctx: CatchUpContext): void {
+  const [first = [], ...rest] = replaySlotFrames(
+    subagentReplaySlots(ctx.focusedSlot(), observedPaneSlots(ctx.queryClient)),
+  )
+  ws.send(JSON.stringify({ type: 'subscribe_subagents', slots: first }))
+  for (const slots of rest) ws.send(JSON.stringify({ type: 'subagent_replay', slots }))
 }
 
 /** The first successful open of this hook: register as connected and take
@@ -30,7 +44,7 @@ export interface CatchUpContext {
 export function runFirstConnect(ws: WebSocket, ctx: CatchUpContext): void {
   const { dispatch, socket } = ctx
   socket.wasConnectedRef.current = true
-  dispatch(sseConnected())
+  markGatewayConnected(dispatch)
   ctx.seedAutomations()
   // FIRST connect only: App's mount effect already dispatched fetchSlots,
   // and the socket's open handler fires strictly after it, so repeating it
@@ -61,9 +75,13 @@ export function runFirstConnect(ws: WebSocket, ctx: CatchUpContext): void {
   // carries events from here on, so without this such a run is invisible
   // until its next phase event — and one that ends first never appears.
   ctx.syncWorkflowRuns()
+  // The same gap for Side Chat: a side turn that ended between a panel's
+  // restore read and this socket's registration sent its final frame to no
+  // socket of this tab, so a panel still waiting on it reads it again.
+  void dispatch(resyncWaitingSideConversations())
   // Eagerly subscribe to subagent events on first connect too.
   dispatch(clearSubagentsForSnapshot())
-  ws.send(JSON.stringify({ type: 'subscribe_subagents' }))
+  sendSubagentSubscribe(ws, ctx)
   // Flush a log subscription that was requested before the socket opened.
   // subscribeLogs() stores the callback but returns early when readyState
   // is not OPEN, so a page mounting during the handshake (a cold load of
@@ -71,11 +89,12 @@ export function runFirstConnect(ws: WebSocket, ctx: CatchUpContext): void {
   // lines at all until an unrelated reconnect. The reconnect path does
   // this too; the two paths must stay symmetric.
   if (socket.logCbRef.current) ws.send(JSON.stringify({ type: 'subscribe_logs' }))
-  // Announce the restored active slot so a resumable session prefetches
-  // while the user reads its transcript (resume prefetch).
-  ws.send(
-    JSON.stringify({ type: 'slot_focused', slot: store.getState().chat.activeSlot || null })
-  )
+  // Announce only a visible mounted transcript. A hidden first connect has no
+  // return edge; visibilitychange will send the later visible frame. The
+  // `announce` mark lets the gateway tell a connect from a return.
+  if (!document.hidden) {
+    ws.send(JSON.stringify({ type: 'slot_focused', slot: ctx.focusedSlot(), announce: true }))
+  }
 }
 
 /** A later open: re-fetch state instead of reloading the page, which keeps
@@ -104,7 +123,7 @@ export function runReconnectCatchUp(ws: WebSocket, ctx: CatchUpContext): void {
   // user is looking at the screen" scenario).
   socket.reconnectingRef.current = true
   buffers.dropForReconnect()
-  dispatch(sseConnected())
+  markGatewayConnected(dispatch)
   dispatch(fetchSlots()).finally(() => { socket.reconnectingRef.current = false })
   refreshServerStateAfterReconnect(queryClient)
   ctx.seedAutomations()
@@ -114,6 +133,9 @@ export function runReconnectCatchUp(ws: WebSocket, ctx: CatchUpContext): void {
   // socket was down pushed a terminal `workflow_run_event` nobody received,
   // and a run that STARTED while it was down has no row at all.
   ctx.syncWorkflowRuns()
+  // A side turn that ended while the socket was down sent its final frame to
+  // nobody here, so a Side Chat panel still waiting on it reads it again.
+  void dispatch(resyncWaitingSideConversations())
   // Re-fetch active slot messages to recover from missed chunks
   const active = store.getState().chat.activeSlot
   if (active) dispatch(refreshSlot(active))
@@ -176,9 +198,11 @@ export function runReconnectCatchUp(ws: WebSocket, ctx: CatchUpContext): void {
   // Eagerly subscribe to subagent events so chunks arrive even when
   // Activity Panel isn't open — final result still comes via done event.
   dispatch(clearSubagentsForSnapshot())
-  ws.send(JSON.stringify({ type: 'subscribe_subagents' }))
+  sendSubagentSubscribe(ws, ctx)
   if (socket.logCbRef.current) ws.send(JSON.stringify({ type: 'subscribe_logs' }))
-  // Re-announce focus: the server lost this socket's focus state with
-  // the old connection, and the store subscription only fires on change.
-  ws.send(JSON.stringify({ type: 'slot_focused', slot: active || null }))
+  // Re-announce only while visible. Reconnect itself is never a return edge;
+  // a hidden reconnect waits for visibilitychange.
+  if (!document.hidden) {
+    ws.send(JSON.stringify({ type: 'slot_focused', slot: ctx.focusedSlot(), announce: true }))
+  }
 }

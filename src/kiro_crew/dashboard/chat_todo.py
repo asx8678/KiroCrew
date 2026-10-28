@@ -1,15 +1,15 @@
 """A person ticking a row of the agent's checklist pill.
 
 The pill above the composer mirrors the list the agent keeps with kiro-cli's
-``todo_list`` tool. Until now the tool was the only writer: the pill could not
-be edited from the dashboard, and when the native conversation restarted
-(agent switch, failed ``session/load``, poisoned-conversation discard,
-``/clear``) the agent's own list came back empty while the pill kept the old
-one -- so neither the agent nor the person could tick the remaining rows.
+``todo_list`` tool. When the native conversation restarts (agent switch, failed
+``session/load``, poisoned-conversation discard, ``/clear``) the agent's own
+list comes back empty while the pill keeps the slot's copy, so this route is
+how the person ticks a remaining row.
 
-This route lets the person flip one row. It writes the slot's copy only; the
-agent learns of it the way it learns of the whole list after a restart, through
-``Slot.todo_recovery_prompt`` on the next fresh native session.
+This route lets the person flip one row. It writes the slot's copy only. The
+agent learns of it on its next turn: a warm turn carries
+``Slot.todo_sync_prompt`` prepended to the message, and a fresh native session
+carries ``Slot.todo_recovery_prompt`` instead.
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ from aiohttp import web
 
 from kiro_crew.dashboard.chat_folders import member_slot_write_refused
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
-from kiro_crew.dashboard.remote_relay import remote_bound_refusal
+from kiro_crew.dashboard.relay_archive import relay_archive_refusal
+from kiro_crew.dashboard.slot_ownership import slot_not_found
 from kiro_crew.dashboard.state import DashboardState, _fold_line_breaks
 from kiro_crew.dashboard.token_auth import (
     effective_request_app,
@@ -43,7 +44,7 @@ async def api_chat_slot_todo(request: web.Request) -> web.Response:
     name = request.match_info["slot"]
     slot = state._slots.get(name)
     if not slot:
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return slot_not_found()
     if (refusal := refuse_unattributable_caller(state, request, _OPERATION)) is not None:
         return refusal
     if (refusal := member_slot_write_refused(state, request, slot, _OPERATION)) is not None:
@@ -61,12 +62,10 @@ async def api_chat_slot_todo(request: web.Request) -> web.Response:
             resources=f"slot={slot.key}",
             error="checklist rows are ticked by the person, not by an app",
         )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
-    # A remote-bound session relays the peer's checklist; the local slot holds
-    # no list to write. The pill draws such rows read-only; this is the server
-    # side of the same rule. AFTER the app fence, so an app caller cannot tell a
-    # bound slot (409) from any other slot it does not own (404).
-    if (refusal := remote_bound_refusal(slot)) is not None:
+        return slot_not_found()
+    # A relay archive is read-only. AFTER the app fence, so an app caller cannot
+    # tell an archive (409) from any other slot it does not own (404).
+    if (refusal := relay_archive_refusal(slot)) is not None:
         return refusal
     body, err = await read_bounded_json(request)
     if err is not None:
@@ -91,7 +90,7 @@ async def api_chat_slot_todo(request: web.Request) -> web.Response:
     # the write. A slot popped and recreated under the same name inside it
     # would take a stale write under the replacement's key; refuse instead.
     if state._slots.get(name) is not slot:
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return slot_not_found()
     payload = slot.todo_payload()
     if payload is None:
         return web.json_response(
@@ -108,7 +107,7 @@ async def api_chat_slot_todo(request: web.Request) -> web.Response:
     # rather than ticking (and telling the agent not to redo) the wrong one.
     #
     # CLICK IDENTITY IS RAW, not canonicalized. The pin/override matching in
-    # state.py canonicalizes (folds line breaks AND neutralizes markers) so a
+    # state_parts/slot_todo.py canonicalizes (folds line breaks AND neutralizes markers) so a
     # row the AGENT rebuilds from the recovery block still matches. That is the
     # wrong equality here: the neutralizers are lossy, so two DIFFERENT task
     # texts can collapse to one canonical string (a real "[Task checklist]" line

@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from pathlib import Path
 
 import pytest
+
+from kiro_crew.testing.wait import async_wait_until
 
 #: The tracked follow-up that seeds the enrolled-member state bug 12 was
 #: reported from and runs a workflow on its behalf; the happy-path test below
@@ -29,14 +30,19 @@ _TRIVIAL_WORKFLOW = (
 
 
 async def _finished(gw, run_id: str, *, secs: float = 60.0) -> dict:
-    deadline = time.monotonic() + secs
     run: dict = {}
-    while time.monotonic() < deadline:
+
+    async def _terminated() -> bool:
+        nonlocal run
         run = await gw.get_json(f"/api/workflows/runs/{run_id}")
-        if run.get("status") != "running":
-            return run
-        await asyncio.sleep(0.1)
-    pytest.fail(f"workflow {run_id} did not terminate: {json.dumps(run)[:500]}")
+        return run.get("status") != "running"
+
+    await async_wait_until(
+        _terminated,
+        timeout=secs,
+        describe=lambda: f"workflow {run_id} did not terminate: {json.dumps(run)[:500]}",
+    )
+    return run
 
 
 # ---------------------------------------------------------------- bug 11 ---
@@ -159,16 +165,28 @@ async def _agents_dir(*, secs: float = 30.0) -> Path:
     from kiro_crew.config.paths import kiro_agents_dir
 
     directory = kiro_agents_dir()
-    deadline = time.monotonic() + secs
-    while not (directory / "kirocrew.json").is_file():
-        if time.monotonic() > deadline:
-            pytest.fail(f"boot did not write the managed agent specs under {directory}")
-        await asyncio.sleep(0.05)
+    await async_wait_until(
+        (directory / "kirocrew.json").is_file,
+        timeout=secs,
+        describe=lambda: f"boot did not write the managed agent specs under {directory}",
+    )
     return directory
 
 
 async def _default_session(gw) -> str:
     slot = (await gw.post_json("/api/chat/slots", {}))["key"]
+    return f"dashboard:{slot}"
+
+
+async def _specless_session(gw) -> str:
+    """A session on an agent that has no spec in the agents directory.
+
+    An agent-less create is the default custom agent, whose managed spec
+    exists, so the tool-policy read resolves it and an unreadable neighbour is
+    provably not its spec. The refusal under test needs an agent the read
+    cannot resolve, so one is named that no spec declares and no file carries.
+    """
+    slot = (await gw.post_json("/api/chat/slots", {"agent": "specless-agent"}))["key"]
     return f"dashboard:{slot}"
 
 
@@ -203,14 +221,14 @@ async def test_a_default_session_reads_an_empty_policy(gateway_boot) -> None:
 
 @pytest.mark.asyncio
 async def test_an_unreadable_neighbour_spec_is_named_in_the_refusal(gateway_boot) -> None:
-    """One malformed spec beside the managed ones. A default session's agent
-    has no spec of its own, so the tool-policy read cannot tell whether the
+    """One malformed spec beside the managed ones. The session's agent has no
+    spec of its own, so the tool-policy read cannot tell whether the
     unreadable file is that agent's: it refuses. The refusal must name the
     file, or the operator has nothing to act on (bug 13: the report said a
     restart did not help, and the error named no path).
     """
     async with gateway_boot() as gw:
-        session = await _default_session(gw)
+        session = await _specless_session(gw)
         bad = (await _agents_dir()) / "bad-agent.json"
         bad.write_text('{"name": "bad-agent", "managedToolPolicy": 42', encoding="utf-8")
 
@@ -227,7 +245,7 @@ async def test_removing_the_unreadable_spec_clears_the_refusal(gateway_boot) -> 
     directory is enough, no restart needed (the report said restart did not
     help, which is true only because the file was still there)."""
     async with gateway_boot() as gw:
-        session = await _default_session(gw)
+        session = await _specless_session(gw)
         bad = (await _agents_dir()) / "bad-agent.json"
         bad.write_text("{not json", encoding="utf-8")
         headers = gw.mcp_headers(session)

@@ -43,6 +43,7 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.dashboard import directive_queue
 from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.session_directive_apply import DirectiveOutcome
 
 # The raw arguments the model sent. Long enough to matter, quoted enough to have
 # defeated the naive repair, and carrying the ``_meta`` block KAS attaches to
@@ -133,6 +134,14 @@ def _stub_state(tmp_path):
     return state
 
 
+def _assert_record_applied_once(spy, slot) -> None:
+    """The parked record, not the frame, was applied exactly once and consumed."""
+    spy.assert_called_once()
+    assert spy.call_args.args[3] == "monitor_start"
+    assert spy.call_args.args[4] == VALIDATED_ARGS
+    assert directive_queue.depth(effective_session_key(slot)) == 0
+
+
 async def _drive(state, slot, events, monkeypatch, *, park=True, park_input=None):
     """Stream *events* through ``_run_chat``; return the apply spy.
 
@@ -165,8 +174,8 @@ async def _drive(state, slot, events, monkeypatch, *, park=True, park_input=None
     client.context_usage_pct = MagicMock(return_value=1.0)
     client.client = None
     state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-    spy = AsyncMock(return_value="[applied]")
-    monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+    spy = AsyncMock(return_value=DirectiveOutcome("[applied]"))
+    monkeypatch.setattr(chat_runner, "apply_session_directive_outcome", spy)
     await chat_runner._run_chat(state, slot, "go", _directive_user_origin=True)
     task = getattr(slot, "task", None)
     if task is not None:
@@ -180,7 +189,7 @@ def _opencode_events(
     result_text: str = "Monitor loop requested.",
     tool_call_id: str = "tc-oc",
 ):
-    """An opencode turn, in the shape CAPTURED off 1.18.30
+    """An opencode turn, in the shape CAPTURED off 1.18.30 and again off 1.19.1
     (``test/fixtures/acp_frames/opencode/mcp-directive-call-live.jsonl``): no
     ``_meta.kiro`` identity anywhere, the tool named ONLY by a single-underscore
     ``<server>_<tool>`` wire title, ``rawInput`` EMPTY on the ``tool_call`` and
@@ -308,7 +317,7 @@ class TestRawInputArrivesLate:
             AcpEvent(kind=EVENT_COMPLETE),
         ]
         spy = await _drive(state, slot, events, monkeypatch)
-        spy.assert_called_once()
+        _assert_record_applied_once(spy, slot)
 
     @pytest.mark.asyncio
     async def test_no_input_on_any_frame_applies_nothing_and_says_why(
@@ -421,7 +430,7 @@ class TestTheKeyStillGrantsNothing:
         call, result, *tail = _kas_events(text)
         mid = AcpEvent(kind=EVENT_TOOL_RESULT, tool_call_id="tc-kas", tool_output=text)
         spy = await _drive(state, slot, [call, mid, result, *tail], monkeypatch)
-        spy.assert_called_once()
+        _assert_record_applied_once(spy, slot)
 
 
 class TestTheToolSideOfTheKey:
@@ -569,8 +578,8 @@ class TestEmptyArgumentDirectives:
         client.context_usage_pct = MagicMock(return_value=1.0)
         client.client = None
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        spy = AsyncMock(return_value="[applied]")
-        monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+        spy = AsyncMock(return_value=DirectiveOutcome("[applied]"))
+        monkeypatch.setattr(chat_runner, "apply_session_directive_outcome", spy)
         await chat_runner._run_chat(state, slot, "go", _directive_user_origin=True)
         spy.assert_called_once()
         assert spy.call_args.args[3] == "reset_conversation"
@@ -626,8 +635,8 @@ class TestPlantedRecordIsNotClaimedByADifferentTool:
         client.context_usage_pct = MagicMock(return_value=1.0)
         client.client = None
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        spy = AsyncMock(return_value="[applied]")
-        monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+        spy = AsyncMock(return_value=DirectiveOutcome("[applied]"))
+        monkeypatch.setattr(chat_runner, "apply_session_directive_outcome", spy)
         await chat_runner._run_chat(state, slot, "go", _directive_user_origin=True)
         spy.assert_not_called()
         assert directive_queue.depth(effective_session_key(slot)) == 1, "record left parked"
@@ -735,8 +744,8 @@ class TestNativeSubagentCannotReachTheParentThroughASharedDigest:
         client.context_usage_pct = MagicMock(return_value=1.0)
         client.client = None
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        spy = AsyncMock(return_value="[applied]")
-        monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+        spy = AsyncMock(return_value=DirectiveOutcome("[applied]"))
+        monkeypatch.setattr(chat_runner, "apply_session_directive_outcome", spy)
         with caplog.at_level("WARNING"):
             await chat_runner._run_chat(state, slot, "go", _directive_user_origin=True)
         spy.assert_not_called()
@@ -1016,8 +1025,8 @@ class TestTheDisplayTitleCannotForgeTheTool:
         client.context_usage_pct = MagicMock(return_value=1.0)
         client.client = None
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        spy = AsyncMock(return_value="[applied]")
-        monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+        spy = AsyncMock(return_value=DirectiveOutcome("[applied]"))
+        monkeypatch.setattr(chat_runner, "apply_session_directive_outcome", spy)
         await chat_runner._run_chat(state, slot, "go", _directive_user_origin=True)
         spy.assert_not_called()
         assert directive_queue.depth(effective_session_key(slot)) == 1
@@ -1145,14 +1154,10 @@ class TestClaudeBackendResolvesTheTool:
             == ""
         )
 
-    @pytest.mark.asyncio
-    async def test_a_claude_shaped_turn_arms(self, tmp_path, monkeypatch):
-        """End to end through the real consumer with the frames the legacy parser
-        produces for Claude: raw mcp__ title on the refinement, no identity."""
-        state = _stub_state(tmp_path)
-        slot = state.get_or_create_slot("claude-turn")
-        slot._titled = True
-        events = [
+    @staticmethod
+    def _claude_turn() -> list[AcpEvent]:
+        """The frames the legacy parser produces for one Claude directive call."""
+        return [
             AcpEvent(
                 kind=EVENT_TOOL_CALL,
                 tool_call_id="tc-cl",
@@ -1179,14 +1184,44 @@ class TestClaudeBackendResolvesTheTool:
             AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
             AcpEvent(kind=EVENT_COMPLETE),
         ]
-        spy = await _drive(state, slot, events, monkeypatch)
+
+    @pytest.mark.asyncio
+    async def test_a_claude_shaped_turn_arms(self, tmp_path, monkeypatch):
+        """End to end through the real consumer with the frames the legacy parser
+        produces for Claude: raw mcp__ title on the refinement, no identity."""
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("claude-turn")
+        slot._titled = True
+        spy = await _drive(state, slot, self._claude_turn(), monkeypatch)
         spy.assert_called_once()
         assert spy.call_args.args[3] == "monitor_start"
+
+    @pytest.mark.asyncio
+    async def test_a_claude_childs_call_with_no_card_is_refused(self, tmp_path, monkeypatch):
+        """The same call from a Claude child that has no card, for example one past
+        the client's child cap. The activity event alone marks the call as a child's,
+        so the parked record is retired instead of acting on the parent's chat."""
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("claude-child")
+        slot._titled = True
+        calls = _sel_spy(monkeypatch)
+        mark = AcpEvent(
+            kind=EVENT_SUBAGENT_ACTIVITY, sub_session_id="child-late", tool_call_id="tc-cl"
+        )
+        spy = await _drive(state, slot, [mark, *self._claude_turn()], monkeypatch)
+        spy.assert_not_called()
+        denied = [c for c in calls if c.get("source") == "mcp-directive"]
+        assert [c["outcome"] for c in denied] == ["denied"]
+        notes = [o for o in _tool_result_outputs(state) if "[Not applied:" in o]
+        assert len(notes) == 1 and "sub-agent" in notes[0]
+        assert directive_queue.depth(effective_session_key(slot)) == 0
+        sent = [c.args[0] for c in state.broadcast_ws.call_args_list if c.args]
+        assert "subagent_spawn" not in sent
 
 
 class TestKasWireTitleCarriesTheBackendPrefix:
     """A recorded KAS ``tool_call`` frame titled the MCP call
-    ``Running: @kirocrew-core/ask_question`` -- the backend's own ``Running: ``
+    ``Running: @kirocrew-core/suggest_followup`` -- the backend's own ``Running: ``
     prefix in front of the wrapper's ``@<server>/<tool>``. Matching the bare
     spelling only left that frame with no digest, so on a KAS session that emits
     no ``_meta.kiro`` the record parked and nothing claimed it: the tool answered
@@ -1195,12 +1230,12 @@ class TestKasWireTitleCarriesTheBackendPrefix:
     @pytest.mark.parametrize(
         "title,expected",
         [
-            ("Running: @kirocrew-core/ask_question", "ask_question"),
+            ("Running: @kirocrew-core/suggest_followup", "suggest_followup"),
             ("Running: @kirocrew-core/monitor_start", "monitor_start"),
             ("@kirocrew-core/monitor_start", "monitor_start"),
             ("Running: @other-server/monitor_start", ""),
             ("Running: Running: @kirocrew-core/monitor_start", ""),  # one prefix, not a loop
-            ("Loading tool: kirocrew-core::ask_question", ""),  # tool_search, not the call
+            ("Loading tool: kirocrew-core::suggest_followup", ""),  # tool_search, not the call
             ("Running: echo @kirocrew-core/monitor_start", ""),
         ],
     )
@@ -1218,7 +1253,7 @@ class TestKasWireTitleCarriesTheBackendPrefix:
         events[0].title = "Running: @kirocrew-core/monitor_start"
         events[0].wire_title = "Running: @kirocrew-core/monitor_start"
         spy = await _drive(state, slot, events, monkeypatch)
-        spy.assert_called_once()
+        _assert_record_applied_once(spy, slot)
 
 
 class TestDisplayStripKeepsAnEnvelopeReadable:
@@ -1248,8 +1283,8 @@ class TestDisplayStripKeepsAnEnvelopeReadable:
         [
             ("monitor_update", {"patch": {"message": 'say "hi" {twice}', "banner": "b"}}),
             (
-                "ask_question",
-                {"questions": [{"question": "pick {one}", "options": [{"label": "a"}]}]},
+                "suggest_followup",
+                {"items": [{"title": "pick {one}", "description": "d", "prompt": 'say "a"'}]},
             ),
             (
                 "suggest_followup",
@@ -1413,7 +1448,7 @@ class TestConcurrentDirectivesInOneSession:
         slot._titled = True
         a_args = {"message": "loop A", "interval_secs": 300}
         b_args = {"message": "loop B", "interval_secs": 600}
-        q_args = {"questions": [{"question": "which?", "options": [{"label": "x"}]}]}
+        q_args = {"items": [{"title": "which?", "description": "d", "prompt": "x"}]}
         child_args: dict = {}
 
         def call(tcid, tool, args):
@@ -1450,14 +1485,14 @@ class TestConcurrentDirectivesInOneSession:
             ),
             AcpEvent(kind=EVENT_SUBAGENT_ACTIVITY, sub_session_id="sub-1", tool_call_id="tc-child"),
             call("tc-a", "monitor_start", a_args),
-            call("tc-q", "ask_question", q_args),
+            call("tc-q", "suggest_followup", q_args),
             call("tc-child", "reset_conversation", child_args),
             call("tc-b", "monitor_start", b_args),
             # Results arrive out of call order.
             result("tc-b", "monitor_start", b_args),
             result("tc-child", "reset_conversation", child_args),
             result("tc-a", "monitor_start", a_args),
-            result("tc-q", "ask_question", q_args),
+            result("tc-q", "suggest_followup", q_args),
             AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
             AcpEvent(kind=EVENT_COMPLETE),
         ]
@@ -1471,7 +1506,7 @@ class TestConcurrentDirectivesInOneSession:
                 sk = effective_session_key(slot)
                 for tool, args in (
                     ("monitor_start", a_args),
-                    ("ask_question", q_args),
+                    ("suggest_followup", q_args),
                     ("reset_conversation", child_args),  # the child's, under the parent key
                     ("monitor_start", b_args),
                 ):
@@ -1488,17 +1523,17 @@ class TestConcurrentDirectivesInOneSession:
         client.context_usage_pct = MagicMock(return_value=1.0)
         client.client = None
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        spy = AsyncMock(return_value="[applied]")
-        monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+        spy = AsyncMock(return_value=DirectiveOutcome("[applied]"))
+        monkeypatch.setattr(chat_runner, "apply_session_directive_outcome", spy)
         await chat_runner._run_chat(state, slot, "go", _directive_user_origin=True)
 
         applied = [
-            (c.args[3], c.args[4].get("message") or c.args[4].get("questions"))
+            (c.args[3], c.args[4].get("message") or c.args[4].get("items"))
             for c in spy.call_args_list
         ]
         assert ("monitor_start", "loop A") in applied
         assert ("monitor_start", "loop B") in applied
-        assert any(k == "ask_question" for k, _ in applied)
+        assert any(k == "suggest_followup" for k, _ in applied)
         assert all(k != "reset_conversation" for k, _ in applied), "child never reaches parent"
         assert len(applied) == 3
         assert directive_queue.depth(effective_session_key(slot)) == 0, "child record retired"

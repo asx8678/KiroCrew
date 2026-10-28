@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import threading
 from unittest.mock import MagicMock
 
@@ -262,6 +263,100 @@ class TestSelfServedVerdicts:
         assert state.installed == probe.MISSING
         assert state.missing_components == (launch_for(backend).binary,)
         assert state.install_command == driver.self_served_install_command(backend)
+
+
+def _npm_copilot(root, version: str, *, name: str = "@github/copilot") -> str:
+    """Lay down an npm global install of Copilot CLI under *root*; return its bin link."""
+    package = root / "lib" / "node_modules" / "@github" / "copilot"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(json.dumps({"name": name, "version": version}))
+    (package / "npm-loader.js").write_text("// loader\n")
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    link = bin_dir / "copilot"
+    link.symlink_to(package / "npm-loader.js")
+    return str(link)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="npm bin links are symlinks on POSIX")
+class TestCopilotWrongVersion:
+    """UX: a Copilot CLI on any release but the verified one refuses every chat at
+    the handshake, so the row must not call it Installed.
+
+    Read from the install's own manifest, so each case lays down a real npm layout
+    and lets the spawn's resolver find it.
+    """
+
+    def _probe(self, monkeypatch, binary: str):
+        from kiro_crew.acp import client
+        from kiro_crew.acp_backends import ACP_BACKEND_COPILOT
+
+        _stub_resolvers(monkeypatch, self_served={ACP_BACKEND_COPILOT: (binary, "/usr/bin")})
+        monkeypatch.setattr(client, "_self_served_bin_caches", {})
+        return probe.probe_backend(ACP_BACKEND_COPILOT)
+
+    def test_another_release_is_missing_the_verified_one(self, monkeypatch, tmp_path):
+        from kiro_crew.agent_sdk.backends import COPILOT_VERIFIED_VERSION
+
+        state = self._probe(monkeypatch, _npm_copilot(tmp_path, "1.0.103"))
+        assert state.installed == probe.MISSING
+        assert state.found_version == "1.0.103"
+        assert state.missing_components == (f"copilot {COPILOT_VERIFIED_VERSION}",)
+        assert state.install_command == f"npm i -g @github/copilot@{COPILOT_VERIFIED_VERSION}"
+
+    def test_the_verified_release_is_installed(self, monkeypatch, tmp_path):
+        from kiro_crew.agent_sdk.backends import COPILOT_VERIFIED_VERSION
+
+        state = self._probe(monkeypatch, _npm_copilot(tmp_path, COPILOT_VERIFIED_VERSION))
+        assert state.installed == probe.INSTALLED
+        assert state.found_version == ""
+
+    def test_an_unreadable_release_is_not_a_wrong_one(self, monkeypatch, tmp_path):
+        """A standalone build carries no manifest: the handshake still decides."""
+        standalone = tmp_path / "copilot"
+        standalone.write_text("#!/bin/sh\n")
+        assert self._probe(monkeypatch, str(standalone)).installed == probe.INSTALLED
+
+    def test_another_packages_manifest_is_not_read(self, monkeypatch, tmp_path):
+        state = self._probe(monkeypatch, _npm_copilot(tmp_path, "9.9.9", name="not-copilot"))
+        assert state.installed == probe.INSTALLED
+
+    def test_a_windows_shim_reads_the_prefix_package(self, tmp_path):
+        from kiro_crew.acp.harness.copilot import copilot_installed_version
+
+        package = tmp_path / "node_modules" / "@github" / "copilot"
+        package.mkdir(parents=True)
+        (package / "package.json").write_text(
+            json.dumps({"name": "@github/copilot", "version": "1.0.102"})
+        )
+        (tmp_path / "copilot.cmd").write_text("@echo off\n")
+        assert copilot_installed_version(str(tmp_path / "copilot.cmd")) == "1.0.102"
+
+    @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_SELF_SERVED_ACP - {"copilot"}))
+    def test_no_other_harness_reads_a_version(self, backend, monkeypatch):
+        from kiro_crew.agent_sdk.drivers import acp as driver
+
+        monkeypatch.setattr(
+            "kiro_crew.acp.client._resolve_self_served_bin", MagicMock(side_effect=AssertionError)
+        )
+        assert driver.self_served_wrong_version(backend) == ""
+
+    def test_the_status_row_carries_the_release_on_a_missing_verdict_only(self):
+        from kiro_crew.dashboard.handlers.acp_backend_status import _row
+
+        wrong = probe.BackendInstallState(
+            "copilot",
+            "copilot",
+            probe.MISSING,
+            ("copilot 1.0.100",),
+            "npm i",
+            found_version="1.0.103",
+        )
+        clamped = probe.BackendInstallState(
+            "copilot", "copilot", probe.INSTALLED, found_version="1.0.103"
+        )
+        assert _row(wrong, frozenset())["found_version"] == "1.0.103"
+        assert _row(clamped, frozenset())["found_version"] == ""
 
 
 class TestPiVerdicts:
@@ -520,6 +615,65 @@ class TestKasTracksKiro:
         )
         assert probe.probe_backend(ACP_BACKEND_KAS).installed == probe.INSTALLED
         assert calls == [1]
+
+
+class TestKasBundleRouteAnswersFromTheInstalledEngine:
+    """With ``agent.kas_bundle`` on, KAS runs Crew's own engine and never kiro-cli.
+
+    The row then has to say what THAT route is missing. A host with no kiro-cli
+    is INSTALLED once the engine is; a host with kiro-cli but no engine is
+    MISSING the bundle, named with the command that lays it down -- and kiro's
+    resolver is not consulted either way, since nothing on this route spawns it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _bundle_route(self, _floor_monkeypatch):
+        # The floor stack, not the test's own: a case that calls ``monkeypatch.undo()``
+        # must not lift the route pin from under its own assertions.
+        _floor_monkeypatch.setattr(probe, "_kas_bundle_route", lambda: True)
+
+    @pytest.mark.parametrize("kiro_bin", ["/usr/local/bin/kiro-cli", None])
+    def test_installed_engine_is_installed_whatever_kiro_cli_says(self, monkeypatch, kiro_bin):
+        from kiro_crew.agent_sdk import kas_bundle
+
+        _stub_resolvers(monkeypatch, kiro=kiro_bin)
+        monkeypatch.setattr(kas_bundle, "installed_bundle", lambda *a, **k: object())
+        kas = probe.probe_backend(ACP_BACKEND_KAS)
+        assert kas.installed == probe.INSTALLED
+        assert kas.missing_components == ()
+        assert kas.policy_id == "kas"
+
+    @pytest.mark.parametrize("kiro_bin", ["/usr/local/bin/kiro-cli", None])
+    def test_no_engine_is_missing_the_bundle_not_kiro_cli(self, monkeypatch, kiro_bin):
+        from kiro_crew.agent_sdk import kas_bundle
+
+        _stub_resolvers(monkeypatch, kiro=kiro_bin)
+        monkeypatch.setattr(kas_bundle, "installed_bundle", lambda *a, **k: None)
+        kas = probe.probe_backend(ACP_BACKEND_KAS)
+        assert kas.installed == probe.MISSING
+        assert kas.missing_components == (probe.COMPONENT_KAS_BUNDLE,)
+        assert kas.install_command == probe.KAS_BUNDLE_INSTALL_COMMAND
+        assert probe.COMPONENT_KIRO_CLI not in kas.missing_components
+
+    def test_kiro_resolver_is_not_consulted_on_the_bundle_route(self, monkeypatch):
+        from kiro_crew.acp import client
+        from kiro_crew.agent_sdk import kas_bundle
+
+        monkeypatch.setattr(kas_bundle, "installed_bundle", lambda *a, **k: object())
+        monkeypatch.setattr(
+            client,
+            "_resolve_kiro_bin",
+            lambda **_kw: (_ for _ in ()).throw(AssertionError("kiro resolver consulted")),
+        )
+        assert probe.probe_backend(ACP_BACKEND_KAS).installed == probe.INSTALLED
+
+    def test_the_relay_route_is_unchanged(self, monkeypatch):
+        # The default (switch off) keeps kas as a copy of kiro's verdict.
+        monkeypatch.setattr(probe, "_kas_bundle_route", lambda: False)
+        _stub_resolvers(monkeypatch, kiro=None)
+        kas = probe.probe_backend(ACP_BACKEND_KAS)
+        assert kas.installed == probe.MISSING
+        assert kas.missing_components == (probe.COMPONENT_KIRO_CLI,)
 
 
 class TestUnknownIsNeverMissing:
@@ -859,6 +1013,7 @@ class TestEndpointPayloadShape:
         assert [r["policy_id"] for r in rows] == [
             "claude",
             "codex",
+            "copilot",
             "deepseek",
             "goose",
             "kas",
@@ -875,6 +1030,8 @@ class TestEndpointPayloadShape:
                 "installed",
                 "missing_components",
                 "install_command",
+                # Non-empty only on a wrong-release MISSING verdict (Copilot's pin).
+                "found_version",
                 "restart_required",
                 "auth",
                 # The capability card, spread into the row rather than nested:
@@ -882,6 +1039,7 @@ class TestEndpointPayloadShape:
                 # line MEANS is pinned in ``test_backend_cards``; this file pins
                 # that the row carries them.
                 "capabilities",
+                "details",
                 "security_notes",
                 "operator_notes",
                 "tool_approval",
@@ -896,6 +1054,7 @@ class TestEndpointPayloadShape:
             assert set(row["mcp"]) == {
                 "per_tool_deny",
                 "costs_whole_server",
+                "spared_servers",
                 "ineffective",
             }
             # Sign-in is the harness's own third fact, so every row carries it --
@@ -909,17 +1068,22 @@ class TestEndpointPayloadShape:
             assert [entry["id"] for entry in row["capabilities"]] == [
                 spec.id for spec in backend_cards.USER_FACING_LINES
             ]
+            assert [entry["id"] for entry in row["details"]] == [
+                spec.id for spec in backend_cards.DETAIL_LINES
+            ]
             assert isinstance(row["tool_approval"], str) and row["tool_approval"]
 
         by_policy = {r["policy_id"]: r for r in rows}
         assert by_policy["kiro"] == {
-            "id": "",
+            # The config-file spelling, which is what the panel PATCHes.
+            "id": "kiro",
             "policy_id": "kiro",
             "selectable": True,
             "independent_setup": False,
             "installed": "installed",
             "missing_components": [],
             "install_command": "",
+            "found_version": "",
             "restart_required": False,
             # Compared against the declaration rather than a literal copy of the
             # remedy: the string is rendered verbatim by the panel, so a literal
@@ -1053,8 +1217,13 @@ class TestForgetProbe:
         assert probe._cached(ACP_BACKEND_KIRO) is None
         assert probe._cached(ACP_BACKEND_KAS) is None
 
-    def test_forgetting_an_unprobed_backend_is_silent(self):
+    def test_forgetting_an_unprobed_backend_is_silent(self, monkeypatch):
+        _stub_resolvers(monkeypatch)
+        cached = probe.probe_backend(ACP_BACKEND_KIRO)
+
         probe.forget_probe("never-probed")
+
+        assert probe._cached(ACP_BACKEND_KIRO) == cached
 
 
 class TestEvictionOutranksAProbeAlreadyRunning:
@@ -1256,9 +1425,16 @@ class TestForgetCachedResolution:
         from kiro_crew.acp import client
         from kiro_crew.agent_sdk.drivers import acp as driver
 
-        monkeypatch.setattr(client, "_self_served_bin_caches", {})
+        caches = {other: _ABSENT for other in ACP_BACKENDS_SELF_SERVED_ACP}
+        monkeypatch.setattr(client, "_self_served_bin_caches", caches)
+        kept = (None, "/usr/bin")
+        monkeypatch.setattr(client, "_claude_acp_argv_cache", kept, raising=False)
+        monkeypatch.setattr(client, "_codex_acp_argv_cache", kept, raising=False)
         driver.forget_cached_resolution(ACP_BACKEND_KIRO)
         driver.forget_cached_resolution(ACP_BACKEND_KAS)
+        assert caches == {other: _ABSENT for other in ACP_BACKENDS_SELF_SERVED_ACP}
+        assert client._claude_acp_argv_cache is kept
+        assert client._codex_acp_argv_cache is kept
 
     def test_the_GET_still_never_clears_anything(self, monkeypatch):
         """The seams' own rule, unchanged by the POST existing.
@@ -1489,6 +1665,24 @@ class TestRecheckEndpoint:
         assert response.status == 200
         assert seen == [ACP_BACKEND_KIRO]
         assert json.loads(response.text or "{}")["backend"]["id"] == ACP_BACKEND_KIRO
+
+    def test_the_row_id_kiro_rechecks_the_kiro_cli_backend(self, monkeypatch):
+        """The panel re-checks by row id, and the Kiro CLI row id is "kiro"."""
+        from kiro_crew.dashboard.handlers import acp_backend_status as handler
+
+        monkeypatch.setattr(handler, "sel", lambda: MagicMock())
+        seen: list[str] = []
+
+        def _recheck(backend: str):
+            seen.append(backend)
+            return {"id": "kiro", "installed": "installed"}
+
+        monkeypatch.setattr(handler, "_recheck", _recheck)
+        response = asyncio.run(
+            handler.api_acp_backend_recheck(_request(json_body={"backend": "kiro"}))
+        )
+        assert response.status == 200
+        assert seen == [ACP_BACKEND_KIRO]
 
     def test_it_answers_one_row_in_the_shape_the_list_sends(self, monkeypatch):
         """Same builder as the GET, so a field cannot go missing from one verb.

@@ -15,7 +15,7 @@ import re
 from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
 
-from kiro_crew.dashboard.source_providers import LOGGER_NAME, contract, sanitize
+from kiro_crew.dashboard.source_providers import LOGGER_NAME, contract, hosts, sanitize
 from kiro_crew.dashboard.source_providers.contract import (
     ConfirmationRequired,
     SourceCapacityError,
@@ -68,9 +68,30 @@ _PROVIDER_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 # Ids the core owns. A plugin may not claim one: `parse_source_url` checks the
 # built-in hosts first, so a shadowing plugin would be dead for parsing yet live
 # for fetching -- two layers disagreeing about one provider.
-_BUILTIN_PROVIDER_IDS = frozenset({"github", "gitlab", "jira"})
+_BUILTIN_PROVIDER_IDS = frozenset(
+    {"github", "gitlab", "jira", contract.BITBUCKET_SERVER_PROVIDER, contract.GERRIT_PROVIDER}
+)
 
 _SOURCE_PROVIDER_PLUGINS: dict[str, SourceProviderPlugin] = {}
+
+# Core providers dispatched through this seam rather than through a built-in
+# branch: each implements the plugin protocol, so it is served from inside the
+# same cache, redaction, byte-cap and setup-error layers, and every write it does
+# not implement is refused by `_require_plugin_hook`. Installed by the owning
+# module when it is imported (the handler imports every owner at load), and never
+# cleared by `reset_source_providers_for_tests`, which only drops registrations.
+_CORE_SEAM_PROVIDERS: dict[str, SourceProviderPlugin] = {}
+#: The ids served ONLY through the seam. A ref carrying one of these with no
+#: installed owner fails closed in `_plugin_for_change` instead of reaching a
+#: built-in branch.
+_CORE_SEAM_PROVIDER_IDS = frozenset({contract.BITBUCKET_SERVER_PROVIDER, contract.GERRIT_PROVIDER})
+
+
+def _install_core_seam_provider(plugin: SourceProviderPlugin) -> None:
+    """Install a core provider served through this seam. Idempotent per id."""
+    if plugin.id not in _BUILTIN_PROVIDER_IDS:
+        raise ValueError(f"core source provider {plugin.id!r} is not a built-in id")
+    _CORE_SEAM_PROVIDERS[plugin.id] = plugin
 
 
 def register_source_provider(plugin: SourceProviderPlugin) -> None:
@@ -179,7 +200,16 @@ def source_link_path_markers() -> tuple[str, ...]:
     Bounded per plugin and validated, since a marker of ``"/"`` would defeat the
     prefilter it exists to be.
     """
-    markers = ["/pull/", "/merge_requests/", "/issues/", "/browse/"]
+    markers = ["/pull/", "/merge_requests/", "/issues/", "/work_items/", "/browse/"]
+    # Bitbucket Server pull requests live under ``/pull-requests/``, which no
+    # other marker covers. Offered only while a Server host is listed, so a
+    # transcript scan with no such host does exactly the work it always did.
+    if hosts._allowed_bitbucket_server_hosts():
+        markers.append("/pull-requests/")
+    # A Gerrit change lives at ``/c/<project>/+/<number>``; ``/+/`` is the one
+    # segment every such URL carries and no other provider uses. Same gating.
+    if hosts._allowed_gerrit_hosts():
+        markers.append("/+/")
     for plugin in _SOURCE_PROVIDER_PLUGINS.values():
         hook = getattr(plugin, "path_markers", None)
         if not callable(hook):
@@ -265,8 +295,16 @@ def source_ref_label(ref: SourceRef) -> str:
 
 
 def _plugin_for_change(ref: SourceRef) -> SourceProviderPlugin | None:
-    """The plugin owning this ref, or None when a built-in path should run."""
-    return _SOURCE_PROVIDER_PLUGINS.get(ref.provider)
+    """The plugin owning this ref, or None when a built-in path should run.
+
+    A core seam provider's ref never falls through to a built-in branch: when its
+    owner has not been imported yet the read fails closed instead of reaching a
+    GitHub or GitLab code path with a foreign host.
+    """
+    plugin = _SOURCE_PROVIDER_PLUGINS.get(ref.provider) or _CORE_SEAM_PROVIDERS.get(ref.provider)
+    if plugin is None and ref.provider in _CORE_SEAM_PROVIDER_IDS:
+        raise SourceProviderError(f"the {ref.provider} source provider is not loaded")
+    return plugin
 
 
 def _plugin_setup_error(
@@ -283,12 +321,45 @@ def _plugin_setup_error(
     # `setup_message()` is edition-authored operator guidance, but the `str(exc)`
     # fallback is plugin RUNTIME text, so the whole message goes through the same
     # redaction a built-in's stderr does rather than only the fallback branch.
-    return SourceProviderError(
-        sanitize._safe_error_text(
-            message or str(exc),
-            fallback=f"{plugin.id} is not configured.",
-        )
+    # The secret name rides along only while the guidance still names it: a
+    # `setup_message()` that replaces the plugin's own guidance may not. On the
+    # fallback the shown text IS that guidance, already cut to its display
+    # length by `_plugin_errors`, so the name is checked on its own instead.
+    text = sanitize._safe_error_text(
+        message or str(exc), fallback=f"{plugin.id} is not configured."
     )
+    if message:
+        carried = _carried_secret_name(exc, message)
+    else:
+        carried = exc.secret_name if _secret_name_survives_scrub(exc.secret_name) else ""
+    return SourceProviderError(text, secret_name=carried)
+
+
+def _secret_name_survives_scrub(name: str) -> bool:
+    """Whether *name* comes through the error scrub unchanged on its own.
+
+    The field is the one piece of a plugin's error the client shows outside the
+    scrubbed sentence, so a name the scrub would alter (an identifier-shaped
+    credential) is never shipped as one.
+    """
+    return bool(name) and sanitize._scrubbed_error_text(name) == name
+
+
+def _carried_secret_name(exc: SourceProviderError, source: str) -> str:
+    """*exc*'s secret name when it survives the scrub and *source* names it, else ``""``.
+
+    *source* is the plugin's own text before it is cut to its display length: a
+    long per-host name can run past that cut, and the field is then the only
+    place the reader gets the name whole. The name must still appear, whole, in
+    the scrubbed text, so the field always names what the sentence names.
+    """
+    name = exc.secret_name
+    if not _secret_name_survives_scrub(name):
+        return ""
+    scrubbed = sanitize._scrubbed_error_text(source)
+    if not re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", scrubbed):
+        return ""
+    return name
 
 
 @contextlib.contextmanager
@@ -311,7 +382,10 @@ def _plugin_errors(plugin_id: str) -> Iterator[None]:
     503 body on exactly that path.
 
     The exception TYPE is preserved so each caller's own handling, and the
-    status code each maps to, are unchanged; only the message is scrubbed.
+    status code each maps to, are unchanged; only the message is scrubbed. A
+    ``secret_name`` is carried over only while it survives the scrub on its own
+    and the scrubbed text still names it (`_carried_secret_name`), so the field
+    never shows the client text the scrub removed from the sentence.
 
     Deliberately NOT ``except Exception``: an unlisted type (a plugin's bare
     ``RuntimeError``, ``KeyError``, its own class) propagates to a generic 500
@@ -324,17 +398,19 @@ def _plugin_errors(plugin_id: str) -> Iterator[None]:
     try:
         yield
     except SourceProviderNotConfigured as exc:
+        message = sanitize._safe_error_text(str(exc), fallback=f"{plugin_id} is not configured")
         raise SourceProviderNotConfigured(
-            sanitize._safe_error_text(str(exc), fallback=f"{plugin_id} is not configured")
+            message, secret_name=_carried_secret_name(exc, str(exc))
         ) from exc
     except SourceCapacityError as exc:
         raise SourceCapacityError(
             sanitize._safe_error_text(str(exc), fallback="provider is busy")
         ) from exc
     except SourceProviderError as exc:
-        raise SourceProviderError(
-            sanitize._safe_error_text(str(exc), fallback=f"the {plugin_id} source provider failed")
-        ) from exc
+        message = sanitize._safe_error_text(
+            str(exc), fallback=f"the {plugin_id} source provider failed"
+        )
+        raise SourceProviderError(message, secret_name=_carried_secret_name(exc, str(exc))) from exc
     except ConfirmationRequired as exc:
         # A ``ValueError`` subclass with response semantics: it is what makes
         # `_owner_mutation_response` add ``confirmationRequired: True`` to the

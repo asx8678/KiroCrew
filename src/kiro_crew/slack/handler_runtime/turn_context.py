@@ -4,7 +4,7 @@ The thread's first message when a new Slack-born session opens in a thread it di
 start (``slack/thread_parent.py``, which also records it as the transcript's first row),
 the replies posted since this conversation's last turn in the thread
 (``slack/thread_replies.py``), and the ``conversations.replies`` fallback line that
-stands in for the parent when its fetch found nothing. ``handle_message`` passes each
+stands in for the parent when its fetch found nothing. ``_run_turn`` passes each
 result to ``ContextBuilder.build_message``.
 
 Composed onto :mod:`kiro_crew.slack.handler`; see
@@ -54,8 +54,8 @@ async def _thread_context(
     """
     # Fetch thread parent message when starting a new session in an
     # existing thread (e.g. replying to a cron thread).  Gives the LLM
-    # context about what started the thread without requiring manual
-    # batch_get_thread_replies. This path persists the user's row only
+    # context about what started the thread without requiring a manual
+    # thread-reading tool call. This path persists the user's row only
     # after the turn, so ``compressed`` is non-empty only when earlier
     # turns exist. A Slack-born session also records the parent as the
     # transcript's first row (see ``slack/thread_parent.py``).
@@ -143,7 +143,8 @@ async def _thread_meta_fallback(
                 if reply_count > 0:
                     _thread_meta = (
                         f'[Thread has {reply_count} replies. Parent message: "{parent_text}"]\n'
-                        "Use batch_get_thread_replies to read the full thread if needed.\n"
+                        "Use the Slack MCP server's thread-reading tool (e.g. get_thread) "
+                        "to read the full thread if needed.\n"
                     )
                 else:
                     _thread_meta = f'[Parent message: "{parent_text}"]\n'

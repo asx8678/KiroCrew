@@ -1,6 +1,7 @@
 import { api } from '../../api/client'
+import { apiErrorCode } from '../../api/apiError'
 import modelTokensRaw from '../../model_tokens.json'
-import { markModelsDegraded } from '../modelListHealth'
+import { markModelsDegraded, markModelsAuthRequired } from '../modelListHealth'
 import { isPricedMultiplier } from '../modelList'
 import { i18nT } from '../../i18n/t'
 import type {
@@ -10,6 +11,7 @@ import type {
   AgentBinding,
   NormalizedUsage,
   NormalizedProviderHook,
+  NormalizedUnsentHook,
   NormalizedPlugin,
   ModelInfo,
   PermissionMode,
@@ -141,6 +143,17 @@ interface RawHookEntry {
   source?: string
 }
 
+/** Raw `unsent` entry from /api/kiro-hooks: a validated `agent.kiro_hooks`
+ *  document left out of the kiro-cli spec. */
+interface RawUnsentHook {
+  name?: string
+  trigger?: string
+  matcher?: string
+  action_type?: string
+  command?: string
+  reason?: string
+}
+
 /** Raw plugin (agent/skill/mcp) entry from /api/capability/*. */
 interface RawPlugin {
   name: string
@@ -152,6 +165,10 @@ interface RawPlugin {
 /** Raw model entry from /api/models. */
 interface RawModel {
   model_name: string
+  /** The backend's own human label for the model (advertised by the harness for
+   *  an advertised-selection backend). Optional: a gateway predating the field
+   *  omits it, and the render site falls back to `model_name`. */
+  display_name?: string
   description?: string
   /** Backend-resolved context window. Two spellings because the endpoint has two
    *  branches: the kiro path returns `kiro-cli --list-models` rows verbatim
@@ -220,7 +237,7 @@ export class AcpAdapter implements ProviderAdapter {
     return agent.kiro_agent || agent.name
   }
 
-  async resolveModel(agentName: string): Promise<string> {
+  async resolveModel(agentName: string, app?: string): Promise<string> {
     // Ask the backend which model a new session on this agent would run on, so
     // the composer shows the real value before a session exists to report one.
     //
@@ -234,9 +251,10 @@ export class AcpAdapter implements ProviderAdapter {
     //
     // `agentName` is a KiroCrew agent name (a "crew"), not a kiro agent
     // template — the per-agent default is stored per crew, and several crews can
-    // share one template.
+    // share one template. `app` names the app that owns the session, so the
+    // answer includes that app's own model setting as the session start does.
     try {
-      const d = await api.agentResolvedModel(agentName)
+      const d = await (app ? api.agentResolvedModel(agentName, app) : api.agentResolvedModel(agentName))
       return d?.model || ''
     } catch {
       return ''
@@ -334,6 +352,20 @@ export class AcpAdapter implements ProviderAdapter {
     return result
   }
 
+  async fetchUnsentProviderHooks(): Promise<NormalizedUnsentHook[]> {
+    const data = await api.kiroHooks()
+    // An older gateway sends no `unsent`; that reads as nothing left out.
+    const unsent: RawUnsentHook[] = Array.isArray(data.unsent) ? data.unsent : []
+    return unsent.map(u => ({
+      name: u.name || '',
+      trigger: u.trigger || '',
+      matcher: u.matcher || '',
+      actionType: u.action_type || '',
+      command: u.command || '',
+      reason: u.reason || '',
+    }))
+  }
+
   async listPlugins(): Promise<NormalizedPlugin[]> {
     const [agents, skills, mcp] = await Promise.all([
       api.capabilityAgentsList().catch(() => []),
@@ -393,6 +425,14 @@ export class AcpAdapter implements ProviderAdapter {
         learnWindow(m.model_name, reported)
         return {
           name: m.model_name,
+          // The backend's native label, kept only when it is a REAL name (not
+          // the id-fallback the gateway fills in when a harness advertised no
+          // name). The auto row keeps its catalog label. The render site falls
+          // back to `name` when this is absent.
+          displayName:
+            m.model_name !== 'auto' && m.display_name && m.display_name !== m.model_name
+              ? m.display_name
+              : undefined,
           description: m.description || '',
           contextWindow: reported || MODEL_TOKENS[m.model_name] || DEFAULT_CONTEXT,
           rateMultiplier: rowMultiplier(m),
@@ -401,11 +441,17 @@ export class AcpAdapter implements ProviderAdapter {
       writeCachedModels(result) // remember this good live list for next hiccup
       markModelsDegraded(this.id, false) // live success → self-heal can stop polling
       return result
-    } catch {
+    } catch (err) {
       // Transient backend failure (503 / network): NOT live — keep polling.
       // Serve the last-good live list if we have one, else auto-only. Never
       // surface canonical registry keys — the ACP CLI rejects them (-32603).
+      // Read the refusal code HERE, where the error is formed, so an expired /
+      // signed-out kiro-cli login (503 `kiro_prerequisite_required`) can raise
+      // the one actionable sign-in banner instead of the generic config-load
+      // failure. Any other cause clears the auth flag — only this code means a
+      // sign-in wall.
       markModelsDegraded(this.id, true)
+      markModelsAuthRequired(this.id, apiErrorCode(err) === 'kiro_prerequisite_required')
       return readCachedModels() ?? this._defaultModels()
     }
   }

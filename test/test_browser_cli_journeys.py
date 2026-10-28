@@ -76,10 +76,16 @@ class TestOperatorConfigIsNotOurs:
         pkg = Path(install.__file__).parent
         writes = []
         for source in sorted(pkg.glob("*.py")):
-            for lineno, line in enumerate(source.read_text().splitlines(), 1):
+            for lineno, line in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
                 if any(
                     call in line
-                    for call in ("write_text(", "write_bytes(", "rmtree(", "atomic_write(")
+                    for call in (
+                        "write_text(",
+                        "write_bytes(",
+                        "rmtree(",
+                        "atomic_write(",
+                        "publish_through_auth_store_staging(",
+                    )
                 ):
                     writes.append(f"{source.name}:{lineno}")
         unexpected = [w for w in writes if w.split(":", 1)[0] not in sanctioned]
@@ -540,7 +546,9 @@ class TestTheViewDoesNotOutliveTheGateway:
 
         from kiro_crew.dashboard import server
 
-        src = inspect.getsource(server)
+        src = inspect.getsource(server) + (
+            Path(server.__file__).parent / "server_runtime" / "browser_lifecycle.py"
+        ).read_text(encoding="utf-8")
         assert "_browser_view_shutdown" in src
         assert "app.on_cleanup.append(_browser_view_shutdown)" in src
         assert "browser_cli_view.stop" in src
@@ -662,8 +670,9 @@ def _drive_install_error(monkeypatch, handler_name: str, body: dict | None = Non
 class TestARecoveredStepIsNotReportedAsAnError:
     """A step can fail and be RECOVERED, so "any step failed" is not the verdict.
 
-    The installer does not retry a refused package step, but a result that
-    carries a failed attempt followed by a successful one must still read as a
+    On an apt host the installer retries a refused ``--with-deps`` browser step
+    without ``--with-deps`` (``install-browser-no-deps``), so a result can carry
+    a failed attempt followed by a successful one, and it must still read as a
     success: the LAST step decides. Scanning every step for ``ok=False`` would
     raise a permanent error banner on a host where browsing works. The panel
     renders ``last_error`` with no gate of its own, so the verdict is made here.
@@ -962,15 +971,24 @@ class TestTokenIsOwnerRestricted:
     ):
         from unittest.mock import patch
 
+        from kiro_crew import hidden_leaf_staging
         from kiro_crew.browser_cli import token
 
         monkeypatch.setattr(token, "config_dir", lambda: tmp_path)
 
-        with patch.object(token, "atomic_write") as mock_aw:
+        # set_token publishes through the masked staging helper, which hands the
+        # staged write to atomic_write; assert on that write's lockdown arguments.
+        with (
+            patch.object(hidden_leaf_staging, "atomic_write") as mock_aw,
+            patch.object(hidden_leaf_staging, "replace_with_retry"),
+        ):
             token.set_token("secret-value")
 
         mock_aw.assert_called_once()
         _args, kwargs = mock_aw.call_args
+        assert (
+            Path(_args[0]).parent == tmp_path / "auth-store-staging"
+        ), "set_token must stage inside the masked staging directory, not beside the token"
         # restrict_to_owner must be True so the secret is locked down on Windows too.
         assert kwargs.get("restrict_to_owner") is True or (
             len(_args) > 2 and _args[2] is True
@@ -1046,7 +1064,6 @@ class TestViewSubprocessesReceiveNodeEnv:
         # stop() issues no subprocess.run call at all (no global --kill).
         mock_run.assert_not_called()
 
-        # Cleanup.
         view_mod._child = None
 
 

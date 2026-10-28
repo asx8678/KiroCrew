@@ -466,7 +466,15 @@ class LaunchApprovals:
         return set(identities)
 
     def admits_launch(self, stem: str, command_hash: str, derived_env_hash: str) -> bool:
-        """Whether one exact command/effective-environment pair was approved."""
+        """Whether one exact command/effective-environment pair was approved.
+
+        A never-pooled server (a credential vendor) is refused whatever its
+        recorded approval: this is the check ``gatewayd`` runs before it spawns
+        a shared backend, so an approval written before the name was listed
+        cannot let it run outside every chat sandbox.
+        """
+        if stem in _unpoolable_stems():
+            return False
         return launch_pair(command_hash, derived_env_hash) in self.approved_pairs.get(stem, ())
 
     def admits_command(self, stem: str, command_hash: str) -> bool:
@@ -784,6 +792,36 @@ def load_approvals(path: Path | None = None) -> LaunchApprovals:
     return _parse(raw)
 
 
+def approvals_store_problem(path: Path | None = None) -> str | None:
+    """Why the store cannot be read, or ``None`` when it reads.
+
+    For diagnostics only. :func:`load_approvals` reads every one of these
+    outcomes as "approves nothing", which is right for launch authorization and
+    wrong for a report: an unreadable store and an empty one look the same there.
+    An absent or blank store is not a problem; it records nothing yet.
+    """
+    target = path or approvals_path()
+    try:
+        text = target.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError:
+        return "not valid UTF-8"
+    except OSError as exc:
+        return f"unreadable ({type(exc).__name__})"
+    if not text.strip():
+        return None
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError:
+        return "not valid JSON"
+    if not isinstance(raw, dict):
+        return "not a JSON object"
+    if raw.get("version") != _VERSION:
+        return "written in a format this version does not read"
+    return None
+
+
 def _document(approvals: LaunchApprovals, refused: Mapping[str, Mapping[str, Any]]) -> str:
     server_records = [
         (stem, fps)
@@ -843,11 +881,19 @@ def _document(approvals: LaunchApprovals, refused: Mapping[str, Mapping[str, Any
 
 
 def _write(path: Path, text: str) -> None:
-    # Deferred: ``atomic_write`` pulls in platform helpers this leaf does not
-    # need at import time.
+    # Deferred: ``atomic_write`` and ``owner_only_files`` pull in platform
+    # helpers this leaf does not need at import time.
     from kiro_crew.atomic_write import atomic_write
+    from kiro_crew.owner_only_files import mkdirs_owner_only
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # The store's directory is born ``0700``, whatever the process umask: a bare
+    # ``mkdir`` takes the umask default (``0755`` under the usual ``022``), and
+    # this directory is the SEAL for the store (the file-tool gate and the OS
+    # sandbox both fence it by name), so an other-readable one would publish
+    # which launches the operator approved to every account on the host. The
+    # sandbox precreates it ``0700`` on a Linux spawn; this is the first writer
+    # on a host that has not spawned yet, and it must not depend on that order.
+    mkdirs_owner_only(path.parent)
     atomic_write(path, text, mode=0o600)
 
 
@@ -1249,6 +1295,29 @@ def refused_servers(path: Path | None = None) -> dict[str, dict[str, Any]]:
     return result
 
 
+def refused_shares(
+    asked: Iterable[str], refused: Mapping[str, Mapping[str, Any]]
+) -> dict[str, str]:
+    """Refusal reason per share-list name whose launch is refused, keyed as configured.
+
+    ``asked`` is ``mcp_gateway.stub_servers`` as config states it; ``refused`` is
+    :func:`refused_servers`. The rewriter admits a slash-named server under its
+    slash-free alias (``npm:@playwright/mcp`` is recorded as ``playwright-mcp``),
+    so each configured name is looked up under itself and then under its alias.
+    A refusal for a server that is not on the share list matches nothing here.
+    """
+    from kiro_crew.mcp_utils import mcp_server_alias
+
+    result: dict[str, str] = {}
+    for name in asked:
+        rec = refused.get(name)
+        if rec is None:
+            rec = refused.get(mcp_server_alias(name))
+        if rec is not None:
+            result[name] = str(rec.get("reason", ""))
+    return result
+
+
 def target_env_stem(key: str) -> str | None:
     """The target stem an env key names, or ``None`` if it names no target.
 
@@ -1275,10 +1344,19 @@ def filter_target_env(
     """
     kept: dict[str, str] = {}
     dropped: set[str] = set()
+    # A never-pooled server is dropped whatever its approval says: an approval
+    # or sidecar written before the name was listed must not let gatewayd spawn
+    # it outside every chat sandbox. Not recorded as a refusal: nothing is
+    # waiting on the person to approve it.
+    denied = _unpoolable_stems()
+    never: set[str] = set()
     for key, spec in target_env.items():
         stem = target_env_stem(key)
         if stem is None:
             kept[key] = spec
+            continue
+        if stem in denied:
+            never.add(stem)
             continue
         try:
             parts = shlex.split(spec)
@@ -1302,7 +1380,22 @@ def filter_target_env(
             stem, approvals.names.get(stem, stem)
         ):
             approvals.refused.setdefault(stem, REFUSED_UNAPPROVED)
-    return kept, sorted(dropped)
+    return kept, sorted(dropped | never)
+
+
+def _unpoolable_stems() -> frozenset[str]:
+    """Target stems of the servers the rewriter never pools.
+
+    Imported lazily: the rewriter imports this module, so a module-level import
+    would be a cycle.
+    """
+    from kiro_crew.mcp_gateway import rewriter_spec
+    from kiro_crew.mcp_utils import mcp_server_alias
+
+    names = rewriter_spec.UNPOOLABLE_SERVERS
+    return frozenset(target_stem(n) for n in names) | frozenset(
+        target_stem(mcp_server_alias(n)) for n in names
+    )
 
 
 def launch_approved(server_name: str, command_hash: str, derived_env_hash: str) -> bool:

@@ -17,13 +17,19 @@
  * on both ends. Non-embedded (top-level) dashboards mount this as a no-op.
  */
 import { useEffect } from 'react'
-import { useAppDispatch } from '../store'
+import { useAppDispatch, useAppStore } from '../store'
 import { setHostModel, type HostModel } from '../store/instancesSlice'
 import { isEmbeddedPane } from '../lib/embedded'
 import { setFocusModeEnabled } from '../hooks/useFocusMode'
+import { noteClipboardRelayHost, PANE_CLIPBOARD_VERSION } from '../lib/paneClipboardRelay'
+import { noteHostOrigin, setHostElectronReader } from '../lib/hostRelay'
 
 const MAC_INSET_CLASS = 'embedded-mac-inset'
 const WIN_INSET_CLASS = 'embedded-win-inset'
+const WIN_CAPTION_RESERVE_PROP = '--mc-win-caption-reserve'
+// Whole-pixel lengths only: the value crosses a postMessage boundary and is
+// written into this document's inline style.
+const WIN_CAPTION_RESERVE_RE = /^\d{1,4}px$/
 
 // Backoff (ms) between re-announcements of `mc-embedded-ready`, applied AFTER
 // the initial announce. The handshake is: child posts `mc-embedded-ready`, the
@@ -93,6 +99,9 @@ export function parseHostModel(data: unknown): HostModel | null {
     // Absence -> false is correct here (unlike `focusMode`): an older host that
     // omits the field simply has no Windows caption inset to relay.
     winInset: !!d.winInset,
+    winCaptionReserve: typeof d.winCaptionReserve === 'string' && WIN_CAPTION_RESERVE_RE.test(d.winCaptionReserve)
+      ? d.winCaptionReserve
+      : undefined,
     // Tri-state on purpose: `false` and "the host never sent the field" must
     // not collapse. An older host omits it AND ignores the pane's echoed
     // `mc-set-focus-mode`, so coercing absence to `false` would revert a
@@ -116,9 +125,14 @@ export function parseHostModel(data: unknown): HostModel | null {
 
 export default function EmbeddedHostBridge() {
   const dispatch = useAppDispatch()
+  const store = useAppStore()
 
   useEffect(() => {
     if (!isEmbeddedPane()) return
+
+    // The pop-out controls ask whether the hub is the desktop app. They read
+    // the stored host model through this getter, so the value has one home.
+    setHostElectronReader(() => store.getState().instances.host?.electron === true)
 
     // Stop re-announcing ONLY on the parent's distinct `mc-embedded-ack`, not on
     // a host model. The parent broadcasts its model to every warm pane on any
@@ -169,8 +183,24 @@ export default function EmbeddedHostBridge() {
       const model = parseHostModel(e.data)
       if (!model) return
       dispatch(setHostModel(model))
+      // Where the tab bar's switch / pin / stable-order relays go: exactly the
+      // origin this model came from, never '*'.
+      noteHostOrigin(e.origin)
+      // Whether this host performs image copies for us, and where to ask. Read
+      // off the raw payload: it is a pane-side capability, not header state.
+      noteClipboardRelayHost(
+        e.origin,
+        (e.data as { clipboardRelay?: unknown }).clipboardRelay === PANE_CLIPBOARD_VERSION,
+      )
       document.documentElement.classList.toggle(MAC_INSET_CLASS, model.macInset)
       document.documentElement.classList.toggle(WIN_INSET_CLASS, model.winInset)
+      // Adopt the host's zoom-aware reserve; without one the pane's own :root
+      // default (142px) applies.
+      if (model.winInset && model.winCaptionReserve) {
+        document.documentElement.style.setProperty(WIN_CAPTION_RESERVE_PROP, model.winCaptionReserve)
+      } else {
+        document.documentElement.style.removeProperty(WIN_CAPTION_RESERVE_PROP)
+      }
       // Adopt the host window's focus mode. `echo: false` because this IS the
       // relayed value — sending it back up is what would make the two frames
       // ping-pong. A toggle the user drives inside this pane still echoes.
@@ -197,10 +227,13 @@ export default function EmbeddedHostBridge() {
       for (const t of retryTimers) window.clearTimeout(t)
       document.documentElement.classList.remove(MAC_INSET_CLASS)
       document.documentElement.classList.remove(WIN_INSET_CLASS)
+      document.documentElement.style.removeProperty(WIN_CAPTION_RESERVE_PROP)
       setFocusModeEnabled(false, { echo: false })
+      noteClipboardRelayHost(null, false)
+      setHostElectronReader(null)
       dispatch(setHostModel(null))
     }
-  }, [dispatch])
+  }, [dispatch, store])
 
   return null
 }

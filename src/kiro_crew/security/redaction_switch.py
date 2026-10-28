@@ -40,8 +40,10 @@ besides. Outside that scope ``redact_credentials`` is unconditional, exactly as
 before: the chat, Slack, Webex, Discord, Telegram and every other channel egress,
 the ACP prompt the model reads, the persisted-history load pass (whose bytes
 also feed the model prompt), and every ADMISSION predicate that decides whether
-a file may leave the machine (``file_send``, ``_gate_upload_file``, the outbox
-flagged-file check) keep scanning whatever the owner chose. The design is the
+a file may reach a third party (``_gate_upload_file``, a non-owner's outbox
+download) keep scanning whatever the owner chose. The owner's own delivery
+surfaces (``file_send``, the outbox card, the owner's downloads) do not scan
+content at all, so the switch has nothing to govern there. The design is the
 opposite of a global bypass on purpose: a scope a caller must open cannot be
 inherited by a third-party sink that forgot to opt out, so adding a channel
 keeps the backend rule "scan before posting to any external surface" without
@@ -69,7 +71,7 @@ it constrains is the agent. ``config.json`` is writable by any auto-approved
 agent shell, so a switch stored there could be flipped by a prompt-injected
 agent that then prints the secrets it can read. The record therefore lives at
 :func:`config.loader.credential_redaction_path`, on the read+write KEYSTONE
-floor (``security._CREW_SECRET_LEAVES``) beside ``file_delivery_consent.json``:
+floor (``security._CREW_SECRET_LEAVES``) beside ``aws_service_consent.json``:
 ``is_sensitive_path`` refuses the tool path and the OS sandbox mounts the leaf
 read-only (readable, never writable, from a sandboxed shell), so the only writer
 is the owner-gated dashboard handler.
@@ -141,8 +143,41 @@ def credential_pass_bypassed() -> bool:
     return _OWNER_VIEW_BYPASS.get()
 
 
+#: Whether the calling context is redacting CODE rather than prose. A ContextVar for
+#: :func:`owner_view`'s reason: a scope the caller must open cannot be inherited by a
+#: sink that forgot to opt out.
+_CODE_TEXT: ContextVar[bool] = ContextVar("kirocrew_redaction_code_text", default=False)
+
+
+@contextmanager
+def code_text() -> Iterator[None]:
+    """Mark the enclosed redaction calls as running over CODE, so pass 3 spares two shapes.
+
+    Pass 3 reads a run of base64-alphabet characters as a bare secret key by its entropy
+    and shape, a guess about PROSE. In code it rewrites what the author wrote on purpose
+    and the program then runs on the redaction marker with no error. Inside this scope it
+    leaves a run alone only when the run is an ordered alphabet (``abc...xyz``) or a payload
+    of 64 characters or more behind a ``data:<type>;base64,`` header; any other run is judged
+    exactly as outside. Every other pass keys on a fixed format and runs unchanged, as does
+    the exfiltration-URL pass. A scope rather than an argument because
+    ``platform.context.redact_via_context`` takes none; open it only through
+    ``platform.context.redact_code_via_context``. Re-entrant and task-local.
+    """
+    token = _CODE_TEXT.set(True)
+    try:
+        yield
+    finally:
+        _CODE_TEXT.reset(token)
+
+
+def bare_secret_pass_enabled() -> bool:
+    """Whether pass 3 judges every run for THIS call: false only inside :func:`code_text`,
+    where it spares an ordered alphabet and a data URI payload."""
+    return not _CODE_TEXT.get()
+
+
 #: Serialises the read-modify-write in :func:`set_enabled`. An in-process lock,
-#: for the same reason ``file_delivery_consent._STORE_LOCK`` gives: the store has
+#: because the store has
 #: exactly one writer (the owner-gated dashboard handler in the gateway process),
 #: and a sibling lock FILE would be an agent-reachable artifact that could block
 #: the owner from turning redaction back ON.

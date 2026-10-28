@@ -48,6 +48,19 @@ class ArtifactStillPublishedError(ArtifactError):
     """
 
 
+class ArtifactConflictError(ArtifactError):
+    """Raised by ``update(expected_token=...)`` when the content changed since that read.
+
+    Another writer -- a second dashboard window, an agent edit -- saved after the
+    caller read the content its token names. Carries the stored current token so
+    the client can refetch and re-base instead of overwriting the newer content.
+    """
+
+    def __init__(self, message: str, *, current_token: str) -> None:
+        super().__init__(message)
+        self.current_token = current_token
+
+
 class ArtifactReplacedError(ArtifactError):
     """Raised when a slug does not hold the artifact generation the caller named.
 
@@ -344,6 +357,13 @@ class Artifact:
     #: that predates auto-registration defaults to ``False`` and is therefore
     #: never swept.
     auto_registered: bool = False
+    #: True for a crewmate's weekly report or monthly review, saved through
+    #: ``save_goal_report`` (:func:`kiro_crew.dashboard.goal_reminder.save_report`).
+    #: The artifact viewer opens such a page in the same sandbox as the crewmate
+    #: Dashboard page. Set only at create time by that one caller, never through
+    #: the artifact API, and kept across every later write. Tolerant-loaded:
+    #: every artifact that predates the field defaults to ``False``.
+    goal_report: bool = False
     #: Publication state. ``None`` until the artifact
     #: is published; carries the stable provider id/URL, visibility,
     #: shared-with aliases, and version-sync bookkeeping once published.
@@ -395,6 +415,11 @@ class Artifact:
     #: Tolerant-loaded from meta.json (older/other-kind artifacts default to
     #: ``None``).
     image: "ImageMetadata | None" = None
+    #: Random optimistic-concurrency token for the current store-backed content.
+    #: Persisted in meta.json and replaced on every content write. Clients receive
+    #: it only beside current store-owned content and echo it as ``expected_token``.
+    #: ``None`` for untokened legacy records, versioned reads and live pointers.
+    content_token: str | None = None
 
     def to_dict(self, *, include_content: bool = False, persist: bool = False) -> dict[str, Any]:
         """Render as a JSON-friendly dict, optionally including the content blob.
@@ -407,6 +432,9 @@ class Artifact:
         d = asdict(self)
         if not include_content:
             d.pop("content", None)
+        # The token only means something next to the current content it names.
+        if not d.get("content_token") or (not persist and not include_content):
+            d.pop("content_token", None)
         # slug_collided_with is an internal create-time signal read off the
         # attribute, never through this dict: a response that reports it composes
         # the key itself, and serializing it here would leak it into every later

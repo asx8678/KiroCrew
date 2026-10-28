@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.dashboard.chat_utils import (
+    STEER_INTENT_META,
     STEER_POSSIBLY_DELIVERED_META,
     _redact_for_display,
     _redact_meta,
@@ -69,6 +70,15 @@ STEER_UNAVAILABLE = "unavailable"
 STEER_STATE_WRITTEN = "written"
 STEER_STATE_CONSUMED = "consumed"
 STEER_STATE_REQUEUED = "requeued"
+# The fourth state, reached only from `written`: the person took the steer back
+# before the turn read it (`dashboard/steer_retract.py`). The row stays, so the
+# transcript keeps its place, and says what became of the text.
+STEER_STATE_RETRACTED = "retracted"
+# Row meta: this `written` steer can be taken back. Stamped only where the take-back
+# works -- the session's own human typed it into the composer, and the running
+# harness can drop a steer its turn has not read -- so the dashboard draws the
+# controls from the row alone.
+STEER_RETRACTABLE_META = "steerRetract"
 
 # Upper bound on a client-minted ``meta.sendId`` accepted into the steer path.
 # Client mints are ~17 chars; the bound exists because the value is raw client
@@ -183,7 +193,7 @@ def queue_entry_is_user_origin(item: dict[str, Any] | None) -> bool:
     ``_directive_channel_origin``, and that author is not the dashboard's
     reader. So the entry must carry the user stamp and not the channel one.
     It must also carry no producer ``kind``: a recovery requeue
-    (``chat_runner._queue_recovery``) inherits the turn's user stamp, yet its
+    (``chat_turn.turn_ledgers._queue_recovery``) inherits the turn's user stamp, yet its
     text is host-built from tool titles and command input, so it is not what
     the human typed.
     An entry without the user stamp (a peer, an app's own message, or one restored from disk,
@@ -240,6 +250,22 @@ def _queued_entry_id(slot: Any, delivery_id: str) -> str:
         if isinstance(meta, dict) and meta.get("steer_delivery_id") == delivery_id:
             return str(item.get("id") or "")
     return ""
+
+
+def is_retracted_steer_row(row: dict[str, Any]) -> bool:
+    """Whether *row* is a steer the person took back before the turn read it.
+
+    The row keeps its place in the transcript with its text cleared, so a walk
+    that takes the nearest ``user`` row as the request has to step past it: the
+    turn never read it, and there is nothing in it to run again.
+    """
+    meta = row.get("meta")
+    return (
+        row.get("role") == "user"
+        and isinstance(meta, dict)
+        and meta.get("steer") is True
+        and meta.get("steerState") == STEER_STATE_RETRACTED
+    )
 
 
 def find_written_steer_row(
@@ -321,6 +347,32 @@ def _log_stop_race(slot: Any, stop_gen: int, *, preserved: bool) -> None:
     )
 
 
+def _engine_has_no_prompt(client: Any) -> bool:
+    """True only when *client* says plainly that no prompt is in flight.
+
+    Reads ``has_active_turn()``, which every ACP client and session provider
+    implements. A client that cannot answer keeps the steer path it had.
+    """
+    probe = getattr(client, "has_active_turn", None)
+    if not callable(probe):
+        return False
+    try:
+        return probe() is False
+    except Exception:  # noqa: BLE001 - an unreadable probe keeps the prior behavior
+        logger.debug("has_active_turn probe failed", exc_info=True)
+        return False
+
+
+def _steer_target(slot: Any) -> tuple[object, bool, int]:
+    """The turn a steer is aimed at: its task, whether it has finished, and the stop count."""
+    task = getattr(slot, "task", None)
+    return (
+        task,
+        bool(task is not None and task.done()),
+        int(getattr(slot, "_stop_generation", 0) or 0),
+    )
+
+
 async def steer_into_running_turn(
     state: "DashboardState",
     slot: "_ChatSlot",
@@ -333,6 +385,8 @@ async def steer_into_running_turn(
     decision_strip: dict | None = None,
     attachments: dict | None = None,
     delivery_id: str | None = None,
+    responsive: bool = False,
+    nudge_meta: dict | None = None,
 ) -> str:
     """Inject *message* into the slot's RUNNING turn; return a ``STEER_*`` outcome.
 
@@ -406,10 +460,39 @@ async def steer_into_running_turn(
     slot can move while the RPC is suspended -- mints it and passes it in, so its
     reconciliation reads identity and never content: the same text can recur in
     a restored transcript, and only an id names THIS delivery.
+
+    ``nudge_meta`` says the text is AUTOMATION (a monitor loop's work-ledger
+    wake), and is the ``meta.nudge`` (``{"cycle", "loop_id"}``) its row carries.
+    The row's role follows the origin, not the branch that ran: the steer is
+    persisted as a ``nudge`` row, the same role the idle fire writes, so it
+    draws as the nudge chip rather than a bubble the person typed. It
+    implies ``user_origin=False``. A requeue stamps it on the queue entry
+    (``AUTOMATION_STEER_META``), so the drained row is a ``nudge`` row too and
+    never merges into a person's queued text. Absent for every other caller,
+    which keeps their rows unchanged.
     """
+    if nudge_meta is not None:
+        user_origin = False
+    # Only api_chat's owner/member gate grants this mode. Keep the wire prefix
+    # out of pending identity, transcript rows, mirrors and send receipts.
+    from kiro_crew.dashboard import responsive_chat
+
+    responsive = responsive and user_origin and not channel_origin
     send_id = normalize_send_id(send_id)
     quote = quote_meta(attachments)
     attachments = attachment_meta(attachments)
+    # A take-back's `_session/steer/clear` drops every steer kiro-cli holds when it
+    # runs, so this steer is not written until that clear has been answered.
+    # circular import: steer_retract imports this module at module level.
+    from kiro_crew.dashboard import steer_retract
+
+    # The clear's answer can come from the turn ending or from a Stop, and either
+    # one's teardown finishes before this resumes. A steer written then reaches no
+    # turn, so it goes back to the caller's queue path instead.
+    aimed_turn = _steer_target(slot)
+    await steer_retract.wait_for_clear(slot)
+    if _steer_target(slot) != aimed_turn:
+        return STEER_UNAVAILABLE
     client = getattr(slot, "_acp_client", None)
     if client is None or not getattr(client, "supports_steer", False):
         return STEER_UNAVAILABLE
@@ -418,6 +501,14 @@ async def steer_into_running_turn(
         # is denied. That limit is accepted only for the composer, where the
         # session's own human watches the turn and can resend; a peer's text
         # takes the caller's queue path instead.
+        return STEER_UNAVAILABLE
+    if _engine_has_no_prompt(client):
+        # The slot reads running from the moment its turn task exists, which is
+        # before the prompt reaches the engine (context build) and after it
+        # returns (queue-cycle bookkeeping). A steer written then reaches no
+        # prompt and nothing consumes it; the queue path delivers it as
+        # the next turn instead.
+        logger.info("no prompt in flight for slot %s; queueing instead of steering", slot.key)
         return STEER_UNAVAILABLE
 
     # Register as pending BEFORE the await: ``steer()`` suspends on
@@ -468,7 +559,9 @@ async def steer_into_running_turn(
             slot._steer_channel_origin,
             slot._steer_admissions,
             slot._steer_attachment_meta,
+            slot._steer_act_now,
             slot._steer_decision_strips,
+            slot._steer_automation,
         )
     )
     if retained_steer_count >= MAX_PENDING_STEERS:
@@ -524,6 +617,12 @@ async def steer_into_running_turn(
         # wrong, and a requeued text runs as its own channel-origin turn anyway;
         # ``chat_runner`` resets it at the turn's end and at the next turn's start.
         slot._turn_channel_narrowed = True
+    if not user_origin:
+        # The same narrowing for "the person sent this turn": a peer's or an
+        # app's text steered into it can ask the model for a user-only action
+        # (``update_self``), so the turn counts as one the user did not send.
+        # Set before the RPC for the reason above; ``chat_runner`` resets it.
+        slot._turn_user_sent = False
     if admission is not None:
         slot._steer_admissions[message] = admission
     if attachments or quote:
@@ -532,6 +631,14 @@ async def steer_into_running_turn(
         # rebuilt from this map -- without the quote here it would render its
         # blockquote as text instead of the card.
         slot._steer_attachment_meta[message] = {**attachments, **quote}
+    if user_origin and not channel_origin:
+        # The composer's own human asked this to act now. Held for the requeue
+        # with the attachment lists rather than in the lockstep origin maps,
+        # which the persisting tail drops while the steer is still unconsumed: a
+        # steer the turn ends before taking keeps its intent past the sub-agent
+        # hold (``STEER_INTENT_META``) instead of parking behind a wave its
+        # sender chose not to wait for.
+        slot._steer_act_now.add(message)
     if decision_strip:
         # Recorded for the REQUEUE, like the maps above: the three `STEER_REQUEUED`
         # returns below all come back before the stamp on the persisted row, and the
@@ -539,11 +646,16 @@ async def steer_into_running_turn(
         # never sees this call's arguments. Absent stores nothing, so a manual steer's
         # requeued entry keeps the exact prior shape.
         slot._steer_decision_strips[message] = decision_strip
+    if nudge_meta is not None:
+        # Held for the REQUEUE like the maps above: a steer the turn ends before
+        # taking drains as its own row, and that row must still be the nudge.
+        slot._steer_automation[message] = dict(nudge_meta)
     slot._pending_steers.append(message)
     possibly_delivered = False
     slot._steer_rpc_in_flight.add(message)
     try:
-        steered = await client.steer(message)
+        wire_message = responsive_chat.steer_message(slot, message) if responsive else message
+        steered = await client.steer(wire_message)
     except Exception as exc:  # best-effort — the caller falls back to the queue
         logger.warning("steer failed for slot %s: %s", slot.key, exc)
         steered = False
@@ -616,7 +728,9 @@ async def steer_into_running_turn(
         slot._steer_channel_origin.pop(message, None)
         slot._steer_admissions.pop(message, None)
         slot._steer_attachment_meta.pop(message, None)
+        slot._steer_act_now.discard(message)
         slot._steer_decision_strips.pop(message, None)
+        slot._steer_automation.pop(message, None)
         logger.info(
             "steer for slot %s was requeued and drained during the RPC; row already " "persisted",
             slot.key,
@@ -648,13 +762,17 @@ async def steer_into_running_turn(
             # above means this is the only matching entry, which is why this is a
             # plain remove and not an index dance over possible duplicates.
             slot._pending_steers.remove(message)
+            slot._steer_possibly_delivered.discard(message)
+            responsive_chat.forget_steer(slot, message)
             slot._steer_delivery_ids.pop(message, None)
             slot._steer_send_ids.pop(message, None)
             slot._steer_user_origin.pop(message, None)
             slot._steer_channel_origin.pop(message, None)
             slot._steer_admissions.pop(message, None)
             slot._steer_attachment_meta.pop(message, None)
+            slot._steer_act_now.discard(message)
             slot._steer_decision_strips.pop(message, None)
+            slot._steer_automation.pop(message, None)
             return STEER_UNAVAILABLE
         if stopped:
             # Still registered means the teardown has not run yet and will
@@ -763,6 +881,8 @@ async def steer_into_running_turn(
     # turn that ends without the echo still requeues the text.
     if not still_registered:
         slot._steer_attachment_meta.pop(message, None)
+        slot._steer_act_now.discard(message)
+        slot._steer_automation.pop(message, None)
 
     ts = datetime.now(timezone.utc).isoformat()
     # Cut the in-flight text segment at the steer boundary BEFORE persisting the
@@ -856,6 +976,19 @@ async def steer_into_running_turn(
         meta.update(attachments)
     if quote:
         meta.update(quote)
+    # Offered only on a steer still waiting for the turn, typed by the session's
+    # own human into the composer, on a harness that can drop it unread. A peer's,
+    # a channel's or an automation's steer is not that person's to take back.
+    _retractable = (
+        _state == STEER_STATE_WRITTEN
+        and user_origin
+        and not channel_origin
+        and nudge_meta is None
+        and not responsive
+        and getattr(client, "supports_steer_retract", False) is True
+    )
+    if _retractable:
+        meta[STEER_RETRACTABLE_META] = True
     # The row survives a page reload via the dirty-flush cycle. The session's own
     # human's steer is stored as typed, like an ordinary send's row; a peer's is
     # stored sanitized, because its text has no human author to be its reader. A
@@ -865,6 +998,28 @@ async def steer_into_running_turn(
     # display redaction even though the provenance marks say a person typed it.
     _shown_as_typed = user_origin and not channel_origin
     _row_content = message if _shown_as_typed else sanitized
+    if nudge_meta is not None:
+        # Automation: the same `nudge` row the idle fire writes, so it draws as
+        # the nudge chip. `meta.steer` stays, which keeps it a steer for every
+        # reader that asks (it opens no turn). No `steer_push`: that frame is
+        # drawn as a user bubble. The append broadcasts the row itself, and
+        # since no tab drew an optimistic bubble for it, open tabs are told to
+        # freeze their streaming text first, so the chip lands at the cut.
+        # `append_and_surface`, not a bare append: with an HTTP stream reader
+        # attached the append's own broadcast is suppressed, and the other tabs
+        # would otherwise get the cut but never the row.
+        # The role, cls and `meta.nudge` come from the wake's origin
+        # (`session_deliver.origin_row`), the mapping the idle fire's row uses.
+        from kiro_crew.dashboard.session_deliver import automation, origin_row
+        from kiro_crew.dashboard.state import append_and_surface
+
+        role, cls, origin_meta = origin_row(
+            automation(nudge_meta.get("cycle", 0), nudge_meta.get("loop_id", ""))
+        )
+        meta.update(origin_meta)
+        state.broadcast_ws("chat_segment", {"slot": slot.key})
+        append_and_surface(state, slot, role, _row_content, cls, meta=meta)
+        return STEER_STEERED
     _row = slot.append("user", _row_content, "msg msg-u", ts=ts, meta=meta)
     push_payload: dict[str, Any] = {
         "slot": slot.key,
@@ -875,6 +1030,8 @@ async def steer_into_running_turn(
         # requeued; a row already persisted as consumed is terminal.
         "steerState": _state,
     }
+    if _retractable:
+        push_payload[STEER_RETRACTABLE_META] = True
     # The row's own id, so the client stores it and the later state patch -- which
     # is keyed on `mid` -- can find this row. Without it the client row has no
     # `mid`, the mid-keyed patch matches nothing, and the promotion is a silent
@@ -936,11 +1093,22 @@ def queue_for_next_turn(
     channel_recipient: dict[str, Any] | None = None,
     quote: dict[str, Any] | None = None,
     commands_off: bool = False,
+    steer_intent: bool = False,
+    admission: dict[str, Any] | None = None,
 ) -> str:
     """Append *message* to the slot's queue and announce it; return the queue id.
 
     The running turn's teardown drains the queue, so this is how a message
     reaches a busy slot when steering is unavailable or not asked for.
+
+    *steer_intent* stamps :data:`STEER_INTENT_META`: the session's own human asked
+    this send to act now and the running turn could not take it, so the sub-agent
+    hold releases it at the turn's end rather than parking it behind the wave.
+    Only the composer's steer fallback passes it.
+
+    *admission* supplies containment captured before an asynchronous queue path
+    began. When absent, containment is captured here at enqueue like every direct
+    caller.
 
     *commands_off* stamps :data:`COMMANDS_OFF_META_KEY` on the entry: the drained
     turn hands the text to the model as content and never runs its first word as a
@@ -996,7 +1164,9 @@ def queue_for_next_turn(
     # circular import: session_control imports this module at module level.
     from kiro_crew.dashboard.session_control import CHANNEL_RECIPIENT_META_KEY, containment_meta
 
-    meta: dict[str, Any] = dict(containment_meta(state, slot))
+    meta: dict[str, Any] = (
+        dict(admission) if admission is not None else dict(containment_meta(state, slot))
+    )
     if channel_recipient:
         meta[CHANNEL_RECIPIENT_META_KEY] = dict(channel_recipient)
     if turn_actor:
@@ -1014,7 +1184,7 @@ def queue_for_next_turn(
         # The whole-message quote rides the entry for the same reason the
         # attachment lists do: the drain unions entry meta onto the row it
         # writes, and without it the row would render its blockquote as text
-        # instead of the card (fork GPT review). Already bounded by
+        # instead of the card. Already bounded by
         # :func:`quote_meta`, which also redacted it when the sender was not
         # the session's own human.
         meta[QUOTE_META_KEY] = quote
@@ -1022,6 +1192,8 @@ def queue_for_next_turn(
         meta["decisions_strip"] = decision_strip
     if commands_off:
         meta[COMMANDS_OFF_META_KEY] = True
+    if steer_intent:
+        meta[STEER_INTENT_META] = True
     qid = slot.queue_append(
         message,
         meta=meta,
@@ -1062,6 +1234,9 @@ def queue_for_next_turn(
         push["meta"] = attachments
     if quote:
         push.setdefault("meta", {})[QUOTE_META_KEY] = quote
+    push_identity = normalize_send_id(send_id)
+    if push_identity:
+        push.setdefault("meta", {})["sendId"] = push_identity
     state.broadcast_ws("queue_push", push)
     # Accepted, and possibly not persisted: the write ceilings refuse an entry
     # past the count cap or the byte budget and the send is still accepted, so
@@ -1076,7 +1251,7 @@ def start_queue_persist(state: "DashboardState", slot: "_ChatSlot") -> None:
     """Begin the durable write for a just-queued prompt, off the event loop.
 
     Called from both places a prompt is accepted onto a slot queue: the busy-slot
-    path in this module, and the sub-agent hold branch in ``chat_handlers``. Both
+    path in this module, and the sub-agent hold branch in ``chat_api/chat_send``. Both
     answer the sender a receipt saying whether the entry is durable, so both must
     start the write that makes it so; a receipt from one path and a write from
     only the other is the asymmetry this seam exists to prevent.
@@ -1307,9 +1482,12 @@ def queue_entry_view(item: dict[str, Any]) -> dict[str, Any]:
             item["content"], user_origin=queue_entry_is_user_origin(item)
         ),
     }
+    send_id = normalize_send_id((item.get("meta") or {}).get("sendId"))
+    if send_id:
+        view["meta"] = {"sendId": send_id}
     attachments = attachment_meta(item.get("meta"))
     if attachments:
-        view["meta"] = attachments
+        view.setdefault("meta", {}).update(attachments)
     # Redacted unless the entry is the session's own human's (an entry restored
     # from disk carries no origin stamp and so stays redacted), the same rule
     # the entry's text follows in `queued_text_for_display`.

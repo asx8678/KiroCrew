@@ -24,24 +24,31 @@ from typing import Any
 
 from kiro_crew import name_grant, permission_floor
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config import live
+from kiro_crew.config import KiroCrewConfig, live
+from kiro_crew.config.fields import _safe_int
+from kiro_crew.config.loader import config_local_path, config_path, read_config_text
 from kiro_crew.config.paths import config_dir
+from kiro_crew.config.resolution import _deep_merge
 from kiro_crew.constants import (
     DENY_CAUSE_APPROVAL_OVERSIZE,
     DENY_CAUSE_APPROVAL_TIMEOUT,
     DENY_CAUSE_POLICY,
     DENY_CAUSE_SURFACE_POLICY,
+    TOOL_APPROVAL_TIMEOUT,
 )
 from kiro_crew.llm_helpers import (
+    CREDENTIAL_RELOAD_RETRY_NOTICE,
     SESSION_NOT_FOUND_GIVE_UP_TEXT,
     SESSION_NOT_FOUND_NOT_REPLAYED_TEXT,
     SESSION_NOT_FOUND_RETRY_NOTICE,
     _steer_host_deny,
     acp_error_is_session_not_found,
+    acp_error_needs_fresh_credentials,
+    credential_give_up_text,
     is_prompt_busy,
-    metered_turn,
+    unfinished_turn_error,
 )
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.messaging.renderer import count_redaction_tags, redaction_notice
 from kiro_crew.trust_patterns import extract_bash_command
 
 logger = logging.getLogger(__name__)
@@ -57,8 +64,10 @@ _MAX_MESSAGES = 200
 # sees the whole command, and a cut title beside a live Approve button is an
 # approval of a suffix nobody read. The refusal notice is itself bounded.
 _APPROVAL_FIELD_MAX_CHARS = 500
-# How long a posted approval card waits for a reader before the HOST declines
-# it. Named so the in-band notice can quote the same figure the wait used.
+# The longest a posted approval card waits for a reader before the HOST
+# declines it, and the wait while ``agent.tool_approval_timeout_secs`` is left at
+# its default (see :func:`_channel_approval_window_secs`). The in-band notice
+# quotes the window the wait actually used.
 _APPROVAL_TIMEOUT_SECS = 3600
 # The card title of a grantable shell command is this prefix plus the command;
 # the exact tier sends the title back (minus the prefix) as its consent proof.
@@ -157,12 +166,26 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # Ending another session's wait moves that turn forward on a schedule the
     # channel's thread text would then be choosing; same containment reason.
     "session_end_wait",
+    # Re-running a turn spends the target's model and tools on work a channel
+    # message did not ask for; same containment reason as stop.
+    "session_retry",
+    # Continuing a thread spends the target's model and tools the same way.
+    "session_continue",
     # Changing a session's model decides what the user's next turn there runs
     # on and spends; same containment reason as stop.
     "session_set_model",
+    # Recoloring a session acts on a session the channel agent would name from
+    # thread text other people wrote; same containment reason as stop.
+    "session_set_color",
     # Reload relaunches another session's agent process; same containment
     # reason as stop.
     "session_reload",
+    # Renaming relabels a session in the person's sidebar, named from thread text
+    # other people wrote; same containment reason as the tree verbs below.
+    "session_rename",
+    # Retitling spends a model call and relabels a session in the person's
+    # sidebar; same containment reason as stop.
+    "session_generate_title",
     "session_send",
     "session_read_message",
     # A digest of the same transcript `session_read_message` returns, so it is
@@ -187,23 +210,35 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # whole subtree under another one.
     "session_adopt",
     "session_release",
+    # Moves who may drive a session, decided from thread text other people wrote.
+    "session_handoff",
     # Pinning belongs with the tree verbs: it moves another session to or from
     # the top of the person's sidebar, and a channel agent names that session
     # from thread text other people wrote. This entry covers the permission
-    # prompt; the chat_session_pin handler in mcp_dashboard.py refuses a
-    # ``channel:`` caller at dispatch, which is what holds for auto-approval.
+    # prompt; the chat_session_pin handler in mcp_dashboard_tag_runs.py refuses
+    # a ``channel:`` caller at dispatch, which is what holds for auto-approval.
     "chat_session_pin",
     # The board-column writes, on the same reason as pinning: they rearrange
-    # the person's own sidebar board. The handlers in mcp_dashboard.py also
-    # refuse a ``channel:`` caller at dispatch, for auto-approved calls.
+    # the person's own sidebar board. The handlers in mcp_dashboard_tag_runs.py
+    # also refuse a ``channel:`` caller at dispatch, for auto-approved calls.
     # ``chat_tag_column_list`` stays available: the layout names no session.
     "chat_tag_column_create",
     "chat_tag_column_move",
+    # Moving a card between board columns retags another session, which a
+    # channel agent would name from thread text; the handler also refuses a
+    # ``channel:`` caller at dispatch.
+    "session_move_to_column",
+    # Reordering pins is the same containment case: it rewrites the person's
+    # sidebar order, and its handler refuses a ``channel:`` caller at dispatch.
+    "chat_session_pin_move",
     "session_revive",
     # Renaming a folder changes the person's sidebar the same way, and a channel
     # caller reaches the endpoint with the person's folder authority. The
     # chat_folder_update handler refuses a ``channel:`` caller at dispatch.
     "chat_folder_update",
+    # Lists archived session titles and keys: a channel thread other people
+    # read is not where the person's closed-session history belongs.
+    "session_history_list",
     # The four work-ledger tools, blocked for the same containment reason and not
     # for a new one: a channel agent has no dispatch relationship, so it is
     # neither a conductor nor a bound worker and has no business holding one.
@@ -295,6 +330,23 @@ def _shell_base_binary(cmd: str) -> str | None:
     return base
 
 
+def _offerable_base_binary(cmd: str) -> str | None:
+    """The base a "Trust all <base> commands" consent may name, else None.
+
+    ``_shell_base_binary`` tokenizes in POSIX mode, where a backslash is an
+    escape, so the Windows path ``.\\deploy.bat`` derives ``.deploy.bat``: a
+    name the user never typed, and one that also covers a different file
+    literally called ``.deploy.bat``. A consent label must name what the user
+    read, so a first token holding a backslash gets no base offer and no base
+    grant; the exact-command tier still covers that command.
+    """
+    stripped = cmd.lstrip() if cmd else ""
+    first = stripped.split(None, 1)[0] if stripped else ""
+    if "\\" in first:
+        return None
+    return _shell_base_binary(cmd)
+
+
 # Anything that makes a command more than ONE plain invocation. Deliberately
 # broader than the enforcement splitter's operator set: over-matching here
 # fails toward "no per-command grant available", never toward a wider grant.
@@ -328,11 +380,15 @@ def _match_trusted_channel_command(cmd: str, agent: "ChannelAgent") -> str | Non
     Compound commands never match a base grant and only match an exact grant
     granted for that identical compound; there is no pattern language and no
     per-segment matching, so a grant can never cover text the user did not
-    read. Returns an audit label or None.
+    read. The base is derived with ``_offerable_base_binary``, the same rule the
+    card offers from: a first token holding a backslash has no base, because
+    POSIX tokenizing drops the backslash and ``n\\pm`` would otherwise match a
+    ``npm`` grant while Windows runs a different file. Returns an audit label
+    or None.
     """
     if cmd in agent._trusted_commands:
         return f"command:{cmd}"
-    base = _shell_base_binary(cmd)
+    base = _offerable_base_binary(cmd)
     if base is not None and base in agent._trusted_bases:
         return f"base:{base}"
     return None
@@ -434,6 +490,9 @@ class ChannelAgent:
     # titles and request-body patterns are LLM-influenced and never scope a
     # grant. Set while ``_approval_future`` is pending, cleared with it.
     _pending_approval_command: str = field(default="", repr=False)
+    # The provider's text when the last lost-session verdict was a credential
+    # failure ("" otherwise), so the recovery notices can name the real cause.
+    _credential_error: str = field(default="", repr=False)
     _task: asyncio.Task | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -554,7 +613,11 @@ class Channel:
         msg_type: str = "progress",
         thread_id: str | None = None,
         meta: dict[str, str] | None = None,
+        notify_members: bool = True,
     ) -> ChannelMessage:
+        # ``notify_members=False`` records, broadcasts and saves the message but
+        # queues it for no member: a display-only notice for the human reader that
+        # must not wake the agent whose thread it lands in.
         # Normalize mentions to a set
         mentions: set[str] = set()
         if isinstance(mention, list):
@@ -605,7 +668,7 @@ class Channel:
         # that changed after it was queued.
         queued = replace(msg)
 
-        for agent in self.members.values():
+        for agent in self.members.values() if notify_members else ():
             if agent.id == from_id or agent.state in ("done", "failed"):
                 continue
             if agent.listen_mode == ListenMode.SILENT:
@@ -1051,7 +1114,7 @@ async def run_channel_agent(
                         (
                             "❌ This agent's session is stuck and could not be recovered. "
                             if fault == _STREAM_BUSY
-                            else f"❌ {SESSION_NOT_FOUND_GIVE_UP_TEXT} "
+                            else f"❌ {_lost_give_up_text(agent)} "
                         )
                         + "Clear its context or wake it to try again.",
                         from_role=agent.role,
@@ -1129,6 +1192,12 @@ _STREAM_LOST = "lost"
 _STREAM_LOST_AFTER_TOOL = "lost_after_tool"
 
 _LOST_AFTER_TOOL_TEXT = f"⟳ {SESSION_NOT_FOUND_NOT_REPLAYED_TEXT}"
+
+
+def _lost_give_up_text(agent: Any) -> str:
+    """The dead end of a lost verdict: the provider's remedy when credentials caused it."""
+    cause = getattr(agent, "_credential_error", "")
+    return credential_give_up_text(cause) if cause else SESSION_NOT_FOUND_GIVE_UP_TEXT
 
 
 async def _reset_busy_session(sessions: Any, agent: ChannelAgent) -> Any | None:
@@ -1220,7 +1289,11 @@ async def _recover_busy_agent(
     if cause == _STREAM_LOST:
         await channel.post(
             agent.id,
-            SESSION_NOT_FOUND_RETRY_NOTICE,
+            (
+                CREDENTIAL_RELOAD_RETRY_NOTICE
+                if getattr(agent, "_credential_error", "")
+                else SESSION_NOT_FOUND_RETRY_NOTICE
+            ),
             from_role=agent.role,
             msg_type="system",
             thread_id=thread_id,
@@ -1246,6 +1319,58 @@ async def _recover_busy_agent(
             "Failed to tear down the abandoned replacement session %s", agent.session_key
         )
     return None
+
+
+def _written_approval_window() -> int:
+    """``agent.tool_approval_timeout_secs`` as ``config.json`` and ``config.local.json`` state it.
+
+    The two documents merge the way the load merges them, the overlay winning key by
+    key. The number is read the way the load reads an integer (a numeric string or an
+    integral float counts, anything else reads as the default) and BEFORE the load's
+    clamps, so a number the loader pulls under the turn ceiling is still the number
+    that was written. The field default when neither document states a usable one.
+    """
+    default = int(TOOL_APPROVAL_TIMEOUT)
+    merged: dict = {}
+    for path in (config_path(), config_local_path()):
+        try:
+            document = json.loads(read_config_text(path))
+        except (OSError, ValueError):
+            continue
+        if isinstance(document, dict):
+            merged = _deep_merge(merged, document)
+    agent = merged.get("agent")
+    written = agent.get("tool_approval_timeout_secs") if isinstance(agent, dict) else None
+    return _safe_int(written, default)
+
+
+def _channel_approval_window_secs() -> int:
+    """How long an unanswered channel approval card waits before it is declined.
+
+    The loaded ``agent.tool_approval_timeout_secs``, capped at
+    :data:`_APPROVAL_TIMEOUT_SECS`, once the operator has written a number other than
+    its default. While the setting is absent or holds the default the card waits the
+    cap, and so it does when config cannot be read.
+
+    Whether a number was chosen is read from the documents
+    (:func:`_written_approval_window`), never from the loaded number or from the
+    key's presence. ``KiroCrewConfig.save`` writes every field, so a config nobody
+    edited carries the default. The loader pulls a window under
+    ``agent.chat_turn_timeout_secs``, which rewrites the number: under a 300 s ceiling
+    a saved 600 and a written 500 both load as 240, and an omitted key loads as 600.
+    Exactly the default cannot be pinned on a channel while any other number can.
+
+    The wait is the loaded number, so it carries the loader's clamps: into 30..7200 s,
+    then under the turn ceiling. A configured zero arrives as 30 s. Reads
+    ``config.json`` and ``config.local.json``: call it off the loop.
+    """
+    try:
+        window = KiroCrewConfig.load().agent.tool_approval_timeout_secs
+        chosen = _written_approval_window() != int(TOOL_APPROVAL_TIMEOUT)
+    except Exception:
+        logger.debug("channel approval window: config unavailable; using the cap", exc_info=True)
+        return _APPROVAL_TIMEOUT_SECS
+    return min(_APPROVAL_TIMEOUT_SECS, window) if chosen else _APPROVAL_TIMEOUT_SECS
 
 
 async def _stream_task(
@@ -1278,427 +1403,113 @@ async def _stream_task(
     tool_seen = False
 
     try:
-        # USE-1: the channel task turn's one usage row, on every exit.
-        async with metered_turn(client, surface="channel", slot_key=agent.session_key):
-            async for event in client.stream(message):
-                if event.kind == EVENT_TEXT_CHUNK:
-                    chunks.append(event.text)
+        async for event in client.stream(message):
+            if event.kind == EVENT_TEXT_CHUNK:
+                chunks.append(event.text)
 
-                elif event.kind == EVENT_TOOL_CALL:
-                    tool_seen = True
-                    # Don't post messages — broadcast status like chat page footer
-                    tool_name = event.text or ""
-                    tool_name, _ = redact_exfiltration_urls(tool_name)
-                    tool_name, _ = redact_credentials(tool_name)
-                    channel._broadcast(
-                        "channel_agent_status",
-                        {
-                            "channel_id": channel.id,
-                            "agent_id": agent.id,
-                            "state": "tool_running",
-                            "tool": tool_name,
-                        },
-                    )
+            elif event.kind == EVENT_TOOL_CALL:
+                tool_seen = True
+                # Don't post messages — broadcast status like chat page footer
+                tool_name = event.text or ""
+                from kiro_crew.security import redact
 
-                elif event.kind == EVENT_PERMISSION_REQUEST:
-                    tool_seen = True
-                    # Block direct-to-user messaging tools — channel agents
-                    # communicate via channel posts only. send_notification is
-                    # functionally equivalent for reaching the user (feed
-                    # publish, badge, sound), so it shares the
-                    # containment boundary.
-                    if _blocked_tool_named(event.text or event.title or ""):
-                        sel().log_tool_invocation(
-                            session_key=agent.session_key,
-                            agent=agent.agent_name,
-                            source="channel",
-                            tool_name=event.text or event.title or "",
-                            outcome="rejected_blocked_tool",
-                        )
-                        # Steer FIRST, reject SECOND: the containment boundary is
-                        # the SURFACE refusing the tool, not a verdict on the
-                        # action, and the model's way forward is a channel post.
-                        # ``_steer_host_deny`` is ``llm_helpers``' (redact, forward
-                        # to the shared notice, answer the wire if cancelled
-                        # mid-steer); every deny site in this stream names its
-                        # cause, and the reader's own Deny below never calls it.
-                        await _steer_host_deny(
-                            client,
-                            event,
-                            "channel agents reach people only through channel posts; "
-                            "direct-to-user messaging tools do not run here",
-                            cause=DENY_CAUSE_SURFACE_POLICY,
-                            title=event.text or event.title or "",
-                        )
-                        await client.reject_tool(event.request_id)
-                        continue
-                    # The PreToolUse gate outranks every approval tier below: YOLO,
-                    # channel trust, a command grant and the human card all sit
-                    # behind it, as session trust does on every other surface.
-                    # Asked with this agent's session and name so its governance
-                    # profile applies; any deny refuses. This is the channel's own
-                    # (counted) gate decision; the transport's approve_tool runs the
-                    # identity-free security floor again, uncounted.
-                    _gate_reason = await asyncio.to_thread(
-                        permission_floor.refusal_for,
-                        event,
+                tool_name = redact(tool_name)
+                channel._broadcast(
+                    "channel_agent_status",
+                    {
+                        "channel_id": channel.id,
+                        "agent_id": agent.id,
+                        "state": "tool_running",
+                        "tool": tool_name,
+                    },
+                )
+
+            elif event.kind == EVENT_PERMISSION_REQUEST:
+                tool_seen = True
+                # Block direct-to-user messaging tools — channel agents
+                # communicate via channel posts only. send_notification is
+                # functionally equivalent for reaching the user (feed
+                # publish, badge, sound), so it shares the
+                # containment boundary.
+                if _blocked_tool_named(event.text or event.title or ""):
+                    sel().log_tool_invocation(
                         session_key=agent.session_key,
                         agent=agent.agent_name,
-                        security_only=False,
+                        source="channel",
+                        tool_name=event.text or event.title or "",
+                        outcome="rejected_blocked_tool",
                     )
-                    if _gate_reason is not None:
-                        sel().log_tool_invocation(
-                            session_key=agent.session_key,
-                            agent=agent.agent_name,
-                            source="channel",
-                            # Permission events populate ``title``; ``text`` is empty.
-                            tool_name=event.text or event.title,
-                            outcome="rejected_hook_deny",
-                            metadata={"reason": _gate_reason},
-                        )
-                        # The gate judged the call itself: a policy verdict, with
-                        # the gate's own reason so the class remediation can key
-                        # off it (audit above, steer, then reject).
-                        await _steer_host_deny(
-                            client,
-                            event,
-                            _gate_reason,
-                            cause=DENY_CAUSE_POLICY,
-                            title=event.text or event.title or "",
-                        )
-                        await client.reject_tool(event.request_id)
-                        continue
-                    # YOLO mode (global) or channel trust — auto-approve
-                    if (is_yolo and is_yolo()) or channel.trusted:
-                        approval_outcome = (
-                            "auto_approved_yolo"
-                            if (is_yolo and is_yolo())
-                            else "auto_approved_channel_trust"
-                        )
-                        # Audit BEFORE the wire call: approve_tool can raise, and a
-                        # decision that reached the transport must not vanish from
-                        # the SEL when it does. The definitive row follows below.
-                        sel().log_tool_invocation(
-                            session_key=agent.session_key,
-                            agent=agent.agent_name,
-                            source="channel",
-                            tool_name=event.text or event.title or "",
-                            outcome=permission_floor.OUTCOME_PENDING_APPROVAL,
-                        )
-                        approval_sent = await client.approve_tool(event.request_id)
-                        if approval_sent is False:
-                            sel().log_tool_invocation(
-                                session_key=agent.session_key,
-                                agent=agent.agent_name,
-                                source="channel",
-                                tool_name=event.text or event.title or "",
-                                outcome=permission_floor.OUTCOME_REJECTED_TRANSPORT_FLOOR,
-                            )
-                        else:
-                            sel().log_tool_invocation(
-                                session_key=agent.session_key,
-                                agent=agent.agent_name,
-                                source="channel",
-                                tool_name=event.text or event.title or "",
-                                outcome=approval_outcome,
-                            )
-                        continue
-                    # Per-command trust grants (trust_command / trust_base) — agent-
-                    # scoped patterns granted via the approve endpoint. Security:
-                    # grants are SHELL-ONLY and match against the ACTUAL command
-                    # extracted from tool_input, never the LLM-authored display
-                    # title; a tool the provider did not classify as shell is never
-                    # matched even when its arguments carry a nested "command" key
-                    # (e.g. cron_add), so a shell grant cannot leak onto MCP tools
-                    # (deny-by-default). Mirrors the dashboard chat slot's
-                    # trusted-pattern gate, hardened on the is_shell axis.
-                    _is_shell = bool(getattr(event, "is_shell", False))
-                    _cmd = (
-                        extract_bash_command(event.tool_input)
-                        if _is_shell and event.tool_input
-                        else ""
+                    # Steer FIRST, reject SECOND: the containment boundary is
+                    # the SURFACE refusing the tool, not a verdict on the
+                    # action, and the model's way forward is a channel post.
+                    # ``_steer_host_deny`` is ``llm_helpers``' (redact, forward
+                    # to the shared notice, answer the wire if cancelled
+                    # mid-steer); every deny site in this stream names its
+                    # cause, and the reader's own Deny below never calls it.
+                    await _steer_host_deny(
+                        client,
+                        event,
+                        "channel agents reach people only through channel posts; "
+                        "direct-to-user messaging tools do not run here",
+                        cause=DENY_CAUSE_SURFACE_POLICY,
+                        title=event.text or event.title or "",
                     )
-                    if (agent._trusted_commands or agent._trusted_bases) and _cmd:
-                        matched = _match_trusted_channel_command(_cmd, agent)
-                        if matched:
-                            # The grant names a PROGRAM; the shell resolves that
-                            # name again through a PATH that can lead with
-                            # agent-writable directories, and the file behind a
-                            # trusted `./deploy.sh` can have been replaced since
-                            # the human approved it. Same shared check as every
-                            # other name-based tier (hook auto-approve, chat
-                            # trusted patterns): a refusal does not reject — the
-                            # request falls through to the interactive card below,
-                            # where the human decides on this specific command.
-                            # Check the COMMAND THE GRANT MATCHED (_cmd, from
-                            # extract_bash_command) rather than re-deriving it
-                            # from the event: event.shell_command returns None
-                            # for raw non-JSON tool_input, and a None command
-                            # would make the check vouch for nothing while the
-                            # tier still auto-approves.
-                            _ng_refusal = await name_grant.refusal_for_command_off_loop(_cmd)
-                            if _ng_refusal is None:
-                                # Audit BEFORE the wire call (approve_tool can raise);
-                                # the definitive row follows below.
-                                sel().log_tool_invocation(
-                                    session_key=agent.session_key,
-                                    agent=agent.agent_name,
-                                    source="channel",
-                                    tool_name=event.text or event.title or "",
-                                    outcome=permission_floor.OUTCOME_PENDING_APPROVAL,
-                                    metadata={"pattern": matched},
-                                )
-                                approval_sent = await client.approve_tool(event.request_id)
-                                if approval_sent is False:
-                                    sel().log_tool_invocation(
-                                        session_key=agent.session_key,
-                                        agent=agent.agent_name,
-                                        source="channel",
-                                        tool_name=event.text or event.title or "",
-                                        outcome=permission_floor.OUTCOME_REJECTED_TRANSPORT_FLOOR,
-                                    )
-                                else:
-                                    sel().log_tool_invocation(
-                                        session_key=agent.session_key,
-                                        agent=agent.agent_name,
-                                        source="channel",
-                                        tool_name=event.text or event.title or "",
-                                        outcome="auto_approved_trusted_pattern",
-                                        metadata={"pattern": matched},
-                                    )
-                                continue
-                            name_grant.log_decline(
-                                source="channel",
-                                session_key=agent.session_key,
-                                agent=agent.agent_name,
-                                event=event,
-                                refusal=_ng_refusal,
-                                tier="channel_trusted_pattern",
-                                sel_factory=sel,
-                            )
-                    # Normal mode — interactive approval
-                    # Redact over the FULL input, then bound: cutting first can
-                    # split a credential at the boundary into fragments no
-                    # redaction regex matches, leaking it into the approval prompt.
-                    # tool_input is model-authored and size-unbounded, so the
-                    # full-text pass runs off-loop (no-blocking-call-on-event-loop).
-                    sanitized_input = await asyncio.to_thread(
-                        redact_and_truncate, event.tool_input, _APPROVAL_FIELD_MAX_CHARS
+                    await client.reject_tool(event.request_id)
+                    continue
+                # The PreToolUse gate outranks every approval tier below: YOLO,
+                # channel trust, a command grant and the human card all sit
+                # behind it, as session trust does on every other surface.
+                # Asked with this agent's session and name so its governance
+                # profile applies; any deny refuses. This is the channel's own
+                # (counted) gate decision; the transport's approve_tool runs the
+                # identity-free security floor again, uncounted.
+                _gate_reason = await asyncio.to_thread(
+                    permission_floor.refusal_for,
+                    event,
+                    session_key=agent.session_key,
+                    agent=agent.agent_name,
+                    security_only=False,
+                )
+                if _gate_reason is not None:
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        # Permission events populate ``title``; ``text`` is empty.
+                        tool_name=event.text or event.title,
+                        outcome="rejected_hook_deny",
+                        metadata={"reason": _gate_reason},
                     )
-                    # The card's tool name. For a shell tool prefer the CANONICAL
-                    # command (from ``tool_input``) over the display title: kiro's
-                    # ``title`` for shell calls can be a model-authored prose
-                    # description, and the trust tiers derive their consent-proof
-                    # pattern from this name — a prose name would make the tiers
-                    # mismatch the real command and fail with
-                    # ``approval_superseded``. Non-shell tools keep the provider
-                    # name (``text`` then ``title`` — the same fallback the
-                    # blocked-tool check above uses; ACP permission events
-                    # populate only ``title``).
-                    # Use the same redactors on the command BYTES that would become
-                    # authority. ``tool_input_redacted`` is transport provenance:
-                    # re-running the scanners cannot reveal bytes an ACP transport
-                    # already removed. Either signal makes the command display-only.
-                    _safe_cmd, _cmd_credential_redacted = redact_credentials(_cmd)
-                    _safe_cmd, _cmd_url_redacted = redact_exfiltration_urls(_safe_cmd)
-                    _command_grantable = bool(_cmd) and not (
-                        bool(getattr(event, "tool_input_redacted", False))
-                        or _cmd_credential_redacted
-                        or _cmd_url_redacted
-                        or _safe_cmd != _cmd
-                        or "[REDACTED" in _cmd
+                    # The gate judged the call itself: a policy verdict, with
+                    # the gate's own reason so the class remediation can key
+                    # off it (audit above, steer, then reject).
+                    await _steer_host_deny(
+                        client,
+                        event,
+                        _gate_reason,
+                        cause=DENY_CAUSE_POLICY,
+                        title=event.text or event.title or "",
                     )
-                    if _cmd:
-                        # ``Running:`` is the channel UI's explicit proof that
-                        # command-scoped tiers are available. Keep an ungrantable
-                        # redacted command visible, but do not give it that marker
-                        # or the card would offer decisions the server must refuse.
-                        #
-                        # The other marker names what is missing and promises
-                        # nothing about scope. It must not say "allow once": the
-                        # blanket channel grant needs no command scope, so ``Trust
-                        # all tools in this channel`` renders beside this label and
-                        # the endpoint records it. A card telling the reader it can
-                        # only be allowed once, while carrying a control that trusts
-                        # the whole channel, is worse than a card that says nothing.
-                        #
-                        # It also must not say the text is HIDDEN, because the text
-                        # is right there beside the marker: what the reader cannot
-                        # have is proof that those characters are the ones that run,
-                        # since two commands differing only in a credential redact
-                        # to the same string. "Exact text unverified" is the fact,
-                        # and it stays out of implementation vocabulary: channel
-                        # readers are not all engineers, so it names neither bytes
-                        # nor redaction.
-                        _card_name = (
-                            f"{_APPROVAL_SHELL_TITLE_PREFIX}{_safe_cmd}"
-                            if _command_grantable
-                            else f"Shell command (exact text unverified): {_safe_cmd}"
-                        )
-                    else:
-                        _card_name = event.text or event.title or ""
-                    sanitized_name, _ = redact_exfiltration_urls(_card_name)
-                    sanitized_name, _ = redact_credentials(sanitized_name)
-                    if len(sanitized_name) > _APPROVAL_FIELD_MAX_CHARS:
-                        # Fail closed. Cutting the title would put a live Approve
-                        # button beside a command the reader cannot read in full
-                        # (the provider would run the whole thing); retaining it
-                        # whole would let one model-authored command grow the
-                        # persisted channel past the bound every other retained
-                        # field obeys. Neither is a decision a channel reader can
-                        # make, so the request is refused here and the notice says
-                        # why, in the reader's terms, with the bounded excerpt the
-                        # card would have shown. Both notices quote the length the
-                        # guard measured (the redacted title -- redaction can grow a
-                        # string), so a split that lands under the limit is accepted.
-                        sel().log_tool_invocation(
-                            session_key=agent.session_key,
-                            agent=agent.agent_name,
-                            source="channel",
-                            tool_name=event.text,
-                            outcome="rejected_over_bound_title",
-                        )
-                        _what = "command" if _cmd else "request"
-                        await channel.post(
-                            agent.id,
-                            f"\u26d4 Approval refused: this {_what} is {len(sanitized_name)} characters and "
-                            f"a channel approval can show at most {_APPROVAL_FIELD_MAX_CHARS}. "
-                            "Nothing was run. A request the reader cannot read in full is not "
-                            "approved here; the agent can split it into shorter steps. "
-                            f"First {len(sanitized_input)} characters of the input:\n"
-                            f"```\n{sanitized_input}\n```",
-                            from_role=agent.role,
-                            msg_type="system",
-                            thread_id=thread_id,
-                        )
-                        # The reader's notice above says why in the reader's terms;
-                        # the model needs the same fact in its own turn, or it
-                        # reads a "user denied" and never learns to split the call.
-                        await _steer_host_deny(
-                            client,
-                            event,
-                            f"this {_what} is {len(sanitized_name)} characters and a channel "
-                            f"approval can show at most {_APPROVAL_FIELD_MAX_CHARS}",
-                            cause=DENY_CAUSE_APPROVAL_OVERSIZE,
-                            title=event.text or event.title or "",
-                        )
-                        await client.reject_tool(event.request_id)
-                        continue
-                    loop = asyncio.get_running_loop()
-                    # Bind-target for a per-command trust decision on THIS
-                    # approval: the canonical shell command ("" for non-shell
-                    # tools, which the tiers refuse — fail closed). A command the
-                    # provider redacted is also refused: two commands differing
-                    # only in their credentials redact to the SAME text, so a
-                    # grant scoped to the redacted form would silently cover
-                    # commands the user never consented to.
-                    approval_future = loop.create_future()
-                    agent._pending_approval_command = _cmd if _command_grantable else ""
-                    agent._approval_future = approval_future
-                    # The card's structured facts, beside the unchanged prose. The
-                    # server is the only side that can refuse a per-command tier
-                    # (``handlers_channel.approve``), so it states here which
-                    # tiers THIS approval can record: ``command_grantable`` gates
-                    # both per-command tiers (a non-shell tool has no command to
-                    # grant), ``base_derivable`` the base tier alone,
-                    # and ``base_command`` is the very binary the endpoint would
-                    # grant -- a compound ``cat f | wc -l`` has none, where a
-                    # first-token guess would have offered ``cat``. Values are the
-                    # already-redacted display strings, each within
-                    # ``_APPROVAL_FIELD_MAX_CHARS`` (the title was refused above if
-                    # it would not fit, and the base is one token of that title);
-                    # the raw command never leaves this scope.
-                    _base_binary = _shell_base_binary(_cmd) if _command_grantable else None
-                    approval_meta: dict[str, str] = {
-                        "tool_title": sanitized_name,
-                        "tool_input": sanitized_input,
-                        "command_grantable": "1" if _command_grantable else "",
-                        "base_derivable": "1" if _base_binary else "",
-                        "base_command": _base_binary or "",
-                    }
-                    _approval_timed_out = False
-                    try:
-                        # Posting and waiting are one ownership scope. If the post
-                        # itself fails, neither the Future nor its command authority
-                        # may leak onto the next approval handled by this agent.
-                        await channel.post(
-                            agent.id,
-                            f"⚠️ Approval needed: **{sanitized_name}**\n```\n{sanitized_input}\n```",
-                            from_role=agent.role,
-                            msg_type="approval",
-                            thread_id=thread_id,
-                            meta=approval_meta,
-                        )
-                        decision = await asyncio.wait_for(
-                            approval_future, timeout=_APPROVAL_TIMEOUT_SECS
-                        )
-                    except asyncio.TimeoutError:
-                        # Nobody answered: the HOST declines, not the reader.
-                        # Recorded apart from the decision so the reject below can
-                        # tell the model an expired card from a human's Deny.
-                        decision = "rejected"
-                        _approval_timed_out = True
-                    finally:
-                        if agent._approval_future is approval_future:
-                            agent._approval_future = None
-                            agent._pending_approval_command = ""
-
-                    if decision not in ("approved", "rejected", "trust"):
-                        decision = "rejected"
-
-                    if decision in ("approved", "trust") and _is_shell and _cmd:
-                        # A human read this exact command and said yes: record the
-                        # identity of the file behind each program name (same
-                        # witness the chat slot pins), so a later per-command
-                        # grant is honoured only while the same file answers to
-                        # the name. Pin BEFORE releasing execution: approving
-                        # first would let a self-replacing script swap the file
-                        # and get the replacement pinned. Runs off-loop (stats +
-                        # digests files).
-                        await asyncio.to_thread(name_grant.pin_human_approval, _cmd)
-                    if decision in ("approved", "trust"):
-                        # Audit BEFORE the wire call (approve_tool can raise); the
-                        # definitive row follows below. A rejection is audited once.
-                        sel().log_tool_invocation(
-                            session_key=agent.session_key,
-                            agent=agent.agent_name,
-                            source="channel",
-                            tool_name=event.text or event.title or "",
-                            outcome=permission_floor.OUTCOME_PENDING_APPROVAL,
-                            metadata={"human_decision": decision},
-                        )
-                    if decision == "trust":
-                        channel.trusted = True
-                        approval_sent = await client.approve_tool(event.request_id)
-                    elif decision == "approved":
-                        approval_sent = await client.approve_tool(event.request_id)
-                    else:
-                        # A rejection is audited once, BEFORE the wire call:
-                        # reject_tool can raise when the ACP child is gone, and
-                        # the human's "no" must reach the log either way.
-                        sel().log_tool_invocation(
-                            session_key=agent.session_key,
-                            agent=agent.agent_name,
-                            source="channel",
-                            tool_name=event.text or event.title or "",
-                            outcome=decision,
-                        )
-                        # One reject line, two provenances. A card that expired
-                        # unanswered is a HOST decline and the model is told so
-                        # before the reject; a reader's Deny is a real decision
-                        # kiro-cli's generic result already describes correctly,
-                        # so it gets no notice.
-                        if _approval_timed_out:
-                            await _steer_host_deny(
-                                client,
-                                event,
-                                "the channel approval card went unanswered for "
-                                f"{_APPROVAL_TIMEOUT_SECS}s",
-                                cause=DENY_CAUSE_APPROVAL_TIMEOUT,
-                                title=event.text or event.title or "",
-                            )
-                        await client.reject_tool(event.request_id)
-                        continue
+                    await client.reject_tool(event.request_id)
+                    continue
+                # YOLO mode (global) or channel trust — auto-approve
+                if (is_yolo and is_yolo()) or channel.trusted:
+                    approval_outcome = (
+                        "auto_approved_yolo"
+                        if (is_yolo and is_yolo())
+                        else "auto_approved_channel_trust"
+                    )
+                    # Audit BEFORE the wire call: approve_tool can raise, and a
+                    # decision that reached the transport must not vanish from
+                    # the SEL when it does. The definitive row follows below.
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text or event.title or "",
+                        outcome=permission_floor.OUTCOME_PENDING_APPROVAL,
+                    )
+                    approval_sent = await client.approve_tool(event.request_id)
                     if approval_sent is False:
                         sel().log_tool_invocation(
                             session_key=agent.session_key,
@@ -1706,7 +1517,6 @@ async def _stream_task(
                             source="channel",
                             tool_name=event.text or event.title or "",
                             outcome=permission_floor.OUTCOME_REJECTED_TRANSPORT_FLOOR,
-                            metadata={"human_decision": decision},
                         )
                     else:
                         sel().log_tool_invocation(
@@ -1714,11 +1524,331 @@ async def _stream_task(
                             agent=agent.agent_name,
                             source="channel",
                             tool_name=event.text or event.title or "",
-                            outcome=decision,
+                            outcome=approval_outcome,
                         )
+                    continue
+                # Per-command trust grants (trust_command / trust_base) — agent-
+                # scoped patterns granted via the approve endpoint. Security:
+                # grants are SHELL-ONLY and match against the ACTUAL command
+                # extracted from tool_input, never the LLM-authored display
+                # title; a tool the provider did not classify as shell is never
+                # matched even when its arguments carry a nested "command" key
+                # (e.g. cron_add), so a shell grant cannot leak onto MCP tools
+                # (deny-by-default). Mirrors the dashboard chat slot's
+                # trusted-pattern gate, hardened on the is_shell axis.
+                _is_shell = bool(getattr(event, "is_shell", False))
+                _cmd = (
+                    extract_bash_command(event.tool_input) if _is_shell and event.tool_input else ""
+                )
+                if (agent._trusted_commands or agent._trusted_bases) and _cmd:
+                    matched = _match_trusted_channel_command(_cmd, agent)
+                    if matched:
+                        # The grant names a PROGRAM; the shell resolves that
+                        # name again through a PATH that can lead with
+                        # agent-writable directories, and the file behind a
+                        # trusted `./deploy.sh` can have been replaced since
+                        # the human approved it. Same shared check as every
+                        # other name-based tier (hook auto-approve, chat
+                        # trusted patterns): a refusal does not reject — the
+                        # request falls through to the interactive card below,
+                        # where the human decides on this specific command.
+                        # Check the COMMAND THE GRANT MATCHED (_cmd, from
+                        # extract_bash_command) rather than re-deriving it
+                        # from the event: event.shell_command returns None
+                        # for raw non-JSON tool_input, and a None command
+                        # would make the check vouch for nothing while the
+                        # tier still auto-approves.
+                        _ng_refusal = await name_grant.refusal_for_command_off_loop(_cmd)
+                        if _ng_refusal is None:
+                            # Audit BEFORE the wire call (approve_tool can raise);
+                            # the definitive row follows below.
+                            sel().log_tool_invocation(
+                                session_key=agent.session_key,
+                                agent=agent.agent_name,
+                                source="channel",
+                                tool_name=event.text or event.title or "",
+                                outcome=permission_floor.OUTCOME_PENDING_APPROVAL,
+                                metadata={"pattern": matched},
+                            )
+                            approval_sent = await client.approve_tool(event.request_id)
+                            if approval_sent is False:
+                                sel().log_tool_invocation(
+                                    session_key=agent.session_key,
+                                    agent=agent.agent_name,
+                                    source="channel",
+                                    tool_name=event.text or event.title or "",
+                                    outcome=permission_floor.OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                                )
+                            else:
+                                sel().log_tool_invocation(
+                                    session_key=agent.session_key,
+                                    agent=agent.agent_name,
+                                    source="channel",
+                                    tool_name=event.text or event.title or "",
+                                    outcome="auto_approved_trusted_pattern",
+                                    metadata={"pattern": matched},
+                                )
+                            continue
+                        name_grant.log_decline(
+                            source="channel",
+                            session_key=agent.session_key,
+                            agent=agent.agent_name,
+                            event=event,
+                            refusal=_ng_refusal,
+                            tier="channel_trusted_pattern",
+                            sel_factory=sel,
+                        )
+                # Normal mode — interactive approval
+                # Redact over the FULL input, then bound: cutting first can
+                # split a credential at the boundary into fragments no
+                # redaction regex matches, leaking it into the approval prompt.
+                # tool_input is model-authored and size-unbounded, so the
+                # full-text pass runs off-loop (no-blocking-call-on-event-loop).
+                sanitized_input = await asyncio.to_thread(
+                    redact_and_truncate, event.tool_input, _APPROVAL_FIELD_MAX_CHARS
+                )
+                # The card's tool name. For a shell tool prefer the CANONICAL
+                # command (from ``tool_input``) over the display title: kiro's
+                # ``title`` for shell calls can be a model-authored prose
+                # description, and the trust tiers derive their consent-proof
+                # pattern from this name — a prose name would make the tiers
+                # mismatch the real command and fail with
+                # ``approval_superseded``. Non-shell tools keep the provider
+                # name (``text`` then ``title`` — the same fallback the
+                # blocked-tool check above uses; ACP permission events
+                # populate only ``title``).
+                # Use the same redactors on the command BYTES that would become
+                # authority. ``tool_input_redacted`` is transport provenance:
+                # re-running the scanners cannot reveal bytes an ACP transport
+                # already removed. Either signal makes the command display-only.
+                from kiro_crew.security import redact_with_findings
 
-                elif event.kind == EVENT_COMPLETE:
-                    break
+                _safe_cmd, _cmd_credential_redacted, _cmd_url_redacted = redact_with_findings(_cmd)
+                _command_grantable = bool(_cmd) and not (
+                    bool(getattr(event, "tool_input_redacted", False))
+                    or _cmd_credential_redacted
+                    or _cmd_url_redacted
+                    or _safe_cmd != _cmd
+                    or "[REDACTED" in _cmd
+                )
+                if _cmd:
+                    # ``Running:`` is the channel UI's explicit proof that
+                    # command-scoped tiers are available. Keep an ungrantable
+                    # redacted command visible, but do not give it that marker
+                    # or the card would offer decisions the server must refuse.
+                    #
+                    # The other marker names what is missing and promises
+                    # nothing about scope. It must not say "allow once": the
+                    # blanket channel grant needs no command scope, so ``Trust
+                    # all tools in this channel`` renders beside this label and
+                    # the endpoint records it. A card telling the reader it can
+                    # only be allowed once, while carrying a control that trusts
+                    # the whole channel, is worse than a card that says nothing.
+                    #
+                    # It also must not say the text is HIDDEN, because the text
+                    # is right there beside the marker: what the reader cannot
+                    # have is proof that those characters are the ones that run,
+                    # since two commands differing only in a credential redact
+                    # to the same string. "Exact text unverified" is the fact,
+                    # and it stays out of implementation vocabulary: channel
+                    # readers are not all engineers, so it names neither bytes
+                    # nor redaction.
+                    _card_name = (
+                        f"{_APPROVAL_SHELL_TITLE_PREFIX}{_safe_cmd}"
+                        if _command_grantable
+                        else f"Shell command (exact text unverified): {_safe_cmd}"
+                    )
+                else:
+                    _card_name = event.text or event.title or ""
+                from kiro_crew.security import redact
+
+                sanitized_name = redact(_card_name)
+                if len(sanitized_name) > _APPROVAL_FIELD_MAX_CHARS:
+                    # Fail closed. Cutting the title would put a live Approve
+                    # button beside a command the reader cannot read in full
+                    # (the provider would run the whole thing); retaining it
+                    # whole would let one model-authored command grow the
+                    # persisted channel past the bound every other retained
+                    # field obeys. Neither is a decision a channel reader can
+                    # make, so the request is refused here and the notice says
+                    # why, in the reader's terms, with the bounded excerpt the
+                    # card would have shown. Both notices quote the length the
+                    # guard measured (the redacted title -- redaction can grow a
+                    # string), so a split that lands under the limit is accepted.
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text,
+                        outcome="rejected_over_bound_title",
+                    )
+                    _what = "command" if _cmd else "request"
+                    await channel.post(
+                        agent.id,
+                        f"\u26d4 Approval refused: this {_what} is {len(sanitized_name)} characters and "
+                        f"a channel approval can show at most {_APPROVAL_FIELD_MAX_CHARS}. "
+                        "Nothing was run. A request the reader cannot read in full is not "
+                        "approved here; the agent can split it into shorter steps. "
+                        f"First {len(sanitized_input)} characters of the input:\n"
+                        f"```\n{sanitized_input}\n```",
+                        from_role=agent.role,
+                        msg_type="system",
+                        thread_id=thread_id,
+                    )
+                    # The reader's notice above says why in the reader's terms;
+                    # the model needs the same fact in its own turn, or it
+                    # reads a "user denied" and never learns to split the call.
+                    await _steer_host_deny(
+                        client,
+                        event,
+                        f"this {_what} is {len(sanitized_name)} characters and a channel "
+                        f"approval can show at most {_APPROVAL_FIELD_MAX_CHARS}",
+                        cause=DENY_CAUSE_APPROVAL_OVERSIZE,
+                        title=event.text or event.title or "",
+                    )
+                    await client.reject_tool(event.request_id)
+                    continue
+                loop = asyncio.get_running_loop()
+                # Bind-target for a per-command trust decision on THIS
+                # approval: the canonical shell command ("" for non-shell
+                # tools, which the tiers refuse — fail closed). A command the
+                # provider redacted is also refused: two commands differing
+                # only in their credentials redact to the SAME text, so a
+                # grant scoped to the redacted form would silently cover
+                # commands the user never consented to.
+                approval_future = loop.create_future()
+                agent._pending_approval_command = _cmd if _command_grantable else ""
+                agent._approval_future = approval_future
+                # The card's structured facts, beside the unchanged prose. The
+                # server is the only side that can refuse a per-command tier
+                # (``handlers_channel.approve``), so it states here which
+                # tiers THIS approval can record: ``command_grantable`` gates
+                # both per-command tiers (a non-shell tool has no command to
+                # grant), ``base_derivable`` the base tier alone,
+                # and ``base_command`` is the very binary the endpoint would
+                # grant -- a compound ``cat f | wc -l`` has none, where a
+                # first-token guess would have offered ``cat``. Values are the
+                # already-redacted display strings, each within
+                # ``_APPROVAL_FIELD_MAX_CHARS`` (the title was refused above if
+                # it would not fit, and the base is one token of that title);
+                # the raw command never leaves this scope.
+                _base_binary = _offerable_base_binary(_cmd) if _command_grantable else None
+                approval_meta: dict[str, str] = {
+                    "tool_title": sanitized_name,
+                    "tool_input": sanitized_input,
+                    "command_grantable": "1" if _command_grantable else "",
+                    "base_derivable": "1" if _base_binary else "",
+                    "base_command": _base_binary or "",
+                }
+                _approval_timed_out = False
+                _approval_window = _APPROVAL_TIMEOUT_SECS
+                try:
+                    # Posting and waiting are one ownership scope. If the post
+                    # itself fails, neither the Future nor its command authority
+                    # may leak onto the next approval handled by this agent.
+                    # The window is read here, inside that scope, for the same
+                    # reason: a cancel while it is read still clears the Future.
+                    _approval_window = await asyncio.to_thread(_channel_approval_window_secs)
+                    await channel.post(
+                        agent.id,
+                        f"⚠️ Approval needed: **{sanitized_name}**\n```\n{sanitized_input}\n```",
+                        from_role=agent.role,
+                        msg_type="approval",
+                        thread_id=thread_id,
+                        meta=approval_meta,
+                    )
+                    decision = await asyncio.wait_for(approval_future, timeout=_approval_window)
+                except asyncio.TimeoutError:
+                    # Nobody answered: the HOST declines, not the reader.
+                    # Recorded apart from the decision so the reject below can
+                    # tell the model an expired card from a human's Deny.
+                    decision = "rejected"
+                    _approval_timed_out = True
+                finally:
+                    if agent._approval_future is approval_future:
+                        agent._approval_future = None
+                        agent._pending_approval_command = ""
+
+                if decision not in ("approved", "rejected", "trust"):
+                    decision = "rejected"
+
+                if decision in ("approved", "trust") and _is_shell and _cmd:
+                    # A human read this exact command and said yes: record the
+                    # identity of the file behind each program name (same
+                    # witness the chat slot pins), so a later per-command
+                    # grant is honoured only while the same file answers to
+                    # the name. Pin BEFORE releasing execution: approving
+                    # first would let a self-replacing script swap the file
+                    # and get the replacement pinned. Runs off-loop (stats +
+                    # digests files).
+                    await asyncio.to_thread(name_grant.pin_human_approval, _cmd)
+                if decision in ("approved", "trust"):
+                    # Audit BEFORE the wire call (approve_tool can raise); the
+                    # definitive row follows below. A rejection is audited once.
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text or event.title or "",
+                        outcome=permission_floor.OUTCOME_PENDING_APPROVAL,
+                        metadata={"human_decision": decision},
+                    )
+                if decision == "trust":
+                    channel.trusted = True
+                    approval_sent = await client.approve_tool(event.request_id)
+                elif decision == "approved":
+                    approval_sent = await client.approve_tool(event.request_id)
+                else:
+                    # A rejection is audited once, BEFORE the wire call:
+                    # reject_tool can raise when the ACP child is gone, and
+                    # the human's "no" must reach the log either way.
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text or event.title or "",
+                        outcome=decision,
+                    )
+                    # One reject line, two provenances. A card that expired
+                    # unanswered is a HOST decline and the model is told so
+                    # before the reject; a reader's Deny is a real decision
+                    # kiro-cli's generic result already describes correctly,
+                    # so it gets no notice.
+                    if _approval_timed_out:
+                        await _steer_host_deny(
+                            client,
+                            event,
+                            f"the channel approval card went unanswered for {_approval_window}s",
+                            cause=DENY_CAUSE_APPROVAL_TIMEOUT,
+                            title=event.text or event.title or "",
+                        )
+                    await client.reject_tool(event.request_id)
+                    continue
+                if approval_sent is False:
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text or event.title or "",
+                        outcome=permission_floor.OUTCOME_REJECTED_TRANSPORT_FLOOR,
+                        metadata={"human_decision": decision},
+                    )
+                else:
+                    sel().log_tool_invocation(
+                        session_key=agent.session_key,
+                        agent=agent.agent_name,
+                        source="channel",
+                        tool_name=event.text or event.title or "",
+                        outcome=decision,
+                    )
+
+            elif event.kind == EVENT_COMPLETE:
+                # A turn the backend never finished is not the agent's reply:
+                # the error branch below posts its notice instead of this text.
+                unfinished = unfinished_turn_error(event, "".join(chunks))
+                if unfinished is not None:
+                    raise unfinished
+                break
     except Exception as exc:
         if is_prompt_busy(exc):
             # No card here: a card is a dead end. The backend still holds an
@@ -1733,6 +1863,7 @@ async def _stream_task(
             logger.warning(
                 "Backend lost the session of channel agent %s (%s): %s", agent.id, agent.role, exc
             )
+            agent._credential_error = str(exc) if acp_error_needs_fresh_credentials(exc) else ""
             return _STREAM_LOST_AFTER_TOOL if tool_seen else _STREAM_LOST
         logger.exception("LLM stream error for agent %s (%s)", agent.id, agent.role)
         await channel.post(
@@ -1748,8 +1879,9 @@ async def _stream_task(
     if not full_text:
         return _STREAM_OK
     # Sanitize LLM output before posting
-    full_text, _ = redact_exfiltration_urls(full_text)
-    full_text, _ = redact_credentials(full_text)
+    from kiro_crew.security import redact
+
+    full_text = redact(full_text)
     # Extract @mentions from agent's response
     mention_ids = [
         m.id for m in channel.members.values() if m.id != agent.id and f"@{m.role}" in full_text
@@ -1762,4 +1894,25 @@ async def _stream_task(
         thread_id=thread_id,
         mention=mention_ids or None,
     )
+    # A reply carrying a redaction placeholder is followed by the same notice
+    # every other channel posts, counted over the text that shipped. It lands in
+    # the reply's thread for the human reader and wakes no member. Best-effort:
+    # the reply is already posted, so a failed notice is logged, never raised.
+    cred_count, url_count = count_redaction_tags(full_text)
+    if cred_count or url_count:
+        try:
+            await channel.post(
+                agent.id,
+                redaction_notice(cred_count, url_count),
+                from_role=agent.role,
+                msg_type="system",
+                thread_id=thread_id,
+                notify_members=False,
+            )
+        except Exception:
+            logger.warning(
+                "Could not post the redaction notice for channel agent %s (reply already posted)",
+                agent.id,
+                exc_info=True,
+            )
     return _STREAM_OK

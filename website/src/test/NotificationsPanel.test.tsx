@@ -23,6 +23,21 @@ vi.mock('../hooks/useNotificationSound', async (importOriginal) => {
   return { ...actual, playPreset: vi.fn() }
 })
 
+// Mock the push hook so PushSection renders deterministically (supported, not
+// subscribed) without needing serviceWorker/PushManager in the test DOM.
+const mockPush = {
+  supported: true,
+  needsInstall: false,
+  subscribed: false,
+  busy: false,
+  error: null as string | null,
+  subscribe: vi.fn(() => Promise.resolve()),
+  unsubscribe: vi.fn(() => Promise.resolve()),
+}
+vi.mock('../hooks/usePushSubscription', () => ({
+  usePushSubscription: () => mockPush,
+}))
+
 const STORAGE_KEY = 'mc-notification-sound'
 
 // Stub AudioContext to prevent real Web Audio calls during component render.
@@ -83,8 +98,7 @@ describe('NotificationsPanel', () => {
       perCategory: { all: 'chime', cron: 'ding' },
     }))
     render(<NotificationsPanel />, 'percategory')
-    // The cron row should show "Ding" (the override), not "Use default"
-    expect(screen.getAllByText(/Ding/).length).toBeGreaterThan(0)
+    expect(screen.getByRole('combobox', { name: 'Cron' }).textContent).toBe('Ding')
   })
 
   it('renders the Agent messages row and loads its seeded override', () => {
@@ -97,17 +111,22 @@ describe('NotificationsPanel', () => {
     }))
     render(<NotificationsPanel />, 'percategory')
     expect(screen.getAllByText('Proactive agent messages').length).toBeGreaterThan(0)
-    // The agent row shows "Ding" (the override), not "Use default"
-    expect(screen.getAllByText(/Ding/).length).toBeGreaterThan(0)
+    expect(screen.getByRole('combobox', { name: 'Proactive agent messages' }).textContent).toBe('Ding')
   })
 
   it('describes the turn sound as a conversation handoff, not an every-turn chime', () => {
     const { container } = render(<NotificationsPanel />, 'percategory')
-    // The chime fires when a conversation hands control back (finished, or
-    // paused for input), so the row must not promise audio on every turn. The
-    // sentence is the row's info tip (its `title` while closed).
+    // The chime fires when a conversation hands control back to the user, so
+    // the row must not promise audio on every turn. An explicit question plays the approval sound instead, and
+    // the tip says so. The sentence is the row's info tip (its `title` while
+    // closed).
     expect(screen.getByText('Conversation handoffs')).toBeTruthy()
-    expect(screen.getByTitle('When a conversation finishes or pauses for your input')).toBeTruthy()
+    expect(
+      screen.getByTitle(
+        'When a conversation finishes and hands control back to you. Agent questions use the “Approvals and questions” sound instead.',
+      ),
+    ).toBeTruthy()
+    expect(container.textContent).not.toContain('pauses for your input')
     expect(container.textContent).not.toContain('Agent replies')
     expect(container.textContent).not.toContain('finishes a turn in any chat')
   })
@@ -197,17 +216,27 @@ describe('NotificationsPanel', () => {
 
   it('approval-row preview matches runtime (presetForKind): plays pulse with no override', () => {
     // Category rows render in CATEGORY_ROWS order:
-    // all, turn, agent, cron, approval, hook, heartbeat, subagent, taskrunner, skills
+    // all, turn, dictation, agent, cron, approval, hook, heartbeat, subagent, taskrunner, skills
     // The per-row Test button plays `effective`, which now goes through
     // presetForKind — so approval with no override must play its built-in
     // 'pulse', exactly what runtime plays, not the 'all' fallback.
     render(<NotificationsPanel />, 'percategory')
     const rowTestBtns = screen.getAllByRole('button', { name: 'Test' })
-    const approvalIdx = 4
+    const approvalIdx = 5
     fireEvent.click(rowTestBtns[approvalIdx])
     const settings = loadSoundSettings()
     expect(presetForKind('approval', settings)).toBe('pulse')
     expect(playPreset).toHaveBeenCalledWith('pulse', settings.volume)
+  })
+
+  it('interrupted-dictation row follows the all-categories sound like the other rows', () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ enabled: true, volume: 0.35, perCategory: { all: 'blip' } }))
+    render(<NotificationsPanel />, 'percategory')
+    expect(screen.getByRole('combobox', { name: 'Interrupted dictation' }).textContent).toBe('Use default')
+    const rowTestBtns = screen.getAllByRole('button', { name: 'Test' })
+    const dictationIdx = 2
+    fireEvent.click(rowTestBtns[dictationIdx])
+    expect(playPreset).toHaveBeenCalledWith('blip', 0.35)
   })
 
   it('does not adopt a change into local state when persistence fails (quota)', () => {
@@ -333,5 +362,103 @@ describe('NotificationsPanel', () => {
     expect(saved.volume).toBe(0.55)
     expect(saved.perCategory.cron).toBe('ding')
     expect(saved.perCategory.all).toBe('chime')
+  })
+
+  it('renders the push toggle and calls subscribe on enable', () => {
+    render(<NotificationsPanel />, 'alerts')
+    const toggle = screen.getByRole('switch', { name: /Notify me even when .* is closed/i })
+    expect(toggle.getAttribute('aria-checked')).toBe('false')
+    fireEvent.click(toggle)
+    expect(mockPush.subscribe).toHaveBeenCalledOnce()
+  })
+
+  it('disables the push toggle and describes it with the blocked hint when permission is denied', () => {
+    const g = globalThis as unknown as { Notification?: unknown }
+    const original = g.Notification
+    g.Notification = { permission: 'denied', requestPermission: vi.fn(() => Promise.resolve('denied')) }
+    mockPush.subscribe.mockClear()
+    try {
+      render(<NotificationsPanel />, 'alerts')
+      const toggle = screen.getByRole('switch', { name: /Notify me even when .* is closed/i })
+      expect(toggle.getAttribute('aria-disabled')).toBe('true')
+      const describedBy = toggle.getAttribute('aria-describedby')
+      expect(describedBy).toBeTruthy()
+      const hint = document.getElementById(describedBy!)
+      // The hint is a SHORT back-reference to the System notifications row above
+      // (#23984), not a second copy of that row's full "blocked" sentence: the
+      // same page already shows the full sentence once, and repeating it read
+      // as two separate problems.
+      expect(hint?.textContent).toBe('Blocked in your browser — see above.')
+      expect(screen.getAllByText(/Turn it back on in the site's permission settings/i)).toHaveLength(1)
+      fireEvent.click(toggle)
+      fireEvent.keyDown(toggle, { key: ' ' })
+      expect(mockPush.subscribe).not.toHaveBeenCalled()
+    } finally {
+      if (original === undefined) delete g.Notification
+      else g.Notification = original
+    }
+  })
+
+  // The hook sets `busy` only inside subscribe()/unsubscribe() and leaves
+  // `subscribed` as it was until the call ends, so the pair tells the two
+  // directions apart with no extra state (#23984).
+  it('says "Turning on…" under the disabled push toggle while subscribing', () => {
+    mockPush.busy = true
+    mockPush.subscribed = false
+    try {
+      render(<NotificationsPanel />, 'alerts')
+      const toggle = screen.getByRole('switch', { name: /Notify me even when .* is closed/i })
+      expect(toggle.getAttribute('aria-disabled')).toBe('true')
+      // The switch shows where it is going, matching the line under it.
+      expect(toggle.getAttribute('aria-checked')).toBe('true')
+      const status = screen.getByRole('status')
+      expect(status.textContent).toBe('Turning on…')
+    } finally {
+      mockPush.busy = false
+    }
+  })
+
+  it('says "Turning off…" under the disabled push toggle while unsubscribing', () => {
+    mockPush.busy = true
+    mockPush.subscribed = true
+    try {
+      render(<NotificationsPanel />, 'alerts')
+      const toggle = screen.getByRole('switch', { name: /Notify me even when .* is closed/i })
+      expect(toggle.getAttribute('aria-disabled')).toBe('true')
+      expect(toggle.getAttribute('aria-checked')).toBe('false')
+      const status = screen.getByRole('status')
+      expect(status.textContent).toBe('Turning off…')
+    } finally {
+      mockPush.busy = false
+      mockPush.subscribed = false
+    }
+  })
+
+  it('keeps an empty status region under the push toggle when nothing is in flight', () => {
+    render(<NotificationsPanel />, 'alerts')
+    screen.getByRole('switch', { name: /Notify me even when .* is closed/i })
+    expect(screen.getByTestId('push-busy-status').textContent).toBe('')
+  })
+
+  // A live region that mounts already holding its text is not announced by
+  // every screen reader, so the same element must exist before it is filled.
+  it('fills the already-mounted status region when a subscribe starts', () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const tree = () => (
+      <MemoryRouter initialEntries={['/settings?tab=notifications&sub=alerts']}>
+        <QueryClientProvider client={qc}><NotificationsPanel /></QueryClientProvider>
+      </MemoryRouter>
+    )
+    const view = rtlRender(tree())
+    const before = screen.getByTestId('push-busy-status')
+    mockPush.busy = true
+    try {
+      view.rerender(tree())
+      const after = screen.getByTestId('push-busy-status')
+      expect(after).toBe(before)
+      expect(after.textContent).toBe('Turning on…')
+    } finally {
+      mockPush.busy = false
+    }
   })
 })

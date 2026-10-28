@@ -2,13 +2,14 @@
 
 Crew member names and memory bindings, config surfaces that still name a
 deprecated agent spec, the optional Claude Code backend, and one sign-in row per
-selectable harness. Names the doctor imports, and the host probes a repository
-gate pins to ``cli_doctor.py``, are read through :mod:`kiro_crew.cli_doctor` at call
-time, so a patch there reaches these sections.
+selectable harness. Names the doctor imports, and the host probes
+``cli_doctor_parts/host_probes.py`` holds, are read through :mod:`kiro_crew.cli_doctor`
+at call time, so a patch there reaches these sections.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 from typing import TYPE_CHECKING
 
@@ -69,6 +70,29 @@ def _doctor_member_dispatchability(cfg: KiroCrewConfig, issues: list[str]) -> No
     issues.append("stored Crew Member names are not dispatchable")
 
 
+def _missing_v1_store_remedy(cfg: KiroCrewConfig, member: str, store: object) -> str:
+    """The create command for a V1 binding whose only defect is a missing store directory."""
+    from kiro_crew.memory_stores import (
+        DEFAULT_MEMORY_STORE,
+        create_store_remedy,
+        memory_store_dir_for,
+        require_member_memory_store,
+    )
+
+    if not isinstance(store, str) or store == DEFAULT_MEMORY_STORE:
+        return ""
+    record = cfg.memory_stores.get(store)
+    if record is None or getattr(record, "memory_version", None) != 1:
+        return ""
+    try:
+        require_member_memory_store(cfg, member, require_directory=False)
+        if os.path.lexists(memory_store_dir_for(store)):
+            return ""
+    except Exception:  # noqa: BLE001 -- a different defect; no create step fixes it
+        return ""
+    return create_store_remedy(store)
+
+
 def _doctor_member_memory_bindings(cfg: KiroCrewConfig, issues: list[str]) -> None:
     """Check every configured member's existing binding without initializing memory."""
     from kiro_crew.memory_stores import (
@@ -111,8 +135,23 @@ def _doctor_member_memory_bindings(cfg: KiroCrewConfig, issues: list[str]) -> No
         except Exception as exc:  # noqa: BLE001 -- one broken member must not hide healthy peers
             print(f"  {binding}: unavailable ({render._safe_display(str(exc))})")
             issues.append(f"member memory binding unavailable: {binding}")
+            remedy = _missing_v1_store_remedy(cfg, name, store)
+            if remedy:
+                print(f"               To fix: {render._safe_display(remedy)}.")
         else:
             print(f"  {binding}: valid binding")
+            if name == cfg.default_agent and isinstance(store, str) and store != "default":
+                # The default crewmate alias may carry a store of its own. A
+                # plain session (no crewmate picked) runs the default TEMPLATE on
+                # Global and does not read this store; it is reached in the
+                # crewmate's DM thread or by picking the crewmate for a chat.
+                # Said here, beside the binding, so the operator who moved the
+                # default crewmate onto its own memory knows where it applies.
+                print(
+                    "               plain sessions use the default template on Global "
+                    "memory; this store is used only in this crewmate's DM and in "
+                    "chats where you pick it"
+                )
     for store, reason in legacy.items():
         if not reason:
             # Dispatchable owners report pending stores above. Unsafe owners are
@@ -356,14 +395,29 @@ def _doctor_agent_auth() -> None:
     on it would make the default host red for an optional backend.
     """
     from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND, selectable_backend_values
-    from kiro_crew.agent_sdk import declaration_for, entitlement_label, signs_in_separately
+    from kiro_crew.agent_sdk import (
+        declaration_for,
+        entitlement_label,
+        kas_bundle,
+        signs_in_separately,
+    )
     from kiro_crew.agent_sdk.backends import ACP_BACKENDS_HOST_AUTH_CALLBACK
+
+    # Read through the facade, as every family does: a second binding here would
+    # be one a patch of ``cli_doctor.ACP_BACKEND_KAS`` does not reach.
+    kas_backend = cli_doctor.ACP_BACKEND_KAS
 
     try:
         backends = selectable_backend_values()
     except Exception:
         # Reading the registry must not break triage; the rows are advisory.
         return
+
+    # On the bundle route KAS runs Crew's own engine and the vault is its ONLY
+    # owner (acp-client.md, "KAS bundle route"), so its row never falls through to
+    # the kiro-cli store: that fallback is the relay's, and on a host with no
+    # kiro-cli it would print "could not check" for a store the route never reads.
+    kas_bundle_route = kas_bundle.kas_bundle_route()
 
     # Probed at most once even though two harnesses share the host store: kiro and
     # KAS both resolve tokens from it, and spawning ``whoami`` per row would pay
@@ -437,6 +491,9 @@ def _doctor_agent_auth() -> None:
                 print(f"  {label.ljust(13)}{glyph}Kiro Crew vault (signed in through Kiro Crew)")
                 if vault_detail:
                     render._print_wrapped(f"crew vault: {vault_detail}")
+                if backend == kas_backend and kas_bundle_route:
+                    # No second store to mention: the bundle has no kiro-cli owner.
+                    continue
                 if host_probed and host_signed_in is True:
                     # Both stores hold a sign-in, and they can be DIFFERENT
                     # accounts (the usage reader's identity checks exist for
@@ -447,6 +504,15 @@ def _doctor_agent_auth() -> None:
                         f"{source} is also present and may be a different account "
                         "(the kiro-cli row reports it); the relay uses the vault."
                     )
+                continue
+            if backend == kas_backend and kas_bundle_route:
+                # Nothing usable in the vault and no fallback owner: the engine's
+                # first prompt will fail with its own "not signed in". The remedy
+                # names Crew's sign-in alone, never ``kiro-cli login``.
+                print(f"  {label.ljust(13)}⏹ Kiro Crew vault; not signed in")
+                render._print_wrapped(kas_bundle.KAS_BUNDLE_SIGN_IN_REMEDY)
+                if vault_detail:
+                    render._print_wrapped(f"crew vault: {vault_detail}")
                 continue
             # Nothing usable in the vault: the kiro-cli branch below is the
             # runtime's fallback owner, so it is this row's report too. A stored

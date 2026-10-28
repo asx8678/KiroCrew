@@ -28,6 +28,8 @@
  */
 import { useRef, type ReactNode } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
+import { usePressActivation } from '../hooks/usePressActivation'
+import { forwardUiLocation, UI_LOCATION_ATTR } from '../uiLocations/uiLocation'
 
 import {
   TABS_COUNT_BASE_CLASS,
@@ -55,6 +57,16 @@ export interface TablistTab<T extends string = string> {
   count?: number
 }
 
+/** A tab that is a registered UI location; its marker lands on that tab. Named
+ *  in `segments` at the call site (`{ key, label, ...uiLocation(id) }`, the
+ *  shape SegmentedControl and CrewEditorNextRail take), so the generator reads
+ *  the marker from one array literal and the tab's `label` as the label. */
+export interface TablistSegment<T extends string> {
+  key: T
+  label: string
+  'data-ui-location'?: string
+}
+
 interface Props<T extends string = string> {
   tabs: Array<TablistTab<T>>
   value: T
@@ -70,6 +82,8 @@ interface Props<T extends string = string> {
    *  in a narrow column whose tabs all carry icons — the crewmate profile card.
    *  Default `always`. */
   labels?: 'always' | 'active'
+  /** The tabs that are registered UI locations (see `TablistSegment`). */
+  segments?: readonly TablistSegment<T>[]
 }
 
 /** Next enabled index in `dir`, wrapping. Disabled tabs are skipped rather than
@@ -106,9 +120,14 @@ export default function Tablist<T extends string = string>({
   ariaLabel,
   layoutId = 'tablist-indicator',
   labels = 'always',
+  segments,
 }: Props<T>) {
   const reduceMotion = useReducedMotion()
   const refs = useRef<Array<HTMLButtonElement | null>>([])
+  const bindPress = usePressActivation()
+  // The tab's find_ui marker (if it is one), merged with the roving-focus ref.
+  const markerOf = (key: T, i: number) =>
+    forwardUiLocation<HTMLButtonElement>(segments?.find(seg => seg.key === key)?.[UI_LOCATION_ATTR], el => { refs.current[i] = el })
 
   const move = (to: number) => {
     const tab = tabs[to]
@@ -127,9 +146,7 @@ export default function Tablist<T extends string = string>({
         return (
           <button
             key={tab.key}
-            ref={el => {
-              refs.current[i] = el
-            }}
+            {...markerOf(tab.key, i)}
             type="button"
             role="tab"
             aria-selected={isActive}
@@ -138,9 +155,11 @@ export default function Tablist<T extends string = string>({
             // rail costs one Tab press instead of one per plane.
             tabIndex={isActive ? 0 : -1}
             title={tab.tooltip || tab.label}
-            onClick={() => {
+            // Select on the mouse press, like the Radix tabs in ui/tabs;
+            // keyboard and touch select on click.
+            {...bindPress(() => {
               if (!isDisabled) onChange(tab.key)
-            }}
+            })}
             onKeyDown={e => {
               if (e.key === 'ArrowRight') {
                 e.preventDefault()

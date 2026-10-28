@@ -15,6 +15,7 @@ kirocrew snapshot                                     # write to ~/.kiro/crew/sn
 kirocrew snapshot ~/my-snapshots --keep 3             # custom dir, prune to 3
 kirocrew snapshot --components memory                 # just memory, ~20 MB
 kirocrew snapshot --list                              # list existing snapshots
+kirocrew snapshot --strict                            # exit 3 if the bundle is incomplete
 kirocrew restore snapshot.tar.gz                      # auto-detects replace vs merge
 kirocrew restore snapshot.tar.gz --components memory,crons
 kirocrew restore snapshot.tar.gz --dry-run            # preview, write nothing
@@ -28,6 +29,23 @@ gateway on that port is not this instance.
 
 Both commands refuse to run on a platform that cannot open a directory relative to a file descriptor, because every component would then be re-opened by name and an ancestor swapped mid-walk could redirect the copy into a credential store. `--allow-unpinned-staging` accepts that by-name traversal instead; a snapshot taken that way records the weaker staging mode in its `MANIFEST.json`.
 
+### Installs larger than 4 GiB
+
+`kirocrew restore` refuses an archive that declares more than 4 GiB of uncompressed
+content, because a small compressed file can declare far more than it holds. `kirocrew
+snapshot` applies the same limit before it writes anything. Past the limit it exits 1,
+writes no bundle, prunes nothing, and names the largest entry. You then have two
+choices:
+
+```bash
+kirocrew snapshot --components memory,config,crons    # leave the large component out
+kirocrew snapshot --max-archive-gib 12                # or raise the limit for this run
+kirocrew restore snapshot.tar.gz --max-archive-gib 12 # ...and at least that N to restore
+```
+
+`--max-archive-gib` accepts 1 to 1024. With it, restore also refuses an archive that
+declares more than the free space where it extracts.
+
 ## What a snapshot contains
 
 | Component | Files |
@@ -36,11 +54,21 @@ Both commands refuse to run on a platform that cannot open a directory relative 
 | crons | `crons.json` |
 | config | `config.json`, `config.local.json`, `session_map.json`, `hooks.json`, `ui-prefs.json` (the dashboard's browser-held settings), `notification_settings.json` (notification mutes and priorities), `project_dir`, `workspace_dir` |
 | skills | `skills/` directory |
+| crew-teams | `crew-teams/teams.json` (the mate team list) |
 | workspace | `workspace/`, `plan_memory/` directories |
 | notifications | `notifications.jsonl` |
 | security | `telemetry_salt` |
 | artifacts | `artifacts/` directory — `--mode replace` only (folder assignments not captured yet) |
 | uploads | `uploads/` directory — `--mode replace` only |
+
+No component carries chat history (`sessions/*.jsonl`, the dashboard's chats).
+Restoring `config` prints a warning that chats from the source machine will not
+appear.
+
+Crew agent templates in `<kiro home>/agents` (`~/.kiro/agents`) are not carried
+either, by `kirocrew snapshot` or by the dashboard export. The dashboard names
+the templates your crews use that the export leaves out, and on import names the
+ones this machine is missing.
 
 `memory` is self-contained: it names the markdown half of memory (preferences,
 projects, history) and the knowledge base explicitly, so `--components memory`
@@ -220,7 +248,10 @@ component was being replaced.
 - **Memory**: existing entries win, new keys are added
 - **Crons**: deduplicated by job name. Existing jobs are kept; new jobs are
   imported with fresh IDs. If either cron file has a JSON shape the merger cannot use, the cron merge is skipped.
-- **Notifications**: deduplicated by timestamp
+- **Notifications**: deduplicated by timestamp. On a platform without
+  `O_NOFOLLOW` (native Windows), a merge into an existing `notifications.jsonl`
+  is skipped with a message and no `✅ notifications` tick; the dashboard import
+  lists it under `refused_merges`.
 - **Config and security**: only files that are missing are restored, never
   overwritten. Every running install already has a `config.json`, so a merge
   usually restores none of the bundle's settings; each settings file kept that
@@ -229,8 +260,9 @@ component was being replaced.
   left behind. Host state in the same component (`session_map.json`,
   `project_dir`, `workspace_dir`) keeps this machine's copy silently. A bundle
   `ui-prefs.json` or `notification_settings.json` that its own store would read
-  as empty, or refuse, stops the restore before anything is installed, in either
-  mode. A restored `config.json`, `config.local.json` or `ui-prefs.json` is
+  as empty, or refuse, stops the restore before anything is installed. A replace
+  always checks it; a merge checks it only where the destination lacks that file,
+  because only then would the merge install it. A restored `config.json`, `config.local.json` or `ui-prefs.json` is
   installed owner-only, as its own writer creates it. A bundle's `config.local.json` is never installed by a merge, even
   where the receiving install has none: that overlay outranks `config.json`, so
   it is reported (`↩️  config.local.json: not applied ...`) instead. To take the
@@ -238,6 +270,9 @@ component was being replaced.
   saves the current files in the pre-restore backup first.
 - **Workspace and skills**: only files that do not exist at the destination are
   copied
+- **Crew teams**: `teams.json` is installed only where the destination has none.
+  A replace from a bundle with no `crew-teams/` tree removes the live team
+  document (saved to the pre-restore backup first)
 
 So a merge never destroys anything on the receiving machine. If you want the
 snapshot to win, use `--mode replace`.

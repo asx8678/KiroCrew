@@ -15,10 +15,8 @@ Execution model (matches the frozen contract in workflows/__init__.py):
   chain of steps shares context.
 
 Structured output (``schema=``) is handled upstream by the runner via
-``schema.run_with_schema`` — which calls this ``agent_fn`` ONCE as its text
-producer — so this module only needs to return the model's text. A reply that
-fails the schema is repaired by the tool-free reformat producer
-``build_reformat_fn`` builds, never by calling ``agent_fn`` again (WF-1).
+``schema.run_with_schema`` — which calls this ``agent_fn`` as its text producer —
+so this module only needs to return the model's text.
 
 Kept out of the hot import path: ``SessionManager`` etc. are passed IN (the
 gateway wires them at startup), so this module imports only ``llm_helpers`` types
@@ -32,10 +30,10 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import time
 from typing import Any, Callable, Optional
 
-from kiro_crew.effort import is_valid_effort
-from kiro_crew.llm_helpers import ToolApprovalPolicy, run_bg_oneliner, stream_and_collect
+from kiro_crew.llm_helpers import ToolApprovalPolicy, provider_last_turn_usage, stream_and_collect
 from kiro_crew.security import redact
 
 logger = logging.getLogger(__name__)
@@ -47,27 +45,9 @@ AgentFn = Callable[[str, dict], Any]
 # but prevents infinite tool loops from prompt injection.
 _MAX_TURNS_PER_STEP = 200
 
-# The schema reformat call (WF-1): ``sel_source`` names its SEL audit source and
-# its usage row's surface (``bg:<source>``); the timeout bounds its drive and the
-# byte cap bounds the JSON it may return.
-_REFORMAT_SEL_SOURCE = "workflow_schema_reformat"
-_REFORMAT_TIMEOUT_SECS = 120.0
-_REFORMAT_MAX_OUTPUT_BYTES = 1_000_000
-
 
 class WorkflowSpawnRefused(Exception):
     """A ``ctx.agent()`` step the spawn policy or the cwd allowlist refuses."""
-
-
-def step_memory(memory_scope: Any, requested: object) -> bool:
-    """Whether a ``ctx.agent()`` step's prompt carries the memory group (CTX-7).
-
-    The scope decides (``WorkflowScope.step_memory``): ``memory=`` when the script
-    gave one, else off except on a member-bound run. A scope without the method
-    (no scope, a test double) answers off, the CTX-7 default.
-    """
-    decide = getattr(memory_scope, "step_memory", None)
-    return bool(decide(requested)) if callable(decide) else requested is True
 
 
 async def vet_step_spawn(
@@ -158,7 +138,6 @@ def build_agent_fn(
     context_builder: Any = None,
     session_key: str = "",
     app: str = "",
-    workflow_name: str = "",
 ) -> AgentFn:
     """Return an ``agent_fn`` that runs each workflow agent step through a model.
 
@@ -170,12 +149,8 @@ def build_agent_fn(
     session, mirroring ``default_agent``/``default_model``/``cwd``. It is a
     per-run pin rather than a per-call override because ``WorkflowContext.agent()``
     exposes no ``env=`` parameter (that Protocol is frozen).
-
-    ``workflow_name`` names the run on each step's usage row (``service``
-    ``workflow:<name>``, else ``workflow:<run_id>``); it changes nothing else.
     """
 
-    usage_service = f"workflow:{workflow_name or run_id}"
     # Per-run, 0-based ephemeral session index (not a module-global, so each run
     # restarts at :0 as the ``wf:{run_id}:{call_index}`` contract documents).
     counter = itertools.count()
@@ -183,26 +158,12 @@ def build_agent_fn(
     async def agent_fn(prompt: str, opts: dict) -> Any:
         # Spawn gates FIRST: a refused step must allocate no session, touch no
         # memory scope and consume no session index.
-        # Vets what the SCRIPT named (see agent_pool.build_pooled_agent_fn).
         step_cwd = await vet_step_spawn(
             session_key=session_key,
-            agent=opts.get("agent"),
+            agent=opts.get("agent") or default_agent,
             cwd=opts.get("cwd"),
             app=app,
         )
-        # WF-5: honor ctx.agent(effort=...) — validate, then thread to the
-        # session as the per-call override the chat path already uses. An
-        # invalid value warns and falls back to the factory's effort (the
-        # call still runs; only the effort pin is dropped).
-        _effort = str(opts.get("effort") or "").strip()
-        if _effort and not is_valid_effort(_effort):
-            logger.warning(
-                "workflow step effort=%r invalid (run=%s); using the default effort",
-                _effort,
-                run_id,
-            )
-            _effort = ""
-
         # Per-call isolated session by default; caller-named session when session=.
         session = opts.get("session")
         ephemeral = session is None
@@ -218,9 +179,12 @@ def build_agent_fn(
             model=opts.get("model") or default_model,
             cwd=step_cwd or cwd,
             extra_env=extra_env,
-            reasoning_effort_override=_effort,
-            model_role="workflow",
         )
+        # Wall clock for THIS agent turn only (not the whole workflow run):
+        # acp leaves TurnUsage.duration_ms at 0, so without this the row's
+        # duration_ms is a literal 0. Started after get_or_create so session
+        # setup is not charged to the turn.
+        _turn_t0 = time.monotonic()
         try:
             from kiro_crew.messaging.identity import publish_turn_identity
 
@@ -235,22 +199,67 @@ def build_agent_fn(
                     resumed=_resumed,
                     agent=opts.get("agent") or default_agent,
                     cwd=step_cwd or cwd,
-                    include_memory=step_memory(memory_scope, opts.get("memory")),
                 )
-            # USE-1: the stage's one usage row (surface ``workflow``) is written
-            # inside stream_and_collect on every exit -- success, a raise, a
-            # timeout's cancellation -- not after it returns, where a failed stage
-            # used to write nothing.
             text = await stream_and_collect(
                 provider,
                 prompt,
                 approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
                 max_turns=_MAX_TURNS_PER_STEP,
-                usage_surface="workflow",
-                usage_session_key=key,
-                usage_agent=opts.get("agent") or default_agent or "",
-                usage_service=usage_service,
             )
+            # ── Per-turn usage row: attribute workflow spend. ──
+            # Best-effort analytics that must never break the workflow run — but
+            # the guards are deliberately NARROW. A single wide try around the
+            # import + context read + persist would swallow ANY of them at
+            # debug, so one import failure or a context-read failure would
+            # silently drop the ENTIRE row (the workflow surface writing zero
+            # rows).
+            #
+            # The import stays function-local on purpose: kiro_crew.dashboard.
+            # handlers.usage pulls in the slack handler chain, so a module-scope
+            # import can raise ImportError under some import orders. A genuine
+            # failure here is a real wiring bug, so surface it (warning) instead
+            # of hiding it — while still not aborting the run.
+            try:
+                from kiro_crew.dashboard.handlers.usage import (
+                    persist_token_record_async,
+                    read_context_tokens,
+                    read_effective_agent,
+                )
+            except ImportError:
+                logger.warning(
+                    "workflow usage row skipped: usage handlers unimportable",
+                    exc_info=True,
+                )
+            else:
+                # Context occupancy is enrichment only. Guard it on its OWN so a
+                # read failure degrades to (0, 0) instead of taking the row down.
+                try:
+                    _used, _window = read_context_tokens(provider)
+                except Exception:
+                    logger.debug("workflow context-token read failed", exc_info=True)
+                    _used, _window = 0, 0
+                # Only the persist stays in a best-effort try: a write failure
+                # must not break the workflow run, but nothing else hides here.
+                try:
+                    await persist_token_record_async(
+                        key,
+                        opts.get("model") or default_model or "",
+                        provider_last_turn_usage(provider),
+                        provider="acp",
+                        surface="workflow",
+                        agent=(
+                            read_effective_agent(provider)
+                            or opts.get("agent")
+                            or default_agent
+                            or ""
+                        ),
+                        context_used=_used,
+                        context_window=_window,
+                        elapsed_ms=int((time.monotonic() - _turn_t0) * 1000),
+                        model_source=provider,
+                    )
+                except Exception:
+                    logger.debug("workflow usage row persist failed", exc_info=True)
             # Apply canonical output redaction to prevent credential or
             # exfiltration-URL leakage into workflow results stored in history
             # or injected into parent chat.
@@ -269,33 +278,3 @@ def build_agent_fn(
                 logger.warning("workflow session lease release failed", exc_info=True)
 
     return agent_fn
-
-
-def build_reformat_fn(sessions: Any) -> Callable[[str], Any]:
-    """Return the tool-free producer that repairs a schema-invalid step reply (WF-1).
-
-    One background one-liner per call (``run_bg_oneliner``): no tools, a fresh
-    ``_bg`` session, the model the ``background`` role resolves to (never a
-    literal; ``resolve_usable_model`` vets it at the wire). ``run_bg_oneliner``
-    writes the usage row (surface ``bg:workflow_schema_reformat``) and feeds the
-    runner's token sink, which charges the run budget. The reactive
-    rejected-model retry is off, so one reformat is exactly one model call. The
-    reply is redacted like a step's.
-    """
-
-    async def reformat(prompt: str) -> str:
-        from kiro_crew.config.loader import KiroCrewConfig
-
-        model = KiroCrewConfig.load().agent.resolve_model("background")
-        text = await run_bg_oneliner(
-            sessions,
-            prompt,
-            model=model,
-            sel_source=_REFORMAT_SEL_SOURCE,
-            timeout=_REFORMAT_TIMEOUT_SECS,
-            max_output_bytes=_REFORMAT_MAX_OUTPUT_BYTES,
-            retry_rejected_model=False,
-        )
-        return redact(text)
-
-    return reformat

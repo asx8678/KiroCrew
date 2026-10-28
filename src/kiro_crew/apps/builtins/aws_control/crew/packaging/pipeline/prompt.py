@@ -1,9 +1,8 @@
 """The persona behind a ``file://`` prompt reference, resolved, fenced and read as one pinned read.
 
-Ported from ``crew_export/spec.py`` and the reader guard in ``serving/smc/bundle.py``
-(``validate_prompt``). The UNC and redirect screens run before any resolution, the
-sensitive-path fences run on the one resolution, and the bytes are authorised against the
-directory those checks pinned, so nothing is re-resolved between a verdict and the read.
+The UNC and redirect screens run before any resolution, the sensitive-path fences run on
+the one resolution, and the bytes are authorised against the directory those checks
+pinned, so nothing is re-resolved between a verdict and the read.
 """
 
 from __future__ import annotations
@@ -81,7 +80,7 @@ def _resolve_prompt_path(raw: str, agents_dir: Path, *, resolved_root: Path | No
     # touch hands over an NTLM exchange.
     #
     # The gate is IMPORTED rather than restated. This repo already owns the rule, and a
-    # second spelling of it is the mistake this branch has now paid for seven times. The
+    # second spelling of it drifts from the first. The
     # trusted-root allowance comes along with it, so a persona that legitimately lives on
     # a share the operator configured still resolves.
     #
@@ -125,10 +124,10 @@ def _resolve_prompt_path(raw: str, agents_dir: Path, *, resolved_root: Path | No
         # the same host was not covered by it and the probe happened before any fence ran.
         #
         # Second, resolve() COLLAPSES the links, so a check placed after it inspects the
-        # targets and cannot see that a link was ever there. An implementation of
-        # this branch walked the components of the resolved path looking for reparse points
-        # and could never have found one; it passed its own tests only because those called
-        # it directly with an unresolved path, which is not what this call site hands it.
+        # targets and cannot see that a link was ever there. Walking the components of the
+        # resolved path for reparse points can never find one; a test that calls such a walk
+        # directly with an unresolved path passes anyway, which is not what this call site
+        # hands it.
         _pinned._refuse_redirects_in_chain(agents_dir, target)
         try:
             path = (agents_dir / target).resolve()
@@ -226,13 +225,13 @@ def _resolve_prompt_path(raw: str, agents_dir: Path, *, resolved_root: Path | No
                     f"without following it, which is the thing this check exists to avoid. "
                     f"Copy the persona next to the agent spec."
                 )
-    # ONE resolution, and every check below runs on its result. An earlier version
-    # resolved the target for the credential fences but left this pseudo-filesystem
-    # loop testing the path as written, so a symlink to /proc/self/environ passed
-    # all three: the link is not under /proc, and /proc is not a credential
-    # location. The read then followed the link and inlined the deploy process's
-    # environment into the shipped prompt, where scan_text catches only
-    # credential-SHAPED text and a secret in another format survives.
+    # ONE resolution, and every check below runs on its result. Resolving the target
+    # for the credential fences while this pseudo-filesystem loop tests the path as
+    # written lets a symlink to /proc/self/environ pass all three: the link is not
+    # under /proc, and /proc is not a credential location. The read then follows the
+    # link and inlines the deploy process's environment into the shipped prompt,
+    # where scan_text catches only credential-SHAPED text and a secret in another
+    # format survives.
     #
     # Containment under agents_dir is deliberately NOT required: an absolute
     # persona path outside that directory is a supported case with its own test.
@@ -270,12 +269,9 @@ def _resolve_prompt_path(raw: str, agents_dir: Path, *, resolved_root: Path | No
                 f"environment."
             )
     # The repo's own fence, when this module can reach it. The local predicates
-    # below are a deliberate self-contained subset, and three review passes in a
-    # row found one more thing that subset does not name (a kubeconfig, then a
-    # symlink, then a git credential store). A denylist needing a new entry per
-    # review pass is the wrong shape here, so prefer the shared implementation
-    # and keep the local pair as the fallback that preserves this module's ability
-    # to run without kiro_crew importable.
+    # are a self-contained subset that does not name every sensitive shape (a
+    # kubeconfig, a symlink, a git credential store), so the shared
+    # implementation is the one that decides.
     try:
         from kiro_crew.security import is_sensitive_path
 
@@ -283,12 +279,9 @@ def _resolve_prompt_path(raw: str, agents_dir: Path, *, resolved_root: Path | No
     except Exception:
         _shared_fence = None
     # FAIL CLOSED when the shared fence is unreachable, rather than continuing on the local
-    # subset. The fallback was written to preserve this module's ability to run without
-    # ``kiro_crew`` importable, and that intent is fine -- but the thing it falls back to is
-    # a denylist that three consecutive review passes each found one more hole in (a
-    # kubeconfig, a symlink, a git credential store). Continuing on it means an environment
-    # where the import fails is an environment where ``file://~/.git-credentials`` is read
-    # and bundled, and nothing in the output says the weaker check was the one that ran.
+    # subset. That subset misses sensitive shapes the shared fence covers, so continuing on
+    # it would let an environment where the import fails read and bundle
+    # ``file://~/.git-credentials``, with nothing in the output saying the weaker check ran.
     #
     # An EXTERNAL prompt reference is the only thing this gates, so the refusal costs a
     # feature that reaches outside the crew directory, not the ordinary case. A crew whose
@@ -297,10 +290,8 @@ def _resolve_prompt_path(raw: str, agents_dir: Path, *, resolved_root: Path | No
         raise ExportRefused(
             f"cannot check whether prompt URI {raw!r} points at sensitive material: this "
             f"repository's own path fence (kiro_crew.security.is_sensitive_path) is not "
-            f"importable here. The local checks below are a deliberate subset and have "
-            f"been found short three times, so an external prompt reference is refused "
-            f"rather than judged by them. Inline the prompt, or run where kiro_crew "
-            f"is importable."
+            f"importable here, so an external prompt reference is refused. Inline the "
+            f"prompt, or run where kiro_crew is importable."
         )
     if _shared_fence(posix):
         raise ExportRefused(

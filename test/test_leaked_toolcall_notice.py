@@ -29,6 +29,8 @@ from __future__ import annotations
 import pathlib
 import re
 
+import pytest
+
 from kiro_crew.acp.types import STOP_REASON_CANCELLED, STOP_REASON_END_TURN
 from kiro_crew.dashboard.chat_utils import (
     has_leaked_tool_call,
@@ -442,7 +444,11 @@ class TestTheNoticeDoesNotStarveARecovery:
     CALL = "should_notice_compaction_dropped_leak("
 
     def _call_line(self) -> str:
-        for line in self.RUNNER.read_text(encoding="utf-8").splitlines():
+        for line in "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [*sorted(self.RUNNER.with_name("chat_turn").glob("*.py")), self.RUNNER]
+            if turn_file.name != "__init__.py"
+        ).splitlines():
             if self.CALL in line:
                 return line
         raise AssertionError("the runner never calls the dropped-leak predicate")
@@ -458,13 +464,21 @@ class TestTheNoticeDoesNotStarveARecovery:
 
     def test_both_recovery_arms_still_have_their_own_conditions(self):
         """The premise: those two arms are recoveries this card could shadow."""
-        source = self.RUNNER.read_text(encoding="utf-8")
+        source = "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [*sorted(self.RUNNER.with_name("chat_turn").glob("*.py")), self.RUNNER]
+            if turn_file.name != "__init__.py"
+        )
         assert "should_recover_promise_only(" in source
         assert "_queue_recovery(" in source
 
     def test_the_card_sets_no_flag_a_recovery_reads(self):
         """`_noticed_leak` suppresses recovery arms, so this card must not set it."""
-        lines = self.RUNNER.read_text(encoding="utf-8").splitlines()
+        lines = "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [*sorted(self.RUNNER.with_name("chat_turn").glob("*.py")), self.RUNNER]
+            if turn_file.name != "__init__.py"
+        ).splitlines()
         start = next(i for i, ln in enumerate(lines) if self.CALL in ln)
         # The card's own block: from its call to the end of its slot.append.
         window = "\n".join(lines[start : start + 40])
@@ -494,7 +508,8 @@ class TestTheBoundaryScanRunsBeforeTheReset:
 
     RUNNER = pathlib.Path(__file__).resolve().parents[1] / "src/kiro_crew/dashboard/chat_runner.py"
     GUARD = re.compile(r"^\s*if not event\.synthesized:")
-    RESET = re.compile(r'^\s*assistant_text = ""\s*$')
+    # ``_cleared_segment_text(slot)`` is the reset that also drops the raw copy.
+    RESET = re.compile(r'^\s*(?:turn\.)?assistant_text = (?:""|_cleared_segment_text\(slot\))\s*$')
     SCAN = "has_leaked_tool_call("
     FLAG = "_compaction_dropped_leak"
     # The assignment must ACCUMULATE. A turn can cross more than one boundary,
@@ -504,7 +519,11 @@ class TestTheBoundaryScanRunsBeforeTheReset:
     ACCUMULATE = re.compile(r"_compaction_dropped_leak\s*=\s*_compaction_dropped_leak\s+or\b")
 
     def _lines(self) -> list[str]:
-        return self.RUNNER.read_text(encoding="utf-8").splitlines()
+        return "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [*sorted(self.RUNNER.with_name("chat_turn").glob("*.py")), self.RUNNER]
+            if turn_file.name != "__init__.py"
+        ).splitlines()
 
     def _boundary(self, lines: list[str]) -> int:
         sites = [i for i, line in enumerate(lines) if self.GUARD.match(line)]
@@ -544,9 +563,101 @@ class TestTheBoundaryScanRunsBeforeTheReset:
             "they saw. Keep `= _compaction_dropped_leak or ...`."
         )
 
+    @staticmethod
+    def _bare_text_resets(source: str) -> list[int]:
+        """Lines in the turn's code that empty ``assistant_text`` and keep its raw copy.
+
+        The turn's code is ``_run_chat`` and every function that takes its turn as
+        the first argument: the owner functions cut from its one-module body. A bare
+        ``assistant_text = ""`` is allowed in two places only: the
+        initialiser (the first binding in the turn's opening, ``_turn_open``, or in
+        ``_run_chat`` itself) and the statement
+        directly after a ``_flush_segment(...)`` call, whose
+        ``_redact_segment`` consumes and clears the raw copy. Every other
+        reset goes through ``_cleared_segment_text``, so the raw copy never
+        outlives the text it mirrors. AST-based, so it reads the same on
+        every OS.
+        """
+        import ast
+
+        units = [
+            n
+            for n in ast.walk(ast.parse(source))
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and (n.name == "_run_chat" or (n.args.args and n.args.args[0].arg == "turn"))
+        ]
+        opening = next(
+            (n for n in units if n.name == "_turn_open"),
+            next(n for n in units if n.name == "_run_chat"),
+        )
+
+        def is_the_reply_text(target: ast.expr) -> bool:
+            # The reply text is a local of `_run_chat`, or the turn object's attribute.
+            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                return target.value.id == "turn" and target.attr == "assistant_text"
+            return isinstance(target, ast.Name) and target.id == "assistant_text"
+
+        def is_bare_reset(stmt: ast.stmt) -> bool:
+            return (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and is_the_reply_text(stmt.targets[0])
+                and isinstance(stmt.value, ast.Constant)
+                and stmt.value.value == ""
+            )
+
+        def is_flush(stmt: ast.stmt) -> bool:
+            return (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Name)
+                and stmt.value.func.id == "_flush_segment"
+            )
+
+        resets: set[tuple[int, bool]] = set()
+        for node in (node for unit in units for node in ast.walk(unit)):
+            for field in ("body", "orelse", "finalbody"):
+                stmts = getattr(node, field, None)
+                if not isinstance(stmts, list):
+                    continue
+                for i, stmt in enumerate(stmts):
+                    if isinstance(stmt, ast.stmt) and is_bare_reset(stmt):
+                        resets.add((stmt.lineno, i > 0 and is_flush(stmts[i - 1])))
+        opened = sorted(
+            line for line, _ in resets if opening.lineno <= line <= (opening.end_lineno or 0)
+        )
+        assert opened, "_run_chat has no assistant_text initialiser"
+        initialiser = opened[0]
+        return sorted(
+            line for line, after_flush in resets if line != initialiser and not after_flush
+        )
+
+    def test_every_mid_segment_text_reset_clears_the_raw_copy(self):
+        """No path in ``_run_chat`` empties the streamed text and leaves the raw
+        copy behind, except right after a flush that consumed it. Each such
+        site's own ordering is out of this class's scope; this pins only that
+        none of them bypasses the helper."""
+        source = "\n".join(self._lines())
+        assert self._bare_text_resets(source) == []
+        # The post-flush resets the sweep allows exist, so it is not vacuous.
+        assert (
+            len(re.findall(r"_flush_segment\(state, slot, (?:turn\.)?assistant_text", source)) >= 3
+        )
+        # Mutation pin: a bare reset in place of the helper turns the sweep red.
+        anchor = "        turn.assistant_text = _cleared_segment_text(slot)"
+        if anchor not in source:
+            anchor = "        assistant_text = _cleared_segment_text(slot)"
+        assert anchor in source
+        mutated = source.replace(anchor, anchor.replace("_cleared_segment_text(slot)", '""'), 1)
+        assert len(self._bare_text_resets(mutated)) == 1
+
     def test_the_recorded_fact_reaches_the_turn_end_predicate(self):
         """The flag is useless unless the notice arm actually reads it."""
-        source = self.RUNNER.read_text(encoding="utf-8")
+        source = "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [*sorted(self.RUNNER.with_name("chat_turn").glob("*.py")), self.RUNNER]
+            if turn_file.name != "__init__.py"
+        )
         assert "should_notice_compaction_dropped_leak(" in source, (
             "the runner records the dropped leak but never consults the predicate "
             "that would surface it"
@@ -555,3 +666,67 @@ class TestTheBoundaryScanRunsBeforeTheReset:
             "the notice arm does not receive the boundary's recorded fact, so the "
             "card can never fire"
         )
+
+
+def _card_texts(record) -> list[str]:
+    """The notice cards a turn posted that describe a leaked tool call."""
+    return [
+        str(row.get("content", ""))
+        for row in record.window
+        if row.get("role") == "notice" and "tool call" in str(row.get("content", ""))
+    ]
+
+
+async def _leak_turn(*, calls_before: int) -> list[str]:
+    from turn_harness import TurnScript, run_turn
+
+    from kiro_crew.acp.types import (
+        EVENT_COMPLETE,
+        EVENT_TEXT_CHUNK,
+        EVENT_TOOL_CALL,
+        EVENT_TOOL_RESULT,
+        AcpEvent,
+    )
+
+    events: list = []
+    for i in range(calls_before):
+        events += [
+            AcpEvent(kind=EVENT_TOOL_CALL, tool_call_id=f"t{i}", title="fs_read", tool_kind="read"),
+            AcpEvent(
+                kind=EVENT_TOOL_RESULT, tool_call_id=f"t{i}", tool_output="ok", tool_final=True
+            ),
+        ]
+    events += [
+        AcpEvent(kind=EVENT_TEXT_CHUNK, text=_LEAK),
+        AcpEvent(kind=EVENT_COMPLETE, stop_reason=_END),
+    ]
+    return _card_texts(await run_turn(TurnScript(events=events)))
+
+
+class TestTheCardsGiveRecoveryAdviceThatWorks:
+    """The two turn-end cards, read off a real dashboard turn.
+
+    A leaked call stays in the chat's own context, so on a re-send the model
+    tends to write the same plain-text call again. A card that promises a
+    re-send retries it sends the reader round the same loop; both cards must
+    instead say that nothing (or the last call) ran because the model wrote the
+    call as text, and point at a new chat or a compaction if it repeats.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_zero_call_card_says_nothing_ran_and_names_the_recovery(self):
+        (card,) = await _leak_turn(calls_before=0)
+        assert "as plain text" in card
+        assert "nothing was run" in card
+        assert "to retry" not in card
+        assert "start a new chat" in card and "compact" in card
+
+    @pytest.mark.asyncio
+    async def test_the_mixed_turn_card_says_earlier_calls_may_have_landed(self):
+        (card,) = await _leak_turn(calls_before=2)
+        assert "as plain text" in card
+        assert "the 2 call(s) before it were attempted" in card
+        assert "may already have taken effect" in card
+        assert "nothing was run" not in card
+        assert "to retry" not in card
+        assert "start a new chat" in card and "compact" in card

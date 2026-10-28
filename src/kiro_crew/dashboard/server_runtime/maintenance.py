@@ -1,8 +1,8 @@
 """The tracked background maintenance both entrypoints start once the listener serves.
 
 The warm-mint scavenge and its cleanup, the local decision model, the session search
-indexer, the knowledge orphan reclaim, and the own-address read for the ssh self-target
-floor.
+indexer, the knowledge orphan reclaim, the data home's owner-only mode repair, the
+pinned-session order load, and the own-address read for the ssh self-target floor.
 """
 
 from __future__ import annotations
@@ -16,7 +16,11 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.server import (
         _OWN_HOST_WARM_TASKS,
         DashboardState,
+        chat,
+        data_home,
         logger,
+        shutdown_event,
+        tighten_data_home,
         warm_own_host_names,
     )
 
@@ -99,21 +103,58 @@ def _kick_local_decision_model(state: DashboardState) -> None:
     task.add_done_callback(state._background_tasks.discard)
 
 
-def _kick_cleanup_loop(state: DashboardState) -> None:
-    """Start the session cleanup loop at gateway boot, not at the first session.
+def _kick_display_verdicts(state: DashboardState) -> None:
+    """Turn on the stored display-redaction verdicts, post-bind, off the loop.
 
-    The loop's sandbox-artifact pass reclaims the runtime-tmpfs mount sources
-    whose exhaustion makes spawning an agent impossible, and before this it
-    started only when a NEW session registered: an idle or headless gateway
-    (no chat, no subagent, no cron run after boot) never swept while its
-    background runtime and MCP respawns kept staging entries, and a host whose
-    tmpfs was ALREADY exhausted could not create the session that would have
-    started the janitor -- a self-locking failure the boot pass exists to
-    break. ``start_cleanup`` is idempotent, so a session registering later
-    finds the loop already running and still gets its one-loop guarantee.
+    ``display_verdicts.enable`` loads the token-signing subkey, computes the
+    rules version (hashing the rule source files) and sweeps orphaned
+    sidecars, so it runs on a worker thread after the listener is serving.
+    Until it returns, renders use the per-process cache exactly as before.
     """
-    if state.sessions is not None:
-        state.sessions._ensure_cleanup_task()
+
+    def _enable_in_thread() -> None:
+        from kiro_crew.dashboard import display_verdicts
+
+        display_verdicts.enable(data_home())
+
+    async def _display_verdicts_enable() -> None:
+        try:
+            await asyncio.to_thread(_enable_in_thread)
+        except Exception:  # noqa: BLE001 -- verdicts are an optimisation only
+            logger.warning("display verdicts could not be enabled", exc_info=True)
+
+    task = asyncio.create_task(_display_verdicts_enable())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
+def _kick_owner_only_sweep(state: DashboardState) -> None:
+    """Repair the data home's file modes as a tracked background task, post-bind.
+
+    ``tighten_data_home`` walks the data home's session, log and memory stores, so
+    its cost grows with the user's history, and on a healthy install it finds
+    nothing to change: it must not sit between process start and the socket
+    accepting requests (``no-new-work-on-gateway-boot-path``, items 3 and 4). Both
+    gateway entrypoints call this only after ``_start_site`` has returned, and the
+    walk runs on a worker thread. Nothing waits for it: what the services create is
+    owner-only from creation, and the sweep changes modes without opening a file,
+    so it releases no lock a store's connection holds. ``shutdown_event`` ends the
+    walk at its next entry, so a stopping gateway does not wait out the sweep's
+    budget in the executor.
+    """
+
+    def _sweep_in_thread() -> None:
+        tighten_data_home(data_home(), should_stop=shutdown_event.is_set)
+
+    async def _owner_only_sweep() -> None:
+        try:
+            await asyncio.to_thread(_sweep_in_thread)
+        except Exception:  # noqa: BLE001 -- a permission repair never fails the gateway
+            logger.warning("owner-only sweep of the data home failed", exc_info=True)
+
+    task = asyncio.create_task(_owner_only_sweep())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
 
 
 def _kick_session_search_index(state: DashboardState) -> None:
@@ -185,6 +226,22 @@ def _kick_session_search_index(state: DashboardState) -> None:
                 "search falls back to scanning the transcripts"
             )
 
+    def _warm_search() -> None:
+        """Pay the first search's query-independent cost before a user does.
+
+        Runs once the index schema is current, off the loop and after readiness,
+        so a cold gateway's first searches do not each start from an unread
+        session list and an unopened index. Best effort: a failure only means
+        the first search pays that cost itself.
+        """
+        log = state.conversation_log
+        if log is None:
+            return
+        try:
+            log.warm_search()
+        except Exception:  # noqa: BLE001 — a warm-up must never stop indexing
+            logger.warning("Session search warm-up failed", exc_info=True)
+
     async def _session_index_supervisor() -> None:
         log = state.conversation_log
         if log is None:
@@ -210,6 +267,7 @@ def _kick_session_search_index(state: DashboardState) -> None:
             # improve by retrying, such as a transcript directory that is not
             # there, sets ``gave_up`` inside ``start`` and so exits immediately.
             await asyncio.to_thread(supervisor.start)
+            await asyncio.to_thread(_warm_search)
             while not supervisor.gave_up:
                 wait_secs = await asyncio.to_thread(supervisor.poll)
                 await asyncio.sleep(wait_secs)
@@ -271,6 +329,17 @@ def _kick_knowledge_orphan_reclaim(state: DashboardState) -> None:
         store = state._knowledge_store
         if store is None:
             return
+        # The one-time rebuilds below read the whole library through SQLite's
+        # B-tree, a random read per page on a cold cache. When one is pending
+        # (the first start after an upgrade), read the file in order first so
+        # they and the first search run from memory. A no-op afterwards.
+        try:
+            if store.has_pending_one_time_work():
+                from kiro_crew.page_cache import read_now
+
+                read_now((getattr(store, "_db_path", None),))
+        except Exception:  # noqa: BLE001 -- a hint only
+            logger.debug("Knowledge page prefetch skipped", exc_info=True)
         with store.maintenance_window() as quiescent:
             # The one-time builds first. Both take SQLite's writer lock for an
             # O(data) pass (the mentions index alone measured 9.2 s on a cold
@@ -279,6 +348,12 @@ def _kick_knowledge_orphan_reclaim(state: DashboardState) -> None:
             if quiescent:
                 _one_time_builds(store)
                 store.reclaim_orphans()
+                # Same drained window: an interrupted agent-document ingest can
+                # leave committed items that no agent_item_state row names, and
+                # nothing on that path reaps them (see
+                # KnowledgeStore.reclaim_agent_source_residue). Running it here
+                # means it only ever sees fully-settled ingests.
+                store.reclaim_agent_source_residue()
         if not quiescent:
             # The store never drained. A window that did not drain yields while
             # still holding the gate's condition lock, and ingestion releases
@@ -315,6 +390,42 @@ def _kick_knowledge_orphan_reclaim(state: DashboardState) -> None:
     task.add_done_callback(state._background_tasks.discard)
 
 
+def _kick_otel_crew_log_subscriber(state: DashboardState) -> None:
+    """Install the OTel usage export's crew-log subscription post-bind, off the loop.
+
+    ``install_otel_crew_log_subscriber`` reads telemetry consent through
+    ``get_recorder()``, and on an opted-in host the first ``get_recorder()`` builds
+    the recorder synchronously: it imports the OTel SDK (about 57 ms) and writes the
+    install id. Called inline between the bind and the ``KIROCREW_READY`` publish, that
+    import and file write sit on the one ordered path the listener's readiness waits on
+    (``no-new-work-on-gateway-boot-path``). So the install runs on a worker thread,
+    the same shape as the ``_kick_*`` calls above it, and nothing is awaited in front
+    of the publish.
+
+    A no-op for an unopted host (``telemetry.enabled`` off, the default): the consent
+    read returns, the thread finds nothing to subscribe, and the task ends. The bus
+    subscription the install registers is a process-global write guarded by the bus's
+    own lock, not loop-bound, so it is safe off the loop; a fold delivered before the
+    subscription lands is simply not exported, which is the baseline the exporter
+    already treats as its floor.
+    """
+
+    def _install_in_thread() -> None:
+        from kiro_crew.metrics.crew_log_export import install_otel_crew_log_subscriber
+
+        install_otel_crew_log_subscriber()
+
+    async def _otel_crew_log_install() -> None:
+        try:
+            await asyncio.to_thread(_install_in_thread)
+        except Exception:  # noqa: BLE001 -- telemetry must never take the gateway down
+            logger.warning("OTel crew-log subscriber install failed", exc_info=True)
+
+    task = asyncio.create_task(_otel_crew_log_install())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
 def _register_own_host_warm(app: web.Application) -> None:
     """Start reading this machine's own addresses at boot, without waiting on it.
 
@@ -344,3 +455,15 @@ def _own_host_warm_done(task: "asyncio.Future[None]") -> None:
     exc = task.exception()
     if exc is not None:
         logger.warning("own-address read failed at startup", exc_info=exc)
+
+
+def _kick_pinned_order_load(state: DashboardState) -> None:
+    """Read the pinned-session order after the bind, as a tracked background task.
+
+    Off the boot path (``no-new-work-on-gateway-boot-path``): the file is
+    read after the listener accepts requests, and every writer reads it first
+    if it has not landed (``chat_folders.ensure_pinned_order_loaded``).
+    """
+    task = asyncio.create_task(chat.load_pinned_order_after_listen(state))
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)

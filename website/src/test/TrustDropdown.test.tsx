@@ -4,6 +4,7 @@ vi.mock("@radix-ui/react-dropdown-menu", async () => await import("./__mocks__/@
 
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 import TrustDropdown from '../components/TrustDropdown'
+import { fmtTime } from '../i18n/format'
 // `/all` for the ja/ko/de/zh-CN catalogs: `../i18n` registers English only.
 import { i18next } from '../i18n/all'
 
@@ -70,15 +71,32 @@ describe('TrustDropdown', () => {
     expect(onAction).toHaveBeenCalledWith('trust_command', cmd)
   })
 
+  // A command ending in a straight quote must appear ONCE, with no catalog
+  // delimiter doubling it — the same character the catalog used to open/close
+  // the operand (issue #12371).
+  it('renders a command ending in a quote with no catalog-quote doubling', () => {
+    const cmd = 'grep -r "two  spaces" /path --include="*.tsx"'
+    render(<TrustDropdown fullCommand={cmd} baseCommand="grep" isShell className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    const commandItem = screen.getAllByRole('menuitem')[0]
+    // The command appears verbatim exactly once in the label text.
+    const text = commandItem.textContent ?? ''
+    const occurrences = text.split(cmd).length - 1
+    expect(occurrences).toBe(1)
+    // The text ends with the command verbatim — no catalog delimiter was
+    // appended after the command's own closing quote.
+    expect(text.endsWith(cmd)).toBe(true)
+  })
+
   // Each locale orders the sentence around the operand differently — Japanese
   // puts it first, German suffixes the base with a hyphen. A fragment pair can
   // only express the English order, so what these pin is that the operand is
   // interpolated INTO the sentence and still renders monospaced.
   it.each([
-    ['ja', '「ls /tmp」を信頼', 'ls コマンドをすべて信頼'],
-    ['ko', '‘ls /tmp’ 신뢰', 'ls 명령 모두 신뢰'],
-    ['de', '„ls /tmp“ vertrauen', 'Allen ls-Befehlen vertrauen'],
-    ['zh-CN', '信任“ls /tmp”', '信任所有 ls 命令'],
+    ['ja', 'ls /tmpを信頼', 'ls コマンドをすべて信頼'],
+    ['ko', 'ls /tmp 신뢰', 'ls 명령 모두 신뢰'],
+    ['de', 'ls /tmp vertrauen', 'Allen ls-Befehlen vertrauen'],
+    ['zh-CN', '信任ls /tmp', '信任所有 ls 命令'],
   ])('places the command inside a whole translated message in %s', async (lng, cmdText, baseText) => {
     await i18next.changeLanguage(lng)
     render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell className={btnClass} onAction={() => {}} />)
@@ -231,7 +249,8 @@ describe('TrustDropdown', () => {
     // The row's accessible name is its own text content, so the full command
     // reaches a screen reader with no `aria-label` duplicating the visible
     // label -- a duplicate is what drifts out of sync and breaks "label in
-    // name" (WCAG 2.5.3).
+    // name" (WCAG 2.5.3). The chip's background boundary is visual-only;
+    // the accessible boundary is the verbatim command text inside the name.
     it('carries the whole command in the row accessible name', () => {
       const [exact] = openWith(overBudget)
       // Matched with a predicate, not an exact string: the accessible-name
@@ -419,5 +438,92 @@ describe('TrustDropdown positioning', () => {
     const menu = screen.getByText('Trust all tools for this session').closest('div[class*="absolute"]')
     expect(menu).toBeInTheDocument()
     expect(menu?.className).toContain('bottom-full')
+  })
+})
+
+describe('TrustDropdown timed grants', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  const rowTexts = () => screen.getAllByRole('menuitem').map(b => b.textContent ?? '')
+
+  it('renders no timed rows unless the surface opts in', () => {
+    render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    const texts = rowTexts()
+    expect(texts.some(t => t.includes('for an hour'))).toBe(false)
+    expect(texts.some(t => t.includes('until midnight'))).toBe(false)
+  })
+
+  it('names the lifetime on every command and family row', () => {
+    render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell timedGrants className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    // Each timed row names the clock time its grant ends.
+    expect(rowTexts()).toEqual([
+      'Trust ls /tmp for this session',
+      expect.stringMatching(/^Trust ls \/tmp for an hour \(until \d.*\)$/),
+      expect.stringMatching(/^Trust ls \/tmp until midnight \(\d.*\)$/),
+      'Trust any ls command for this session',
+      expect.stringMatching(/^Trust any ls command for an hour \(until \d.*\)$/),
+      expect.stringMatching(/^Trust any ls command until midnight \(\d.*\)$/),
+      'Trust all tools for this session',
+    ])
+  })
+
+  it('wraps the family rows rather than clipping the lifetime off their end', () => {
+    render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell timedGrants className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    const family = screen.getAllByRole('menuitem').filter(b => /^Trust any ls command/.test(b.textContent ?? ''))
+    expect(family).toHaveLength(3)
+    for (const row of family) expect(row.querySelector('span')?.className).not.toContain('truncate')
+  })
+
+  it('keeps the unqualified labels where the surface offers no timed rows', () => {
+    render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    expect(rowTexts().slice(0, 2)).toEqual(['Trust ls /tmp', 'Trust all ls commands'])
+  })
+
+  it('sends an hour as ttlSeconds on the timed command row', () => {
+    const onAction = vi.fn()
+    render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell timedGrants className={btnClass} onAction={onAction} />)
+    fireEvent.click(screen.getByText('Trust'))
+    fireEvent.click(screen.getAllByRole('menuitem').find(b => b.textContent?.startsWith('Trust ls /tmp for an hour'))!)
+    expect(onAction).toHaveBeenCalledWith('trust_command', 'ls /tmp', 3600)
+  })
+
+  it('names the end time the click would grant on each timed row', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 0, 15, 22, 30, 0))
+    render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell timedGrants className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    const hour = fmtTime(new Date(2026, 0, 15, 23, 30, 0))
+    const midnight = fmtTime(new Date(2026, 0, 16, 0, 0, 0))
+    expect(rowTexts()).toContain(`Trust ls /tmp for an hour (until ${hour})`)
+    expect(rowTexts()).toContain(`Trust any ls command until midnight (${midnight})`)
+  })
+
+  it('sends the seconds left until local midnight on the rest-of-today family row', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 0, 15, 22, 30, 0))
+    const onAction = vi.fn()
+    render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell timedGrants className={btnClass} onAction={onAction} />)
+    fireEvent.click(screen.getByText('Trust'))
+    const row = screen.getAllByRole('menuitem').find(b => b.textContent?.startsWith('Trust any ls command until midnight'))!
+    fireEvent.click(row)
+    expect(onAction).toHaveBeenCalledWith('trust_base', 'ls *', 90 * 60)
+  })
+
+  it('keeps the chat-long rows sending no lifetime', () => {
+    const onAction = vi.fn()
+    render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell timedGrants className={btnClass} onAction={onAction} />)
+    fireEvent.click(screen.getByText('Trust'))
+    fireEvent.click(screen.getAllByRole('menuitem').find(b => b.textContent === 'Trust ls /tmp for this session')!)
+    expect(onAction).toHaveBeenCalledWith('trust_command', 'ls /tmp')
+  })
+
+  it('offers no timed row for the session-wide tier', () => {
+    render(<TrustDropdown fullCommand="" baseCommand="" isShell={false} hasCommand={false} timedGrants trustReadsLabelKey="components.chatInput.trust_reads" className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    expect(rowTexts().some(t => t.includes('hour') || t.includes('midnight'))).toBe(false)
   })
 })

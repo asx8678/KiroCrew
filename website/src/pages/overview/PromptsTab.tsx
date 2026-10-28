@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { ScrollText, Pencil, Trash2, MessageSquare } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { bestFilterMatch } from '../../utils/filterSelection'
 import { useAppDispatch, useAppSelector } from '../../store'
 import { setPendingInput, switchSlot } from '../../store/chatSlice'
 import { api, ApiError } from '../../api/client'
@@ -13,6 +14,7 @@ import ErrorNotice from '../../components/ErrorNotice'
 import ListDetailBack from '../../components/ListDetailBack'
 import { useSidePanelLeaveGuard } from '../../components/SidePanelLayout'
 import { parseErrorCode, findReport, type ErrorReport } from '../../utils/errorReport'
+import { isUntitledSession, sessionDisplayTitle } from '../../utils/sessionDisplayTitle'
 import { useListDetailView } from '../../hooks/useListDetailView'
 import { useProvider } from '../../providers'
 
@@ -60,12 +62,21 @@ function SlotPicker({ prompt, onClose }: { prompt: Prompt; onClose: () => void }
     <div ref={ref} className="absolute right-0 top-full mt-1 z-50 bg-bg-elevated border border-border rounded-lg shadow-lg min-w-[220px] max-h-[240px] overflow-y-auto py-1 animate-slide-in-left">
       <div className="px-3 py-1.5 text-[11px] text-muted uppercase tracking-wider font-semibold">{i18nT('pages.overview.promptsTab.send_to')}</div>
       <div role="button" tabIndex={0} className="px-2 py-1 mx-1 rounded-md cursor-pointer text-[13px] text-accent font-medium hover:bg-bg-hover transition-colors" onClick={() => send()} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); send() } }}>{i18nT('pages.overview.promptsTab.new_chat')}</div>
-      {slots.map(s => (
-        <div key={s.key} role="button" tabIndex={0} className="px-2 py-1.5 mx-1 rounded-md cursor-pointer text-[13px] hover:bg-bg-hover transition-colors flex items-center gap-2" onClick={() => send(s.key)} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); send(s.key) } }}>
-          {s.running && <span className="w-1.5 h-1.5 rounded-full bg-ok shrink-0" />}
-          <span className="truncate">{s.title && s.title !== s.key ? s.title : s.agent || s.key}</span>
-        </div>
-      ))}
+      {slots.map(s => {
+        // Two untitled sessions can show the same row text, so the key that
+        // tells them apart leads a muted second line, and the hover repeats it.
+        const untitled = isUntitledSession(s)
+        const shown = untitled ? s.agent || sessionDisplayTitle(s) : s.title
+        return (
+          <div key={s.key} role="button" tabIndex={0} title={untitled ? `${shown} · ${s.key}` : shown} className="px-2 py-1.5 mx-1 rounded-md cursor-pointer text-[13px] hover:bg-bg-hover transition-colors flex items-center gap-2" onClick={() => send(s.key)} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); send(s.key) } }}>
+            {s.running && <span className="w-1.5 h-1.5 rounded-full bg-ok shrink-0" />}
+            <div className="flex-1 min-w-0">
+              <div className="truncate">{shown}</div>
+              {untitled && <div data-testid="slot-key-hint" className="text-[11px] text-muted font-mono mt-0.5 truncate">{s.key}</div>}
+            </div>
+          </div>
+        )
+      })}
       {slots.length === 0 && <div className="px-3 py-1.5 text-[12px] text-muted italic">{i18nT('pages.overview.promptsTab.no_active_chats')}</div>}
     </div>
   )
@@ -186,6 +197,8 @@ export default function PromptsTab() {
 
   const promptKey = (p: Prompt) => `${p.source}:${p.package}/${p.name}`
   const pendingRef = useRef('')
+  // True once the user opened a row; the auto-pick below leaves that row alone.
+  const userPickedRef = useRef(false)
   // Which prompt a save was started for, and which is selected right now. Refs
   // rather than state because a mutation callback closes over the render that
   // fired it and would otherwise compare against a stale selection.
@@ -393,6 +406,7 @@ export default function PromptsTab() {
     // hash beneath the old text, and the next Save would present a base it was
     // not written against, silently overwriting the very edit that conflicted.
     if (key === selectedKey) {
+      userPickedRef.current = true
       openDetail()
       if (!detailEditing && (readOnlyReason === 'failed' || conflictRef.current)) void load(p)
       return
@@ -407,6 +421,7 @@ export default function PromptsTab() {
     setEditForm(EMPTY_FORM)
     setMutationError('')
     setPickerOpen(false)
+    userPickedRef.current = true
     setSelectedKey(key)
     openDetail()
     void load(p)
@@ -415,15 +430,20 @@ export default function PromptsTab() {
   // Keep a desktop detail pane populated: with both panes always on screen, an
   // empty right-hand side on first paint reads as a broken tab. Skipped while
   // editing so a re-render cannot yank the pane out from under a draft.
+  // A prompt the user opened stays open while the filter still shows it; one
+  // this effect opened by itself moves to the best match for what was typed.
   useEffect(() => {
     if (detailEditing) return
     if (allFiltered.length === 0) { if (selectedKey !== null) setSelectedKey(null); return }
-    if (!selectedKey || !allFiltered.some(p => promptKey(p) === selectedKey)) {
-      const first = allFiltered[0]
-      setSelectedKey(promptKey(first))
-      void load(first)
+    const visible = !!selectedKey && allFiltered.some(p => promptKey(p) === selectedKey)
+    if (visible && (userPickedRef.current || !filter.trim())) return
+    const best = bestFilterMatch(allFiltered, filter, p => [p.name, p.fullName])
+    if (best && promptKey(best) !== selectedKey) {
+      userPickedRef.current = false
+      setSelectedKey(promptKey(best))
+      void load(best)
     }
-  }, [allFiltered, selectedKey, detailEditing, load])
+  }, [allFiltered, selectedKey, detailEditing, load, filter])
 
   const renderRow = (p: Prompt) => {
     const pk = promptKey(p)
@@ -513,7 +533,7 @@ export default function PromptsTab() {
         /* List-detail: prompt list on the left, the selected prompt's content
          *  (or its editor) on the right — the shape SkillsTab uses. */
         <div className={PANE_SHELL_CLASS}>
-          {showList && <div className={`${isMobile ? 'w-full' : 'w-[240px]'} shrink-0 overflow-y-auto scrollbar-overlay border border-border rounded-md p-2`} role="listbox" aria-label={i18nT('pages.overview.promptsTab.prompts')}>
+          {showList && <div className={`${isMobile ? 'w-full' : 'w-[240px]'} shrink-0 overflow-y-auto border border-border rounded-md p-2`} role="listbox" aria-label={i18nT('pages.overview.promptsTab.prompts')}>
             {filteredUser.length > 0 && (
               <div className="text-[11px] text-muted font-semibold tracking-wider px-2 py-1.5 mb-1">
                 {i18nT('pages.overview.promptsTab.user_prompts_count', { count: filteredUser.length })}

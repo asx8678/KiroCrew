@@ -1,17 +1,10 @@
 """Bound the bundled shell-audit hook's ``audit.log`` from the gateway side.
 
 The default ``postToolUse`` hook in ``config/defaults.json`` records every
-``execute_bash`` call by appending ONE line to
-``${KIROCREW_HOME:-$HOME/.kiro/crew}/audit.log``: a UTC timestamp, ``BASH:``, and
-the hook-event JSON kiro-cli hands it on stdin (the tool call -- its command and,
-on this event, its result) with CR and LF stripped. The result is written as
-kiro-cli reports it, unredacted: on the kiro-cli backend a secret a command
-prints lands in this file verbatim. The other backends fire the hook from Crew
-with redacted output capped at 2,000 characters. Because of that content the
-hook's Python path creates the file owner-only (0600), and
-:func:`rotate_shell_audit_log` restricts both generations to the owner on every
-sweep, which covers a file the ``printf`` fallback or an older hook created
-under the umask (typically 0644).
+``execute_bash`` call as a single line -- a UTC stamp, then `` BASH: ``, then
+the hook-event JSON kiro-cli hands it on stdin (the tool call -- its command
+and, on this event, its result) with every CR and LF stripped -- appended to
+``${KIROCREW_HOME:-$HOME/.kiro/crew}/audit.log``.
 The command is one shell append and bounds nothing, so on a default install
 the file only grows: measured at 4.4 MB over about five weeks of ordinary
 use, as a single file with no sibling generation.
@@ -127,14 +120,12 @@ def rotate_shell_audit_log(data_home: Path) -> bool:
     """Rotate ``<data_home>/audit.log`` aside to ``audit.log.1`` once it reaches the cap.
 
     The cap is :data:`SHELL_AUDIT_LOG_MAX_BYTES`, the one shipped value; no
-    caller varies it. Returns ``True`` when this call moved the file aside.
-    Never raises: a fresh install without the file, an unreadable or unusable
-    path, or a rotation the primitive could not complete (lock lost to a
-    concurrent rotator, a blocked rename) all answer ``False`` and leave the
-    live file exactly as it was, apart from its mode: both generations are
-    restricted to the owner first (:func:`_restrict_generations_to_owner`). An
-    over-cap file that stays over the cap is
-    logged at WARNING, at most once per
+    caller varies it. Returns ``True`` when the file was moved aside by the
+    time this call checked -- by this call or by a concurrent rotator that won
+    the lock. Never raises: a fresh install without the file, an unreadable or
+    unusable path, or a rotation the primitive could not complete (a blocked
+    rename) all answer ``False`` and leave the live file exactly as it was. An
+    over-cap file that stays over the cap is logged at WARNING, at most once per
     :data:`SHELL_AUDIT_LOG_WARN_INTERVAL_SECS` per data home, so a rotation that
     stopped working is told apart from a file under the cap without repeating
     the same line on every retry.

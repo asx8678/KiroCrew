@@ -4,10 +4,10 @@ from the injected caller block.
 The same failure mode ``kirocrew-cron`` guards against applies here: both servers
 already routed identity through :func:`mcp_core._resolve_session_key_strict`,
 whose FIRST source is the gateway-injected per-call caller block — but neither
-advertised ``kirocrew.caller-identity``, and ``mcp_gateway/backend.py`` strips
+advertised ``kirocrew.caller-identity``, and ``mcp_gateway/backend_stubs.py`` strips
 any stub-supplied block from every forwarded request and re-injects its own only
 for a backend that advertised. Nothing declines to pool an unadvertised backend
-(``rewriter.UNPOOLABLE_SERVERS`` is empty), so not advertising bought a shared
+(``rewriter.UNPOOLABLE_SERVERS`` lists only credential vendors), so not advertising bought a shared
 process that never received an identity: pooled and identity-blind.
 
 The gateway half — that gatewayd injects the block into a backend that

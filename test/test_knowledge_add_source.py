@@ -18,6 +18,7 @@ from kiro_crew.dashboard.handlers.knowledge import (
     pick_folder,
 )
 from kiro_crew.knowledge.store import KnowledgeStore
+from kiro_crew.testing.wait import async_wait_until
 
 
 @pytest.fixture()
@@ -121,7 +122,6 @@ class TestAddSourceLocalFile:
 
     @pytest.mark.asyncio
     async def test_rejects_sensitive_path(self, store, tmp_path):
-        # Create a symlink to a sensitive path
         sensitive = str(Path.home() / ".ssh" / "config")
         async with TestClient(TestServer(_make_app(store))) as client:
             resp = await client.post("/api/knowledge/sources", json={
@@ -197,13 +197,11 @@ class TestAddSourceLocalFile:
                 "name": "link.md", "source_type": "local_file", "uri": str(link)
             })
             assert resp.status == 201
-            # Stored URI should be the resolved path
             source = store.get_source_by_uri(str(real_file.resolve()))
             assert source is not None
 
     @pytest.mark.asyncio
     async def test_symlink_to_sensitive_blocked(self, store, tmp_path):
-        # Create symlink pointing to sensitive location
         link = tmp_path / "innocent.md"
         sensitive_target = Path.home() / ".aws" / "credentials"
         link.symlink_to(sensitive_target)
@@ -226,13 +224,9 @@ class TestAddSourceLocalFile:
             })
             assert resp.status == 201
             # The task claims 'syncing' off the loop before it ingests, so reaching
-            # ingest_file costs a worker-thread hop. Poll rather than sleep a fixed
-            # span, which races that on a loaded runner.
-            import asyncio
-            for _ in range(200):
-                if pipeline.ingest_file.called:
-                    break
-                await asyncio.sleep(0.01)
+            # ingest_file costs a worker-thread hop. Wait on the call rather than
+            # sleep a fixed span, which races that on a loaded runner.
+            await async_wait_until(lambda: pipeline.ingest_file.called)
             pipeline.ingest_file.assert_called_once()
 
     @pytest.mark.asyncio
@@ -248,7 +242,6 @@ class TestAddSourceLocalFile:
             resp = await client.post("/api/knowledge/sources", json={
                 "name": "safe.md", "source_type": "local_file", "uri": traversal
             })
-            # Should succeed but store the resolved canonical path
             assert resp.status == 201
             source = store.get_source_by_uri(str(test_file.resolve()))
             assert source is not None

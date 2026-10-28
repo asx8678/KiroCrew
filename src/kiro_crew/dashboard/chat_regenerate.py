@@ -8,7 +8,8 @@ import logging
 
 from aiohttp import web
 
-from kiro_crew.dashboard.chat_delivery import queued_text_for_display
+from kiro_crew.dashboard.body_numbers import body_int
+from kiro_crew.dashboard.chat_delivery import is_retracted_steer_row, queued_text_for_display
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 from kiro_crew.dashboard.chat_runner import _run_chat, _start_next_queued_turn
 from kiro_crew.dashboard.chat_utils import (
@@ -19,7 +20,7 @@ from kiro_crew.dashboard.chat_utils import (
     variant_from_row,
 )
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
-from kiro_crew.dashboard.remote_relay import remote_bound_refusal
+from kiro_crew.dashboard.relay_archive import relay_archive_refusal
 from kiro_crew.dashboard.slot_ownership import (
     checkpoint_slot_replaced,
     deny_app_slot_session_access,
@@ -96,9 +97,9 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
     if under_construction is not None:
         return under_construction
 
-    # A crew-bound slot has no local regenerate: it would truncate LOCAL history
-    # and re-run the turn on this machine, diverging from the peer.
-    refusal = remote_bound_refusal(slot)
+    # A relay archive is read-only: regenerate would truncate its history and
+    # re-run the turn on this machine.
+    refusal = relay_archive_refusal(slot)
     if refusal is not None:
         return refusal
 
@@ -113,6 +114,10 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
         ai_idx = -1
         for i in range(len(msgs) - 1, -1, -1):
             role = msgs[i].get("role")
+            # A taken-back steer keeps its row, text cleared, inside the turn it
+            # was sent into. The turn never read it, so it is not a user turn.
+            if is_retracted_steer_row(msgs[i]):
+                continue
             # Never cross a real user turn: the truncation below deletes
             # everything after the target reply's user row, so a reply found
             # PAST a newer user row (e.g. a /compact row awaiting only its
@@ -136,7 +141,7 @@ async def api_chat_slot_regenerate(request: web.Request) -> web.Response:
             )
         u_idx = -1
         for i in range(ai_idx - 1, -1, -1):
-            if msgs[i].get("role") == "user":
+            if msgs[i].get("role") == "user" and not is_retracted_steer_row(msgs[i]):
                 u_idx = i
                 break
         if u_idx < 0:
@@ -296,7 +301,7 @@ async def api_chat_slot_switch_variant(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     try:
-        idx = int(body.get("index"))  # type: ignore[arg-type]
+        idx = body_int(body.get("index"))
     except (TypeError, ValueError):
         return web.json_response({"error": "invalid index", "code": "index_invalid"}, status=400)
 
@@ -401,7 +406,7 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
     # ``validation`` <-> ``artifacts`` cycle resolves only once something else
     # has pulled those in), so hoisting these two to module scope makes
     # ``import kiro_crew.dashboard.chat_regenerate`` fail on its own. Same reason
-    # ``session_control`` and ``handlers/core`` reach it this way.
+    # ``session_control`` and ``handlers/core_config_models`` reach it this way.
     from kiro_crew.dashboard.chat_handlers import (
         _reauthorize_after_await,
         _subagents_attached_response,
@@ -440,11 +445,9 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
 
-    # A crew-bound slot has no local edit-and-resend: it would truncate LOCAL
-    # history and re-run the edited turn on this machine, diverging from the peer.
-    # AFTER the app-ownership 404 above so a foreign app cannot tell a remote slot
-    # apart from a missing one via the 409.
-    refusal = remote_bound_refusal(slot)
+    # A relay archive is read-only. AFTER the app-ownership 404 above so a
+    # foreign app cannot tell an archive apart from a missing slot via the 409.
+    refusal = relay_archive_refusal(slot)
     if refusal is not None:
         return refusal
 
@@ -975,9 +978,8 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
                 # ``total_messages`` is a LIFETIME counter that survives
                 # trimming, and the prospective ``append`` bumped only the COPY's
                 # int -- so without this the edited row is invisible to every
-                # reader of it: ``_get_active_workspace`` picks the max-counter
-                # slot to resolve which workspace's lessons to load, and the
-                # Slack mirror compares the counter against its own start value
+                # reader of it: the Slack mirror compares the counter against
+                # its own start value
                 # to decide whether anything happened. Incremented by ONE here
                 # rather than adopted from the copy, whose value predates the
                 # arrived rows above (which bumped the live counter themselves).

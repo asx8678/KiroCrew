@@ -62,12 +62,19 @@ export interface WorkBoardItem {
   last_report_at: string | null
   created_at: string
   closed_at: string | null
+  /** When the conductor last answered with `decide`. A decision at or after the
+   *  last report hands a blocked or question item back to the worker. */
+  decided_at: string | null
   /** Nothing is left to read this item's reports. */
   orphaned: boolean
   /** The move is with the worker and it has gone quiet. */
   stale: boolean
   /** The bar is one `accept_eval.py` can actually evaluate. */
   acceptance_concrete: boolean
+  /** The worker's last `work_report` / `work_brief` call never reached the
+   *  ledger (the harness could not deliver it) and nothing has landed since.
+   *  Derived from the worker's transport, not something it wrote. */
+  report_undelivered?: { tool: 'work_report' | 'work_brief'; at: string } | null
   /** A question with no NEWER answering decision. Lifts the row into the band. */
   outstanding: boolean
   terminal: boolean
@@ -92,7 +99,8 @@ export interface WorkBoardResponse {
   items: WorkBoardItem[]
   /**
    * Whether this gateway can take an orphaned item over. False on main: no
-   * server-side primitive exists to delegate to, so the button renders disabled.
+   * server-side primitive exists to delegate to, so the page renders no
+   * take-over button.
    *
    * The only capability field here, because it is the only one the page reads.
    * `stop_available`, `channels_available` and a reason code were sent too, so

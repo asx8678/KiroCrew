@@ -33,7 +33,6 @@ from kiro_crew.apps.builtins.meetings.backend import store
 from kiro_crew.apps.builtins.meetings.backend.domain.dictionary import DomainDictionary
 from kiro_crew.apps.builtins.meetings.backend.domain.translate import (
     TranslationQueue,
-    close_translation_session,
     run_oneshot_translation,
 )
 from kiro_crew.context import (
@@ -218,12 +217,7 @@ async def dispatch_to_agent(
     # cold start were cancelled here, the later transcript batches would inherit a
     # session that never received its OUTPUT_FILE contract. The timeout begins only
     # once there is a provider that can receive the kickoff.
-    # LOOP-4: meeting agents are unattended background work, so an unpinned one
-    # follows the background role (``agent.role_models.background``, else auto)
-    # rather than the chat model; a template's own concrete pin still wins.
-    provider, _is_new, _resumed = await sessions.get_or_create(
-        key, agent=agent or None, model_role="background"
-    )
+    provider, _is_new, _resumed = await sessions.get_or_create(key, agent=agent or None)
 
     async def _run_turn() -> None:
         # Identity is threaded so the PreToolUse gate resolves ceiling ∩ PROFILE,
@@ -241,7 +235,6 @@ async def dispatch_to_agent(
             session_key=key,
             agent=agent,
             app=k.APP_NAME,
-            usage_surface="meetings",
         )
 
     turn_task = asyncio.create_task(_run_turn())
@@ -303,10 +296,6 @@ class AgentQueue:
     _initializing: bool = field(default=False, repr=False)
     _fail_count: int = 0
     _backoff: float = 0.0
-    # LOOP-4: what a recycle re-seeds with, set at kickoff; empty disables it.
-    standing_instructions: str = ""
-    output_path: str = ""
-    _batches_since_seed: int = field(default=0, repr=False)
 
     @property
     def fail_count(self) -> int:
@@ -344,7 +333,7 @@ class AgentQueue:
                 # The timer is already inside a live turn, so it cannot be
                 # replaced. Remember the request and skip the NEXT batch delay
                 # after that turn completes; otherwise opening speech enqueued
-                # during initialization can still wait a whole batch interval.
+                # during initialization can still wait the ordinary 30 seconds.
                 self._flush_soon_requested = True
                 return
             task.cancel()  # replace the sleeping batch timer
@@ -549,11 +538,7 @@ class AgentQueue:
                 self._backoff = 0.0
                 return False
             batch, size = self._take_batch()
-            message = batch
-            if self.standing_instructions and self._batches_since_seed >= k.SESSION_RECYCLE_BATCHES:
-                message = await self._recycled(batch)
-            await dispatch_to_agent(self.sessions, self.key, message, self.agent, hooks=self.hooks)
-            self._batches_since_seed += 1
+            await dispatch_to_agent(self.sessions, self.key, batch, self.agent, hooks=self.hooks)
             del self.queue[:size]
             self._fail_count = 0
             self._backoff = 0.0
@@ -575,39 +560,6 @@ class AgentQueue:
         finally:
             self.busy = False
         return more_queued
-
-    async def _recycled(self, batch: str) -> str:
-        """End this agent's session and return the re-seeded first message (LOOP-4).
-
-        ``destroy`` drops the resume mapping too, so the next turn starts a fresh
-        conversation rather than reloading the old one. A failed destroy keeps the
-        old session and sends the plain batch: a recycle is a cost saving, so it
-        never counts toward the dispatch-failure breaker.
-        """
-        try:
-            await self.sessions.destroy(self.key)
-        except Exception:  # noqa: BLE001 - keep the session; try again next batch
-            logger.warning("meetings: recycling %s's session failed", self.name, exc_info=True)
-            return batch
-        self._batches_since_seed = 0
-        current = ""
-        if self.output_path:
-            try:
-                current = await asyncio.to_thread(
-                    Path(self.output_path).read_text, encoding="utf-8", errors="replace"
-                )
-            except OSError:
-                current = ""
-        cap = k.RESEED_OUTPUT_MAX_CHARS
-        if len(current) > cap:
-            head = cap * 2 // 3
-            current = (
-                current[:head]
-                + f"\n[… {len(current) - cap} chars omitted; read OUTPUT_FILE for them …]\n"
-                + current[-(cap - head) :]
-            )
-        logger.info("meetings: recycled %s's session after its batch budget", self.name)
-        return build_reseed_message(self.standing_instructions, self.output_path, current, batch)
 
     def cancel(self) -> None:
         """Drop any pending timer (meeting teardown)."""
@@ -714,17 +666,11 @@ class MeetingSession:
         language = str(config.get("translation_language") or "")
         if language in k.TRANSLATION_LANG_CODES and self.sessions is not None:
             sessions = self.sessions
-            meeting_id = self.meeting_id
-
-            async def _close() -> None:
-                await close_translation_session(sessions, meeting_id)
-
             self.translations = TranslationQueue(
-                meeting_id=meeting_id,
+                meeting_id=self.meeting_id,
                 language=language,
-                runner=lambda prompt: run_oneshot_translation(sessions, prompt, meeting_id),
+                runner=lambda prompt: run_oneshot_translation(sessions, prompt),
                 root=self.root,
-                closer=_close,
             )
 
     def _make_queue(self, agent_id: str, agent: str) -> AgentQueue:
@@ -734,7 +680,6 @@ class MeetingSession:
             agent=agent,
             sessions=self.sessions,
             hooks=self.hooks,
-            batch_interval=k.AGENT_BATCH_INTERVALS.get(agent_id, k.BATCH_INTERVAL_SECS),
         )
 
     def add_agent(self, agent_id: str, agent: str) -> AgentQueue:
@@ -1179,15 +1124,13 @@ def build_meeting_context(meta: dict[str, Any]) -> str:
     return context
 
 
-def build_agent_instructions(
+def build_init_message(
     agent_def: dict[str, Any],
     meta: dict[str, Any],
     output_path: str,
     cross_ref: str,
 ) -> str:
-    """An agent's standing instructions: its output file, role, meeting context
-    and where the other agents write. The kickoff and a recycle's re-seed both
-    carry them (LOOP-4)."""
+    """The first message an agent receives when a meeting starts."""
     prompt = agent_def.get("prompt") or (
         f"You are the {agent_def.get('name') or agent_def.get('id')} agent for this meeting."
     )
@@ -1201,40 +1144,12 @@ def build_agent_instructions(
         "Do not accumulate in memory — write immediately so your output survives "
         "a context limit.\n\n"
         f"Meeting context:\n{build_meeting_context(meta)}\n\n"
-        f"{cross_ref}"
-    )
-
-
-def build_init_message(
-    agent_def: dict[str, Any],
-    meta: dict[str, Any],
-    output_path: str,
-    cross_ref: str,
-) -> str:
-    """The first message an agent receives when a meeting starts."""
-    return (
-        f"{build_agent_instructions(agent_def, meta, output_path, cross_ref)}\n\n"
+        f"{cross_ref}\n\n"
         "Read any attached documents now for context. Do not call a wait, sleep, "
         "polling, or monitoring tool, and do not keep this turn open. Reply with a "
         "brief ready acknowledgment and end this turn. Transcription will arrive in "
         "later messages."
     )
-
-
-def build_reseed_message(instructions: str, output_path: str, current: str, batch: str) -> str:
-    """The first message of a recycled session: one turn that restores the
-    agent's instructions and its file as it stands, then carries the batch
-    (LOOP-4)."""
-    parts = [
-        "[Session refreshed: your earlier conversation was cleared to keep each "
-        "batch cheap. Your standing instructions and your output file as it stands "
-        "follow. Continue the file from where it is; do not restart it.]",
-        instructions,
-    ]
-    if current:
-        parts.append(f"Current contents of {output_path}:\n{current}")
-    parts.append(batch)
-    return "\n\n".join(parts)
 
 
 TASK_EXTRACTOR_PROMPT = (
@@ -1303,36 +1218,18 @@ async def init_agents(
             continue
         agent_id = str(agent_def["id"])
         message = build_init_message(agent_def, meta, f"{mdir}/{fname}", cross_ref)
-        _arm_recycle(session, agent_id, agent_def, meta, f"{mdir}/{fname}", cross_ref)
         dispatches.append(_safe_dispatch(session, agent_id, message, agent_def.get("agent") or ""))
 
-    task_def = {
-        "id": k.TASK_EXTRACTOR_ID,
-        "name": "Task Extractor",
-        "prompt": TASK_EXTRACTOR_PROMPT,
-    }
-    task_message = build_init_message(task_def, meta, f"{mdir}/{k.TASKS_FILE}", cross_ref)
-    _arm_recycle(session, k.TASK_EXTRACTOR_ID, task_def, meta, f"{mdir}/{k.TASKS_FILE}", cross_ref)
+    task_message = build_init_message(
+        {"id": k.TASK_EXTRACTOR_ID, "name": "Task Extractor", "prompt": TASK_EXTRACTOR_PROMPT},
+        meta,
+        f"{mdir}/{k.TASKS_FILE}",
+        cross_ref,
+    )
     dispatches.append(
         _safe_dispatch(session, k.TASK_EXTRACTOR_ID, task_message, k.TASK_EXTRACTOR_AGENT)
     )
     await asyncio.gather(*dispatches)
-
-
-def _arm_recycle(
-    session: MeetingSession,
-    agent_id: str,
-    agent_def: dict[str, Any],
-    meta: dict[str, Any],
-    output_path: str,
-    cross_ref: str,
-) -> None:
-    """Give an agent's queue what a session recycle re-seeds with (LOOP-4)."""
-    queue = session.agents.get(agent_id)
-    if queue is None:
-        return
-    queue.standing_instructions = build_agent_instructions(agent_def, meta, output_path, cross_ref)
-    queue.output_path = output_path
 
 
 async def _safe_dispatch(session: MeetingSession, agent_id: str, message: str, agent: str) -> None:

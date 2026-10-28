@@ -162,11 +162,6 @@ def _set_fallback_attrs(slot, monkeypatch):
     )
 
 
-# ---------------------------------------------------------------------------
-# Test 1: Same-model retry succeeds — no fallback model/selected.
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_same_model_retry_success_no_fallback_logged(tmp_path, monkeypatch):
     """A throttle that retries on the SAME model and succeeds.
@@ -175,6 +170,7 @@ async def test_same_model_retry_success_no_fallback_logged(tmp_path, monkeypatch
     """
     monkeypatch.setattr("kiro_crew.dashboard.chat_runner._agent_fallback_chain", lambda: ())
     monkeypatch.setattr("kiro_crew.dashboard.chat_runner.transient_retry_delay", lambda _a: 0.0)
+    monkeypatch.setattr("kiro_crew.dashboard.chat_runner.throttle_retry_delay", lambda _a: 0.0)
 
     call_count = 0
 
@@ -205,11 +201,6 @@ async def test_same_model_retry_success_no_fallback_logged(tmp_path, monkeypatch
     assert len(closers) >= 1, f"no turn closer: {[e['type'] for e in entries]}"
 
 
-# ---------------------------------------------------------------------------
-# Test 2: Fallback swap — model/selected written with source=fallback.
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_fallback_swap_records_model_selected(tmp_path, monkeypatch):
     """Throttle exhausts same-model budget, swaps to fallback.
@@ -223,6 +214,7 @@ async def test_fallback_swap_records_model_selected(tmp_path, monkeypatch):
         lambda: ("fallback-model-A", "auto"),
     )
     monkeypatch.setattr("kiro_crew.dashboard.chat_runner.transient_retry_delay", lambda _a: 0.0)
+    monkeypatch.setattr("kiro_crew.dashboard.chat_runner.throttle_retry_delay", lambda _a: 0.0)
 
     async def _fake_advance(client, fb_state, *, surface="", log_suffix=""):
         if fb_state.pos < len(fb_state.chain):
@@ -264,11 +256,6 @@ async def test_fallback_swap_records_model_selected(tmp_path, monkeypatch):
     assert isinstance(fb["turn"], int) and fb["turn"] > 0
 
 
-# ---------------------------------------------------------------------------
-# Test 3: Empty fallback chain — turn fails, tokens/credits absent.
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_empty_fallback_chain_fails_with_no_cost(tmp_path, monkeypatch):
     """Throttle exhausts budget with NO fallback candidates.
@@ -277,6 +264,7 @@ async def test_empty_fallback_chain_fails_with_no_cost(tmp_path, monkeypatch):
     """
     monkeypatch.setattr("kiro_crew.dashboard.chat_runner._agent_fallback_chain", lambda: ())
     monkeypatch.setattr("kiro_crew.dashboard.chat_runner.transient_retry_delay", lambda _a: 0.0)
+    monkeypatch.setattr("kiro_crew.dashboard.chat_runner.throttle_retry_delay", lambda _a: 0.0)
 
     async def _stream():
         raise _transient_error()
@@ -298,11 +286,6 @@ async def test_empty_fallback_chain_fails_with_no_cost(tmp_path, monkeypatch):
         data = failed[-1]["data"]
         assert "tokens" not in data, f"failed turn carried tokens: {data}"
         assert "credits" not in data, f"failed turn carried credits: {data}"
-
-
-# ---------------------------------------------------------------------------
-# Test 4: Withheld model pin — _crew_log_model returns the session fact.
-# ---------------------------------------------------------------------------
 
 
 def test_withheld_pin_names_served_model_not_configured_pin():
@@ -329,11 +312,6 @@ def test_withheld_pin_names_served_model_not_configured_pin():
     assert _crew_log_model(_MinimalDouble(), "fb") == "fb"
 
 
-# ---------------------------------------------------------------------------
-# Test 5: Repeated fallback swaps — each produces a model/selected.
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_repeated_fallback_swaps_produce_multiple_model_selected(tmp_path, monkeypatch):
     """Multiple fallback candidates: each swap writes its own model/selected.
@@ -355,6 +333,7 @@ async def test_repeated_fallback_swaps_produce_multiple_model_selected(tmp_path,
         lambda: candidates,
     )
     monkeypatch.setattr("kiro_crew.dashboard.chat_runner.transient_retry_delay", lambda _a: 0.0)
+    monkeypatch.setattr("kiro_crew.dashboard.chat_runner.throttle_retry_delay", lambda _a: 0.0)
 
     async def _fake_advance(client, fb_state, *, surface="", log_suffix=""):
         if fb_state.pos < len(fb_state.chain):

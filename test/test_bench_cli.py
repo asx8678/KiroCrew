@@ -1,4 +1,4 @@
-"""``kirocrew bench`` CLI behaviour that a reviewer flagged and a test must pin.
+"""``kirocrew bench`` CLI behaviour a test must pin.
 
 Two of these pin ``kirocrew bench`` CLI behaviour, and the third pins the
 deliberate exception to the ``top-level-imports`` rule so a future
@@ -256,6 +256,7 @@ def test_importing_cli_bench_does_not_drag_the_vector_store_into_the_boot_path()
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         env=env,
     )
     assert proc.returncode == 0, proc.stderr

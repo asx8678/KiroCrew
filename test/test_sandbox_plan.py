@@ -198,6 +198,45 @@ def test_a_lift_of_an_ordinary_mask_only_cancels_it() -> None:
     )
 
 
+def test_the_boolean_opt_in_seals_every_caller_mask_not_the_tier_dirs() -> None:
+    """``seal_hidden_dirs=True`` seals every caller mask of the request; tier dirs never.
+
+    A write into a hidden directory in the sandbox lands in a WRITABLE empty tmpfs
+    stand-in and is lost on namespace teardown. The launcher seals that stand-in
+    read-only so the write fails loudly -- but only when the spawn opted in, and only
+    for its own ``extra_hidden_dirs`` (caller) masks. The tier host-credential dirs
+    (``.aws`` re-exposing ``.aws/config`` in cc mode, ``.gnupg`` ...) are never caller
+    masks, so they keep their writable stand-in -- which is what ``restore_exposed_files``
+    and the vendor CLIs depend on.
+    """
+    bundle = "/data/bundle/data"
+    other = "/data/other"
+    plan = _plan("cc", extra_hidden_dirs=(bundle, other), seal_hidden_dirs=True)
+    seal = set(plan.seal_windowless_masks)
+    # Every caller mask of the opted-in request is sealed.
+    assert bundle in seal and other in seal
+    # The tier host-credential dirs are never caller masks, so never sealed: their tools
+    # keep working and the cc-mode .aws re-expose does not hit a read-only mount.
+    assert f"{HOME}/.aws" not in seal
+    assert f"{HOME}/.gnupg" not in seal
+    # Everything in the set is actually masked (not a cancelled lift).
+    assert seal <= set(plan.sensitive_dirs)
+    # The payload the launcher reads carries the same set.
+    assert set(sandbox_plan.namespace_payload(plan)["seal_windowless_masks"]) == seal
+
+
+def test_a_mask_seals_nothing_by_default() -> None:
+    """With ``seal_hidden_dirs`` unset, nothing is sealed -- the default is unchanged.
+
+    This is the invariant the review asked for: no mask is read-only unless its creator
+    explicitly opted in, so a tier spawn and an ordinary caller mask behave exactly as
+    they did before the opt-in seal existed.
+    """
+    plan = _plan("cc", extra_hidden_dirs=("/data/bundle/data",))
+    assert plan.seal_windowless_masks == ()
+    assert sandbox_plan.namespace_payload(plan)["seal_windowless_masks"] == []
+
+
 # --------------------------------------------------------------------------- #
 # The places the two backends differ, as declared capabilities.
 # --------------------------------------------------------------------------- #
@@ -206,16 +245,41 @@ def test_a_lift_of_an_ordinary_mask_only_cancels_it() -> None:
 def test_the_capabilities_are_declared_per_renderer() -> None:
     caps = sandbox_plan.CAPABILITIES
     assert set(caps) == {BACKEND_NAMESPACE, BACKEND_SEATBELT}
-    assert caps[BACKEND_SEATBELT].cc_unmaskable_dirs == frozenset({".aws"})
+    assert caps[BACKEND_SEATBELT].cc_unmaskable_dirs == frozenset()
     assert caps[BACKEND_NAMESPACE].cc_unmaskable_dirs == frozenset()
 
 
-def test_seatbelt_cannot_partially_expose_aws_so_cc_leaves_it_visible() -> None:
+def test_cc_masks_aws_on_both_backends_and_exposes_only_config() -> None:
     linux = _plan("cc", BACKEND_NAMESPACE)
     macos = _plan("cc", BACKEND_SEATBELT)
     assert f"{HOME}/.aws" in linux.sensitive_dirs
-    assert f"{HOME}/.aws" not in [m.path for m in macos.masks]
+    aws = {m.path: m for m in macos.masks}[f"{HOME}/.aws"]
+    assert aws.exposed == (f"{HOME}/.aws/config",)
+    assert not aws.cancelled
+    # strict hides .aws with no exception; standard does not touch it.
     assert _plan("strict", BACKEND_SEATBELT).masks[0].path == f"{HOME}/.aws"
+    assert _plan("strict", BACKEND_SEATBELT).masks[0].exposed == ()
+
+
+def test_seatbelt_cc_profile_denies_aws_except_config() -> None:
+    """Everything under ~/.aws but ``config`` is unreadable in a macOS cc profile:
+    the credentials file, the SSO token cache and any link name inside it. The
+    exception is a ``literal``, so it opens one path and nothing beneath ``config``."""
+    profile = sandbox_seatbelt.render_seatbelt_profile(_plan("cc", BACKEND_SEATBELT))
+    aws = f"{HOME}/.aws"
+    read_rule = (
+        f'(deny file-read* (require-all (subpath "{aws}")'
+        f' (require-not (literal "{aws}/config"))))'
+    )
+    assert read_rule in profile.splitlines()
+    assert f'(deny file-link (subpath "{aws}"))' in profile.splitlines()
+    assert f'(deny file-read* (subpath "{aws}"))' not in profile
+    # The only exception under ~/.aws is config itself.
+    assert profile.count("require-not") == 1
+    # A literal exception: nothing beneath a ``config`` directory or link name opens.
+    assert f'(require-not (subpath "{aws}/config"))' not in profile
+    for leaf in ("credentials", "sso/cache/abc123.json", "cli/cache/x.json", "config.bak"):
+        assert f"{aws}/{leaf}" not in profile
 
 
 #: For each declared capability: the tier and request that exercise it, and a value it
@@ -224,7 +288,7 @@ _CAPABILITY_FLIPS: dict[str, tuple[str, dict[str, Any], dict[str, Any]]] = {
     "cc_unmaskable_dirs": (
         "cc",
         {},
-        {BACKEND_NAMESPACE: frozenset({".aws"}), BACKEND_SEATBELT: frozenset()},
+        {BACKEND_NAMESPACE: frozenset({".aws"}), BACKEND_SEATBELT: frozenset({".aws"})},
     ),
 }
 
@@ -528,6 +592,8 @@ _SEATBELT_GOLDEN = """\
 (deny file-write* (subpath "/srv/u/.kiro/crew/.env"))
 (deny file-write* (literal "/srv/u/.kiro/crew/.env"))
 (deny file-link (subpath "/srv/u/.kiro/crew/.env"))
+(deny file-read* (literal "/srv/u/.kiro/crew/.env"))
+(deny file-link (literal "/srv/u/.kiro/crew/.env"))
 (deny file-read* (subpath "/srv/u/.kiro/crew/run/voice-runtime"))
 (deny file-write* (subpath "/srv/u/.kiro/crew/run/voice-runtime"))
 (deny file-link (subpath "/srv/u/.kiro/crew/run/voice-runtime"))

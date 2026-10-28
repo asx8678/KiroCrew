@@ -45,7 +45,7 @@ APP_NAME = "auto-improvement"
 #: REJECTED by ``save_session`` after ``openSession`` had already seeded the chat
 #: slot, so the link was lost and every retry spawned another orphaned chat. 250
 #: clears the longest real key while keeping ``<key>.json`` (255-char component
-#: limit on ext4/APFS/NTFS) safely in bounds. Raised by the GPT review.
+#: limit on ext4/APFS/NTFS) safely in bounds.
 _SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,249}$")
 
 
@@ -103,7 +103,7 @@ def workspace_key(config: dict | None = None) -> str:
     # could apply one repository's queued diff to another. The digest carries the distinction
     # the slug throws away; the slug stays in front so the directory is still recognizable.
     # Lower-cased before hashing because GitHub repository names are case-insensitive, so
-    # `owner/A-B` and `owner/a-b` must keep sharing one workspace. Raised by the GPT review.
+    # `owner/A-B` and `owner/a-b` must keep sharing one workspace.
     digest = hashlib.sha256(f"{repo.lower()}\x00{branch}".encode("utf-8")).hexdigest()[:10]
     return f"{readable}__{digest}"
 
@@ -116,14 +116,18 @@ def workspace_dir() -> Path:
     ruler, results, PR queue, profiles, and ledger move here so a repo/branch
     switch swaps the whole set atomically.
     """
+    from kiro_crew.owner_only_files import ensure_directory
+
     path = data_dir() / "repos" / workspace_key()
-    path.mkdir(parents=True, exist_ok=True)
+    ensure_directory(path)  # 0700 levels in the data home
     return path
 
 
 def _sub(name: str) -> Path:
+    from kiro_crew.owner_only_files import ensure_directory
+
     path = workspace_dir() / name
-    path.mkdir(parents=True, exist_ok=True)
+    ensure_directory(path)  # 0700 levels in the data home
     return path
 
 
@@ -151,8 +155,10 @@ def sessions_dir() -> Path:
     its own subject id and may reference any repo, so it is not scoped to the
     active one.
     """
+    from kiro_crew.owner_only_files import ensure_directory
+
     path = data_dir() / "sessions"
-    path.mkdir(parents=True, exist_ok=True)
+    ensure_directory(path)  # 0700 in the data home
     return path
 
 

@@ -41,7 +41,8 @@ export function parseOptions(content: string): ParsedOptions {
 }
 
 export interface FollowUpDerivation {
-  followUpOptions: string[]
+  /** Read-only: every "no options" result shares one frozen array (see `NO_FOLLOW_UPS`). */
+  followUpOptions: readonly string[]
   /**
    * Identity of the row the options were derived from — `meta.mid` when
    * present, else the row's `ts`, else an index fallback. `null` when no
@@ -53,7 +54,19 @@ export interface FollowUpDerivation {
    * fresh offer from a stale one after a single-write transcript hydration.
    */
   followUpSourceKey: string | null
+  /**
+   * The marker's select mode: `true` for `[OPTIONS:]` (several picks compose),
+   * `false` for `[OPTION:]` (a pick replaces the previous one). `true` when no
+   * options are on offer, so a caller that ignores it keeps multi-select.
+   */
+  followUpMulti: boolean
 }
+
+/** The one "no options on offer" array. A fresh `[]` per derivation changes
+ *  identity on every streamed chunk and re-renders every memoized consumer of
+ *  `followUpOptions`, so every empty result returns this same frozen array. */
+const NO_FOLLOW_UPS: readonly string[] = Object.freeze([])
+const NONE: FollowUpDerivation = Object.freeze({ followUpOptions: NO_FOLLOW_UPS, followUpSourceKey: null, followUpMulti: true })
 
 /**
  * Identity of the transcript row *m* sits at index *i* of, stable across
@@ -99,8 +112,8 @@ const rowIdentity = (m: ChatMessage, i: number): string =>
  *    `kind="compaction"` (see `chat_utils._broadcast_compaction_result`). It
  *    carries no `[OPTIONS:]` marker, so without this skip it would shadow the
  *    real options-bearing turn it follows and the buttons would vanish after a
- *    compaction. The marker is read from `kind` (live websocket path) or
- *    `meta.kind` (history-reload path).
+ *    compaction. The marker rides in `meta.kind` on both the live websocket
+ *    frame and the history reload; a top-level `kind` is still honoured.
  *
  * A `user`/`queued` row is only a valid stop because it means "the user has
  * answered, so the question is closed". A `user` row whose turn FAILED answered
@@ -131,29 +144,42 @@ const rowIdentity = (m: ChatMessage, i: number): string =>
  * consume, leaving the user waiting on an answer the agent never receives.
  * Callers that never render a card pass nothing — suppressing pills there would
  * leave that surface with no way to answer at all.
+ *
+ * `movedOnRow` hides the pills once a running turn has moved past the row that
+ * offered them: a row it matches that is newer than the offering row means the
+ * agent kept working, so the question is stale (#15926). While the offering row
+ * is still the newest one, the pills stay, so a pick can be steered into the
+ * turn. The caller passes it only while its turn runs, and defines which rows
+ * count, because this module renders nothing and so cannot import the display
+ * layer's row classifiers. Callers that hide pills for the whole busy turn pass
+ * nothing.
  */
 export function deriveFollowUpOptions(
   messages: ChatMessage[],
   isStreaming: boolean,
   questionPending = false,
+  movedOnRow?: (m: ChatMessage) => boolean,
 ): FollowUpDerivation {
-  if (isStreaming || questionPending) return { followUpOptions: [], followUpSourceKey: null }
+  if (isStreaming || questionPending) return NONE
   // Errors were already transparent here (no branch matched them); the flag is
   // what makes that transparency mean something.
   let sawError = false
+  // A row newer than the offering row that shows the running turn moved on.
+  let movedOn = false
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
+    if (movedOnRow?.(m)) { movedOn = true; continue }
     // A deliberate Stop ENDS the turn rather than interrupting it, so the choice is closed
     // by the user's own cancellation — the error licence below must not reach back past it.
-    if (isStopEvent(m)) return { followUpOptions: [], followUpSourceKey: null }
+    if (isStopEvent(m)) return NONE
     // Only a TERMINAL error licenses a crossing. A retry notice means the recovery is
     // already queued, so re-offering the pill would run the same choice a second time.
     if (m.role === 'error') { if (!isRetryNotice(m)) sawError = true; continue }
     // `queued` is an UNCONDITIONAL stop: its queue entry OUTLIVES the error (only a hard
     // kill clears the queue), so re-offering the pill would run the choice a second time.
-    if (m.role === 'queued') return { followUpOptions: [], followUpSourceKey: null }
+    if (m.role === 'queued') return NONE
     if (m.role === 'user') {
-      if (!sawError) return { followUpOptions: [], followUpSourceKey: null }
+      if (!sawError) return NONE
       // Cross this failed turn and keep looking. Re-armed only by another error,
       // so a SUCCESSFUL turn further back still stops the scan.
       sawError = false
@@ -165,21 +191,22 @@ export function deriveFollowUpOptions(
     if (m.role === 'inject' && isNoteRow(m) && m.content) {
       const parsed = parseOptions(m.content)
       if (parsed.options.length) {
+        if (movedOn) return NONE
         // A note row still gets an identity: the bar keys its render off it, and a note whose
         // options never re-key would let a later identical note reuse the earlier row's key.
-        return { followUpOptions: parsed.options, followUpSourceKey: rowIdentity(m, i) }
+        return { followUpOptions: parsed.options, followUpSourceKey: rowIdentity(m, i), followUpMulti: parsed.multi }
       }
       continue
     }
     if (m.role === 'assistant' && m.content) {
-      const { options } = parseOptions(m.content)
+      const { options, multi } = parseOptions(m.content)
       // A failed turn can flush the text it streamed as a real assistant row before the
       // error, and that option-less row shadowed the question exactly as the `user` row did.
       // Crossing does NOT consume the error licence: the `user` row below still needs it.
       if (!options.length && sawError) continue
-      const followUpSourceKey = options.length > 0 ? rowIdentity(m, i) : null
-      return { followUpOptions: options, followUpSourceKey }
+      if (!options.length || movedOn) return NONE
+      return { followUpOptions: options, followUpSourceKey: rowIdentity(m, i), followUpMulti: multi }
     }
   }
-  return { followUpOptions: [], followUpSourceKey: null }
+  return NONE
 }

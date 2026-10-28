@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from aiohttp import web
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.handlers.agents import (
+        AUTO_WORKSPACE,
         DEFAULT_MEMORY_STORE,
         EFFORT_LEVELS,
         EFFORT_VALUES,
@@ -17,11 +18,13 @@ if TYPE_CHECKING:
         KiroCrewConfig,
         MemberAlreadyExists,
         MemberNameError,
+        MemberWorkspaceUnavailable,
         UnknownMemoryStore,
         _drained_to_thread,
         _foreign_private_copy_owner,
         _get_config_lock,
         _is_ghost_shaped,
+        _lineage_unverifiable_error,
         _model_pin_rejected,
         _name_would_be_masked,
         _pin_entitlement_backend,
@@ -39,27 +42,73 @@ if TYPE_CHECKING:
         normalize_agent_model,
         persist_member_config,
         provision_member_memory,
+        provision_member_workspace,
         resolve_agent_identity,
         resolve_effective_model,
         retire_unpublished_allocation,
+        retire_unpublished_workspace,
         teams_mod,
         validate_member_name,
     )
 
 
+async def _eager_copy_mate_config(name: str) -> str:
+    """Write crewmate *name*'s own custom-agent file and repoint its binding at it.
+
+    The eager copy of ``rfc-mate-owned-agent-config`` §5.4. Reads whatever the
+    crewmate's ``kiro_agent`` resolves to right now (its template, after the
+    mate-tools grant has run), copies it into ``~/.kiro/mates/agents/<name>.json``
+    with the prompt inlined as literal text, then repoints ``kiro_agent`` to
+    *name* so resolution finds the owned file and the picker never offers it.
+
+    Best-effort and never raises: a crewmate that was already published must not
+    be reported as a failed create over this copy. Returns a short outcome code
+    for the log. On any failure ``kiro_agent`` is left pointing at the source
+    template, which still resolves and runs (the pre-RFC shared-pointer model),
+    so the degradation is graceful.
+
+    Runs with :mod:`kiro_crew.dashboard.handlers.agents`'s injected namespace, so
+    ``KiroCrewConfig``, ``persist_member_config``, ``_get_config_lock`` and
+    ``_drained_to_thread`` resolve there -- this helper is ALSO re-exported into
+    that module (the namespace-injection contract), or it NameErrors live.
+    """
+    from kiro_crew.mate_config import MateConfigError, adopt_own_file
+
+    try:
+        async with _get_config_lock():
+            # The one copy-and-repoint every creation path shares, which also
+            # publishes the file so the crewmate's first chat is on the conductor.
+            return await _drained_to_thread(adopt_own_file, name)
+    except MateConfigError:
+        logger.warning("crewmate %s: mate config copy failed; kept source pointer", name)
+        return "copy_failed"
+    except Exception:
+        logger.warning("crewmate %s: mate config copy errored; kept source pointer", name)
+        return "errored"
+
+
 async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Response:
-    """GET /api/agents/resolved-model?agent=NAME — the model a new session uses.
+    """GET /api/agents/resolved-model?agent=NAME[&app=APP] — the model a new session uses.
 
     Serves the one backend resolver so the dashboard's model chip does not have
     to re-derive the precedence client-side (and drift from it). ``agent`` is a
     Kiro Crew agent name; omitted falls back to the configured default agent.
-    ``model`` is "" when every tier defers to the backend's own choice.
+    ``app`` names the app that owns the session, so the answer includes that
+    app's own model setting the way the session start does; a value that is not
+    an app name is ignored. ``model`` is "" when every tier defers to the
+    backend's own choice.
     """
     agent_name = request.query.get("agent", "").strip()
+    app_name = request.query.get("app", "").strip()
+    # The manifest's own name grammar, read where the answer is built: this module
+    # takes its names from the agents facade, which carries no app vocabulary.
+    from kiro_crew.apps.manifest import KEBAB_RE
+
+    app_kw = {"app_name": app_name} if KEBAB_RE.fullmatch(app_name) else {}
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
     # Globs ~/.kiro/agents and may read the installed agent file — keep the
     # filesystem work off the event loop.
-    model = await asyncio.to_thread(resolve_effective_model, cfg, agent_name or None)
+    model = await asyncio.to_thread(resolve_effective_model, cfg, agent_name or None, **app_kw)
     alias, kiro_agent, model_pin = await asyncio.to_thread(
         resolve_agent_identity, cfg, agent_name or None
     )
@@ -163,8 +212,37 @@ def _crew_memory_store_rejected(raw: object) -> str | None:
     )
 
 
+async def _mark_first_greeting_owed(name: str, cfg: object) -> None:
+    """Record that the crewmate just created opens its chat with its goal question.
+
+    Best-effort: the crewmate exists either way, and a failed record only means
+    its chat opens empty, so :func:`kiro_crew.members.mark_welcome_owed` logs it
+    rather than failing the create. The record lands in the directory of the
+    member's immutable ``member_id`` slug, the one its thread uses.
+    """
+    from kiro_crew.members import WELCOME_KIND_GOAL, mark_welcome_owed
+
+    await asyncio.to_thread(mark_welcome_owed, name, config=cfg, kind=WELCOME_KIND_GOAL)
+
+
 async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
-    """POST /api/agents — create a new Kiro Crew agent."""
+    """POST /api/agents — create a new Kiro Crew agent.
+
+    Wrapped in the UI-guide commit hook: when the owner's tab names a guide
+    waiting on its ``crewmate.create`` step (``X-Guide-*`` headers), the guide is
+    credited only from THIS handler's own success response and its immutable
+    ``member_id``. Without the headers it is exactly the handler below.
+    """
+    from kiro_crew.dashboard.handlers.guide import run_guided_crewmate_create
+
+    # The hook returns the inner handler's own response object unchanged.
+    return cast(
+        web.Response, await run_guided_crewmate_create(request, _api_kirocrew_agents_create)
+    )
+
+
+async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
+    """The create itself — see :func:`api_kirocrew_agents_create`."""
 
     denied = await _require_owner(request, "agent.create")
     if denied is not None:
@@ -280,6 +358,21 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             {"error": effort_reason, "code": "invalid_reasoning_effort"}, status=400
         )
     reasoning_effort = _raw_effort.strip()
+    # Absent leaves the mode unset, which a thread opens in
+    # MEMBER_APPROVAL_MODE_UNSET_EFFECTIVE. A caller that must never leave the new
+    # crewmate in that mode, even before a follow-up PUT, pins it in this write.
+    # Local: same reason as crew_update's import of the tuple.
+    from kiro_crew.config.sections import MEMBER_APPROVAL_MODES
+
+    if "approval_mode" in body and body["approval_mode"] not in MEMBER_APPROVAL_MODES:
+        return web.json_response(
+            {
+                "error": "approval_mode must be one of " + ", ".join(MEMBER_APPROVAL_MODES),
+                "code": "invalid_approval_mode",
+            },
+            status=400,
+        )
+    approval_mode = body.get("approval_mode", "")
     # Same placement rule as the other pre-lock validations: refused before any
     # state is touched. Presentation only, but strictly a string — every roster
     # surface renders it verbatim in place of the name.
@@ -317,6 +410,28 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    # Provenance of a crewmate imported from a .crewmate file (rfc-crewmate-share.md
+    # §5.4 step 5). The caller names what it read; the instant is the gateway's.
+    imported: dict = {}
+    if "imported" in body:
+        from datetime import datetime, timezone
+
+        from kiro_crew.config.sections import safe_imported
+
+        raw_imported = body["imported"]
+        stamp = {
+            **(raw_imported if isinstance(raw_imported, dict) else {}),
+            "imported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        imported = safe_imported(stamp) if isinstance(raw_imported, dict) else {}
+        if not imported or "imported_at" in raw_imported:
+            return web.json_response(
+                {
+                    "error": "imported must be {format_version, sender_label, sha256}",
+                    "code": "invalid_imported",
+                },
+                status=400,
+            )
     # Old clients still send default/empty on create. They now mean automatic
     # private allocation; no caller can choose or reuse another member's store.
     memory_store = body.get("memory_store", DEFAULT_MEMORY_STORE)
@@ -333,6 +448,15 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    # Absent or empty means a workspace of the crew's own, allocated with the
+    # record (member_workspace.provision_member_workspace); a name is the explicit
+    # opt-in to share one, stored as given like every other create always did.
+    _raw_workspace = body.get("workspace", AUTO_WORKSPACE)
+    if not isinstance(_raw_workspace, str):
+        return web.json_response(
+            {"error": "workspace must be a string", "code": "invalid_workspace"}, status=400
+        )
+    workspace = _raw_workspace.strip()
     pending_reason = await _revalidate_crew_pin(model, request)
     if pending_reason:
         return web.json_response({"error": pending_reason, "code": "invalid_model"}, status=400)
@@ -354,14 +478,14 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             return web.json_response({"error": model_reason, "code": "invalid_model"}, status=400)
         # Checked INSIDE the config lock, immediately before the binding is
         # added: a fork recording lineage after a pre-lock validation must not
-        # slip another crew's private copy into this new binding (GPT
-        # round-34, same shape as the locked rebind's in-mutate check).
+        # slip another crew's private copy into this new binding (same shape
+        # as the locked rebind's in-mutate check).
         try:
             owner = await asyncio.to_thread(_foreign_private_copy_owner, name, kiro_agent)
-        except _UnverifiableLineage:
+        except _UnverifiableLineage as exc:
             return web.json_response(
                 {
-                    "error": f"Cannot verify whether '{kiro_agent}' is a private copy; retry.",
+                    "error": _lineage_unverifiable_error(kiro_agent, exc),
                     "code": "lineage_unverifiable",
                 },
                 status=409,
@@ -375,6 +499,21 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
                 },
                 status=409,
             )
+        from kiro_crew.mate_config import user_agent_named
+
+        if kiro_agent == name or await asyncio.to_thread(user_agent_named, name):
+            # The crewmate's own file is resolved under its name, and a template
+            # of the same name would read as that file already being there (or,
+            # at the user level, win over it): the crewmate would run that
+            # template instead of its own copy.
+            return web.json_response(
+                {
+                    "error": f"A template is already named '{name}'; give this crew "
+                    "another name.",
+                    "code": "template_name_in_use",
+                },
+                status=409,
+            )
         # A crew that carried this name before may still be listed on a team
         # (every removal path drops it best-effort). persist_member_config
         # purges that INSIDE the registry's locked mutation, right before the
@@ -385,30 +524,44 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
         # A purge that cannot be made refuses the create (409 below).
         new_agent = KiroCrewAgentConfig(
             kiro_agent=kiro_agent,
-            workspace=body.get("workspace", "default"),
+            workspace=workspace,
             memory_store=memory_store,
             model=model,
             reasoning_effort=reasoning_effort,
+            approval_mode=approval_mode,
             display_name=display_name,
             description=body.get("description", ""),
             triggers=body.get("triggers", ""),
             source=body.get("source", "kirocrew"),
             session_color=session_color,
             avatar=avatar,
+            imported=imported,
         )
-        # Provision against this snapshot; publish the agent and owned store
-        # together through persist_member_config's flocked delta and create guard.
-        # A fresh allocation that never reached config.json is removed on the way
-        # out (retire_unpublished_allocation re-reads the disk under the config
-        # lock first, so a publication that did land is kept).
+        # Provision against this snapshot; publish the agent, its owned store and
+        # its own workspace together through persist_member_config's flocked delta
+        # and create guard. A fresh allocation that never reached config.json is
+        # removed on the way out (retire_unpublished_allocation re-reads the disk
+        # under the config lock first, so a publication that did land is kept; the
+        # workspace retire is in-memory, its directory is only ever made inside
+        # the locked write).
         cfg.agents[name] = new_agent
         previous_store = new_agent.memory_store
         previous_member_id = new_agent.member_id
+        previous_workspace = new_agent.workspace
+        new_workspace = ""
         try:
             try:
                 await _drained_to_thread(provision_member_memory, cfg, name)
-                await _drained_to_thread(lambda: persist_member_config(cfg, name, create=True))
+                new_workspace = await _drained_to_thread(provision_member_workspace, cfg, name)
+                await _drained_to_thread(
+                    lambda: persist_member_config(
+                        cfg, name, create=True, new_workspace=new_workspace
+                    )
+                )
             except BaseException:
+                retire_unpublished_workspace(
+                    cfg, name, new_workspace, previous_workspace=previous_workspace
+                )
                 allocated = cfg.agents[name].memory_store
                 if allocated != previous_store:
                     await _drained_to_thread(
@@ -421,6 +574,11 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
                         )
                     )
                 raise
+        except MemberWorkspaceUnavailable as exc:
+            # A name or directory collision under the lock, or a directory the
+            # host refused: a retry or another choice resolves it, like the
+            # memory-store refusals below.
+            return web.json_response({"error": str(exc), "code": exc.code}, status=409)
         except MemberAlreadyExists:
             return web.json_response(
                 {"error": f"Agent '{name}' already exists", "code": "agent_exists"}, status=409
@@ -439,12 +597,42 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": str(exc), "code": "member_memory_unavailable"}, status=409
             )
+    # Eager copy (``rfc-mate-owned-agent-config`` §5.4), FIRST. The crewmate owns
+    # a custom-agent file in ``~/.kiro/mates/agents/<name>.json``, copied from
+    # whatever ``kiro_agent`` resolves to right now (its chosen template), with
+    # its prompt inlined so no ``file://`` link back to the source survives, and
+    # the binding's ``kiro_agent`` is repointed to the crewmate id. This runs
+    # BEFORE the mate-tools grant so the grant has an owned file to edit directly
+    # (the severed-copy model): if the eager copy ran second it would re-copy the
+    # source AFTER the grant and the grant's additions would be lost, and if the
+    # grant ran first via the capability editor it would mint a ``crew-`` draft
+    # and repoint the binding to it, clobbering the mate id (the create-ordering
+    # bug the live pod surfaced).
+    #
+    # Best-effort: a crewmate that was published must not be reported as a failed
+    # create over the copy. A copy that does not land leaves ``kiro_agent``
+    # pointing at the source template (the pre-RFC shared-pointer model), and the
+    # grant below then skips (``mate_file_missing``) rather than minting a fork.
+    mate_copy = await _eager_copy_mate_config(name)
+    logger.info("new crewmate %s: mate-owned config %s", name, mate_copy)
+    # A template without the crewmate's own tools gets them on the member's OWNED
+    # config file (member_mate_tools edits ``mates/agents/<name>.json`` in place --
+    # no fork, no enroll, no ``crew-`` draft); the create stands whatever the
+    # outcome.
+    from kiro_crew.member_mate_tools import grant_mate_tools_to_new_member
+
+    async with _get_config_lock():
+        mate_tools = await _drained_to_thread(grant_mate_tools_to_new_member, name)
+    if mate_tools != "template_has_it":
+        logger.info("new crewmate %s: mate tools %s", name, mate_tools)
     # A crew APPEARING changes what the effort chain resolves even with no pin of
     # its own: the factory's captured config does not know the crew, so it cannot
     # read the binding the role default keys on, and a scheduled or messaging
     # session naming that crew would take the chat default instead. Creation is
     # therefore always a change by `_effort_inputs` (None -> a tuple).
     await _refresh_session_defaults(request, name)
+    if body.get("first_greeting") is True:
+        await _mark_first_greeting_owed(name, cfg)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="agent.create",

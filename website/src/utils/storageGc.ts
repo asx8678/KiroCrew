@@ -20,6 +20,9 @@
 const SESSION_PREFIXES = [
   'vc_heights_',
   'vc_anchor3_',
+  // The caught-up marker (`chat-core/transcript/caughtUpMarker.ts`): keyed by
+  // the raw slot key, so it is swept with the slot's heights and anchors.
+  'vc_seen_',
   // The pre-version-bump anchor prefixes. `ScrollAnchorCache` reaps these
   // outright when it loads, but that only happens once the chat virtualizer is
   // on screen — so the boot sweep keeps owning them for a user who never opens a
@@ -59,7 +62,7 @@ const SESSION_PREFIXES = [
  *
  *  - `artifacts-gallery` — the virtualizer partitions its height cache by
  *    `sessionId`, and the gallery is not a chat session but still has to name a
- *    partition. Writer: `ARTIFACT_HEIGHT_NS` in `pages/ArtifactsPage.tsx`.
+ *    partition. Writer: `ARTIFACT_HEIGHT_NS` in `pages/ArtifactsPageGallery.tsx`.
  *    Reserved under every prefix, and the partition IS owned by this name, so an
  *    explicit delete of it is honoured.
  *  - `no-slot` — slot-less consumers park a per-slot preference here. Writer:

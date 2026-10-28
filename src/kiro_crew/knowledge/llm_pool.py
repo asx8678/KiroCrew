@@ -21,6 +21,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_KIRO,
     POLICY_ID_BY_BACKEND,
     Routing,
+    backend_from_stored,
     effort_config_option_id,
     effort_config_option_value,
     resolve_selected_backend,
@@ -78,10 +79,9 @@ DEFAULT_POOL_SIZE = 3
 DEFAULT_TIMEOUT = 60.0
 FETCH_TIMEOUT = 120.0
 AGENT_NAME = "kirocrew-knowledge"
-# Knowledge extraction is low-effort by default (MOD-2). An operator pin in
-# knowledge.extraction_effort still wins. URL fetching uses a separate pool
-# and passes no explicit effort, so it retains the provider default.
-DEFAULT_EXTRACTION_EFFORT = "low"
+# Knowledge extraction is deliberately high-effort by default. URL fetching uses
+# a separate pool and passes no explicit effort, so it retains provider default.
+DEFAULT_EXTRACTION_EFFORT = "high"
 
 # Seconds the pool may sit FULLY idle (no worker checked out) before it is
 # scaled to zero — all workers shut down, freeing ~1GB of held process trees.
@@ -103,7 +103,7 @@ DEFAULT_IDLE_TTL_SECS = 300.0
 # real signal; the call count is the fallback for backends that report no context
 # telemetry at all (a 0% reading is indistinguishable from an empty transcript).
 WORKER_RECYCLE_PCT = 50.0
-WORKER_RECYCLE_CALLS = 1
+WORKER_RECYCLE_CALLS = 20
 
 
 # Sandbox modes accepted by ``kiro_crew.sandbox.wrap_argv`` (see its docstring).
@@ -192,39 +192,79 @@ def _get_acp_backend(config: Optional[dict] = None) -> str:
     resolved backend is safe to hand it, asked rather than enumerated so a
     backend that later earns both answers needs no change here:
     ``SessionCapabilities.honors_zero_tool_ban`` (kiro-cli/KAS natively, plus
-    opencode/goose via ``AcpClient._deny_zero_tools``; not claude, whose routing
-    is unenforced so an inherited pre-approval can skip the permission request;
-    not codex, whose sessions run on ``AcpRuntime`` with no such refusal; not
-    pi/deepseek, which have no mirror at all) and ``.acp_client_spawnable`` (not
+    opencode/goose/deepseek/pi via ``AcpClient._deny_zero_tools``; not claude,
+    whose routing is unenforced so an inherited pre-approval can skip the
+    permission request; not codex, whose sessions run on ``AcpRuntime`` with no
+    such refusal) and ``.acp_client_spawnable`` (not
     kas/codex, which need ``AcpRuntime`` and have no arm in ``AcpClient._spawn``).
 
     The pool reads raw ``config.json``, which never passed the loader's
-    normalizer, so an unselectable or malformed value degrades to Kiro here --
+    normalizer, so the stored vocabulary is translated first (``"kiro"`` is Kiro
+    CLI, absent or ``""`` is the default) and an unselectable or malformed value
+    degrades to Kiro here --
     and so does a resolved value that fails either capability check above.
+
+    The capability fallback warns only when the user declared a backend. With
+    none declared the default (KAS) is not something they chose, so the pool
+    falls back to Kiro silently instead of warning every process about it.
     """
     data = _read_config() if config is None else config
-    resolved = resolve_selected_backend(_section(data, "agent").get("acp_backend"))
+    selection = backend_from_stored(_section(data, "agent").get("acp_backend"))
+    resolved = resolve_selected_backend(selection)
     if not capabilities_for(resolved).honors_zero_tool_ban:
-        if resolved not in _WARNED_UNSAFE_BACKENDS:
-            _WARNED_UNSAFE_BACKENDS.add(resolved)
-            logger.warning(
-                "Knowledge pool: configured acp_backend=%s does not honor a zero-tool "
-                "spec (honors_zero_tool_ban is False); falling back to %s",
-                resolved,
-                ACP_BACKEND_KIRO,
-            )
+        _log_capability_fallback(
+            resolved,
+            selection is not None,
+            "does not honor a zero-tool spec (honors_zero_tool_ban is False)",
+        )
         return ACP_BACKEND_KIRO
     if not capabilities_for(resolved).acp_client_spawnable:
-        if resolved not in _WARNED_UNSAFE_BACKENDS:
-            _WARNED_UNSAFE_BACKENDS.add(resolved)
-            logger.warning(
-                "Knowledge pool: configured acp_backend=%s is not acp_client_spawnable; "
-                "falling back to %s",
-                resolved,
-                ACP_BACKEND_KIRO,
-            )
+        _log_capability_fallback(resolved, selection is not None, "is not acp_client_spawnable")
         return ACP_BACKEND_KIRO
     return resolved
+
+
+def _log_capability_fallback(resolved: str, declared: bool, reason: str) -> None:
+    """Log the Kiro fallback: a once-per-backend WARNING for a declared backend,
+    a debug line for the undeclared default."""
+    if not declared:
+        logger.debug(
+            "Knowledge pool: default acp_backend=%s %s; using %s",
+            resolved,
+            reason,
+            ACP_BACKEND_KIRO,
+        )
+        return
+    if resolved in _WARNED_UNSAFE_BACKENDS:
+        return
+    _WARNED_UNSAFE_BACKENDS.add(resolved)
+    logger.warning(
+        "Knowledge pool: configured acp_backend=%s %s; falling back to %s",
+        resolved,
+        reason,
+        ACP_BACKEND_KIRO,
+    )
+
+
+def _knowledge_spec_model() -> str | None:
+    """The model pin the installer writes into the knowledge spec, or None for no pin.
+
+    The same rule the installer applies (``knowledge.extraction_model`` →
+    ``agent.model`` → ``"auto"``, ``kiro_crew.agent.knowledge_agent_model``), so
+    a harness that reads no spec of Crew's runs the model kiro-cli would read
+    from it. ``"auto"`` or a blank is no pin. Blocking (reads the config) and
+    never raises; callers run it off the loop.
+    """
+    try:
+        from kiro_crew.agent import knowledge_agent_model
+
+        model = knowledge_agent_model()
+    except Exception:
+        logger.debug("knowledge model pin unreadable; no pin", exc_info=True)
+        return None
+    if not isinstance(model, str) or not model.strip() or model.strip() == "auto":
+        return None
+    return model.strip()
 
 
 def _get_idle_ttl(config: Optional[dict] = None) -> float:
@@ -259,8 +299,9 @@ def _get_workload_effort(
        default instead.
 
     The chain deliberately has NO role-policy leg: extraction effort is a
-    Knowledge policy, independent of ``agent.role_efforts.background``. An
-    unset key uses ``DEFAULT_EXTRACTION_EFFORT`` (low), not the chat effort.
+    Knowledge policy, independent of ``agent.role_efforts.background`` (which
+    controls other background workers) — an unset key keeps the historical
+    always-``high`` behavior rather than silently following a role change.
     A key present but invalid or typed-wrong also lands on *fallback* (the
     pre-config default), and logs — nothing silently changes cost.
     Pure: never raises, works on a raw (possibly hand-edited) config dict.
@@ -308,8 +349,13 @@ def _select_effort_level(requested: str, supported: list[str]) -> Optional[str]:
         level for level in supported if isinstance(level, str) and is_valid_effort(level)
     }
     if not supported_levels:
-        # An advertised option without a usable level is treated like a lazy
-        # backend: attempt the requested value and let ACP confirm it.
+        # An option offering ``off`` alone is the harness saying the current model
+        # takes no level (goose, per model): a write there is accepted and reads
+        # back as ``off``, so nothing is sent.
+        if supported and all(level == "off" for level in supported):
+            return None
+        # Any other advertised option without a usable level is treated like a
+        # lazy backend: attempt the requested value and let ACP confirm it.
         return requested
     requested_index = EFFORT_LEVELS.index(requested)
     eligible = [
@@ -318,6 +364,18 @@ def _select_effort_level(requested: str, supported: list[str]) -> Optional[str]:
         if level in supported_levels and EFFORT_LEVELS.index(level) <= requested_index
     ]
     return eligible[-1] if eligible else None
+
+
+def _repair_agent_spec() -> bool:
+    """Rewrite the installed :data:`AGENT_NAME` spec from its template if it drifted.
+
+    True when the file was rewritten. ``kiro_crew.agent`` is imported here, not at
+    the top, because nothing else in this module needs it. Blocking: callers run it
+    with ``asyncio.to_thread``.
+    """
+    from kiro_crew import agent as agent_mod
+
+    return agent_mod.repair_knowledge_agent_spec()
 
 
 class Worker(ABC):
@@ -329,10 +387,6 @@ class Worker(ABC):
     # ``__init__``, so a subclass that does not chain up still has the counter
     # (``+=`` rebinds it per instance).
     calls_since_reset: int = 0
-    # The usage row's ``service`` for the prompt being served (``knowledge:extraction``,
-    # ``auto_research``, …). The pool sets it on each checkout, before the send, from
-    # the pool's own workload name; one worker serves one prompt at a time.
-    usage_service: str = ""
 
     @abstractmethod
     async def start(self) -> None:
@@ -424,8 +478,8 @@ class AcpWorker(Worker):
         )
         self._client, authored_before_spawn = await self._spawn_client(acp_backend, sandbox_mode)
         # A zero-tool spec must be CONFIRMED, not assumed. A backend that is not
-        # routed through Routing.AGENT_SPEC relies on the mirror's consumed
-        # projection (spec_zero_tools). If the spec was missing, malformed, or
+        # routed through Routing.AGENT_SPEC relies on the session's consumed
+        # projection (spec_zero_tools: the mirror's, or pi's mirror-less parse). If the spec was missing, malformed, or
         # shadowed by a project-level spec, that signal is false and every native
         # tool request would auto-approve, so this worker restarts on Kiro before
         # any prompt is sent.
@@ -450,14 +504,15 @@ class AcpWorker(Worker):
         # harness resolves --agent against <cwd>/.kiro/agents before the global
         # directory, and this pool's cwd is a workspace under the data home, so a
         # project-level spec of the same name that carries tools would shadow the
-        # installed one and auto-approve them for untrusted document text. The
-        # projected view the harness consumed through --agent is the authority
-        # when one exists: it is prepared before the spawn and never re-read, so a
-        # later spec edit cannot change the answer. Without one (the rollback
-        # switch, or an alias that could not be taken) the harness loads the named
-        # spec itself, so the authored spec is read before the spawn and again
-        # after start, and both reads must declare an empty list. A worker that
-        # cannot confirm the ban does not start: Kiro is the last fallback.
+        # installed one and auto-approve them for untrusted document text. With a
+        # prepared projection the harness is launched as the view's published
+        # alias, so the view and the alias file kiro-cli loads, read after start,
+        # must both declare an empty list; the authored spec is not read there.
+        # Without one (the rollback switch, or an alias that could not be taken)
+        # the harness loads the named spec itself, so the authored spec is read
+        # before the spawn and again after start, and both reads must declare an
+        # empty list. A worker that cannot confirm the ban does not start: Kiro is
+        # the last fallback.
         if routing_for(acp_backend) is Routing.AGENT_SPEC and not (
             await asyncio.to_thread(
                 self._client.effective_spec_declares_zero_tools,
@@ -478,8 +533,8 @@ class AcpWorker(Worker):
             raise RuntimeError(
                 f"knowledge agent {AGENT_NAME!r} could not be confirmed to declare a "
                 "zero-tool spec (a project-level spec may shadow the installed one, "
-                "or the spec could not be read); refusing to run the knowledge pool "
-                "without a confirmed tool ban"
+                "or the installed one could not be read or restored); refusing to run "
+                "the knowledge pool without a confirmed tool ban"
             )
         await self._apply_effort()
         # Shield the live worker PID from the periodic orphan sweep for as long
@@ -499,19 +554,43 @@ class AcpWorker(Worker):
     async def _spawn_client(self, acp_backend: str, sandbox_mode: str) -> tuple[AcpClient, bool]:
         """Build the client for *acp_backend*, bring it up, and return it with the pre-spawn read.
 
+        The installed spec is repaired from its template first
+        (:func:`_repair_agent_spec`), on every backend, because every one of them
+        resolves the agent by name from the shared agents directory, where another
+        tool may have rewritten it since the boot rebuild. The confirmation in
+        :meth:`start` still decides whether the worker runs.
+
         The client is stored as ``self._client`` before ``ensure_ready`` so a failed
         start still leaves it reachable. For a backend routed through
         ``Routing.AGENT_SPEC`` the authored spec is read BEFORE this client's
         ``ensure_ready`` spawns the harness, and the result is returned so the
         post-start confirmation can require both reads to agree when no projection
         was prepared. Any other backend returns False.
+
+        The model pin follows the same split. A ``Routing.AGENT_SPEC`` harness reads
+        the spec's own ``model`` (the installer resolves ``knowledge.extraction_model``
+        → ``agent.model`` → ``"auto"`` into it), so nothing is passed and its
+        construction is unchanged. Every other harness reads no spec of Crew's, so
+        the same pin, by the installer's own rule, is handed to the client, whose
+        startup model application scopes it to this backend (a model another
+        harness serves falls back to the backend default rather than being sent).
         """
-        client = AcpClient(
-            agent=AGENT_NAME,
-            sandbox_mode=sandbox_mode,
-            acp_backend=acp_backend,
-            audit_source="subagent",
-        )
+        await asyncio.to_thread(_repair_agent_spec)
+        if routing_for(acp_backend) is Routing.AGENT_SPEC:
+            client = AcpClient(
+                agent=AGENT_NAME,
+                sandbox_mode=sandbox_mode,
+                acp_backend=acp_backend,
+                audit_source="subagent",
+            )
+        else:
+            client = AcpClient(
+                agent=AGENT_NAME,
+                sandbox_mode=sandbox_mode,
+                acp_backend=acp_backend,
+                audit_source="subagent",
+                model=await asyncio.to_thread(_knowledge_spec_model),
+            )
         self._client = client
         self._effective_effort = None
         authored_before_spawn = False
@@ -536,8 +615,9 @@ class AcpWorker(Worker):
         This pool's ``acp_backend`` is restricted by ``_get_acp_backend`` to a
         backend that answers both ``honors_zero_tool_ban`` and
         ``acp_client_spawnable`` True, and those do NOT all answer these capabilities
-        the same way -- kiro takes the slash command, opencode and goose take
-        neither -- which is exactly why they are asked here instead of an identity.
+        the same way -- kiro takes the slash command, goose and opencode take the
+        config option (``thinking_effort`` and ``effort``) -- which is exactly why
+        they are asked here instead of an identity.
         ``test_agent_sdk_capabilities`` pins every member's answers, so a backend
         that later qualifies with different answers is caught there, not assumed to
         inherit an existing member's.
@@ -606,15 +686,8 @@ class AcpWorker(Worker):
         if self._client is None or not self._client.is_ready:
             await self.start()
         assert self._client is not None
-        # Function-local, like the rest of this module's host imports: the pool
-        # is reached from the knowledge CLI without the gateway's import chain.
-        from kiro_crew.llm_helpers import metered_turn
-
         try:
-            # USE-1: each knowledge prompt (extraction, agent fetch) is a billed
-            # turn; one usage row, on every exit, before a failed client is shut.
-            async with metered_turn(self._client, surface="knowledge", service=self.usage_service):
-                return await self._client.send_message(prompt, timeout=timeout)
+            return await self._client.send_message(prompt, timeout=timeout)
         except Exception:
             # A timed-out turn is still running in the child, so a reused client
             # answers "Prompt already in progress". Prompts are self-contained,
@@ -684,31 +757,6 @@ def _text_blocks(container: Any) -> list[str]:
     ]
 
 
-def _claude_result_billing(event: dict) -> tuple[Any, str]:
-    """The billing a Claude CLI ``result`` event reports, and the model it served.
-
-    USE-1: the CLI's ``usage`` object carries the token counts and
-    ``total_cost_usd`` the cost; ``modelUsage`` names the served model(s). Absent
-    fields read as zero, so an event without billing yields a usage that
-    :func:`~kiro_crew.llm_helpers.usage_has_billing` rejects.
-    """
-    from kiro_crew.acp.types import TurnUsage
-
-    usage = event.get("usage") or {}
-    model_usage = event.get("modelUsage") or {}
-    model = next(iter(model_usage), "") if isinstance(model_usage, dict) else ""
-    turn = TurnUsage(
-        input_tokens=int(usage.get("input_tokens", 0) or 0),
-        output_tokens=int(usage.get("output_tokens", 0) or 0),
-        cache_creation_tokens=int(usage.get("cache_creation_input_tokens", 0) or 0),
-        cache_read_tokens=int(usage.get("cache_read_input_tokens", 0) or 0),
-        cost_usd=float(event.get("total_cost_usd", 0.0) or 0.0),
-        num_turns=int(event.get("num_turns", 0) or 0),
-        duration_ms=int(event.get("duration_ms", 0) or 0),
-    )
-    return turn, str(model)
-
-
 class CCWorker(Worker):
     """Long-lived external agent CLI subprocess using stream-json I/O."""
 
@@ -724,10 +772,6 @@ class CCWorker(Worker):
         # rather than take ``wrap_argv``'s own default. ``None`` -> resolve
         # lazily in ``_spawn`` (direct construction outside the pool / tests).
         self._sandbox_mode = sandbox_mode
-        # USE-1: the billing of the reply being collected, read off its result
-        # event (``(TurnUsage, served model)``), so ``send_message`` can write
-        # the turn's one usage row on every exit.
-        self._turn_billing: Optional[tuple[Any, str]] = None
 
     async def start(self) -> None:
         self._claude_bin = shutil.which("claude")
@@ -820,7 +864,8 @@ class CCWorker(Worker):
             start_new_session=platform_compat.IS_POSIX,
             creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             # The agent enforcement point, passed exactly as the agent-CLI
-            # spawns in ``dashboard/handlers/sessions.py`` pass it. This worker
+            # spawns in ``dashboard/handlers/sessions.py`` and
+            # ``sessions_parts/usage_scrape.py`` pass it. This worker
             # runs with its permission prompts disabled and its inputs are
             # knowledge documents, so gateway-owned credentials must not be
             # readable inside it. The tier does not cover this: no tier below
@@ -875,7 +920,6 @@ class CCWorker(Worker):
             await stdin.drain()
             return await self._collect_response()
 
-        self._turn_billing = None
         # The queue may hold only this prompt's events, so the worker survives
         # a message only when its result event was consumed. Anything else (a
         # timeout, a dead reader, a reply that broke off, a cancelled caller)
@@ -893,37 +937,8 @@ class CCWorker(Worker):
             settled = True  # the error result is the result event
             raise
         finally:
-            # USE-1: a timed-out, cancelled or failed reply still spent what its
-            # result event reported, so the row is written before the shutdown.
-            await self._record_turn_usage()
             if not settled:
                 await self.shutdown()
-
-    async def _record_turn_usage(self) -> None:
-        """Write this reply's one usage row (surface ``knowledge``), if it billed.
-
-        Never raises: the row is analytics and must not fail the turn it measures.
-        """
-        billing, self._turn_billing = self._turn_billing, None
-        if billing is None:
-            return
-        usage, model = billing
-        # Function-local, like the rest of this module's host imports.
-        from kiro_crew.dashboard.handlers.usage import persist_token_record_async
-        from kiro_crew.llm_helpers import usage_has_billing
-
-        try:
-            if usage_has_billing(usage):
-                await persist_token_record_async(
-                    "_bg",
-                    model,
-                    usage,
-                    "claude_code",
-                    surface="knowledge",
-                    service=self.usage_service,
-                )
-        except Exception:
-            logger.debug("CCWorker: knowledge usage row failed", exc_info=True)
 
     async def _collect_response(self) -> str:
         """Collect text from events until a result event arrives.
@@ -948,8 +963,6 @@ class CCWorker(Worker):
 
             elif event_type == "result":
                 result = event.get("result")
-                # Read before the error check: an error result is still a turn.
-                self._turn_billing = _claude_result_billing(event)
                 if event.get("is_error") is True:
                     detail = result if isinstance(result, str) else event.get("subtype", "")
                     raise CCWorkerReplyError(f"CLI reported an error result: {str(detail)[:500]}")
@@ -1019,12 +1032,8 @@ class LLMPool:
         effort_key: Optional[str] = None,
         fallback_effort: str = "",
         config_pool_size_key: Optional[str] = None,
-        service: str = "",
     ):
         self._pool_size = pool_size
-        # The usage row's ``service`` for this pool's workload (``knowledge:extraction``,
-        # ``auto_research``, …), stamped on each worker as it is checked out.
-        self._service = service
         self._effort = _normalize_effort(effort)
         # Workload-bound effort resolution: when ``effort_key`` is set, the
         # effort is re-resolved from the config read in ``start()`` (explicit
@@ -1366,7 +1375,6 @@ class LLMPool:
         """Convenience: acquire a worker, send prompt, release, return response."""
         idx, worker = await self.acquire()
         try:
-            worker.usage_service = self._service
             return await worker.send_message(prompt, timeout=timeout)
         finally:
             try:

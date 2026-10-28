@@ -8,31 +8,34 @@ import functools
 import json
 import mimetypes
 import os
+import threading
 import urllib.parse
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, BinaryIO
 
 from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.handlers.files import (
-        _MAX_UPLOAD_BYTES,
+        _DOWNLOAD_CHUNK_STALL_SECS,
+        _DOWNLOAD_SCAN_MAX_BYTES,
         _STREAM_CHUNK_BYTES,
         _STREAM_MAX_BYTES,
         _STREAM_TEXT_PROBE_BYTES,
         FILE_READ_SCHEMA,
         ValidationError,
-        _open_checked,
         _open_checked_file,
+        _open_refusal,
         _OpenDenied,
-        _OpenRefusal,
         _PathProbeBusy,
         _probe_busy_response,
         _probe_request_path,
+        _project_relative_stall_path,
         _resolve_project_relative,
         _run_path_probe,
         _sel,
         _sniff_media_type,
+        binary_content_is_flagged,
         logger,
         redact,
         require_owner_dashboard_request,
@@ -88,7 +91,6 @@ async def api_file_watch(request: web.Request) -> web.StreamResponse:
     resp.content_type = "text/event-stream"
     resp.headers["Cache-Control"] = "no-cache"
     resp.headers["X-Accel-Buffering"] = "no"
-    await resp.prepare(request)
 
     poll_interval = 1.0
     read_cap = 512_000
@@ -100,6 +102,7 @@ async def api_file_watch(request: web.Request) -> web.StreamResponse:
             return f.read(cap)
 
     try:
+        await resp.prepare(request)
         while not (request.transport is None or request.transport.is_closing()):
             # Each poll tick is a probe on the watched path. A refused tick is
             # skipped, not fatal: the stream is already open, the pool is busy
@@ -136,6 +139,10 @@ async def api_file_watch(request: web.Request) -> web.StreamResponse:
                     break
                 try:
                     content = await asyncio.to_thread(_read_file, current_resolved, read_cap)
+                    # A read that filled the cap saw only the head of the file,
+                    # so an equal head says nothing about the rest: a write past
+                    # the cut changes the mtime and nothing this read can see.
+                    capped = len(content) >= read_cap
                     # NOT an owner-view seam, on purpose: this stream also
                     # serves file-backed artifact live reload, and neither
                     # consumer renders the frame -- both re-read through
@@ -147,13 +154,17 @@ async def api_file_watch(request: web.Request) -> web.StreamResponse:
                     await asyncio.sleep(poll_interval)
                     continue
 
-                if content != last_content:
+                if content != last_content or capped:
+                    # A capped write that left the head unchanged is a signal
+                    # only: both consumers re-read on it, so the frame carries
+                    # no body rather than the same 512,000 characters again.
+                    body = content if content != last_content else ""
                     last_content = content
                     # ensure_ascii=False keeps multi-byte content (e.g. CJK)
                     # inspectable as-is in DevTools instead of \uXXXX escapes,
                     # and produces smaller payloads. Body bytes are still
                     # valid UTF-8 because we explicitly .encode() below.
-                    payload = json.dumps({"content": content, "mtime": mtime}, ensure_ascii=False)
+                    payload = json.dumps({"content": body, "mtime": mtime}, ensure_ascii=False)
                     await resp.write(f"data: {payload}\n\n".encode("utf-8"))
 
             await asyncio.sleep(poll_interval)
@@ -163,7 +174,7 @@ async def api_file_watch(request: web.Request) -> web.StreamResponse:
     return resp
 
 
-async def api_file_download(request: web.Request) -> web.Response:
+async def api_file_download(request: web.Request) -> web.StreamResponse:
     """GET /api/file-download?path=... — download a file as raw bytes.
 
     Sibling of /api/file-read. file-read decodes content as UTF-8 with
@@ -175,17 +186,21 @@ async def api_file_download(request: web.Request) -> web.Response:
 
     Security: same path-validation as file-read (validate_tool_args,
     _validate_dashboard_path, sensitive-path filter). Symlinks rejected
-    via O_NOFOLLOW. Files larger than _MAX_UPLOAD_BYTES are rejected.
-    Text files are still scanned for sensitive content (credentials and
-    exfiltration URLs); a positive hit aborts the download. Binary
-    files are served as-is without a MIME allowlist, since attachment
-    disposition + nosniff prevents inline rendering on the dashboard
-    origin.
+    via O_NOFOLLOW. The route is owner-only, so the content is NOT scanned:
+    the owner downloads their own file as-is. Binary files are served
+    without a MIME allowlist, since attachment disposition + nosniff
+    prevents inline rendering on the dashboard origin.
+
+    A file up to _DOWNLOAD_SCAN_MAX_BYTES is read whole. A larger file
+    streams in bounded chunks so it is never held in memory whole; see
+    :func:`_stream_unscanned_download`. Small or large is decided by the fstat
+    of the ONE descriptor every byte is read from, so no other file can be
+    swapped in between the size check and the send.
     """
     owner_denied = await require_owner_dashboard_request(request, "file_download")
     if owner_denied is not None:
         return owner_denied
-    # Path validation now happens inside ``_open_checked``, which keeps the
+    # Path validation happens inside ``_open_checked_file``, which keeps the
     # late-binding ``handlers`` alias so tests can still monkey-patch
     # ``_validate_dashboard_path`` (legitimate circular-import workaround,
     # listed as an exception in the top-level-imports rule).
@@ -194,7 +209,11 @@ async def api_file_download(request: web.Request) -> web.Response:
     # api_file_read). Off-loop: the resolution is a pair of realpath calls.
     if request.query.get("resolve") == "1":
         try:
-            raw_path, _resolve_err = await _run_path_probe(_resolve_project_relative, raw_path)
+            raw_path, _resolve_err = await _run_path_probe(
+                _resolve_project_relative,
+                raw_path,
+                stall_path=_project_relative_stall_path(raw_path),
+            )
         except _PathProbeBusy:
             return _probe_busy_response(resource=raw_path, tool_name="file_download")
         if _resolve_err == "cannot_resolve":
@@ -219,53 +238,92 @@ async def api_file_download(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "invalid input"}, status=400)
 
-    # Envelope shared with api_file_raw. No header sniff: this endpoint
-    # serves attachment + nosniff rather than choosing a content type. Offloaded
-    # to a worker thread: the envelope is synchronous file I/O (realpath, open,
-    # fstat, full read up to the cap) and must not block the event loop.
+    # The checked prefix shared with file-raw, file-stream and file-sheet:
+    # validate, sensitive-path filter, nofollow open, fstat. No header sniff:
+    # this endpoint serves attachment + nosniff rather than choosing a content
+    # type. Synchronous file I/O, so it runs on the bounded transfer pool.
     try:
-        opened = await _run_path_probe(
-            functools.partial(
-                _open_checked, raw_path, tool_name="file_download", max_bytes=_MAX_UPLOAD_BYTES
-            ),
+        checked = await _run_path_probe(
+            functools.partial(_open_checked_file, raw_path, tool_name="file_download"),
             transfer=True,
+            stall_path=raw_path,
         )
     except _PathProbeBusy:
         return _probe_busy_response(resource=raw_path, tool_name="file_download")
-    if isinstance(opened, _OpenRefusal):
-        return opened.response
-    path, data = opened.path, opened.data
-
-    # Defense in depth: scan content for credentials / exfil URLs via the
-    # context-aware redact() shim, which runs BOTH the exfil-URL and credential
-    # passes (exfil URLs first so embedded credentials in URL fragments are
-    # caught) and additionally applies a loaded companion's extra regexes before
-    # content reaches an external surface.
-    #
-    # Mostly-binary files can still hide credential patterns in their
-    # decodable runs (e.g. an ASCII-art `AKIA...` with one stray non-UTF-8
-    # byte). Decoding with errors='replace' for the *scan only* (the served
-    # bytes are still raw) ensures the credential pass cannot be bypassed
-    # by sprinkling a single non-UTF-8 byte into the file.
+    if isinstance(checked, _OpenDenied):
+        return _open_refusal(checked, tool_name="file_download").response
+    f, path = checked.file, checked.path
+    # Set while a chunk read of the unscanned stream may still be running on a
+    # pool thread: after a stall (or a cancelled request) that thread holds the
+    # file's buffer lock, and a close would wait on it.
+    read_in_flight = [False]
     try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        text = data.decode("utf-8", errors="replace")
-    # Route through the context-aware redact() so a loaded companion's extra
-    # credential regexes also abort the download; the scrubbed != text diff is
-    # the gate (no count needed).
-    scrubbed = redact(text)
-    if scrubbed != text:
+        if checked.size > _DOWNLOAD_SCAN_MAX_BYTES:
+            return await _stream_unscanned_download(request, f, path, checked.size, read_in_flight)
+        # Bounded read on the same fd: one byte past the threshold says the
+        # file grew after the fstat, and a file over it is never scanned whole.
+        # Marked in flight like a stream chunk: an execution timeout or a
+        # cancellation leaves the read running on its pool thread, so the
+        # close below must not wait on it.
+        read_in_flight[0] = True
+        try:
+            data = await _run_path_probe(
+                f.read, _DOWNLOAD_SCAN_MAX_BYTES + 1, transfer=True, stall_path=path
+            )
+        except _PathProbeBusy:
+            # Refused before it ran: no read holds the file.
+            read_in_flight[0] = False
+            return _probe_busy_response(resource=path, tool_name="file_download")
+        except TimeoutError:
+            # Past the execution ceiling. TimeoutError is an OSError, so it is
+            # caught here first: the read is still running, the flag stays set.
+            _sel().log_tool_invocation(
+                session_key="dashboard",
+                tool_name="file_download",
+                outcome="failure",
+                resources=path,
+                error="read_stalled",
+            )
+            return web.json_response(
+                {"error": "cannot read file", "code": "read_failed"}, status=500
+            )
+        except OSError:
+            read_in_flight[0] = False
+            logger.exception("file_download read failed for %s", path)
+            _sel().log_tool_invocation(
+                session_key="dashboard",
+                tool_name="file_download",
+                outcome="failure",
+                resources=path,
+            )
+            return web.json_response(
+                {"error": "cannot read file", "code": "read_failed"}, status=500
+            )
+        read_in_flight[0] = False
+    finally:
+        # A close that may wait on a read still running -- the pool is full, or
+        # a chunk read stalled or was abandoned -- goes to a thread of its own:
+        # it needs no pool admission, never blocks the loop or this response,
+        # and only ever waits on this one file.
+        deferred = read_in_flight[0]
+        if not deferred:
+            try:
+                await _run_path_probe(f.close, transfer=True, stall_path=path)
+            except _PathProbeBusy:
+                deferred = True
+        if deferred:
+            threading.Thread(target=f.close, name="file-download-close", daemon=True).start()
+    if len(data) > _DOWNLOAD_SCAN_MAX_BYTES:
         _sel().log_tool_invocation(
             session_key="dashboard",
             tool_name="file_download",
             outcome="denied",
             resources=path,
-            error="content_redacted",
+            error="file_grew_during_read",
         )
         return web.json_response(
-            {"error": "file content was redacted; download aborted", "code": "content_redacted"},
-            status=400,
+            {"error": "file changed while it was read; retry", "code": "file_changed"},
+            status=409,
         )
 
     safe_name = urllib.parse.quote(os.path.basename(path), safe="")
@@ -287,6 +345,93 @@ async def api_file_download(request: web.Request) -> web.Response:
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+def _download_read_chunk(f: BinaryIO, size: int) -> bytes:
+    """One chunk of an unscanned download: a plain read on the transfer pool."""
+    return f.read(size)
+
+
+async def _stream_unscanned_download(
+    request: web.Request, f: BinaryIO, path: str, size: int, read_in_flight: list[bool]
+) -> web.StreamResponse:
+    """Serve a download over the in-memory threshold by streaming it.
+
+    The file streams from *f* -- the descriptor whose fstat gave
+    *size* -- in chunks of ``_STREAM_CHUNK_BYTES``, and never past *size*: a
+    file that grows while it streams is cut at what the fstat said. A file that
+    shrinks ends the response short and drops the connection, so the client
+    sees a failed download rather than a short file it takes for whole.
+    """
+    name = os.path.basename(path)
+    content_type, _ = mimetypes.guess_type(path)
+    resp = web.StreamResponse(
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(name, safe='')}",
+            "Content-Type": content_type or "application/octet-stream",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+    resp.content_length = size
+    # SEL: the ALLOW decision is recorded before any byte moves.
+    _sel().log_tool_invocation(
+        session_key="dashboard",
+        tool_name="file_download",
+        outcome="success",
+        resources=path,
+        error="unscanned_large_file",
+    )
+    await resp.prepare(request)
+    remaining = size
+    while remaining > 0:
+        # Each chunk is one hop on the bounded transfer pool, never the shared
+        # default executor, and is given _DOWNLOAD_CHUNK_STALL_SECS: a read on
+        # a hung mount then costs one transfer worker and ends this response,
+        # instead of parking default-executor threads every file route needs.
+        error = ""
+        # Cleared only once the read has returned: a stall or a cancellation
+        # leaves it set, so the caller does not wait on the abandoned read.
+        read_in_flight[0] = True
+        try:
+            chunk = await asyncio.wait_for(
+                _run_path_probe(
+                    _download_read_chunk,
+                    f,
+                    min(_STREAM_CHUNK_BYTES, remaining),
+                    transfer=True,
+                    stall_path=path,
+                ),
+                timeout=_DOWNLOAD_CHUNK_STALL_SECS,
+            )
+        except _PathProbeBusy:
+            chunk, error = b"", "unscanned_large_file_pool_busy"
+        except asyncio.TimeoutError:
+            chunk, error = b"", "unscanned_large_file_read_stalled"
+        except OSError:
+            chunk = b""
+        if not error:
+            read_in_flight[0] = False
+        if not chunk:
+            # Shrunk, unreadable, stalled or refused mid-stream: the announced
+            # length cannot be met, so drop the connection rather than end it
+            # cleanly, and the client sees a failed download.
+            _sel().log_tool_invocation(
+                session_key="dashboard",
+                tool_name="file_download",
+                outcome="failure",
+                resources=path,
+                error=error or "unscanned_large_file_short_read",
+            )
+            resp.force_close()
+            return resp
+        remaining -= len(chunk)
+        try:
+            await resp.write(chunk)
+        except (ConnectionResetError, ConnectionError, ClientConnectionResetError):
+            return resp  # client hung up
+    with contextlib.suppress(Exception):
+        await resp.write_eof()
+    return resp
 
 
 def _parse_range_header(value: str, size: int) -> tuple[int, int] | None:
@@ -395,16 +540,15 @@ async def api_file_stream(request: web.Request) -> web.StreamResponse:
             # Sibling-control parity: file-download refuses text content that
             # redact() flags. Media magics can be weak (the bare mp3 frame
             # sync is two bytes), so a credential-bearing TEXT file with a
-            # forged prefix must not stream out here. Decode with
-            # errors="replace" -- exactly as the download scan does -- so an
-            # invalid byte (including the forged magic itself) cannot skip
-            # the credential pass; replacement chars break no real credential
-            # pattern, and genuine binary media decodes to replacement-dense
-            # junk that redact() leaves unchanged. The scan is bounded to the
-            # probe window; the full-file scan remains the download path's.
+            # forged prefix must not stream out here. A non-UTF-8 probe takes
+            # the shared binary scan, as file-download does.
             probe = header + fobj.read(_STREAM_TEXT_PROBE_BYTES - len(header))
-            probe_text = probe.decode("utf-8", errors="replace")
-            if redact(probe_text) != probe_text:
+            try:
+                probe_text = probe.decode("utf-8")
+                flagged = redact(probe_text) != probe_text
+            except UnicodeDecodeError:
+                flagged = binary_content_is_flagged(probe)
+            if flagged:
                 fobj.close()
                 return ("refused", "content_redacted", validated)
             fobj.seek(0)

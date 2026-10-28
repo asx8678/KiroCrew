@@ -34,7 +34,6 @@ from kiro_crew.acp.types import (
 from kiro_crew.dashboard.handlers import usage
 from kiro_crew.dashboard.handlers.hooks import (
     _EVENT_PERMISSION_REQUEST_KIND,
-    _hook_mcp_spawn_notice,
     _run_hook_inner,
 )
 from kiro_crew.hooks import TOOL_ALLOW, TOOL_AUTO_APPROVE, TOOL_DENY, ToolHookResult
@@ -42,6 +41,7 @@ from kiro_crew.permission_floor import (
     OUTCOME_PENDING_APPROVAL,
     OUTCOME_REJECTED_TRANSPORT_FLOOR,
 )
+from kiro_crew.testing.wait import await_until, finished
 
 _REQUEST_ID = "perm-req-9790"
 
@@ -147,10 +147,11 @@ def _drive(
     gate_result=None,
     event=None,
     approval_sent: bool = True,
+    client: _FakeClient | None = None,
 ):
     """Run one webhook turn; return (client, sel, gate, result_text)."""
     sel = _RecordingSel()
-    # _sel() in handlers/hooks.py resolves through the handlers package's
+    # _sel() in handlers/hooks_scripts.py resolves through the handlers package's
     # late-binding sel() exactly for this patch point.
     import kiro_crew.dashboard.handlers as handlers_pkg
 
@@ -159,14 +160,15 @@ def _drive(
     # tests intercept).
     monkeypatch.setattr(usage, "_write_token_record", lambda _record, _now: None)
 
-    client = _FakeClient(event, approval_sent=approval_sent)
+    client = client or _FakeClient(event, approval_sent=approval_sent)
     if gate_result is None and gate_action is not None:
         gate_result = ToolHookResult(action=gate_action)
     gate = _FakeGate(gate_result) if gate_result is not None else None
     builder = _FakeContextBuilder(gate) if gate is not None else None
-    result_text, _names = asyncio.run(
-        asyncio.wait_for(
+    result_text = asyncio.run(
+        finished(
             _run_hook_inner(_FakeState(client, builder), "hook:test:9790", "go", None),
+            "the webhook turn",
             timeout=_PROMPT_BOUND_S,
         )
     )
@@ -175,57 +177,6 @@ def _drive(
 
 def _denial_rows(sel: _RecordingSel) -> list[dict]:
     return [r for r in sel.tool_rows if r.get("outcome") == "denied"]
-
-
-def test_mcp_problem_names_are_read_and_notice_is_prepended(monkeypatch):
-    """SES-14: a webhook run whose MCP servers failed to start reads the
-    session's MCP report through the provider contract, and the names-only
-    summary reaches both the notice prepended to the turn and the caller."""
-    from types import SimpleNamespace
-
-    class _McpClient(_FakeClient):
-        def mcp_session_report(self):
-            report = SimpleNamespace()
-            report.problem_summary = lambda include_reasons=True: (
-                "kirocrew-core (init failed)" if include_reasons else "kirocrew-core"
-            )
-            return report
-
-    sel = _RecordingSel()
-    import kiro_crew.dashboard.handlers as handlers_pkg
-
-    monkeypatch.setattr(handlers_pkg, "sel", lambda: sel)
-    monkeypatch.setattr(usage, "_write_token_record", lambda _record, _now: None)
-
-    client = _McpClient()
-    result_text, names = asyncio.run(
-        asyncio.wait_for(
-            _run_hook_inner(_FakeState(client, None), "hook:test:mcp", "go", None),
-            timeout=_PROMPT_BOUND_S,
-        )
-    )
-    assert names == "kirocrew-core"
-    assert "hello world" in result_text
-
-    notice = _hook_mcp_spawn_notice(names)
-    assert "kirocrew-core" in notice
-    assert "BEGIN_UNTRUSTED_MCP" in notice
-
-    class _HealthyClient(_FakeClient):
-        def mcp_session_report(self):
-            report = SimpleNamespace()
-            report.problem_summary = lambda include_reasons=True: ""
-            return report
-
-    healthy = _HealthyClient()
-    result, names2 = asyncio.run(
-        asyncio.wait_for(
-            _run_hook_inner(_FakeState(healthy, None), "hook:test:ok", "go", None),
-            timeout=_PROMPT_BOUND_S,
-        )
-    )
-    assert names2 == ""
-    assert "hello world" in result
 
 
 def test_no_gate_rejects_audits_and_still_returns_text(monkeypatch):
@@ -391,9 +342,10 @@ def test_unauditable_auto_approve_is_denied(monkeypatch):
 
     client = _FakeClient()
     builder = _FakeContextBuilder(_FakeGate(ToolHookResult(action=TOOL_AUTO_APPROVE)))
-    result_text, _names = asyncio.run(
-        asyncio.wait_for(
+    result_text = asyncio.run(
+        finished(
             _run_hook_inner(_FakeState(client, builder), "hook:test:9790", "go", None),
+            "the webhook turn",
             timeout=_PROMPT_BOUND_S,
         )
     )
@@ -415,3 +367,88 @@ def test_permission_kind_constant_matches_the_wire_vocabulary():
     """The handler spells the event kind locally (the agent-sdk boundary gate
     forbids adding an ACP import edge); this pin breaks if the vocabulary moves."""
     assert _EVENT_PERMISSION_REQUEST_KIND == EVENT_PERMISSION_REQUEST
+
+
+# ── The in-band host notice ──────────────────────────────────────────────────
+#
+# kiro-cli tells the model "User denied tool execution" for every rejection. No
+# person is attached to a webhook turn, so every deny is the HOST's, and the
+# model must read which one before the reject goes on the wire -- while the
+# request is unanswered the turn is provably in flight and the notice is queued.
+
+
+class _SteeringClient(_FakeClient):
+    """A steer-capable client recording steer and reject in one ordered trace."""
+
+    supports_refusal_steer = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.trace: list[tuple[str, object]] = []
+
+    async def steer(self, text: str) -> bool:
+        self.trace.append(("steer", text))
+        return True
+
+    async def reject_tool(self, request_id) -> None:
+        self.trace.append(("reject", request_id))
+        await super().reject_tool(request_id)
+
+
+def _notice(client: _SteeringClient) -> str:
+    assert [kind for kind, _ in client.trace] == ["steer", "reject"], client.trace
+    text = str(client.trace[0][1])
+    assert text.startswith("[Kiro Crew host notice]")
+    assert "User denied tool execution" in text
+    return text
+
+
+@pytest.mark.parametrize(
+    ("gate_result", "clause", "fragment"),
+    [
+        (None, "tool policy of the surface", "no hook gate"),
+        (
+            ToolHookResult(action=TOOL_DENY, reason="Blocked by security policy: secrets dir"),
+            "blocked by a Kiro Crew safety policy",
+            "secrets dir",
+        ),
+        (ToolHookResult(action=TOOL_ALLOW), "tool policy of the surface", "no person to approve"),
+        (RuntimeError("gate exploded"), "PreToolUse hook raised", "hook gate raised"),
+    ],
+    ids=["no_hook_store", "hook_deny", "no_interactive_approver", "gate_error"],
+)
+def test_every_webhook_deny_steers_its_cause_before_rejecting(
+    monkeypatch, gate_result, clause, fragment
+):
+    client = _SteeringClient()
+    _drive(monkeypatch, None, gate_result=gate_result, client=client)
+    text = _notice(client)
+    assert clause in text and fragment in text, text
+    assert client.rejected == [_REQUEST_ID]
+
+
+def test_an_unauditable_auto_approve_steers_the_audit_cause(monkeypatch):
+    class _RaisingSel(_RecordingSel):
+        def log_tool_invocation(self, **kwargs) -> None:
+            if kwargs.get("outcome") == OUTCOME_PENDING_APPROVAL:
+                raise OSError("audit disk full")
+
+    import kiro_crew.dashboard.handlers as handlers_pkg
+
+    monkeypatch.setattr(handlers_pkg, "sel", lambda: _RaisingSel())
+    monkeypatch.setattr(usage, "_write_token_record", lambda _record, _now: None)
+    client = _SteeringClient()
+    builder = _FakeContextBuilder(_FakeGate(ToolHookResult(action=TOOL_AUTO_APPROVE)))
+
+    async def _turn() -> None:
+        await await_until(
+            asyncio.ensure_future(
+                _run_hook_inner(_FakeState(client, builder), "hook:test:9790", "go", None)
+            ),
+            what="the webhook turn",
+        )
+
+    asyncio.run(_turn())
+    text = _notice(client)
+    assert "could not write the audit record" in text
+    assert client.approved == []

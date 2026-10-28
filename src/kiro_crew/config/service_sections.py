@@ -1,7 +1,7 @@
 """Sections that configure the gateway's background services.
 
-Owns the DTOs and defaults for ``taskrunner``, ``orchestrator``, ``messaging``,
-``cron_history``, ``monitoring``, ``heartbeat`` and ``watchdog``. The monitoring
+Owns the DTOs and defaults for ``taskrunner``, ``messaging``,
+``cron_history``, ``monitoring``, ``heartbeat``, ``watchdog`` and ``power``. The monitoring
 runtime bounds come from ``monitoring.limits``, their single owner.
 ``config.sections`` re-exports every name; this module never imports it, the
 loader, schema or validation.
@@ -13,10 +13,11 @@ from dataclasses import dataclass, field
 
 from kiro_crew.config.fields import _meta, field_default
 from kiro_crew.monitoring.limits import DEFAULT_RUNTIME_CEILING_SECS, MAX_RUNTIME_CEILING_SECS
-
-# Ceiling for a WHOLE orchestrator plan. The per-stage timeout multiplies by
-# stage count, so this is the only bound on total unattended runtime.
-
+from kiro_crew.work_vocab import (
+    WORK_MAX_DEPTH_DEFAULT,
+    WORK_MAX_DEPTH_MAX,
+    WORK_MAX_DEPTH_MIN,
+)
 
 DEFAULT_MAX_PARALLEL_STEPS = (
     0  # 0 = auto: host memory over the per-agent cost (compute_memory_sized_parallel_cap)
@@ -40,6 +41,23 @@ class TaskRunnerConfig:
             "every execution operates in this folder instead of a per-run scratch "
             "directory, so the task runner works on the intended target location. "
             "Empty = use the default per-run workspace directory.",
+        ),
+    )
+    test_command: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Test Command",
+            'Argument list run after each step, no shell (e.g. ["python", "-m", '
+            '"pytest", "-q"]). Exit 0 verifies the step. Empty = not configured.',
+            restart=True,
+        ),
+    )
+    require_verification: bool = field(
+        default=False,
+        metadata=_meta(
+            "Require Verification",
+            "Fail a step unless its test command exited 0; refuse a run with none to run.",
+            restart=True,
         ),
     )
 
@@ -137,8 +155,9 @@ class MonitoringConfig:
     """Monitor arming preference and finite wall-clock policy.
 
     The preference changes tool guidance, not eligibility. The runtime ceiling
-    is enforced across tools, API mutations and persistence; raising it never
-    extends an existing loop's stored budget or creation time.
+    is checked whenever a budget is written (monitor tools, API mutations,
+    structured-monitor writes); persisted records are not re-checked on load.
+    Raising it never extends an existing loop's stored budget or creation time.
     """
 
     max_runtime_secs: int = field(
@@ -214,7 +233,7 @@ class HeartbeatConfig:
 
 @dataclass
 class WatchdogConfig:
-    """ACP per-session watchdog / liveness-oracle tuning (acp/session_handle.py).
+    """ACP per-session watchdog / liveness-oracle tuning (acp/session_handle_watchdog.py).
 
     Wellness (the liveness oracle) is the primary detector; these windows govern
     only the UNKNOWN-verdict backstop class. A WORKING verdict is never acted on
@@ -290,9 +309,11 @@ class WatchdogConfig:
             "Hard cap (s)",
             "Absolute ceiling for UNKNOWN-verdict forbearance (e.g. the extended "
             "probably-thinking window) and for any per-agent "
-            "watchdog_tool_stall_* override. Applies ONLY to UNKNOWN verdicts — "
-            "never to a WORKING session, which is deferred before this cap is "
-            "consulted and is therefore bounded only by the turn's own ceiling. "
+            "watchdog_tool_stall_* override. Also bounds an opaque MCP tool "
+            "whose only WORKING evidence is movement somewhere in the runtime's "
+            "process tree. Every other WORKING reading (a matched shell child, "
+            "a declared wait, a keepalive-pinging core tool) is deferred before "
+            "this cap is consulted and is bounded only by the turn's own ceiling. "
             "Default 2h, clamped against the transport's per-prompt timeout like "
             "the suspect window.",
         ),
@@ -315,17 +336,20 @@ class WatchdogConfig:
             "Idle seconds before an MCP tool that looks blocked on its own remote "
             "call is cancelled and the turn routed to tool-stall recovery. The "
             "shape is a tool whose process tree shows no CPU or IO movement while "
-            "a process below kiro-cli holds an established TCP connection: a "
-            "remote call waiting on a peer that may never answer. The window is "
+            "the tool's own MCP server, or a process it started, holds an "
+            "established TCP connection: a remote call waiting on a peer that may "
+            "never answer. The server is recognized by the command the session "
+            "launched it with, so another server's persistent connection never "
+            "counts; a server that cannot be recognized exactly once (a launcher "
+            "that re-executes under a different command line, or a second copy "
+            "of it on the same runtime) keeps the full window. The window is "
             "measured from the last stream frame or the last probe that saw the "
             "tree move, whichever is later, so a slow stream that moves bytes now "
             "and then keeps the full tool_stall_suspect_secs window. Linux and "
             "macOS only; Windows has no socket view and keeps the full window. "
-            "Off (0) by default: the connection cannot yet be tied to the MCP "
-            "server serving the in-flight tool, so another server's persistent "
-            "connection could cut a quiet tool short. 900 is the suggested value "
-            "when opting in. Clamped against the transport's per-prompt timeout "
-            "like the other windows.",
+            "Off (0) by default; 900 is the suggested value when opting in. "
+            "Clamped against the transport's per-prompt timeout like the other "
+            "windows.",
         ),
     )
     wellness_sample_secs: float = field(
@@ -334,5 +358,67 @@ class WatchdogConfig:
             "Wellness sample interval (s)",
             "Minimum spacing between CPU/IO counter samples used for movement "
             "deltas in the liveness oracle.",
+        ),
+    )
+
+
+@dataclass
+class WorkLedgerConfig:
+    """Work-ledger nesting (``work_ledger_records.MAX_DEPTH``, read through ``may_conduct``)."""
+
+    max_depth: int = field(
+        default=WORK_MAX_DEPTH_DEFAULT,
+        metadata=_meta(
+            "Max conducting depth",
+            "How many levels of the work ledger may conduct: depth 0 is the root, so 2 "
+            "(the default) lets a root dispatch one level of conductors whose own items "
+            "are workers, and 3 lets those conductors dispatch conductors of their own. "
+            f"Accepted range {WORK_MAX_DEPTH_MIN}-{WORK_MAX_DEPTH_MAX}; a value outside it is "
+            "refused at load with a warning and the default applies, it is never "
+            "clamped. Each extra level multiplies sessions (three levels of three items "
+            "is 27), so raise it only where concurrency is already capped per level. "
+            "Lowering it does not touch ledgers already open: new ledgers and new items "
+            "at the levels it removes are refused.",
+        ),
+    )
+
+
+#: ``power.on_battery`` values. ``normal`` ignores the power source.
+ON_BATTERY_NORMAL = "normal"
+ON_BATTERY_REDUCED = "reduced"
+ON_BATTERY_PAUSED = "paused"
+ON_BATTERY_MODES = (ON_BATTERY_NORMAL, ON_BATTERY_REDUCED, ON_BATTERY_PAUSED)
+
+
+def normalize_on_battery(value: object) -> str:
+    """``power.on_battery`` as a known mode; anything else is ``normal``.
+
+    An unknown value keeps today's behaviour rather than guessing a throttle: a
+    typo must never silently stop background work.
+    """
+    if isinstance(value, str) and value.strip().lower() in ON_BATTERY_MODES:
+        return value.strip().lower()
+    return ON_BATTERY_NORMAL
+
+
+@dataclass
+class PowerConfig:
+    """What Knowledge Library background sweeps do while this machine runs on battery."""
+
+    on_battery: str = field(
+        default=ON_BATTERY_NORMAL,
+        metadata=_meta(
+            "On battery",
+            "What Knowledge Library background sweeps do while this machine "
+            "runs on battery; nothing else reads it yet. 'normal' (the default) "
+            "ignores the power source. 'reduced' cuts each sweep's chunk budget "
+            "to a quarter, at least 10 chunks and never more than the "
+            "configured budget. 'paused' skips the sweeps until the machine is "
+            "back on mains. A document you add yourself always ingests; a folder "
+            "you add ingests its first paced batch at once, and the rest of a "
+            "large folder arrives with the sweeps, so under 'paused' it waits "
+            "for mains. A host that cannot report its power source counts as "
+            "plugged in.",
+            enum=list(ON_BATTERY_MODES),
         ),
     )

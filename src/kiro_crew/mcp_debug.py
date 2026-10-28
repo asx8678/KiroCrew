@@ -267,7 +267,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "appears as 'chat'); off Linux far fewer fields are measured — on "
                 "macOS the ps snapshot carries pid/ppid only, no kind is argv-derived "
                 "(every non-gateway node is 'other'), and state, threads, env, fds, "
-                "cwd, cmdline, rss and cpu are null. ALWAYS read 'roster.degraded': it "
+                "cwd, cmdline and cpu are null. On macOS 'rss_kb' is the libproc "
+                "phys_footprint, not a resident set: it counts compressed and swapped "
+                "pages, so it reads higher than ps RSS, and it is null for a node "
+                "whose footprint could not be read. ALWAYS read 'roster.degraded': it "
                 "lists which fields this snapshot could not carry and why, and whether "
                 "orphan detection ran at all (where it did not, 'orphans: 0' means "
                 "UNMEASURED, not none). The orphan verdict, when measured, is computed "
@@ -278,8 +281,8 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "the second read onward and null only on the first read or when the "
                 "read is degraded ('gil_saturated_hint' is false while they are "
                 "null). For thread contention ask debug_threads mode='now'. Use this "
-                "to see who exists, who owns them, and which are orphaned; where 'rss' "
-                "is measured it also shows how much memory each holds. READ-ONLY: "
+                "to see who exists, who owns them, and which are orphaned; where "
+                "'rss_kb' is measured it also shows how much memory each holds. READ-ONLY: "
                 "there is no kill here, and killing stays with the reaper."
             ),
             "inputSchema": {
@@ -622,7 +625,7 @@ def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
 #: :func:`~kiro_crew.mcp_core.require_strict_session_key`, whose first source is
 #: that block, and the route scopes every read on the key this server forwards.
 #:
-#: Advertising is not cosmetic. ``mcp_gateway/backend.py`` strips any client-forged
+#: Advertising is not cosmetic. ``mcp_gateway/backend_stubs.py`` strips any client-forged
 #: caller block from EVERY forwarded request and re-injects its own only when the
 #: backend advertised this capability — so without the advertisement the block
 #: never arrives and a pooled backend would resolve an empty identity for every

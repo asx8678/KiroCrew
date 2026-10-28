@@ -2,12 +2,16 @@
  *  folder, clears what hides the target, opens its ancestors, then scrolls to and
  *  flashes it with a bounded retry. */
 import { useRef, useState, useEffect, useCallback, type Dispatch, type SetStateAction, type RefObject } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
+import { api } from '../../api/client'
+import { invalidateFoldersWhenIdle } from '../../api/chatFoldersWrite'
 import { useAppSelector, type AppDispatch } from '../../store'
 import { clearSlotReveal } from '../../store/chatSlice'
 import type { ChatFolder } from '../../types'
 import { safeSetItem } from '../../utils/safeStorage'
 import { sessionRowIdentity } from './rowIdentity'
 import { HIDDEN_FOLDERS_LS_KEY } from './persistence'
+import { FOLDER_BODY_COLLAPSE_MS } from '../../components/FolderBody'
 import type { SortKey } from '../chat/sessionOrder'
 import type { Slot, RevealBlockingFilter } from './types'
 
@@ -50,9 +54,11 @@ const REVEAL_FLASH_HOLD_MS = 1600
  *  the classes are removed at HOLD + FADE + slack, so shortening this below
  *  the CSS duration snaps the outline off mid-fade. */
 const REVEAL_FLASH_FADE_MS = 500
+/** Margin past the folder-body open animation before a retried reveal scrolls. */
+const REVEAL_SETTLE_SLACK_MS = 50
 
 /** Consumes session and folder reveal requests and flashes the target row. */
-export function useSidebarReveal({ sidebarRootRef, dispatch, localSlots, revealBlockingFilters, staleCollapseMs, sortKey, isStaleExempt, slotFolders, setStaleExpanded, expandFolderAncestors, expandConductorAncestors, folders, setSlotFilter, setFilterHiddenFolders, setRevealForcedVisible, setFlatView }: {
+export function useSidebarReveal({ sidebarRootRef, dispatch, localSlots, revealBlockingFilters, staleCollapseMs, sortKey, isStaleExempt, slotFolders, setStaleExpanded, expandFolderAncestors, expandConductorAncestors, folders, foldersSettled, setSlotFilter, setFilterHiddenFolders, setRevealForcedVisible, setFlatView }: {
   sidebarRootRef: RefObject<HTMLDivElement>
   dispatch: AppDispatch
   localSlots: Slot[]
@@ -65,6 +71,10 @@ export function useSidebarReveal({ sidebarRootRef, dispatch, localSlots, revealB
   expandFolderAncestors: (folderId: string) => void
   expandConductorAncestors: (key: string) => void
   folders: ChatFolder[]
+  /** The folder query is idle and its last fetch succeeded, so a folder
+   *  missing from `folders` is missing on the server too. False while the
+   *  query is in error, because a failed fetch does not show that. */
+  foldersSettled: boolean
   setSlotFilter: Dispatch<SetStateAction<string>>
   setFilterHiddenFolders: Dispatch<SetStateAction<Set<string>>>
   setRevealForcedVisible: Dispatch<SetStateAction<Set<string>>>
@@ -78,6 +88,15 @@ export function useSidebarReveal({ sidebarRootRef, dispatch, localSlots, revealB
   // well as on change (#912 D1). The nonce makes repeat reveals of the same
   // row distinct requests, so the effect re-fires even when the key repeats.
   const revealRequest = useAppSelector(s => s.chat.revealRequest)
+  const queryClient = useQueryClient()
+  // A folder-path open whose folder is not listed yet: the request this
+  // sidebar made its own folder read for. Keyed by the request object, which a
+  // new request replaces. See the `openFoldersOnly` branch below.
+  const folderWaitRef = useRef<{ request: object } | null>(null)
+  // The current request, read by that folder read when it answers, so an
+  // answer never clears a newer request.
+  const revealRequestRef = useRef(revealRequest)
+  revealRequestRef.current = revealRequest
   // Serial + pending timer for the in-flight reveal: a newer reveal cancels
   // the older retry loop, and unmount stops the pending timer outright.
   const revealRunRef = useRef<{ seq: number; timer: number | null }>({ seq: 0, timer: null })
@@ -95,6 +114,10 @@ export function useSidebarReveal({ sidebarRootRef, dispatch, localSlots, revealB
     const run = revealRunRef.current
     if (run.timer != null) clearTimeout(run.timer)
     revealFlashTimersRef.current.forEach(clearTimeout)
+    // A folder read still in flight answers to nobody once this sidebar is
+    // gone: its callback finds no wait and does nothing, so it cannot clear a
+    // request made after the unmount. The next sidebar makes its own read.
+    folderWaitRef.current = null
   }, [])
   /**
    * Scroll a revealed row into view and flash it, retrying until the row exists.
@@ -130,6 +153,7 @@ export function useSidebarReveal({ sidebarRootRef, dispatch, localSlots, revealB
     const seq = run.seq
     if (run.timer != null) { clearTimeout(run.timer); run.timer = null }
     let attempt = 0
+    let settled = false
     const tryScroll = () => {
       if (revealRunRef.current.seq !== seq) return
       let el: HTMLElement | null = null
@@ -161,6 +185,17 @@ export function useSidebarReveal({ sidebarRootRef, dispatch, localSlots, revealB
         else console.debug('reveal-in-sidebar: row never became visible for', kind, key)
         return
       }
+      // A row found on a RETRY was waiting for something to open, usually a
+      // collapsed ancestor whose FolderBody is still animating its track open.
+      // Measured now, the row sits about where the closed body was, and the
+      // opening body then pushes it past a short sidebar's edge. Scroll once the
+      // open has finished. Same serial check as the retry, so a newer reveal
+      // still cancels this one.
+      if (attempt > 0 && !settled) {
+        settled = true
+        run.timer = window.setTimeout(tryScroll, FOLDER_BODY_COLLAPSE_MS + REVEAL_SETTLE_SLACK_MS)
+        return
+      }
       const reduce = !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
       if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'center' })
       // Visible confirmation even when the row never moved (#912 D4): an
@@ -188,9 +223,66 @@ export function useSidebarReveal({ sidebarRootRef, dispatch, localSlots, revealB
     // what removes the ordering hazard the old field pair had.
     if (revealRequest.kind !== 'session') return
     const key = revealRequest.target
+    const slot = localSlots.find(s => s.key === key)
+    // A new chat's or an opened fork's request (see `revealRequest.openFoldersOnly`):
+    // open the folder path and stop. The user created or forked a chat; they did
+    // not ask to drop their search or filters, so a row a filter hides stays
+    // hidden until they clear it, exactly as after a folder "+" create. A new
+    // chat is never stale-collapsed and has no conductor, and the row needs no
+    // flash to be found, so the steps below do not apply.
+    //
+    // Runs before the row lookup and prefers the request's `folderId`, because
+    // the listed row can be missing or stale when the request runs, and the
+    // folder path must open either way.
+    if (revealRequest.openFoldersOnly) {
+      const folderId = revealRequest.folderId ?? slot?.folder_id
+      // `expandFolderAncestors` walks the folder list and does nothing for an id
+      // it cannot find. Until the folder query settles that list is the empty
+      // default, which is the case when a closed mobile drawer first mounts the
+      // sidebar after the fork. So the request stays pending until the folder is
+      // listed, and this effect runs again when `folders` changes. A failed fetch
+      // keeps it pending too, for the retry or the websocket seed.
+      //
+      // A settled list can also predate the folder. An import from a new sender
+      // creates its `from <sender>` folder, and a command-bar run can create its
+      // command's folder, and the list only learns of either from a later slots
+      // frame. So a settled list without the folder makes ONE server read of its
+      // own. The read goes to the API, not through the query cache, because a
+      // folder write's optimistic `setQueryData` and its `cancelQueries` also
+      // move the cache, and neither is a server answer. Only that read can drop
+      // the request: if it lacks the folder, the folder is gone. If it lists the
+      // folder, the cache is asked to refetch and the request waits for the
+      // list to carry it. A failed read keeps the request for the next change.
+      if (folderId && !folders.some(f => f.id === folderId)) {
+        if (!foldersSettled) return
+        if (folderWaitRef.current?.request === revealRequest) return
+        const request = revealRequest
+        folderWaitRef.current = { request }
+        api.chatFolders().then(
+          (listed: ChatFolder[]) => {
+            if (folderWaitRef.current?.request !== request) return
+            if (listed.some(f => f.id === folderId)) {
+              invalidateFoldersWhenIdle(queryClient)
+              return
+            }
+            folderWaitRef.current = null
+            if (revealRequestRef.current !== request) return
+            dispatch(clearSlotReveal())
+            // eslint-disable-next-line no-console -- the folder named by a create or fork no longer exists, and nothing else records that the path was not opened
+            console.debug('reveal-in-sidebar: no folder for id', folderId)
+          },
+          () => {
+            if (folderWaitRef.current?.request === request) folderWaitRef.current = null
+          },
+        )
+        return
+      }
+      dispatch(clearSlotReveal())
+      if (folderId) expandFolderAncestors(folderId)
+      return
+    }
     // Consume immediately: the request must not survive to a later remount.
     dispatch(clearSlotReveal())
-    const slot = localSlots.find(s => s.key === key)
     if (!slot) {
       // Stale key or a session outside this surface's slot list. Not user-visible
       // (there is nothing to highlight), so leave a trace for bug reports.
@@ -236,7 +328,7 @@ export function useSidebarReveal({ sidebarRootRef, dispatch, localSlots, revealB
     // session could scroll to the peer's row instead. `slot` above is resolved
     // from the LOCAL `slots` prop, so its identity is the right target.
     runReveal('session', key, sessionRowIdentity(slot))
-  }, [revealRequest, dispatch, localSlots, revealBlockingFilters, expandFolderAncestors, expandConductorAncestors, runReveal, isStaleExempt, slotFolders, staleCollapseMs, sortKey, setStaleExpanded])
+  }, [revealRequest, dispatch, queryClient, localSlots, folders, foldersSettled, revealBlockingFilters, expandFolderAncestors, expandConductorAncestors, runReveal, isStaleExempt, slotFolders, staleCollapseMs, sortKey, setStaleExpanded])
   // ── Reveal a FOLDER row ───────────────────────────────────────────────────
   // The folder twin of the session reveal above, driven by the command launcher's
   // Folders group and the palette's Folders tab ("search a folder, land on it").

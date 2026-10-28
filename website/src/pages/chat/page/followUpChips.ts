@@ -3,12 +3,18 @@ import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type 
 import { deriveFollowUpOptions } from '../../../app-sdk/protocol'
 import type { ComposerDraftStore } from '../../../chat-core/composer/draftStore'
 import type { pendingQuestionFor } from '../../../store/chatSlice'
-import { appendFollowUpOption, removeFollowUpOption, type OwnedSuffix } from '../../../lib/followUpToggle'
+import { appendFollowUpOption, removeFollowUpOption, selectSingleFollowUpOption, type OwnedSuffix } from '../../../lib/followUpToggle'
 import type { ChatMessage } from '../../../types'
+import { isReasoningRole } from '../groupDisplayItems'
+
+/** A row that shows a running turn moved past the chips' offer: tool work or reasoning (#15926). */
+export const isTurnActivityRow = (m: ChatMessage): boolean => m.role === 'tool' || isReasoningRole(m)
 
 interface FollowUpChipsOptions {
   messages: ChatMessage[]
   isStreaming: boolean
+  /** The slot's turn is running: chips hide once a tool or thinking row follows them. */
+  turnRunning: boolean
   /** A pending question card suppresses the chips: only the card can answer it. */
   pendingQuestion: ReturnType<typeof pendingQuestionFor>
   activeSlot: string | null
@@ -27,6 +33,7 @@ interface FollowUpChipsOptions {
 export function useFollowUpChips({
   messages,
   isStreaming,
+  turnRunning,
   pendingQuestion,
   activeSlot,
   inputRef,
@@ -38,9 +45,9 @@ export function useFollowUpChips({
   // Swapping chats (activeSlot change) → messages change → memo recomputes fresh.
   // A pending question card suppresses them: both would offer the same choices in
   // the same band, and only the card can answer the blocked tool call.
-  const { followUpOptions, followUpSourceKey } = useMemo(
-    () => deriveFollowUpOptions(messages, isStreaming, !!pendingQuestion),
-    [messages, isStreaming, pendingQuestion],
+  const { followUpOptions, followUpSourceKey, followUpMulti } = useMemo(
+    () => deriveFollowUpOptions(messages, isStreaming, !!pendingQuestion, turnRunning ? isTurnActivityRow : undefined),
+    [messages, isStreaming, pendingQuestion, turnRunning],
   )
   // Visual-only highlight state; text in the input is the source of truth for
   // what gets sent. Cleared whenever the options list changes (new assistant
@@ -72,7 +79,11 @@ export function useFollowUpChips({
     if (!prefillEditedRef.current) setPrefillEdited(true)
   }, [clearFollowUpOwnership, setInput, setPrefillEdited])
   const followUpOptionsKey = followUpOptions.join('\x00')
-  useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, activeSlot])
+  // A single-select offer is keyed on its source row too: a newer reply can repeat
+  // the same labels, and a single-select pick must not replace text the user picked
+  // from the older offer. Multi-select rows keep the label-only reset.
+  const singleSourceKey = followUpMulti ? null : followUpSourceKey
+  useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, singleSourceKey, followUpMulti, activeSlot])
   const toggleFollowUpOption = (o: string) => {
     // Regular options: toggle. Click unpicked → append + mark; click
     // picked → try to remove text + unmark (if the user edited the
@@ -91,9 +102,12 @@ export function useFollowUpChips({
       setInput(r.value)
       setFollowUpPicked(next)
     } else {
-      const next = new Set(followUpPickedRef.current); next.add(o)
+      // `[OPTION:]` is single-select: the new pick replaces the previous one.
+      const next = followUpMulti ? new Set(followUpPickedRef.current) : new Set<string>(); next.add(o)
       followUpPickedRef.current = next
-      const r = appendFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
+      const r = followUpMulti
+        ? appendFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
+        : selectSingleFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
       followUpInsertedRef.current = r.owned
       inputRef.current = r.value
       setInput(r.value)
@@ -101,7 +115,7 @@ export function useFollowUpChips({
     }
   }
   return {
-    followUpOptions, followUpSourceKey,
+    followUpOptions, followUpSourceKey, followUpMulti,
     followUpPicked, followUpPickedRef, toggleFollowUpOption,
     composerRootChange, composerUserEdit,
   }

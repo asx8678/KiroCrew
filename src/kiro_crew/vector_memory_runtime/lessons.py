@@ -5,8 +5,8 @@ A lesson is a ``lesson.*`` semantic row whose value is either the mapping
 below reads both without guessing. The readers here decide which rows count as
 lesson population, which reach a prompt and in which tier and order, which rows
 a contradiction sweep or a delete may address, and they fetch through the
-store's locked helpers. The write path, ``VectorMemoryStore.write_lesson``, stays
-on the store and uses the same codec.
+store's locked helpers. The write path, ``VectorMemoryStore.write_lesson``, lives
+in ``lesson_write`` and uses the same codec.
 """
 
 from __future__ import annotations
@@ -19,15 +19,14 @@ import re
 import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from kiro_crew import context_omissions
 from kiro_crew.embeddings import PRIORITY_INTERACTIVE
 from kiro_crew.lesson_validation import (
-    HUMAN_LESSON_SOURCES,
     LESSON_APPLIES_ON_TOPIC,
     LESSON_APPLIES_UNSTATED,
     LESSON_APPLIES_VALUES,
-    advisory_lesson_line,
     contains_volatile_lesson_fact,
     render_lesson_tier,
     render_withheld_tier,
@@ -835,8 +834,15 @@ def delete_lesson(
     repo_scope: str | None = None,
     *,
     exact: bool = False,
+    keep_one: bool = False,
 ) -> bool:
     """Delete lessons whose value contains rule_substring.
+
+    *keep_one* deletes only the EXTRA copies: matched rows are grouped by their
+    whole stored row (see ``_keep_one_identity``),
+    the oldest row of each group (``created_at``, then ``key``) stays, and the
+    rest go. Two different lessons never share a group, so a broad substring
+    cannot remove the last copy of any lesson in this mode.
 
     Substring matching on the rule text is deliberate: a user targets a
     lesson by a fragment of its rule rather than retyping the whole thing.
@@ -867,6 +873,7 @@ def delete_lesson(
     scope_selective = repo_scope is not None
     wanted_scope = canonical_scope(repo_scope) if scope_selective else None
     wanted_text = rule_substring.lower().strip()
+    matched: list[tuple[dict[str, Any], str]] = []
     for e in store.get_lessons():
         val = json.loads(e["value_json"])
         # Match against the rendered lesson text so a mapping-shaped row is
@@ -896,9 +903,70 @@ def delete_lesson(
                 continue
             if canonical_scope(_lesson_scope(val)) != wanted_scope:
                 continue
-        store.delete_semantic(e["key"], "user_explicit")
-        deleted = True
+        if not keep_one:
+            store.delete_semantic(e["key"], "user_explicit")
+            deleted = True
+            continue
+        matched.append((e, _keep_one_identity(val)))
+    if keep_one:
+        # Only rows the prompt can serve take part. A row outside its validity
+        # window, superseded or otherwise withheld is never the survivor (the
+        # lesson would vanish from prompts with an active copy deleted) and is
+        # never removed here either.
+        servable = {r["key"] for r in store._eligible_rows([m[0] for m in matched], "directive")}
+        matched = [m for m in matched if m[0]["key"] in servable]
+        # A row's record metadata (validity window, subject, scope facets) is
+        # part of the lesson as well: two rows that differ in any of it are not
+        # copies, so a copy valid for longer is never traded for one that expires.
+        facets = {
+            r["key"]: json.dumps(r.get("record_metadata") or {}, sort_keys=True)
+            for r in store.with_record_metadata([m[0] for m in matched])
+        }
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for e, identity in matched:
+            groups.setdefault((identity, facets[e["key"]]), []).append(e)
+        for rows in groups.values():
+            rows.sort(key=lambda r: (str(r.get("created_at") or ""), str(r["key"])))
+            if len(rows) < 2:
+                continue
+            # The rows are a snapshot. A survivor whose body differs from the
+            # snapshot (a clause attached, a re-tier) may not be a copy of the
+            # others, so the group is left alone; each extra is a
+            # COMPARE-AND-DELETE on the body read here, so a copy enriched
+            # since is kept, not tombstoned.
+            survivor = store.get_semantic(rows[0]["key"])
+            if survivor is None or survivor.get("value_json") != rows[0]["value_json"]:
+                continue
+            for extra in rows[1:]:
+                if store.delete_semantic(
+                    extra["key"], "user_explicit", expect_value_json=extra["value_json"]
+                ):
+                    deleted = True
     return deleted
+
+
+def _keep_one_identity(val: object) -> str:
+    """What makes two stored lesson rows copies of one lesson for ``keep_one``.
+
+    The WHOLE stored value, not a chosen subset of its fields: any stored
+    difference (a NOT-clause, a tier, a scope, a field added later) makes two
+    rows different lessons, so ``keep_one`` never removes one. Only the rule
+    and clause text compare case-insensitively with edge whitespace ignored,
+    and an admissible scope compares canonically, matching how a plain delete
+    and the write path read them. A rule that itself contains the clause
+    separator stays apart from a rule plus a clause, since their stored values
+    differ.
+    """
+    if not isinstance(val, dict):
+        return json.dumps(["text", str(val).lower().strip()])
+    # An absent field and a null one read the same on every path.
+    norm = {k: v for k, v in val.items() if v is not None}
+    for field in ("rule", "negative"):
+        if isinstance(norm.get(field), str):
+            norm[field] = norm[field].lower().strip()
+    if "repo_scope" in norm and not _lesson_scope_unusable(val):
+        norm["repo_scope"] = canonical_scope(_lesson_scope(val))
+    return json.dumps(["value", norm], sort_keys=True, default=repr)
 
 
 def get_lessons_context(
@@ -912,7 +980,6 @@ def get_lessons_context(
     hard_cap: int = 0,
     directive_budget: int = 0,
     experience_budget: int = 0,
-    tier: str = "all",
 ) -> str:
     """Format lessons for prompt injection, most relevant first.
 
@@ -1008,8 +1075,6 @@ def get_lessons_context(
                 untagged.append(entry)
             else:
                 authored.append(entry)
-        authored.sort(key=lambda entry: str(entry[0].get("key") or ""))
-        untagged.sort(key=lambda entry: str(entry[0].get("key") or ""))
         directives = authored + untagged
         unclassified = len(untagged)
         # The model-safety ceiling bounds the two blocks TOGETHER, and the
@@ -1019,7 +1084,7 @@ def get_lessons_context(
             "header": (
                 "[Learned corrections — retained rules from past mistakes.\n"
                 "Follow explicit user rules; stored inferences do not override "
-                "the current user." + advisory_lesson_line(directives) + "]"
+                "the current user.]"
             ),
             "footer": "[End of learned corrections]",
             "omission": (
@@ -1048,6 +1113,7 @@ def get_lessons_context(
         directive_block, directive_omitted = render_lesson_tier(
             directives,
             directive_room,
+            omission_kind=context_omissions.LESSON_RULES,
             **directive_tier,
         )
         # ``max(1, …)`` rather than the bare remainder: ``tighter_lesson_budget``
@@ -1078,6 +1144,7 @@ def get_lessons_context(
             # can act on rather than an absence it cannot see.
             experience_block = render_withheld_tier(
                 len(experiences),
+                omission_kind=context_omissions.LESSON_FINDINGS,
                 header="[Learned experience — past findings]",
                 footer="[End of learned experience]",
                 notice=(
@@ -1093,6 +1160,7 @@ def get_lessons_context(
             experience_block, experience_omitted = render_lesson_tier(
                 experiences,
                 experience_room,
+                omission_kind=context_omissions.LESSON_FINDINGS,
                 header=(
                     "[Learned experience — past findings, relevant ones first.\n"
                     "Reference material, not standing rules; call memory_recall for more.]"
@@ -1122,10 +1190,6 @@ def get_lessons_context(
             len(experiences),
             len(experience_block),
         )
-        if tier == "directives":
-            return directive_block
-        if tier == "experiences":
-            return experience_block
         return directive_block + experience_block
     total = len(entries)
     ranked = (
@@ -1138,7 +1202,7 @@ def get_lessons_context(
     def render(rows: list[tuple[dict, str]]) -> str:
         header = (
             "[Learned corrections — user-taught rules from past mistakes.\n"
-            "ALWAYS follow these. They override default behavior." + advisory_lesson_line(ranked)
+            "ALWAYS follow these. They override default behavior."
         )
         if len(rows) < total:
             header += (
@@ -1195,13 +1259,6 @@ def _renderable_entries(
         text, scope = rendered
         if not text:
             continue
-        # Provenance tag (SEC-11, decision (b)): a row whose writer was not a
-        # human names that writer, so the reader can weigh it as advisory.
-        # The tag rides the DISPLAY text only -- the embedding text and the
-        # stored row are untouched, so ranking and dedup do not shift.
-        _source = str(row.get("source") or "").strip()
-        if _source and _source not in HUMAN_LESSON_SOURCES:
-            text = f"{text} [auto: {_source[:24]}]"
         if scope and not project_scope_satisfied(scope, project_dir):
             continue
         entries.append((row, text))

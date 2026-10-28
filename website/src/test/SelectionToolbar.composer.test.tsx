@@ -475,6 +475,33 @@ describe('SelectionToolbar — composer mode', () => {
     expect(composer.onClose).not.toHaveBeenCalled()
   })
 
+  it('keeps the border in the grown height, so typing does not shrink the box', async () => {
+    render(<Harness actions={actions} composer={composer} />)
+    const input = await openComposer() as HTMLTextAreaElement
+    // jsdom has no layout: stand in a one-line box, 34px tall with a 1px
+    // border, whose scrollHeight (padding + content, no border) is 32px.
+    Object.defineProperty(input, 'offsetHeight', { value: 34, configurable: true })
+    Object.defineProperty(input, 'offsetParent', { value: document.body, configurable: true })
+    Object.defineProperty(input, 'clientHeight', { value: 32, configurable: true })
+    Object.defineProperty(input, 'scrollHeight', { value: 32, configurable: true })
+    fireEvent.change(input, { target: { value: 'a' } })
+    expect(input.style.height).toBe('34px')
+  })
+
+  it('scrolls a draft at the height cap instead of clipping it by the border', async () => {
+    render(<Harness actions={actions} composer={composer} />)
+    const input = await openComposer() as HTMLTextAreaElement
+    // 159px of text in a 1px-bordered box: 161px needed, capped at 160, so the
+    // content box is 158px and the last line would be cut off unless it scrolls.
+    Object.defineProperty(input, 'offsetHeight', { value: 160, configurable: true })
+    Object.defineProperty(input, 'offsetParent', { value: document.body, configurable: true })
+    Object.defineProperty(input, 'clientHeight', { value: 158, configurable: true })
+    Object.defineProperty(input, 'scrollHeight', { value: 159, configurable: true })
+    fireEvent.change(input, { target: { value: 'long draft' } })
+    expect(input.style.height).toBe('160px')
+    expect(input.style.overflowY).toBe('auto')
+  })
+
   it('lays the icons out beside the input on a wide viewport and below it on a narrow one', async () => {
     render(<Harness actions={actions} composer={composer} />)
     await openComposer()
@@ -1294,6 +1321,29 @@ describe('SelectionToolbar — composer opened from an external selection', () =
     await waitFor(() => expect(screen.queryByTestId('selection-composer')).toBeNull())
     // Submit and close are exclusive here as on the DOM path.
     expect(composer.onClose).not.toHaveBeenCalled()
+  })
+
+  it('a press inside the container that itself hands over a selection does not close the box it opens', async () => {
+    // A code block's gutter button sits inside the container: a touch tap fires
+    // mousedown, mouseup and click in one go, so the host's open lands before
+    // the press's deferred dismissal runs. That dismissal must not undo it.
+    // Fake timers: the press defers its dismissal with a 0ms timer, and
+    // running exactly the pending timers is the barrier — no wall-clock wait.
+    vi.useFakeTimers()
+    try {
+      const { rerender } = render(<ExternalHarness actions={actions} composer={composer} externalSelection={null} />)
+      fireEvent.mouseDown(screen.getByTestId('container'))
+      rerender(<ExternalHarness actions={actions} composer={composer} externalSelection={external} />)
+      expect(screen.getByLabelText('Comment on the selected text')).toBeInTheDocument()
+      act(() => { vi.runOnlyPendingTimers() })
+      expect(screen.getByLabelText('Comment on the selected text')).toBeInTheDocument()
+      // A later plain press inside the container still dismisses an empty box.
+      fireEvent.mouseDown(screen.getByTestId('container'))
+      act(() => { vi.runOnlyPendingTimers() })
+      expect(screen.queryByTestId('selection-composer')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('sits BELOW the point the host handed over, never over the annotated line', async () => {

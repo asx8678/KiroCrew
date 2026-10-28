@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -38,6 +39,7 @@ from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
 from kiro_crew.autonudge import AutoNudgeService, NudgeLoop
+from kiro_crew.autonudge_service.model import SERVICE_SHUTTING_DOWN_MESSAGE
 from kiro_crew.dashboard.handlers import autonudge as h
 from kiro_crew.monitoring.models import MonitorState
 
@@ -84,7 +86,7 @@ async def _run_armed_cycle(svc: AutoNudgeService, loop_id: str) -> None:
     """Await the timer task ``fire_now`` just armed, to completion.
 
     The suite's established shape (``await svc._timers[loop.id]`` in
-    ``test_autonudge.py``). Captured by REFERENCE before any await, because the
+    ``test_autonudge_firing.py``). Captured by REFERENCE before any await, because the
     gates inside ``_timer`` reach ``update``/``remove``, which pop the entry from
     ``_timers`` — reading the dict afterwards would raise KeyError on exactly
     the paths this file is here to test. Draining "until no tasks remain"
@@ -344,9 +346,14 @@ class _FakeSvc:
         self.loops = loops
         self.fired: list[str] = []
         self.result: tuple[NudgeLoop | None, str, int] | None = None
+        self.released: list[tuple[str, bool]] = []
 
     def get_by_id(self, loop_id: str) -> NudgeLoop | None:
         return next((lp for lp in self.loops if lp.id == loop_id), None)
+
+    async def release_approval_hold(self, slot_key: str, *, why: str, arm: bool = True) -> bool:
+        self.released.append((slot_key, arm))
+        return False
 
     async def fire_now(self, loop_id: str) -> tuple[NudgeLoop | None, str, int]:
         self.fired.append(loop_id)
@@ -422,6 +429,61 @@ async def test_route_fires_and_returns_the_updated_loop(monkeypatch) -> None:
     assert body["ok"] is True
     assert body["loop"]["id"] == "lp-1"
     assert svc.fired == ["lp-1"]
+    # A press is a person: it ends an approval hold first, unarmed, because the
+    # fire arms the tick itself -- else the tick would find the loop still held.
+    assert svc.released == [("chat-1-111", False)]
+
+
+@pytest.mark.asyncio
+async def test_route_refuses_when_the_approval_hold_cannot_be_released(monkeypatch) -> None:
+    """A release the store refused leaves the loop held, so a fire would do nothing."""
+    loop = NudgeLoop(id="lp-1", slot_key="chat-1-111", message="check", idle_secs=300)
+
+    class _Svc(_FakeSvc):
+        async def release_approval_hold(self, slot_key: str, *, why: str, arm: bool = True) -> bool:
+            raise OSError("disk full")
+
+    svc = _Svc([loop])
+    monkeypatch.setattr(h, "_autonudge_get", lambda: svc)
+
+    resp = await h.api_autonudge_fire(_mk("lp-1", slot=_slot()))
+
+    assert resp.status == 503
+    assert _body(resp)["code"] == "approval_hold_release_failed"
+    assert svc.fired == []
+
+
+@pytest.mark.asyncio
+async def test_route_maps_closed_held_loop_to_shutdown_without_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    svc_base_dir: Any,
+) -> None:
+    svc, loop = _svc_with_loop(svc_base_dir)
+    loop.approval_stalled = True
+    loop.approval_stalled_at = 1.0
+    await svc.shutdown()
+    monkeypatch.setattr(h, "_autonudge_get", lambda: svc)
+    caplog.clear()
+
+    try:
+        with caplog.at_level(logging.WARNING, logger=h.logger.name):
+            response = await h.api_autonudge_fire(_mk(loop.id, slot=_slot()))
+
+        assert response.status == 503
+        assert _body(response) == {
+            "error": SERVICE_SHUTTING_DOWN_MESSAGE,
+            "code": "shutting_down",
+        }
+        assert loop.approval_stalled
+        assert loop.id not in svc._timers
+        assert not [
+            record
+            for record in caplog.records
+            if record.name == h.logger.name and record.levelno >= logging.WARNING
+        ], "the expected shutdown refusal emitted a warning traceback"
+    finally:
+        svc.stop()
 
 
 @pytest.mark.asyncio
@@ -596,7 +658,7 @@ async def test_every_early_refusal_is_audited_as_denied(monkeypatch, sel_mock: M
 
 @pytest.mark.asyncio
 async def test_the_busy_refusal_is_audited_as_denied(monkeypatch, sel_mock: MagicMock) -> None:
-    """The busy guard specifically -- it is the one a reviewer flagged.
+    """The busy guard specifically.
 
     Kept separate from the loop above because it needs a slot in a distinct
     state rather than a distinct service, and because it is the refusal an
@@ -727,3 +789,48 @@ async def test_fire_now_never_suspends_which_is_what_makes_it_race_free(svc_base
             "closed here, because those writers take no lock."
         )
     svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_fire_now_refuses_closed_mutation_admission_without_arming(
+    svc_base_dir,
+) -> None:
+    """The timer guard's no-op must never be reported as a successful fire."""
+    from kiro_crew.autonudge_service.model import SERVICE_SHUTTING_DOWN_MESSAGE
+
+    svc, loop = _svc_with_loop(svc_base_dir)
+    svc._accepting_mutations = False
+
+    armed, error, status = await svc.fire_now(loop.id)
+
+    assert (armed, error, status) == (
+        None,
+        SERVICE_SHUTTING_DOWN_MESSAGE,
+        503,
+    )
+    assert loop.id not in svc._timers, "the closed service armed a manual timer"
+    svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_route_maps_the_shutdown_refusal_to_a_literal_503(
+    monkeypatch, sel_mock: MagicMock
+) -> None:
+    """The HTTP arm preserves both the shutdown status and machine code."""
+    from kiro_crew.autonudge_service.model import SERVICE_SHUTTING_DOWN_MESSAGE
+
+    loop = NudgeLoop(id="lp-1", slot_key="chat-1-111", message="check", idle_secs=300)
+    svc = _FakeSvc([loop])
+    svc.result = (None, SERVICE_SHUTTING_DOWN_MESSAGE, 503)
+    monkeypatch.setattr(h, "_autonudge_get", lambda: svc)
+
+    response = await h.api_autonudge_fire(_mk("lp-1", slot=_slot()))
+
+    assert response.status == 503
+    assert _body(response) == {
+        "error": SERVICE_SHUTTING_DOWN_MESSAGE,
+        "code": "shutting_down",
+    }
+    kwargs = sel_mock.log_tool_invocation.call_args.kwargs
+    assert kwargs["outcome"] == "denied"
+    assert kwargs["metadata"]["error"] == SERVICE_SHUTTING_DOWN_MESSAGE

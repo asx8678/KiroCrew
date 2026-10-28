@@ -17,6 +17,10 @@ from kiro_crew.effort import EFFORT_LEVELS
 
 logger = logging.getLogger("kiro_crew.config.loader")
 
+#: Ceiling of ``memory.startup_recall_timeout_secs``. The dashboard's early embed
+#: keeps its own allowance above it, so a build never outwaits the embed it joined.
+STARTUP_RECALL_TIMEOUT_MAX_SECS = 10.0
+
 
 @dataclass
 class MemoryConfig:
@@ -94,6 +98,16 @@ class MemoryConfig:
             "Seconds without any embedding before the embedding model is unloaded "
             "from memory. The next search or memory write loads it again, which takes "
             "a few seconds. 0 keeps the model loaded.",
+        ),
+    )
+    embedding_child_process: bool = field(
+        default=False,
+        metadata=_meta(
+            "Run Embeddings in a Child Process",
+            "Load the embedding model and run inference in a separate low-priority "
+            "process, so embedding work never competes with the gateway itself. Off "
+            "by default: the model runs inside the gateway. Takes effect at the next "
+            "model load.",
         ),
     )
     embed_model_url: str = field(
@@ -237,8 +251,26 @@ class MemoryConfig:
             "writes (lessons, consolidation extraction, task-runner lessons) "
             "and no stored memory/lessons injected into new sessions; "
             "within-conversation context is unaffected. Explicit dashboard "
-            "edits and deletions stay available. An installed app's own "
-            "ingestion sweep is out of scope and still writes app-scoped rows.",
+            "edits and deletions stay available.",
+        ),
+    )
+    writes_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Memory Writes Enabled",
+            "Off: no automatic memory writes (lessons, consolidation extraction, "
+            "task-runner lessons), the same writers Persistence Enabled stops, "
+            "while stored memory and lessons are still injected into new sessions "
+            "and memory_recall still answers. Incognito is unaffected. Explicit "
+            "dashboard edits and deletions stay available.",
+        ),
+    )
+    lesson_extraction_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Lesson Extraction Enabled",
+            "Off: history consolidation and the task runner save no extracted "
+            "lessons; every other memory write, learn_add and injection carry on.",
         ),
     )
     inject_memory: bool = field(
@@ -279,6 +311,19 @@ class MemoryConfig:
             "Requires inject_memory.",
         ),
     )
+    startup_recall_timeout_secs: float = field(
+        default=1.0,
+        metadata=_meta(
+            "Session-Start Recall Wait (seconds)",
+            "How long a new dashboard chat's first message waits for its own "
+            "embedding, which the dashboard starts ahead of the session-start build, "
+            "beside session startup when the chat has to start its session. The "
+            "embedding ranks the memory activity and lessons the session starts with "
+            "by meaning; past the wait they are ranked by keyword. 0 turns the early "
+            "embedding off, and the build embeds the message itself, as on other "
+            "surfaces. Clamped to [0, 10].",
+        ),
+    )
     migrated: bool = field(
         default=False,
         metadata=_meta("Migrated", "Whether memory has been migrated to vector store."),
@@ -294,6 +339,32 @@ class MemoryConfig:
 #: widgets). ``svg`` is excluded because ``.svg`` is not in
 #: ``FileReader.SUPPORTED``.
 DEFAULT_AUTO_INGEST_ARTIFACT_KINDS = ["markdown", "text", "html", "json"]
+
+
+def memory_writes_off_key(memory: object) -> str | None:
+    """The config key that stops automatic memory writes, or None when writes run.
+
+    ``memory.persistence_enabled`` stops writes and injection together;
+    ``memory.writes_enabled`` stops writes alone. Every automatic writer gates on
+    this one answer, so the two switches cover the same writers. Read with
+    ``getattr`` so a partial config stand-in that predates a key counts it as on.
+    """
+    if not getattr(memory, "persistence_enabled", True):
+        return "memory.persistence_enabled"
+    if not getattr(memory, "writes_enabled", True):
+        return "memory.writes_enabled"
+    return None
+
+
+def lesson_extraction_enabled(memory: object) -> bool:
+    """Whether automatic lesson extraction may save lessons.
+
+    False when ``memory.lesson_extraction_enabled`` is off, or when automatic
+    writes are off as a whole.
+    """
+    return memory_writes_off_key(memory) is None and bool(
+        getattr(memory, "lesson_extraction_enabled", True)
+    )
 
 
 def _coerce_embedding_provider(raw: str) -> str:
@@ -354,10 +425,9 @@ class KnowledgeConfig:
         default=10.0,
         metadata=_meta(
             "Embed Timeout (seconds)",
-            "Per-request timeout for the Knowledge-Library embedder. Raise it "
-            "when a large chunk times out on a cold Ollama model load (the embed "
-            "then never completes and the item is retried every maintenance "
-            "pass). 0 or unset keeps the built-in 10s default.",
+            "Retained for config compatibility; it bounds no call. The "
+            "Knowledge-Library embedder runs in-process (llama.cpp), so there is "
+            "no per-request timeout for this value to apply to.",
         ),
     )
     embed_content_budget: int = field(
@@ -633,8 +703,9 @@ class SkillsConfig:
             "Auto Similarity Threshold",
             "Skip creation when an existing skill's description has keyword overlap "
             "≥ this fraction with the synthesized description (0.0-1.0). Prevents "
-            "near-duplicate skills. Used as the lexical fallback when the Haiku "
-            "dedupe judge is unavailable.",
+            "near-duplicate skills. Used as the lexical fallback when the dedupe "
+            "judge is unavailable, and as a safety net after the judge returns a "
+            "NEW verdict.",
         ),
     )
     # ── Staged approval + lifecycle (v2) ──
@@ -706,7 +777,11 @@ class SkillsConfig:
             "Extra Skill Paths",
             "Additional directories to scan for skills. Supports ~ expansion. "
             "Skills from extra_paths are read-only (trigger matching + loading). "
-            "Local ~/.kiro/crew/skills/ takes precedence for duplicate names.",
+            "Local ~/.kiro/crew/skills/ takes precedence for duplicate names. "
+            "A skill folder linked into the skills directory from an outside "
+            "location is not followed through the link; to load it, add the "
+            "target's parent directory here. Otherwise it is skipped and a "
+            "warning naming the target is logged.",
         ),
     )
     project_skills_enabled: bool = field(
@@ -832,9 +907,10 @@ class SessionSummaryConfig:
         metadata=_meta(
             "Assistant Excerpt Size",
             "Characters kept from each end of an assistant message when building "
-            "the summarization input (>=80). User messages are included in full "
-            "unless the whole input exceeds the fixed 40,000-character summary input "
-            "limit -- they carry intent and are small -- while assistant output is "
+            "the summarization input (>=80). Each user message is capped at its "
+            "first 4,000 characters, and kept whole up to that cap unless the whole "
+            "input exceeds the fixed 40,000-character summary input limit -- user "
+            "messages carry intent and are small -- while assistant output is "
             "excerpted because it holds the progress detail but dominates the "
             "transcript. Past that limit, middle turns are dropped and any turn is "
             "cut to about 5,000 characters per end, so larger values stop helping.",

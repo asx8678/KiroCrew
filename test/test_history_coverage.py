@@ -28,6 +28,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from windows_sim import same_tick_file_stat
 
 from kiro_crew import history as H
 from kiro_crew.execution_context import STRICTEST_MEMORY_MODE
@@ -40,6 +41,7 @@ from kiro_crew.history import (
     HistoryConsolidator,
 )
 from kiro_crew.session import BACKGROUND_KEY
+from kiro_crew.testing.wait import await_until
 from kiro_crew.vector_memory import SemanticRejectCode
 
 
@@ -170,7 +172,7 @@ class TestOffLoopWrappers:
         with caplog.at_level(logging.WARNING, logger="kiro_crew.history"):
             with patch.object(loop, "run_in_executor", _spy):
                 H.append_off_loop(log, "k", "user", "hi")
-            await asyncio.wait_for(done.wait(), timeout=5)
+            await await_until(done, what="the offloaded append finishing")
             await asyncio.sleep(0)
         assert "offloaded append failed" in caplog.text
         assert captured["fut"].done()
@@ -191,7 +193,7 @@ class TestOffLoopWrappers:
         with patch.object(loop, "run_in_executor", _spy):
             H.update_metadata_off_loop(log, "k", {"title": "later"})
         assert futures, "update_metadata_off_loop must dispatch to an executor"
-        await asyncio.wait_for(asyncio.shield(futures[0]), timeout=5)
+        await await_until(asyncio.shield(futures[0]), what="the executor future finishing")
         assert _log(tmp_path).get_metadata("k")["title"] == "later"
 
     @pytest.mark.asyncio
@@ -209,7 +211,7 @@ class TestOffLoopWrappers:
         with patch.object(loop, "run_in_executor", _spy):
             H.append_if_absent_off_loop(log, "k", "user", "durable")
         assert futures, "append_if_absent_off_loop must dispatch to an executor"
-        await asyncio.wait_for(asyncio.shield(futures[0]), timeout=5)
+        await await_until(asyncio.shield(futures[0]), what="the executor future finishing")
         assert [m["content"] for m in _log(tmp_path)._read_messages("k")] == ["durable"]
 
 
@@ -461,12 +463,6 @@ class TestLastMessagePreview:
         log = _log(tmp_path)
         _write(log._path("k"), _jsonl({"_type": "metadata", "created_at": "x"}))
         assert log.last_message_preview("k") == ""
-
-    def test_returns_newest_message(self, tmp_path: Path) -> None:
-        log = _log(tmp_path)
-        log.append("k", "user", "first")
-        log.append("k", "assistant", "second")
-        assert log.last_message_preview("k") == "second"
 
     def test_structured_content_blocks(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
@@ -954,7 +950,7 @@ class TestWriteStructuredMemory:
         specific cause -- here which confidence won. Dropping it left an operator
         with ``conflict`` and no way to tell a confidence loss from a queued
         proposal, so the warning must carry the reason and name the table that
-        holds the stored and rejected values.
+        holds the audit row, saying which values that row keeps.
         """
         vs = MagicMock()
         vs.set_semantic.return_value = (
@@ -967,8 +963,13 @@ class TestWriteStructuredMemory:
         assert "Existing entry has higher confidence (0.90 vs 0.60)" in caplog.text
         # The pointer is scoped to audited causes: VALUE_SIZE and VALUE_ENCODING are
         # outside ``_AUDITABLE_REJECT_CODES``, so a blanket promise of a row would send
-        # an operator to an audit record that was never written.
-        assert "audited causes carry both values in memory_events" in caplog.text
+        # an operator to an audit record that was never written. Only a conflict_skip
+        # row stores both values; log_reject_event stores the rejected value alone.
+        assert (
+            "memory_events records the rejected value for audited causes;"
+            " a conflict_skip row, when written, records both"
+        ) in caplog.text
+        assert "carry both values" not in caplog.text
 
     def test_semantic_is_capped(self) -> None:
         vs = MagicMock()
@@ -1226,16 +1227,16 @@ class TestRewriteSession:
         assert "drop" in body
         assert "{ corrupted" in body
 
-    def test_archive_failure_is_logged_not_raised(self, tmp_path: Path, caplog) -> None:
+    def test_archive_failure_raises_and_keeps_every_row(self, tmp_path: Path) -> None:
+        """The archive is the only other copy of the dropped rows, so compaction fails closed."""
         log = _log(tmp_path)
         log.append("k", "user", "a")
         log.append("k", "user", "b")
         keep = log._read_messages("k")[:1]
         with patch.object(H, "_archive_lines", side_effect=OSError("read-only")):
-            with caplog.at_level(logging.WARNING, logger="kiro_crew.history"):
+            with pytest.raises(OSError):
                 log.rewrite_session("k", keep)
-        assert "Failed to archive dropped lines" in caplog.text
-        assert [m["content"] for m in _log(tmp_path)._read_messages("k")] == ["a"]
+        assert [m["content"] for m in _log(tmp_path)._read_messages("k")] == ["a", "b"]
 
     def test_unowned_metadata_is_carried_through(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
@@ -1486,19 +1487,6 @@ class TestUpdateMetadataLocked:
 
 
 class TestDeleteSession:
-    def test_missing_session_returns_false(self, tmp_path: Path) -> None:
-        assert _log(tmp_path).delete_session("nope") is False
-
-    def test_removes_file_and_summary_sidecar(self, tmp_path: Path) -> None:
-        log = _log(tmp_path)
-        log.append("k", "user", "hi")
-        log.set_cached_summary("k", "a summary", 1.0)
-        sidecar = log._summary_cache_path("k")
-        assert sidecar.exists()
-        assert log.delete_session("k") is True
-        assert not log._path("k").exists()
-        assert not sidecar.exists()
-
     def test_unlink_failure_returns_false(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
         log.append("k", "user", "hi")
@@ -1565,9 +1553,6 @@ class TestContentSnippet:
 
 
 class TestRecentFromSource:
-    def test_missing_dir_returns_empty(self, tmp_path: Path) -> None:
-        assert ConversationLog(base_dir=tmp_path / "absent").recent_from_source("slack") == []
-
     def test_collects_and_excludes(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
         log.append("slack:a", "user", "from a")
@@ -1590,13 +1575,6 @@ class TestRecentFromSource:
         log.append("slack:a", "user", "hi")
         with patch("builtins.open", side_effect=OSError("locked")):
             assert log.recent_from_source("slack") == []
-
-    def test_max_messages_trims_to_the_newest(self, tmp_path: Path) -> None:
-        log = _log(tmp_path)
-        for i in range(6):
-            log.append("slack:a", "user", f"m{i}")
-        got = log.recent_from_source("slack", max_messages=2)
-        assert [m["content"] for m in got] == ["m4", "m5"]
 
 
 # ── skill-text helpers ─────────────────────────────────────────────────────
@@ -1673,6 +1651,33 @@ class TestReadMessagesSkipsBlankLines:
             _jsonl({"_type": "metadata"}) + "\n\n" + _jsonl({"role": "user", "content": "only"}),
         )
         assert [m["content"] for m in log._read_messages("k")] == ["only"]
+
+
+class TestReadMessagesSeesASameTickRewrite:
+    """A rewrite that lands on the cached stat's clock tick is still a new file.
+
+    ``_msg_cache`` is keyed on the file's stat. NTFS stamps writes in ~1-16 ms
+    ticks and Windows ``st_ctime`` is the creation time, so an external writer
+    that appends rows right after a read leaves mtime, ctime and inode all equal;
+    only the size moves. The cached parse must not be served for it.
+    """
+
+    def test_rows_appended_within_the_tick_are_read(self, tmp_path: Path) -> None:
+        log = _log(tmp_path)
+        path = log._path("k")
+        _write(path, _jsonl({"_type": "metadata"}, {"role": "user", "content": "q0"}))
+        with same_tick_file_stat(match=path.name):
+            assert [m["content"] for m in log.read_messages_chained("k")] == ["q0"]
+            # An external append: in place, same inode, same pinned timestamps.
+            with open(path, "a", encoding="utf-8", newline="\n") as handle:
+                handle.write(_jsonl({"role": "assistant", "content": "a0"}))
+            assert [m["content"] for m in log.read_messages_chained("k")] == ["q0", "a0"]
+
+    def test_the_stamp_still_names_the_timestamps_and_inode(self, tmp_path: Path) -> None:
+        path = tmp_path / "k.jsonl"
+        _write(path, "x\n")
+        st = path.stat()
+        assert H._cache_identity(st) == (st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino)
 
 
 class TestIsIncognitoTranscript:

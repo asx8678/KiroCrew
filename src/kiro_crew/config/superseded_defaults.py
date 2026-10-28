@@ -935,6 +935,38 @@ def drop_acks(dotted_keys: list[str]) -> None:
     _update_acked(lambda existing: {k: v for k, v in existing.items() if k not in drop})
 
 
+def ack_explicit_write(dotted_key: str, value: object) -> bool:
+    """Acknowledge *value* when an operator explicitly writes an auto-adopting old default.
+
+    A Settings save is the operator's answer, exactly as ``--keep`` is. Without the
+    ack, saving the round value an ``auto_adopt`` row names as its ``old_default``
+    (a two-hour turn limit, say) reads on the next load as a materialized default,
+    and the one-shot adoption deletes it -- silently replacing a choice made seconds
+    earlier. Recording the value as acknowledged takes it out of drift, which is
+    the filter :func:`auto_adoptable` applies first.
+
+    Only ``auto_adopt`` rows are acked. A report-only row loses nothing on load, so
+    its report keeps working the way it always has.
+
+    The caller must hold the config write lock and call this BEFORE the config
+    write, the same config-then-ack order :func:`record_acks` uses. A failure
+    propagates (``OSError``, including :class:`AckPathRefused`) so the caller
+    abandons the write: a value saved without its ack is the one the next load
+    would delete. If the ack lands and the config write then fails, the ack only
+    holds back adoption of that exact value, which is what the operator asked for.
+
+    Returns True when an ack was recorded.
+    """
+    for entry in SUPERSEDED_DEFAULTS:
+        if entry.dotted_key != dotted_key or not entry.auto_adopt:
+            continue
+        if type(value) is not type(entry.old_default) or value != entry.old_default:
+            return False
+        _update_acked(lambda existing: {**existing, dotted_key: value})
+        return True
+    return False
+
+
 def _stored_value(base_data: dict, dotted_key: str) -> object:
     """Return what *base_data* stores at *dotted_key*, or ``_ABSENT``."""
     section, field = _split_dotted(dotted_key)
@@ -1129,8 +1161,10 @@ class CoercedValue:
     #: setting is the one thing the command promises never to do.
     resolves_to: Callable[[object], str]
     #: Section default for the key, so an adoption whose resolution IS the default
-    #: can delete the key (an absent key resolves to it) rather than write it.
-    default: str
+    #: can delete the key (an absent key resolves to it) rather than write it. A
+    #: callable when the absent-key answer can move at runtime (an edition's
+    #: ``default_stt()``): deleting the key must land where the stored value did.
+    default: "str | Callable[[], str]"
     reason: str
     is_coerced: Callable[[object], bool]
 
@@ -1138,7 +1172,15 @@ class CoercedValue:
         """What ``--adopt`` should leave in the file for *stored*: a value to
         write, or ``None`` to delete the key because the default already answers."""
         resolved = self.resolves_to(stored)
-        return None if resolved == self.default else resolved
+        default = self.default() if callable(self.default) else self.default
+        return None if resolved == default else resolved
+
+
+def _stt_provider_default() -> str:
+    """What an absent ``stt.provider`` resolves to, the edition's default included."""
+    from kiro_crew.config.sections_stt import default_stt_provider  # circular import
+
+    return default_stt_provider()
 
 
 def _stt_provider_is_coerced(value: object) -> bool:
@@ -1173,7 +1215,7 @@ COERCED_VALUES: tuple[CoercedValue, ...] = (
     CoercedValue(
         dotted_key="stt.provider",
         resolves_to=_stt_provider_resolution,
-        default="local",
+        default=_stt_provider_default,
         reason=(
             "names a retired speech provider (voice input runs on 'local') or an "
             "unknown one (no recogniser runs, as if it were 'off')"

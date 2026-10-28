@@ -1,5 +1,6 @@
 import { safeSetItem } from './safeStorage'
 import { mergeRecoveredDraft } from './chatDrafts'
+import { knowledgeEnvelopeEndInRow } from './knowledgeEnvelope'
 /**
  * Paste-token utilities.
  *
@@ -328,9 +329,10 @@ export function expandAll(text: string, blocks: PasteBlock[]): string {
  * Replaces the FIRST non-overlapping occurrence of each block in document
  * order, so repeated sends of the same paste each collapse to their own token.
  * A block whose content is not found verbatim is skipped (that region renders
- * as-is). Returns `content` unchanged when nothing matched.
+ * as-is). Text before `from` is kept verbatim (e.g. a recorded knowledge head).
+ * Returns `content` unchanged when nothing matched.
  */
-export function recollapsePastes(content: string, blocks: PasteBlock[]): string {
+export function recollapsePastes(content: string, blocks: PasteBlock[], from = 0): string {
   if (!content || !blocks.length) return content
   interface Hit { start: number; end: number; block: PasteBlock }
   const hits: Hit[] = []
@@ -340,12 +342,12 @@ export function recollapsePastes(content: string, blocks: PasteBlock[]): string 
   // another's). Returns -1 when every occurrence overlaps a claim or none exist.
   const firstUnclaimed = (needle: string): number => {
     if (!needle) return -1
-    let from = 0
-    while (from <= content.length) {
-      const idx = content.indexOf(needle, from)
+    let searchFrom = from
+    while (searchFrom <= content.length) {
+      const idx = content.indexOf(needle, searchFrom)
       if (idx < 0) return -1
       if (!claimed.some(([s, e]) => idx < e && idx + needle.length > s)) return idx
-      from = idx + 1
+      searchFrom = idx + 1
     }
     return -1
   }
@@ -388,12 +390,16 @@ export function recollapsePastes(content: string, blocks: PasteBlock[]): string 
  * Merge preserved paste state from `existing` onto `incoming` (from backend
  * refresh). For each user message in `existing` with `meta.pastes`, the
  * tokenized content + pastes are re-applied to the matching incoming user
- * message — matched by expansion equality (`expandAll(old.content, old.pastes)
- * === new.content`). Consumed FIFO so repeated sends don't collide.
+ * message. Matched in priority order: (1) exact `meta.sendId` identity, then
+ * (2) expansion equality (`expandAll(old.content, old.pastes) === new.content`),
+ * consumed FIFO so repeated sends don't collide. Id identity runs first so a
+ * repeated paste sent with different files cannot have its FIFO entry consumed
+ * by the wrong send.
  *
  * Falls back to `readStoredPaste(incoming.content)` for messages that have no
  * in-memory counterpart (e.g. after page reload or chat switch) — this reads
- * from the localStorage side table populated by `saveStoredPaste`.
+ * from the localStorage side table populated by `saveStoredPaste` — and
+ * finally to self-contained re-collapse from the row's own `meta.pastes`.
  *
  * Why: the backend only sees/stores the LLM-facing expanded text. Without
  * this merge, the user bubble would "expand" to full text as soon as the
@@ -403,7 +409,23 @@ export function mergePreservedPastes<M extends { role: string; content: string; 
   existing: M[],
   incoming: M[],
 ): M[] {
-  const preserved: Array<{ content: string; pastes: PasteBlock[]; expanded: string; files: string[] | null }> = []
+  type PreservedEntry = { content: string; pastes: PasteBlock[]; expanded: string; files: string[] | null; mid: string }
+  const preserved: PreservedEntry[] = []
+  // Id-keyed preservation, keyed on the stable `meta.sendId` the plain-send and
+  // steer paths both stamp (and the backend re-serves `sendId` on the persisted
+  // row — but NOT `meta.pastes`, which the backend never stores).
+  // This is the resolution that must NOT regress: once ANY earlier reconcile
+  // established `meta.pastes` on a row, every later reconcile of the same send
+  // keeps it — even when the in-memory FIFO queue has been consumed and the
+  // localStorage side table has evicted the entry (200-entry / 30-day cap). A
+  // row whose pastes come and go across reconciles is exactly what makes the
+  // chip flip to raw text and back as the virtualized transcript remounts it on
+  // scroll; carrying by id keeps the representation stable and remount-proof.
+  // Each id maps to the SAME entry object that is pushed into the FIFO queue,
+  // so an id hit can splice that entry out of the queue — otherwise the entry
+  // stays FIFO-matchable and a later id-less row with identical expanded
+  // content would inherit this send's pastes/files (a cross-row leak).
+  const byId = new Map<string, PreservedEntry>()
   for (const m of existing) {
     const pastes = (m.meta?.pastes as PasteBlock[] | undefined) || []
     if (m.role === 'user' && pastes.length) {
@@ -411,10 +433,25 @@ export function mergePreservedPastes<M extends { role: string; content: string; 
       // Normalize trailing whitespace — the backend strips it before storing,
       // so our expanded text (which may have a trailing newline/space from the
       // token + newline pattern) won't match the incoming content byte-for-byte.
-      preserved.push({ content: m.content, pastes, expanded: expandAll(m.content, pastes).trimEnd(), files })
+      const entry: PreservedEntry = {
+        content: m.content,
+        pastes,
+        expanded: expandAll(m.content, pastes).trimEnd(),
+        files,
+        mid: typeof m.meta?.mid === 'string' && m.meta.mid ? m.meta.mid : '',
+      }
+      preserved.push(entry)
+      const sid = typeof m.meta?.sendId === 'string' && m.meta.sendId ? m.meta.sendId : ''
+      // First writer wins per sendId: a duplicate sendId is anomalous, and the
+      // earliest row is the authoritative resolution to carry forward.
+      if (sid && !byId.has(sid)) byId.set(sid, entry)
     }
   }
   const queue = preserved.slice()
+  const incomingSid = (m: M): string =>
+    typeof m.meta?.sendId === 'string' && m.meta.sendId ? m.meta.sendId : ''
+  const incomingMid = (m: M): string =>
+    typeof m.meta?.mid === 'string' && m.meta.mid ? m.meta.mid : ''
   // A backend-served user message that carries its own `meta.pastes` but whose
   // content is still fully expanded (no `[ Paste #N ]` token) needs fallback 3
   // (self-contained re-collapse) even when there is no optimistic bubble and no
@@ -432,6 +469,7 @@ export function mergePreservedPastes<M extends { role: string; content: string; 
   // common no-pastes case.
   if (
     !queue.length &&
+    !byId.size &&
     !incoming.some(m => m.role === 'user' && readStoredPaste(m.content.trimEnd())) &&
     !incoming.some(needsSelfCollapse)
   ) {
@@ -439,8 +477,120 @@ export function mergePreservedPastes<M extends { role: string; content: string; 
   }
   return incoming.map(m => {
     if (m.role !== 'user') return m
-    // 1) In-memory preservation (optimistic bubble still present)
-    if (queue.length) {
+    // Set when a reused-sendId mid-conflict proves the held entry belongs to a
+    // DIFFERENT row: this row then bypasses the FIFO content match too, so it
+    // cannot inherit the foreign entry's pastes by coincidental expansion
+    // equality — while the entry stays in the queue for its true owner row.
+    let skipFifo = false
+    // 1) Id-keyed carry-forward — keyed on the stable `meta.sendId` both send
+    // paths stamp and the backend re-serves. This MUST run before the FIFO
+    // match (2): FIFO matches purely on expansion-equality, so when the same
+    // paste text is sent twice with DIFFERENT files it would consume the wrong
+    // optimistic entry for a later send (and surface the older send's
+    // attachment) before any `sendId` lookup. An exact id match is the precise
+    // identity, so it wins. Once ANY earlier reconcile established `meta.pastes`
+    // on a row, every later reconcile of the same send keeps it — even when the
+    // FIFO queue is empty (plain refresh/chat-switch) and the localStorage side
+    // table (3) has evicted the entry (200-entry / 30-day cap). A row whose
+    // pastes come and go across reconciles is exactly what flips the chip to
+    // raw text and back as the virtualized transcript remounts it on scroll;
+    // carrying by id keeps the representation stable and remount-proof.
+    const sid = incomingSid(m)
+    if (sid) {
+      const held = byId.get(sid)
+      // Guard against a reused sendId naming two DIFFERENT persisted rows. The
+      // server-minted `meta.mid` is the stable per-row identity; a client could
+      // (maliciously or by a bug) reuse another row's `sendId` while carrying a
+      // different paste body, and an older-history merge would then match by id
+      // and hand the older row the newer row's pastes/files. When BOTH rows
+      // carry a non-empty `mid` and they DIFFER, they are provably different
+      // rows — skip the id path and fall through to the content-/cache-keyed
+      // routes. A missing `mid` on either side (the optimistic pre-confirm
+      // window, where carry-forward is exactly what prevents the chip flip)
+      // leaves the sendId match intact.
+      const midHeld = held ? held.mid : ''
+      const midIn = incomingMid(m)
+      const midConflict = !!held && !!midHeld && !!midIn && midHeld !== midIn
+      if (held && midConflict) {
+        // Proven-different rows share a reused sendId. The held entry belongs
+        // to a DIFFERENT persisted row (different mid), so skip the id path for
+        // THIS row and let it resolve via the content-/cache-keyed routes
+        // below. Do NOT evict the held entry: a later row carrying the matching
+        // mid is the entry's true owner, and evicting here would strand it
+        // (dropping that row's pastes and, for a merged/large paste, rendering
+        // it expanded). Bypass FIFO for only this conflicting row instead.
+        skipFifo = true
+      } else if (held) {
+        const newMeta: Record<string, unknown> = { ...m.meta, pastes: held.pastes }
+        if (held.files && held.files.length) newMeta.files = held.files
+        // Consume the held entry from BOTH the id map and the FIFO queue once
+        // we commit to using it. Leaving it in `queue` would let a later
+        // id-less row with identical expanded content match it by expansion
+        // equality (fallback 2) and inherit this send's pastes/files — a
+        // cross-row leak. Deleting the id key keeps a second row sharing this
+        // sendId from double-consuming it. Only consume on a path that actually
+        // returns the carried pastes; if neither form below applies we fall
+        // through WITHOUT consuming, leaving the entry available to the FIFO
+        // and side-table routes.
+        const consumeHeld = () => {
+          byId.delete(sid)
+          const qi = queue.indexOf(held)
+          if (qi >= 0) queue.splice(qi, 1)
+        }
+        // Choose a content form that is NEVER the raw expanded wire text:
+        //  - held content expands to the incoming text  → use held (keeps a
+        //    collapsed chip collapsed; identical to the last-shown render);
+        //  - otherwise the incoming wire text diverges from the bubble text.
+        //    Prefer the exact side-table entry keyed on the wire text, because
+        //    the composer saved the TRUE display form there (saveStoredPaste
+        //    stores the LLM wire text as the key and the display text as the
+        //    value). The wire text can contain send-only material the bubble
+        //    never showed — attached-file markers, and critically a prepended
+        //    `[KNOWLEDGE CONTEXT …]` block — so reconstructing the display from
+        //    the wire via recollapsePastes would fold only the paste body and
+        //    leave that injected block visible in the bubble. The side table's
+        //    displayTxt has none of it. Only if the side table misses do we
+        //    fall back to a generic re-collapse (attached-file-marker case with
+        //    no stored entry), and only if that folds a token.
+        // Reuse the entry's precomputed `expanded` (built identically from the
+        // same content/pastes, never mutated) instead of re-materializing a
+        // potentially multi-hundred-KB paste body on the main thread per
+        // reconcile just to run one equality check.
+        const heldExpanded = held.expanded
+        if (heldExpanded === m.content.trimEnd()) {
+          consumeHeld()
+          return { ...m, content: held.content, meta: newMeta }
+        }
+        const storedForWire = readStoredPaste(m.content.trimEnd())
+        if (storedForWire) {
+          consumeHeld()
+          const sideMeta: Record<string, unknown> = { ...m.meta, pastes: storedForWire.pastes }
+          const sideFiles = (storedForWire.files && storedForWire.files.length)
+            ? storedForWire.files
+            : (held.files && held.files.length ? held.files : null)
+          if (sideFiles) sideMeta.files = sideFiles
+          return { ...m, content: storedForWire.displayTxt, meta: sideMeta }
+        }
+        // A knowledge-prefixed send carries a `[KNOWLEDGE CONTEXT …]` envelope
+        // in the wire text only (never the bubble). We do NOT wholesale-restore
+        // held.content here: a busy-drain can fold several queued messages into
+        // ONE reconciled row, so this row's content may contain OTHER messages'
+        // text beside the knowledge send — returning held.content would drop
+        // them from the transcript permanently. Fall through to a generic
+        // re-collapse that folds only the paste tokens and preserves all other
+        // merged content.
+        const recollapsed = recollapsePastes(m.content, held.pastes,
+          knowledgeEnvelopeEndInRow(m.content, m.meta))
+        if (recollapsed !== m.content) {
+          consumeHeld()
+          return { ...m, content: recollapsed, meta: newMeta }
+        }
+        // No token could be folded in — do not clobber or consume; try the
+        // routes below.
+      }
+    }
+    // 2) In-memory FIFO preservation (optimistic bubble still present)
+    if (queue.length && !skipFifo) {
       // Compare against trimEnd()'d incoming content — backend strips trailing
       // whitespace on storage, so our expanded text (pre-strip) wouldn't match.
       const incomingTrimmed = m.content.trimEnd()
@@ -454,26 +604,169 @@ export function mergePreservedPastes<M extends { role: string; content: string; 
         return { ...m, content: match.content, meta: newMeta }
       }
     }
-    // 2) localStorage side table (survives refresh/chat-switch)
+    // 3) localStorage side table (survives refresh/chat-switch)
     const stored = readStoredPaste(m.content.trimEnd())
     if (stored) {
       const newMeta: Record<string, unknown> = { ...m.meta, pastes: stored.pastes }
       if (stored.files && stored.files.length) newMeta.files = stored.files
       return { ...m, content: stored.displayTxt, meta: newMeta }
     }
-    // 3) Self-contained re-collapse. The backend re-serves `meta.pastes`
-    // alongside the fully-expanded content, so when neither the optimistic
-    // bubble nor the side table can re-collapse (fresh tab, evicted entry),
-    // fold the message's own blocks back into `[ Paste #N ]` tokens. Without
-    // this a huge paste stays expanded in state and the virtualizer measures /
-    // the renderer parses hundreds of KB on the main thread, freezing the tab.
+    // 4) Self-contained re-collapse. When a row still carries `meta.pastes`
+    // from an earlier in-session reconcile but its content is fully expanded
+    // (fresh reconcile, side table evicted), fold the message's own blocks back
+    // into `[ Paste #N ]` tokens. Without this a huge paste stays expanded in
+    // state and the virtualizer measures / the renderer parses hundreds of KB
+    // on the main thread, freezing the tab. NOTE: the backend does NOT persist
+    // `meta.pastes` on the chat row (it only reads the field to build the LLM
+    // prompt), so a cold load / fresh tab / reload serves the row WITHOUT
+    // `meta.pastes` and this route cannot fire — see the known-limit note in
+    // the PR description. The in-session chip stability is carried by route 1
+    // (sendId) above.
     const ownPastes = (m.meta?.pastes as PasteBlock[] | undefined) || []
     if (ownPastes.length && !findTokenRanges(m.content, ownPastes).length) {
-      const collapsed = recollapsePastes(m.content, ownPastes)
+      const collapsed = recollapsePastes(m.content, ownPastes,
+        knowledgeEnvelopeEndInRow(m.content, m.meta))
       if (collapsed !== m.content) return { ...m, content: collapsed }
     }
     return m
   })
+}
+
+/**
+ * Fold expanded content back to its tokens when the blocks' ORDER in the text
+ * is known, or refuse. `blocks` is the blocks in token order (the order the
+ * composer's display text had them); each body is looked for at or after the
+ * end of the one before it, so a body that is a prefix of a later sibling's
+ * cannot claim that sibling's start, and the later one cannot claim an earlier
+ * body plus the text after it. {@link recollapsePastes} cannot tell those
+ * apart from the text alone, which is fine for a bubble that only draws the
+ * chip; a surface that EDITS the folded text and expands the tokens again
+ * (the queue card) needs the attribution right, or a deleted token takes a
+ * sibling's text with it.
+ *
+ * The order alone does not settle a body that also stands in the text as
+ * plain words (a paste expanded in place, then pasted again collapsed): the
+ * token could sit on either copy, and an edit that deletes it would remove
+ * the wrong one. So the fold is accepted only when exactly ONE placement of
+ * all the blocks, in order, exists; a second complete placement refuses it.
+ * An occurrence inside a later sibling's body is not a second placement,
+ * because that sibling then finds no body after it.
+ *
+ * Verbatim first, then the body with trailing whitespace off (the gateway
+ * strips it from a stored message). Returns null when a body is not found in
+ * order, when the placement is ambiguous, or when the fold does not expand
+ * back to `content` (trailing whitespace aside), so the caller shows the
+ * text as sent instead.
+ */
+/** Every start of `needle` in `text`, overlapping ones included, in one pass
+ *  over each (Knuth-Morris-Pratt). A repeated `indexOf` from each hit
+ *  re-compares the whole needle at every position, which for a body of
+ *  thousands of identical lines standing at thousands of positions is the
+ *  product of the two; this stays at their sum. */
+export function allOccurrences(text: string, needle: string): number[] {
+  const out: number[] = []
+  const m = needle.length
+  if (!m || m > text.length) return out
+  // fail[i]: length of the longest proper prefix of needle[0..i] that is also its suffix.
+  const fail = new Int32Array(m)
+  for (let i = 1, k = 0; i < m; i++) {
+    while (k > 0 && needle.charCodeAt(i) !== needle.charCodeAt(k)) k = fail[k - 1]
+    if (needle.charCodeAt(i) === needle.charCodeAt(k)) k++
+    fail[i] = k
+  }
+  for (let i = 0, k = 0; i < text.length; i++) {
+    while (k > 0 && text.charCodeAt(i) !== needle.charCodeAt(k)) k = fail[k - 1]
+    if (text.charCodeAt(i) === needle.charCodeAt(k)) k++
+    if (k === m) { out.push(i - m + 1); k = fail[k - 1] }
+  }
+  return out
+}
+
+export function foldPastesInOrder(content: string, blocks: PasteBlock[]): string | null {
+  if (!content || !blocks.length || blocks.some(b => !b.content)) return null
+  const end = content.trimEnd().length
+  // Every place a body stands in the text, scanned ONCE per distinct body:
+  // verbatim anywhere, and with its trailing whitespace off only where the
+  // text ENDS (the gateway strips trailing whitespace from the stored text,
+  // never from the middle). Both forms count toward uniqueness: a verbatim
+  // copy earlier in the text must not hide the stripped tail as the other
+  // possible placement. A body of repeated lines stands at hundreds of
+  // overlapping positions, so the list is built once and sliced by position,
+  // never rescanned.
+  type Candidate = { at: number; len: number }
+  const occurrences = new Map<string, Candidate[]>()
+  const allCandidates = (body: string): Candidate[] => {
+    const known = occurrences.get(body)
+    if (known) return known
+    const out: Candidate[] = allOccurrences(content, body).map(at => ({ at, len: body.length }))
+    const trimmed = body.trimEnd()
+    if (trimmed && trimmed !== body) {
+      const at = end - trimmed.length
+      if (at >= 0 && content.startsWith(trimmed, at) && !out.some(c => c.at === at)) out.push({ at, len: trimmed.length })
+    }
+    out.sort((a, b) => a.at - b.at)
+    occurrences.set(body, out)
+    return out
+  }
+  // Index of the first candidate at or after `from` (the list is sorted).
+  const firstAtOrAfter = (list: Candidate[], from: number): number => {
+    let lo = 0
+    let hi = list.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (list[mid].at < from) lo = mid + 1; else hi = mid
+    }
+    return lo
+  }
+  // The least room the blocks after `i` need, so a placement that leaves
+  // less is refused before its tail is searched.
+  const roomAfter: number[] = new Array(blocks.length + 1).fill(0)
+  for (let i = blocks.length - 1; i >= 0; i--) roomAfter[i] = roomAfter[i + 1] + blocks[i].content.trimEnd().length
+  // Complete placements of blocks[i..] from `pos`, counted up to 2, with the
+  // first one found (leftmost first, in order). Memoized on (i, pos): many
+  // blocks with one body would otherwise re-walk the same failed tails.
+  type Placement = { count: number; first: Candidate[] | null }
+  const memo = new Map<string, Placement>()
+  const place = (i: number, pos: number): Placement => {
+    if (i === blocks.length) return { count: 1, first: [] }
+    const key = `${i}:${pos}`
+    const hit = memo.get(key)
+    if (hit) return hit
+    let count = 0
+    let first: Candidate[] | null = null
+    const list = allCandidates(blocks[i].content)
+    for (let k = firstAtOrAfter(list, pos); k < list.length; k++) {
+      const c = list[k]
+      if (c.at + c.len + roomAfter[i + 1] > content.length) break
+      const rest = place(i + 1, c.at + c.len)
+      if (rest.count && !first && rest.first) first = [c, ...rest.first]
+      count += rest.count
+      if (count >= 2) break
+    }
+    const result = { count, first }
+    memo.set(key, result)
+    return result
+  }
+  // No placement at all when the bodies cannot even be met left to right
+  // (one missing, or standing before the one that precedes it): refused here
+  // in one greedy pass, because the search below ends early only on a SECOND
+  // complete placement, and with none it would walk every failed pair.
+  for (let i = 0, pos = 0; i < blocks.length; i++) {
+    const list = allCandidates(blocks[i].content)
+    const k = firstAtOrAfter(list, pos)
+    if (k === list.length) return null
+    pos = list[k].at + list[k].len
+  }
+  const { count, first } = place(0, 0)
+  if (count !== 1 || !first) return null
+  let out = ''
+  let pos = 0
+  first.forEach((c, i) => {
+    out += content.slice(pos, c.at) + formatToken(blocks[i])
+    pos = c.at + c.len
+  })
+  out += content.slice(pos)
+  return expandAll(out, blocks).trimEnd() === content.trimEnd() ? out : null
 }
 
 /* ---- localStorage side table: content-addressed paste preservation ---- */

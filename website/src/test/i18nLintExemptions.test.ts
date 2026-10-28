@@ -186,6 +186,18 @@ describe('the autolink template placeholder is exempt', () => {
   })
 })
 
+describe('the Unicode code-point prefix is exempt', () => {
+  it('stays quiet on U+ before an interpolated hex value', async () => {
+    // Real site: lib/scriptLabel.ts names a refused letter as `U+041E`.
+    expect(await lint('export const label = (hex: string) => `U+${hex}`')).toEqual([])
+  })
+
+  it('still reports copy that merely starts with U+', async () => {
+    const messages = await lint(`export const PROBE = ['U+ is not allowed', 'Use U+']`)
+    expect(messages).toHaveLength(2)
+  })
+})
+
 describe('the goal loop kill-switch placeholder is exempt', () => {
   it('stays quiet on the exact wire token', async () => {
     expect(await lint(`export const STOP_FILE_TOKEN = '{{STOP_FILE}}'`)).toEqual([])
@@ -377,6 +389,17 @@ describe('string comparison is a position exemption', () => {
     // The snake exemption is narrow: one lowercase run per underscore, no spaces.
     expect(await lint(`export const LABEL = 'save changes_now'`)).toHaveLength(1)
   })
+
+  it('keeps a versioned snake_case wire token exempt', async () => {
+    // Real site: the `fold_delta.1` socket capability in hooks/websocket/foldWatch.ts.
+    expect(await lint(`export const FOLD_CAP = 'fold_delta.1'`)).toEqual([])
+    expect(await lint(`export const cap = 'fold_delta.12'`)).toEqual([])
+  })
+
+  it('still reports copy that only looks like a versioned token', async () => {
+    expect(await lint(`export const LABEL = 'Version 1.2'`)).toHaveLength(1)
+    expect(await lint(`export const LABEL = 'save changes_now.1'`)).toHaveLength(1)
+  })
 })
 
 describe('Gateway wire markers with a bracketed ALL-CAPS tag are exempt', () => {
@@ -423,5 +446,12 @@ describe('capability retention protocol sentinel', () => {
   it('allows the exact wire mask but still reports prose around it', async () => {
     expect(await lint("export const mask = '[REDACTED]'" )).toEqual([])
     expect(await lint("export const label = 'Keep [REDACTED] value'" )).not.toEqual([])
+  })
+})
+
+describe('config-path attributes', () => {
+  it('exempts a configKey naming an underscored section, but not the label beside it', async () => {
+    expect(await lint('export const A = () => <X configKey="session_environments.coder_url" />')).toEqual([])
+    expect(await lint('export const B = () => <X configKey="session_environments.coder_url" label="Coder URL" />')).toHaveLength(1)
   })
 })

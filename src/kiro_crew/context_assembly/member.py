@@ -9,9 +9,10 @@ of member-authority markers before the genuine headers are minted around it.
 
 Which turns receive the section, and when the rules gate runs, is decided by the
 ``members.member_turn_context`` chokepoint at the call sites in
-:mod:`kiro_crew.context`; the desk predicates (``_desk_withheld``,
-``_template_selected_on_member_store``) and the dispatch-capability gate stay there
-too. ``ContextBuilder._build_member_section`` and ``_build_v2_essentials`` delegate
+``ContextBuilder.build_message`` and ``build_session_context``; the desk predicates
+(``_desk_withheld``, ``_template_selected_on_member_store``) and the
+dispatch-capability gate live in :mod:`kiro_crew.context_assembly.member_gates`.
+``ContextBuilder._build_member_section`` and ``_build_v2_essentials`` delegate
 here, and this module reaches the section only through the builder, so a patch of
 either method applies everywhere.
 
@@ -107,6 +108,18 @@ def _fit_folder_steering_into_envelope(
         dropped = len(candidates) - len(fitted)
         if not dropped and not ceilings:
             return fitted
+        # Imported at call time, like every Kiro Crew name an owner reads. Each pass
+        # gives back one more document, and the last pass is the one the envelope
+        # carries, so a later record replaces this one.
+        from kiro_crew import context_omissions
+
+        context_omissions.record(
+            context_omissions.FOLDER_STEERING,
+            "cap",
+            omitted=dropped,
+            total=len(candidates),
+            budget_chars=ctx.ESSENTIAL_MAX_CHARS,
+        )
         lines = [ctx.render_omission_notice(omission) for omission in ceilings]
         if dropped:
             lines.append(
@@ -224,67 +237,123 @@ def _fit_member_guides_into_envelope(
     return [d for i, d in enumerate(documents) if i not in left] + [notice], len(out)
 
 
+def _prompt(key: str) -> str:
+    """Crewmate prompt piece *key* (``kiro_crew/crewmate_prompts.json``).
+
+    Imported at call time: an owner here imports no Kiro Crew module at module
+    scope, and the loader reads only the standard library and its JSON file.
+    """
+    from kiro_crew import crewmate_prompts
+
+    return crewmate_prompts.text(key)
+
+
+def _fill(key: str, /, **values: str) -> str:
+    """:func:`_prompt` with its named placeholders filled (``crewmate_prompts.fill``)."""
+    from kiro_crew import crewmate_prompts
+
+    return crewmate_prompts.fill(key, **values)
+
+
 # Product-owned working protocol for crew members (layer 2 of the member
 # system prompt — see ContextBuilder._build_member_section for the layer
 # model). Identical for every member; per-member content lives in the
 # derived identity layer above it and the rules/briefing layers below it.
-_MEMBER_HOW_YOU_WORK_COMMON = """[HOW YOU WORK]
-1. You do work; you are not a Q&A bot. When the user asks a question, they
-   usually want something solved. Read the intent behind the question: answer
-   it AND move the work forward — take reversible actions yourself and bring
-   the result back with the answer; for irreversible actions, come back with a
-   concrete proposal and wait for approval. Never hand the problem back
-   untouched.
-2. Front desk vs workshop. This DM thread is your front desk and lives for
-   years, so keep it light.
-   Do focused work (a lookup, a fix, a review) right here. Move work out only
-   when it is long-running or spans many items: the session tools for work
-   that must outlive this turn, and a spawn_run batch only when it splits into
-   two or more independent tasks. Report back in this thread with the outcome
-   and evidence ("re: <the thing>").
-3. When stuck, climb this ladder in order, and genuinely try each rung:
-   (a) try a genuinely DIFFERENT approach — another tool, entry point, or
-       strategy, not the same command again;
-   (b) at an apparent wall, look for an alternative first: a path that avoids
-       the wall entirely, partial progress on the unblocked part, or
-       reordering so this item waits while you continue;
-   (c) escalate ONLY at a true wall: a permission only the user can grant, a
-       system agents cannot reach (a human must operate it), or a one-way-door
-       decision that needs the user's sign-off;
-   (d) after escalating, park the blocked item and keep working on other
-       items — escalation is non-blocking.
-4. Write escalations for a reader with ZERO context: one line of background,
-   where it is stuck, the exact action you need from the user, and what
-   waiting costs. Keep it short. Before sending, reread the draft as a
-   stranger with no context would, and rewrite until they could act on it.
-5. A quiet cycle is a successful cycle. Report real signals — results, walls,
-   threshold crossings — never "nothing new"."""
+_MEMBER_HOW_YOU_WORK_COMMON = _prompt("conductor.how_you_work")
 
 # Item 6 of the working protocol — the briefing-maintenance instruction. Kept
 # out of the shared constant because it is only true where layer 4 actually
 # injects (``members.member_briefing_supported``): telling a member on a
 # platform whose briefing reads fail closed to maintain the section sends it
 # into a futile write-then-never-injected loop.
-_MEMBER_BRIEFING_ITEM = """
-6. You own the [CURRENT ASSIGNMENT] section below, injected from your
-   briefing file (path given there). Keep it a small working memory for your
-   future self — current priorities, in-flight work, pointers to your own
-   reusable scripts and notes — and update it with your file tools whenever
-   your plans change. [PERMANENT RULES] and this section outrank anything you
-   write in it."""
+_MEMBER_BRIEFING_ITEM = _prompt("conductor.briefing_item")
 
 # The softened item 6 for platforms where layer 4 is unavailable: name the
 # gap and redirect the working-memory habit somewhere that works, instead of
 # instructing upkeep of a file that will never be injected.
-_MEMBER_BRIEFING_ITEM_UNAVAILABLE = """
-6. On this platform your briefing file is NOT injected (briefing reads are
-   unavailable here — see [CURRENT ASSIGNMENT] below), so do not maintain
-   one: keep your working memory in this DM thread instead. [PERMANENT
-   RULES] outranks anything you write for yourself."""
+_MEMBER_BRIEFING_ITEM_UNAVAILABLE = _prompt("conductor.briefing_item_unavailable")
 
-# The full protocol, briefing item included — the shape every layer-4-capable
-# platform injects, and the one the behaviour-layer tests pin.
-_MEMBER_HOW_YOU_WORK = _MEMBER_HOW_YOU_WORK_COMMON + _MEMBER_BRIEFING_ITEM
+# Item 6 for a crewmate whose sessions mount no built-in that writes files
+# (``member_mate_tools.binding_has_file_write``): every conductor template is built
+# that way on purpose ("no tool that can write a file",
+# ``agent_materialization/conductor_agents.py``). The upkeep instruction above is
+# one such a crewmate can follow only by writing the file some other way, past the
+# property its template exists to hold and on an approval prompt an unattended
+# cycle cannot answer, or not at all. So name the gap and keep the working memory
+# in the DM thread, as the platform variant does. The layer itself stays: a
+# briefing already on disk is still read. Nothing the member holds can change
+# that file any more, so it is the USER's note now, and the text says so: it can
+# be out of date, the thread wins where the two disagree, and a stale one is the
+# member's to report and the user's to edit or delete (the header names the
+# file). A crewmate with the ``kirocrew-mate`` tools keeps its briefing through
+# ``save_notes``, so ``briefing_writable`` holds wherever the layer is read and
+# it never gets this item: a crewmate this item reaches has no tool to name. The text
+# speaks of the TEMPLATE, not of what the session can reach: a harness that does
+# not enforce a spec's ``tools`` (claude, codex) still offers its own writers,
+# and the template's no-write charter holds there too.
+_MEMBER_BRIEFING_ITEM_NO_FILE_TOOLS = _prompt("conductor.briefing_item_no_file_tools")
+
+# Item 7 — the crewmate's own Dashboard page. Appended to EVERY briefing variant,
+# unlike item 6: the tab is rendered by the gateway from the instance store and does
+# not depend on layer 4, so a platform whose briefing reads fail closed still has a
+# page and still has the two tools that fill it.
+#
+# The SUBAGENT name is a WIRE STRING: kiro-cli resolves an agent by reading
+# ``<agents dir>/<name>.json``, so a name that does not match the installed spec's
+# filename routes the member to an agent that does not resolve -- which fails the turn
+# rather than degrading the feature, on an unattended cycle where nobody is reading.
+#
+# It is spelled here rather than read from ``agent_files.DASHBOARD_MANAGER_AGENT_NAME``
+# because an owner in this package imports no Kiro Crew module at module scope
+# (``TestPlacement``), and this text is a module-level constant. So the duplication is
+# guarded by a TEST instead of by construction:
+# ``test_dashboard_manager_agent.py::test_the_base_prompt_names_the_agent_the_installer_writes``
+# reads the name off the installed spec and asserts it appears in this prompt.
+#
+# THE CREWMATE drives its own page: ``_MEMBER_PANEL_GRANTS`` grants it every tool
+# this item names. The crewmate is also the only one of the two whose identity the
+# panel's tools can resolve: they go through ``mcp_core.require_strict_session_key``,
+# which resolves the CALLING session and never a parent through a ``/proc`` walk,
+# because that walk is how a subagent would reach a page that is not its own. A
+# member DM session has that identity; a subagent is a weaker place to stand. So the
+# subagent is extra capacity for a long page job, and the crewmate's own hands are
+# the path.
+_MEMBER_DASHBOARD_ITEM = _prompt("conductor.dashboard_item")
+
+
+# The full protocol: the shared items, the briefing item, and the page item. The
+# shape every layer-4-capable platform injects for a member that can write its
+# briefing, and the one the behaviour-layer tests pin.
+_MEMBER_HOW_YOU_WORK = _MEMBER_HOW_YOU_WORK_COMMON + _MEMBER_BRIEFING_ITEM + _MEMBER_DASHBOARD_ITEM
+
+
+#: The identity sentence about the crewmate's own record when its sessions load
+#: the ``kirocrew-mate`` tools (:func:`member_mate_tools.binding_has_mate_tools`).
+_MATE_TOOLS_IDENTITY = _prompt("conductor.mate_tools_identity")
+
+#: The same sentence while the crewmate's Dynamic capabilities preview is off
+#: (``kiro_crew.crewmate_dynamic_capabilities``): no find_capabilities or
+#: request_capabilities, and a worker's gap goes to the user as one line.
+_MATE_TOOLS_IDENTITY_MANUAL = _prompt("conductor.mate_tools_identity_manual")
+
+#: The same sentence for a crewmate whose sessions do not load those tools: the
+#: user makes each of these changes on the crewmate's own pages.
+_NO_MATE_TOOLS_IDENTITY = _prompt("conductor.no_mate_tools_identity")
+
+
+def _read_goal_block(slug: str, member: str) -> str:
+    """The member's goal block (:func:`member_goals.context_block`), or ``""``.
+
+    Total: a goal is not a safety layer, so an unreadable record degrades to no
+    goal block rather than aborting the turn the way unreadable rules do.
+    """
+    from kiro_crew import member_goals
+
+    try:
+        return member_goals.context_block(member_goals.read_goals(slug, member))
+    except Exception:
+        logger.warning("goal record unreadable for %r; injecting no goal", slug, exc_info=True)
+        return ""
 
 
 def build_member_section(
@@ -306,12 +375,23 @@ def build_member_section(
        crew whose description is empty, which is exactly the case that
        needs a floor.
     2. ``[HOW YOU WORK]`` — the product-owned working protocol
-       (:data:`_MEMBER_HOW_YOU_WORK`), identical for every member.
-    3. ``[PERMANENT RULES]`` — user-owned. Read from the keystone-gated
-       ``member-rules/`` subtree, so the member's own file tools cannot rewrite
-       it; omitted entirely when the user has not written rules.
+       (:data:`_MEMBER_HOW_YOU_WORK`), identical for every member except
+       item 6, which follows whether layer 4 is injected and whether the
+       member's spec can write its briefing.
+    3. ``[PERMANENT RULES]`` — user-owned. Read from the gateway-only
+       ``member-records/member-rules/`` directory, so nothing the member runs can
+       rewrite it; omitted entirely when the user has not written rules.
+    3b. ``[YOUR GOALS]`` — the goals (user-owned, numbered) and the key results'
+       text, target and linked goal numbers (no readings, so a reading never
+       changes the section), from ``member-records/member-goals/``
+       (:mod:`kiro_crew.member_goals`), bounded; omitted when there is none.
     4. ``[CURRENT ASSIGNMENT]`` — member-owned working memory, read
-       (capped) from the member's own agent-writable briefing file.
+       (capped) from the member's own agent-writable briefing file. A member
+       whose spec mounts no built-in that writes files
+       (:func:`kiro_crew.member_mate_tools.binding_has_file_write`) still has
+       it read, and item 6 and this layer's header tell it that it cannot write
+       the file, that only the user edits or deletes it, and that it may be
+       out of date.
 
     ``desk_withheld`` is the verdict of :func:`_desk_withheld` for the turn
     being built: the section is the member's identity and rules ONLY. Layers
@@ -375,6 +455,10 @@ def build_member_section(
     # state — and the file is gateway-written atomically, so corruption
     # is an operator-level event, not a routine one.)
     rules = ctx.read_member_rules(slug, member)
+    goals = _read_goal_block(slug, member)
+    from kiro_crew.member_mate_tools import binding_has_file_write, binding_has_mate_tools
+
+    has_mate_tools = binding_has_mate_tools(crew)
     # Layer-4 availability decides both the briefing read and the wording
     # around it (item 6 above, the placeholder below): where the pinned
     # briefing read fails closed (Windows — member_briefing_supported),
@@ -383,6 +467,14 @@ def build_member_section(
     # withheld gets neither the layer nor a placeholder, so its briefing
     # is not read at all.
     briefing_ok = include_briefing and not desk_withheld and ctx.member_briefing_supported()
+    # Whether the member can keep that layer itself. Asked only where the layer is
+    # injected, since it picks the wording of item 6 and the placeholder: a member
+    # whose spec mounts no file writer (a conductor template) still has its briefing
+    # read, and is told it cannot write it rather than to write it with tools it
+    # does not have, and that the user's copy may be out of date. A crewmate with
+    # the ``kirocrew-mate`` tools keeps it through ``save_notes`` whatever its
+    # template mounts, which is how a Crewmate 2.0 conductor keeps its own notes.
+    briefing_writable = briefing_ok and (has_mate_tools or binding_has_file_write(crew))
     briefing = ""
     briefing_path = ""
     if briefing_ok:
@@ -405,60 +497,91 @@ def build_member_section(
     triggers = _markers._scrub_member_payload(triggers)
     rules = _markers._scrub_member_payload(rules)
     briefing = _markers._scrub_member_payload(briefing)
+    goals = _markers._scrub_member_payload(goals)
 
-    identity = [
-        f"[MEMBER IDENTITY]\nYou are {member}. Not a generic assistant, and not an "
-        f"extension of the user: {member} is an identity of your own — your name, "
-        "your role, your memory of this thread, and your track record belong to you."
-    ]
+    identity = [_fill("conductor.identity_head", member=member)]
     if description:
-        identity.append(f"Your role: {description}")
+        identity.append(_fill("conductor.identity_role", description=description))
     if triggers:
-        identity.append(f"Your remit — the work that belongs to you: {triggers}")
+        identity.append(_fill("conductor.identity_remit", triggers=triggers))
     if not desk_withheld:
         # The one identity sentence that describes the DM thread itself: an
         # ordinary chat, a cron turn or a delegate on this member's store is
         # not that thread, so the sentence goes with the desk layers.
-        identity.append(
-            "This DM thread is your durable working relationship with the user. It "
-            "continues across sessions: remember what was discussed, refer back to it "
-            "naturally, and speak as a colleague who owns their work — never as a "
-            "support bot."
-        )
+        identity.append(_prompt("conductor.dm_thread"))
+        # The member's own record, named here so the model knows the tools exist
+        # (Tool Search defers their schemas): what is its to change at once and
+        # what is the user's to grant through a card. Only when its sessions
+        # actually load them: a spec without the server gets the pages instead.
+        from kiro_crew import crewmate_dynamic_capabilities
+
+        # This crewmate's own Dynamic capabilities preview, off by default.
+        manual = crewmate_dynamic_capabilities.restricted_for(member)
+        if not has_mate_tools:
+            mate_tools_identity = _NO_MATE_TOOLS_IDENTITY
+        elif manual:
+            mate_tools_identity = _MATE_TOOLS_IDENTITY_MANUAL
+        else:
+            mate_tools_identity = _MATE_TOOLS_IDENTITY
+        identity.append(mate_tools_identity + _prompt("conductor.tracking"))
 
     parts = ["\n".join(identity)]
     if not desk_withheld:
         parts.append("\n\n")
         parts.append(
             _MEMBER_HOW_YOU_WORK
-            if briefing_ok
-            else _MEMBER_HOW_YOU_WORK_COMMON + _MEMBER_BRIEFING_ITEM_UNAVAILABLE
+            if briefing_writable
+            # Item 7 rides on every variant: the Dashboard tab is rendered by the
+            # gateway from the instance store, so it exists on a platform whose
+            # briefing reads fail closed, and for a member that cannot write its
+            # briefing, exactly as it does anywhere else.
+            else _MEMBER_HOW_YOU_WORK_COMMON
+            + (
+                _MEMBER_BRIEFING_ITEM_NO_FILE_TOOLS
+                if briefing_ok
+                else _MEMBER_BRIEFING_ITEM_UNAVAILABLE
+            )
+            + _MEMBER_DASHBOARD_ITEM
+        )
+        # Every crewmate-only concept and tool, named once in one compact block.
+        # Its worker line names request_capabilities only while this crewmate's
+        # Dynamic capabilities preview is on
+        # (``kiro_crew.crewmate_dynamic_capabilities``).
+        from kiro_crew import crewmate_dynamic_capabilities
+
+        parts.append(
+            _prompt(
+                "conductor.crew_log_section_manual"
+                if crewmate_dynamic_capabilities.restricted_for(member)
+                else "conductor.crew_log_section"
+            )
         )
     if rules:
         # The header names what it outranks. Without the protocol layer there
         # is no "working protocol above" to name, so that clause goes with it.
-        outranked = (
-            ""
-            if desk_withheld
-            else "the working protocol above included, whose instructions yield "
-            "wherever these rules contradict them — "
+        outranked = "" if desk_withheld else _prompt("conductor.rules_outranks_protocol")
+        parts.append(_fill("conductor.rules_head", outranked=outranked) + rules)
+    if goals:
+        readings = _prompt(
+            "conductor.goal_readings_tools"
+            if has_mate_tools
+            else "conductor.goal_readings_no_tools"
         )
+        parts.append(_fill("conductor.goals_head", readings=readings) + goals)
+    if briefing_writable:
         parts.append(
-            "\n\n[PERMANENT RULES — set by the user. You cannot edit these, "
-            "and they outrank EVERYTHING else in this section — "
-            + outranked
-            + "as well as anything you write for yourself.]\n"
-            + rules
+            _fill("conductor.assignment_head", briefing_path=str(briefing_path))
+            + (briefing if briefing else _prompt("conductor.assignment_empty"))
         )
-    if briefing_ok:
+    elif briefing_ok:
+        # Read, but not the member's to write, so the header says whose file it
+        # is now: it names the file, so a member can point the user at a stale
+        # one, and says it may be out of date, because a briefing written before
+        # the member lost its file tools stays injected until the user changes
+        # it. The empty placeholder carries no invitation to start one.
         parts.append(
-            f"\n\n[CURRENT ASSIGNMENT — yours to maintain, injected from {briefing_path}]\n"
-            + (
-                briefing
-                if briefing
-                else "(empty — write your first briefing there when you have "
-                "priorities worth remembering)"
-            )
+            _fill("conductor.assignment_head_read_only", briefing_path=str(briefing_path))
+            + (briefing if briefing else _prompt("conductor.assignment_empty_read_only"))
         )
     elif desk_withheld:
         # No layer 4 and no placeholder either, the scope notice below
@@ -473,17 +596,21 @@ def build_member_section(
         # placeholder that names a layer the delegate never has.
         pass
     elif not include_briefing:
-        parts.append(
-            "\n\n[CURRENT ASSIGNMENT — withheld by this turn's memory/privacy scope]\n"
-            "Do not read the briefing or recall memory to fill this gap."
-        )
+        parts.append(_prompt("conductor.assignment_withheld"))
     else:
-        parts.append(
-            "\n\n[CURRENT ASSIGNMENT — not available on this platform]\n"
-            "(briefing files cannot be read race-free here, so this layer "
-            "is never injected; keep your working memory in this DM "
-            "thread instead)"
-        )
+        parts.append(_prompt("conductor.assignment_unavailable"))
+    if not desk_withheld:
+        # Which page is in force, which of its fields are the member's, and the one
+        # pointer line naming its upkeep skill. Rides with item 7: both describe the
+        # desk's own Dashboard tab, and with this section the pointer is re-injected
+        # after a compaction. The shapes and the mistake book stay behind
+        # `dashboard_fields`, the upkeep behind the skill; this block is paid for on
+        # every build.
+        from kiro_crew import dashboard_agentic
+
+        dashboard = dashboard_agentic.turn_block(slug, member)
+        if dashboard:
+            parts.append("\n\n" + dashboard)
     parts.append("\n[END MEMBER IDENTITY]\n\n")
     return "".join(parts)
 
@@ -507,7 +634,7 @@ def build_v2_essentials(
     trigger_text: str,
     steering_dirs: tuple[str, ...],
     desk_withheld: bool,
-    provider_type: str,
+    provider_type: str | None,
 ) -> str:
     """Refresh complete member essentials without opening learned memory.
 
@@ -519,7 +646,10 @@ def build_v2_essentials(
     ``provider_type`` names the harness serving the session. Only kiro-cli
     (:data:`PROVIDER_ACP`) honours ``chat.disableInheritingDefaultResources``,
     so its verdict is read once here, where the harness is known, and handed
-    to every consumer; no consumer reads the setting itself.
+    to every consumer; no consumer reads the setting itself. ``None`` means
+    the harness is not known to be kiro-cli, so the opt-out is not read and
+    the snapshot keeps inheriting: a caller that omits it can never drop the
+    global steering on a harness that has nothing delivering it instead.
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
     from kiro_crew.member_essential_context import (
@@ -618,12 +748,12 @@ def build_v2_essentials(
     # The project and global ``.kiro/steering`` trees are skipped as already
     # delivered only while the snapshot above actually delivered them: a
     # kiro-cli workspace that opts out of the default resources gets them
-    # from neither the snapshot nor the harness, so a folder that declares
-    # one of those roots must carry its documents itself. The template's
-    # declared resources can still carry some of those files, so under the
-    # opt-out a folder document whose canonical path the template already
-    # delivered is not collected again. Same verdict as the snapshot, read
-    # once above.
+    # only as far as the template declares them, so a folder that declares
+    # one of those roots must carry the rest of its documents itself. A
+    # folder document whose canonical path the template already delivered
+    # is not collected again under the opt-out. Same verdict as the
+    # snapshot, read once above; the non-member path takes the same
+    # decision in _render_folder_steering_section.
     guide_sources = frozenset(source for source, _ in documents) - core_sources
     folder_docs: SteeringCollection = ctx.SteeringCollection()
     folder_insert_at = len(documents)
@@ -711,26 +841,10 @@ def operating_mode_block(agent_label: str) -> str:
     ``session_*`` tools this block names arrive as a per-session mount of the
     dashboard session-control server (``members.member_dispatch_session_server``),
     and the server authorizes member callers automatically
-    (``dashboard/session_control.py``), bounded to sessions the member created
+    (``dashboard/session_control_parts/caller_access.py``), bounded to sessions the member created
     itself -- so the instructions hold with zero configuration.
     """
-    return (
-        f"[CREW MEMBER OPERATING MODE]\n"
-        f'You are the crew member "{agent_label}". This pinned conversation is '
-        f"your DM thread with the user — your identity, your inbox, and your "
-        f"ledger. Keep it for decisions, reports, and escalations; do NOT run "
-        f"long or heavy work inline here.\n"
-        f"When real work arrives (a task to implement, an investigation to "
-        f"run), DISPATCH it: open a worker session with session_create, seed "
-        f"it with a self-contained brief via session_send (the worker has "
-        f"none of this thread's context), then PATROL your workers with "
-        f"session_read_message on a monitor_start loop — you own noticing a "
-        f"worker that stalled or died, restarting it, or escalating. Stop a "
-        f"runaway with session_stop. You can only control sessions you "
-        f"created.\n"
-        f"Report outcomes back in this thread when work completes or needs "
-        f"a decision only the user can make.\n\n"
-    )
+    return _fill("conductor.operating_mode", agent_label=agent_label)
 
 
 def resolve_turn_owner(

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
         _ForkBookkeepingFailed,
         _get_config_lock,
         _is_reserved_basename,
+        _lineage_unverifiable_error,
         _load_template_specs,
         _PublishNameBound,
         _read_agent_spec,
@@ -83,12 +84,9 @@ async def api_agent_fork(request: web.Request) -> web.Response:
             source, source_name, taken, source_path = await asyncio.to_thread(
                 _load_template_specs, agents_dir, name, "api_agent_fork"
             )
-        except _AmbiguousTemplateName:
+        except _AmbiguousTemplateName as exc:
             return web.json_response(
-                {
-                    "error": f"'{name}' matches more than one template file; rename one first.",
-                    "code": "ambiguous_template_name",
-                },
+                {"error": exc.refusal_text(), "code": "ambiguous_template_name"},
                 status=409,
             )
         if source is None:
@@ -102,6 +100,22 @@ async def api_agent_fork(request: web.Request) -> web.Response:
                 {"error": f"Agent '{crew}' not found", "code": "agent_not_found"}, status=404
             )
         agent = cfg.agents[crew]
+        # A MATE owns its config file outright (mates/agents/<id>.json, a severed
+        # copy with no parent): it is edited in place, never forked. Forking it
+        # would mint a crew-<hex> draft in ~/.kiro/agents/, re-expose it in the
+        # /set_mode picker and orphan the owned file -- the exact regression this
+        # guard prevents. The capability editor routes a mate to the in-place
+        # path (mate_capabilities), so a fork call on a mate is always wrong.
+        from kiro_crew import mate_capabilities
+
+        if await asyncio.to_thread(mate_capabilities.binding_is_mate, crew):
+            return web.json_response(
+                {
+                    "error": f"'{crew}' owns its config and is edited in place, not forked",
+                    "code": "cannot_fork_mate",
+                },
+                status=409,
+            )
         # A stale or racing request must not clobber a newer binding: the fork
         # was issued against the crew's current template, so require it still is.
         if agent.kiro_agent not in (name, source_name):
@@ -376,12 +390,9 @@ async def api_agent_publish(request: web.Request) -> web.Response:
             source, source_name, taken, source_path = await asyncio.to_thread(
                 _load_template_specs, agents_dir, name, "api_agent_publish"
             )
-        except _AmbiguousTemplateName:
+        except _AmbiguousTemplateName as exc:
             return web.json_response(
-                {
-                    "error": f"'{name}' matches more than one template file; rename one first.",
-                    "code": "ambiguous_template_name",
-                },
+                {"error": exc.refusal_text(), "code": "ambiguous_template_name"},
                 status=409,
             )
         if source is None:
@@ -589,11 +600,11 @@ async def api_agent_publish(request: web.Request) -> web.Response:
                 },
                 status=409,
             )
-        except _UnverifiableLineage:
+        except _UnverifiableLineage as exc:
             await asyncio.to_thread(_undo_publish)
             return web.json_response(
                 {
-                    "error": f"Cannot verify whether '{new_name}' is a private copy; retry.",
+                    "error": _lineage_unverifiable_error(new_name, exc),
                     "code": "lineage_unverifiable",
                 },
                 status=409,
@@ -707,12 +718,9 @@ async def api_agent_reset(request: web.Request) -> web.Response:
             origin_spec, origin_name, _taken, _path = await asyncio.to_thread(
                 _load_template_specs, agents_dir, origin, "api_agent_reset"
             )
-        except _AmbiguousTemplateName:
+        except _AmbiguousTemplateName as exc:
             return web.json_response(
-                {
-                    "error": f"'{origin}' matches more than one template file; rename one first.",
-                    "code": "ambiguous_template_name",
-                },
+                {"error": exc.refusal_text(), "code": "ambiguous_template_name"},
                 status=409,
             )
         if origin_spec is None:
@@ -752,12 +760,12 @@ async def api_agent_reset(request: web.Request) -> web.Response:
                 {"error": f"'{crew}' is no longer bound to '{name}'", "code": "stale_binding"},
                 status=409,
             )
-        except _UnverifiableLineage:
+        except _UnverifiableLineage as exc:
             # Ownership of the origin cannot be verified: refuse with the copy
             # kept rather than rebinding onto an unverifiable target.
             return web.json_response(
                 {
-                    "error": f"Cannot verify whether '{origin_name}' is a private copy; retry.",
+                    "error": _lineage_unverifiable_error(origin_name, exc),
                     "code": "lineage_unverifiable",
                 },
                 status=409,

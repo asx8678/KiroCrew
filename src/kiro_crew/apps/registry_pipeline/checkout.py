@@ -172,7 +172,7 @@ async def _clone_origin_url(dest: Path) -> str | None:
     module — the argv is fixed, but *dest* is derived from an index-supplied
     app name, so the cwd is not ours to trust.
     """
-    if not (dest / ".git").is_dir():
+    if not await asyncio.to_thread((dest / ".git").is_dir):
         return None
     origin_cmd, _cleanup = await wrap_argv_async(
         ["git", "remote", "get-url", "origin"],
@@ -364,6 +364,7 @@ async def _git_fetch_ref(
     clone_env: dict[str, str],
     sandbox_mode: str,
     mask_local_git_config: bool = False,
+    forward_ssh_auth_sock: bool = False,
 ) -> dict[str, Any] | None:
     """Materialise *dest* from one remote ref. Returns None on success.
 
@@ -443,7 +444,10 @@ async def _git_fetch_ref(
         # checkout. ``argv[0]`` is always ``git``; the ``-c`` overrides go right after
         # it so they precede the subcommand.
         argv = [argv[0], *_HOOKS_NEUTRALIZER_ARGV, *argv[1:]]
-        sandboxed, _cleanup = await wrap_argv_async(argv, mode=sandbox_mode, _prepare=wrap_argv)
+        fwd = forward_ssh_auth_sock and network  # the agent socket is for the network step only
+        sandboxed, _cleanup = await wrap_argv_async(
+            argv, mode=sandbox_mode, forward_ssh_auth_sock=fwd, _prepare=wrap_argv
+        )
         sandboxed = cgroup_scope_argv(sandboxed)
         if network:
             process_env = _git_transport_env(credential_target, git_url, clone_env)
@@ -500,19 +504,17 @@ async def _git_fetch_ref(
         "-c",
         "fetch.recurseSubmodules=no",
     ]
-    # Destination lifecycle, stated as one invariant because three reviewer findings
-    # were three exits from the same mistake:
+    # Destination lifecycle, stated as one invariant:
     #
     #   THIS FUNCTION MAY DELETE `dest` IF AND ONLY IF THIS INVOCATION CREATED IT
     #   AND DID NOT SUCCEED -- and that is decided in ONE place, not per branch.
     #
-    # The earlier drafts put cleanup on each failure branch, so each fix closed one
-    # exit and left the others: adopting a non-checkout destination (deleted the
-    # user's files), a moved-aside restore that skipped on cancellation, and finally
-    # a spawn exception between `git init` and `git remote add` that left a `.git`
-    # directory with no origin -- which then wedges every later attempt on
-    # `unreadable_clone_origin`, a fail-closed path that deliberately does not clean
-    # up after itself.
+    # Cleanup on each failure branch leaves the other exits open: adopting a
+    # non-checkout destination (deletes the user's files), a moved-aside restore
+    # skipped on cancellation, or a spawn exception between `git init` and
+    # `git remote add` that leaves a `.git` directory with no origin -- which then
+    # wedges every later attempt on `unreadable_clone_origin`, a fail-closed path
+    # that deliberately does not clean up after itself.
     #
     # Cleanup therefore belongs to the LIFETIME of the thing created, not to the
     # enumeration of ways to fail. The `finally` below covers return, raise and
@@ -660,6 +662,7 @@ async def _git_fetch_commit(
     credential_target: str | None = None,
     clone_env: dict[str, str],
     sandbox_mode: str,
+    forward_ssh_auth_sock: bool = False,
 ) -> dict[str, Any] | None:
     """Materialise *dest* at exactly *commit*. Returns None on success."""
     return await _git_fetch_ref(
@@ -670,6 +673,7 @@ async def _git_fetch_commit(
         credential_target=credential_target,
         clone_env=clone_env,
         sandbox_mode=sandbox_mode,
+        forward_ssh_auth_sock=forward_ssh_auth_sock,
     )
 
 
@@ -683,11 +687,14 @@ async def _git_fetch_branch(
     clone_env: dict[str, str],
     sandbox_mode: str,
     mask_local_git_config: bool = False,
+    forward_ssh_auth_sock: bool = False,
 ) -> dict[str, Any] | None:
     """Fetch and check out *branch* without exposing credentials to checkout.
 
     *mask_local_git_config* is forwarded to :func:`_git_fetch_ref`; see there. It
     is for the pre-install store-art prewarm only and stays off for installs.
+    *forward_ssh_auth_sock* is forwarded the same way and reaches the network step
+    only; a caller sets it when the owner designated *git_url*.
     """
     return await _git_fetch_ref(
         git_url,
@@ -699,6 +706,7 @@ async def _git_fetch_branch(
         clone_env=clone_env,
         sandbox_mode=sandbox_mode,
         mask_local_git_config=mask_local_git_config,
+        forward_ssh_auth_sock=forward_ssh_auth_sock,
     )
 
 
@@ -765,6 +773,7 @@ async def _git_clone_or_pull(
 
     clone_env = anonymous_git_env() if index_originated else minimal_env()
     sandbox_mode = "strict" if index_originated else _context_clone_sandbox_mode(git_url)
+    forward_sock = not index_originated  # an index entry never reaches the owner's ssh-agent
     # SSRF gate: refuse to clone/pull from a host the owner does not explicitly
     # trust (public forge or configured registry). The git_url may originate
     # from an untrusted external registry index; this prevents a clone against
@@ -950,11 +959,10 @@ async def _git_clone_or_pull(
         if commit:
             # A PINNED INSTALL NEVER REUSES AN EXISTING TREE.
             #
-            # Four review rounds landed here, each a different way of trusting
-            # on-disk state: adopting a destination that was not a checkout, an
-            # exception leaving a half-built one, HEAD equality standing in for
-            # contents, and finally content `git status` cannot report at all. The
-            # last one is why no cleanliness check can close this class: `.git/`
+            # Reusing a tree means trusting on-disk state: a destination that is
+            # not a checkout, a half-built one an exception left, HEAD equality
+            # standing in for contents, or content `git status` cannot report at
+            # all. The last one is why no cleanliness check can close this class: `.git/`
             # is never reported by any `git status` variant, so an added
             # `.git/hooks/post-checkout` is invisible, and an untracked
             # `sitecustomize.py` executes on interpreter start if the tree lands on
@@ -967,8 +975,8 @@ async def _git_clone_or_pull(
             # `git init --template=`, which is also what keeps hooks absent.
             #
             # The cost is one shallow fetch of a single commit per pinned reinstall.
-            # The fast path it replaces was buying that round-trip with trust in an
-            # agent-writable directory.
+            # Skipping it would buy that round-trip with trust in an agent-writable
+            # directory.
             moved_aside = await _move_checkout_aside(dest, log_lines)
             # This one is the SAME repository with the user's own edits, so a failed
             # transaction must put it back. The origin-mismatch move above is a
@@ -1012,6 +1020,7 @@ async def _git_clone_or_pull(
             pull_cmd, _cleanup = await wrap_argv_async(
                 ["git", *_HOOKS_NEUTRALIZER_ARGV, "pull", "--ff-only", git_url, branch],
                 mode=sandbox_mode,
+                forward_ssh_auth_sock=forward_sock,
                 _prepare=wrap_argv,
             )
             pull_cmd = cgroup_scope_argv(pull_cmd)
@@ -1072,6 +1081,7 @@ async def _git_clone_or_pull(
                 credential_target=credential_target,
                 clone_env=clone_env,
                 sandbox_mode=sandbox_mode,
+                forward_ssh_auth_sock=forward_sock,
             )
             if result is not None:
                 return result
@@ -1108,7 +1118,7 @@ async def _git_clone_or_pull(
             str(dest),
         ]
         sandboxed_cmd, _cleanup = await wrap_argv_async(
-            clone_cmd, mode=sandbox_mode, _prepare=wrap_argv
+            clone_cmd, mode=sandbox_mode, forward_ssh_auth_sock=forward_sock, _prepare=wrap_argv
         )
         sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
         transport_env = _git_transport_env(credential_target, git_url, clone_env)

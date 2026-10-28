@@ -7,11 +7,12 @@ continue to work without changes.
 The actual implementation lives in:
 - chat_utils.py       — shared helpers, redaction, model normalization
 - chat_persistence.py — session save/restore, history
-- chat_runner.py      — _run_chat, streaming, prompt expansion
+- chat_runner.py      — _run_chat and its stream loop; its owners live in chat_turn/
 - chat_handlers.py    — HTTP API endpoints
 - chat_title.py       — title generation
 - chat_regenerate.py  — regenerate, variant switch, edit-resend
 - chat_folders.py     — folder CRUD, pin, assignment
+- chat_manual_order.py — the manual session order (sort "Manual")
 - chat_voice.py       — TTS config + synthesis (optional)
 - chat_slack.py       — Slack link, handoff, channels
 - chat_fork.py        — fork session
@@ -40,9 +41,13 @@ from kiro_crew.dashboard.chat_folders import (  # noqa: F401
     api_chat_folder_reorder,
     api_chat_folder_update,
     api_chat_folders,
+    api_chat_pinned_order,
     api_chat_slot_folder,
     api_chat_slot_mode,
+    api_chat_slot_muted,
+    api_chat_slot_mutes_opened,
     api_chat_slot_pin,
+    load_pinned_order_after_listen,
 )
 from kiro_crew.dashboard.chat_fork import api_chat_slot_fork  # noqa: F401
 from kiro_crew.dashboard.chat_handlers import (  # noqa: F401
@@ -74,15 +79,22 @@ from kiro_crew.dashboard.chat_handlers import (  # noqa: F401
     api_chat_slot_selection_capabilities,
     api_chat_slot_source_link_unlink,
     api_chat_slot_source_links,
+    api_chat_slot_steer_retract,
     api_chat_slot_stop,
     api_chat_slot_summary,
     api_chat_slot_summary_generate,
+    api_chat_slot_turn_timeout,
     api_chat_slot_workspace,
     api_chat_slots,
     api_chat_slots_cleanup,
     api_chat_slots_model,
+    api_chat_slots_unrestored,
+    api_favorite_project_add,
+    api_favorite_project_remove,
+    api_favorite_projects,
     api_recent_projects,
 )
+from kiro_crew.dashboard.chat_manual_order import api_chat_manual_order  # noqa: F401
 from kiro_crew.dashboard.chat_mirror import (  # noqa: F401
     api_channel_targets,
     api_chat_slot_mirror_link,

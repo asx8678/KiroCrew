@@ -1,7 +1,6 @@
-import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { lazy, memo, Suspense, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { shallowEqual } from 'react-redux'
-import { useAppSelector, useAppDispatch } from '../../store'
+import { useAppSelector, useAppDispatch, type RootState } from '../../store'
 import { clearFocusToolCallId, mcpAppKey } from '../../store/chatSlice'
 import { useSimplifiedToolNames } from '../../hooks/useSimplifiedToolNames'
 import ToolRiskBadge from './ToolRiskBadge'
@@ -19,22 +18,35 @@ import { extractDenyDetail, extractDenyNotice } from '../../utils/denyReason'
 import { registerToolPill } from '../../store/toolPillRegistry'
 import { ROW_PILL_BUTTON_CLASS, ROW_PILL_WRAPPER_CLASS } from './rowPill'
 import { extractToolFilePath } from '../../utils/toolFilePath'
+import { extractToolImagePaths } from '../../utils/toolImagePaths'
+import { ToolImageThumbnails } from './ToolImageThumbnails'
 import { countDiffStats } from '../../utils/diffLineCounts'
 import { isWaitToolTitle } from '../../utils/waitToolTitle'
 import { isSafePath } from '../../utils/safePath'
-import { fileReadUrl } from '../../utils/fileReadUrl'
+import { usePathKind } from '../../hooks/usePathKind'
 import McpAppFrame from '../../components/McpAppFrame'
 import DiffBlock, { extractFilePath as extractDiffHeaderPath } from '../../components/DiffBlock'
 import { presentToolDiff } from './toolDiff'
-import { FileDiff } from 'lucide-react'
+import { FileDiff, CircleCheck } from 'lucide-react'
+import { ASK_QUESTION_SERVER, isAskQuestionToolName } from '../../utils/askQuestionTool'
+import { isAskAnsweredOutput } from '../../utils/askQuestionAnswers'
 import { i18nT } from '../../i18n/t'
 import { fmtDateFields, fmtDuration as fmtDurationParts, fmtUnit } from '../../i18n/format'
 import { api } from '../../api/client'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
-import { isRejectedDecision } from '../../utils/approvalDecision'
-import { selectToolRowIndex, lookupLogEntry, denySiblingContent } from './toolRowIndex'
+import { isApprovedDecision, isRejectedDecision } from '../../utils/approvalDecision'
+import { selectToolRowIndex, lookupLogEntry, denySiblingContent, isNewestOccurrence } from './toolRowIndex'
+import { slotRowByKey } from '../../store/slotIndex'
 import type { ToolActivity } from '../../types'
-import { pathBasename } from '../../utils/pathBasename'
+import { pathBasename, decodePathForDisplay } from '../../utils/pathBasename'
+import { selectEditRuns } from './editRuns'
+import { useToolCallsStartExpanded } from '../../hooks/useToolCallsStartExpanded'
+import { InstantTip, useInstantTip } from '../../components/InstantTip'
+import { PILL_TIP_OPEN_CLASS, ToolCommandTip } from './ToolCommandTip'
+import { useReportRowActive } from './rowActivity'
+
+// Lazy so the rarely-shown answers card stays out of the App chunk.
+const AskAnswersResult = lazy(() => import('./AskAnswersCard').then(m => ({ default: m.AskAnswersResult })))
 
 // Stable empties for slots with no per-slot state yet. A fresh `[]` per
 // selector run would change identity every dispatch and defeat the
@@ -157,15 +169,281 @@ function StatusRow({ show, snap = false, children }: { show: boolean; snap?: boo
   )
 }
 
-/** Inline tool call pill. Click toggles an expanded panel below the pill that
- *  shows purpose / input / output. */
-export default memo(function ToolCallLine({ message, running: _running, slot, onFileOpen, disclosure, disclosureKey, onDisclosureChange, appInPanel, onOpenApp, transcriptHot = false }: { message: ChatMessage; running: boolean; slot?: string; onFileOpen?: (path: string) => void; disclosure?: boolean; disclosureKey?: string; onDisclosureChange?: (key: string, expanded: boolean) => void; appInPanel?: boolean; onOpenApp?: (toolCallId: string) => void;
+type ToolCallLineProps = { message: ChatMessage; running: boolean; slot?: string; onFileOpen?: (path: string) => void; disclosure?: boolean; disclosureKey?: string; onDisclosureChange?: (key: string, expanded: boolean) => void; appInPanel?: boolean; onOpenApp?: (toolCallId: string) => void;
   /** True while the transcript is streaming at high frequency (host-derived
    *  from useStreamIdle). Gates the entrance/status height eases: a hot-stream
    *  mount lands at full height in one frame, a quiet-transcript mount keeps
    *  the ease. Defaults to false so hosts without a heat signal keep the
    *  animations unconditionally. */
-  transcriptHot?: boolean }) {
+  transcriptHot?: boolean }
+
+/** The slot's transcript, the same choice every selector in this file makes. */
+const slotMessagesOf = (s: RootState, slot: string | undefined): ChatMessage[] => {
+  const bg = slot && slot !== s.chat.activeSlot ? slot : null
+  return bg ? (s.chat.slotMessages[bg] ?? EMPTY_MESSAGES) : s.chat.messages
+}
+
+/** The slot's tool log, the same choice every selector in this file makes. */
+const slotToolLogOf = (s: RootState, slot: string | undefined): ToolActivity[] => {
+  const bg = slot && slot !== s.chat.activeSlot ? slot : null
+  return bg ? (s.chat.slotActivity[bg]?.toolLog ?? EMPTY_TOOL_LOG) : s.chat.toolLog
+}
+
+const slotEditRuns = (s: RootState, slot: string | undefined) =>
+  selectEditRuns(slotMessagesOf(s, slot), slotToolLogOf(s, slot))
+
+/** Same members, same order: the run index rebuilds on every transcript flush,
+ *  and a fresh array of the same rows must not repaint the row. */
+const sameRows = (a: readonly ChatMessage[], b: readonly ChatMessage[]): boolean =>
+  a.length === b.length && a.every((m, i) => m === b[i])
+
+const NO_RUN: readonly ChatMessage[] = []
+const NO_OUTPUTS: readonly string[] = []
+
+/** The call's tool-log entry, or the row's persisted meta when the log has
+ *  none (a historical row). Returns purpose/input/output for the inline
+ *  expansion as well as completion status for the icon. All transcript scans
+ *  go through the shared per-slot index (see toolRowIndex.ts): built once per
+ *  (messages, toolLog) identity change, O(1) per row per dispatch. */
+function readToolEntry(s: RootState, slot: string | undefined, message: ChatMessage, toolCallId: string | undefined, label: string) {
+  // Slot-aware: for a non-active slot (split-view pane) read that slot's
+  // per-slot tool log / messages / running state; `slot` undefined or equal to
+  // the active slot → active-slot globals.
+  const bg = slot && slot !== s.chat.activeSlot ? slot : null
+  const log = bg ? (s.chat.slotActivity[bg]?.toolLog ?? EMPTY_TOOL_LOG) : s.chat.toolLog
+  const slotRunning = bg ? ((s.chat.slotRun[bg]?.state ?? 'idle') !== 'idle') : s.chat.slotRunning
+  const msgs = bg ? (s.chat.slotMessages[bg] ?? EMPTY_MESSAGES) : s.chat.messages
+  const index = selectToolRowIndex(msgs, log)
+
+  // Was this tool's permission resolved as rejected? Only the NEWEST
+  // permission message for the id carries the decision.
+  const wasRejectedByPerm = () => {
+    if (!toolCallId) return false
+    const perm = index.lastPermById.get(toolCallId)
+    return perm ? isRejectedDecision(perm.meta?.resolved) : false
+  }
+
+  // Auto-denied detection. When a security-policy deny rule or hook blocks a
+  // tool, the gateway appends a SECOND tool message — "🚫 <title> …" —
+  // sharing this pill's tool_call_id. That message never renders (TurnBlock
+  // hides every tool message not starting with 🔧), so the visible 🔧 pill
+  // must find its hidden sibling to know the call was blocked. Its CONTENT is
+  // used too: the row carries "— Blocked by security policy: <reason>", and the
+  // Output panel leads with its own LOCALIZED sentence and follows with the
+  // rule, so the user learns which rule fired without a translated sentence
+  // being replaced by untranslated English (extractDenyDetail yields "" for a
+  // row without that marker). A row without the marker but with the host's
+  // own "Blocked: …" sentence — the gate-crash refusal, which says no policy
+  // rule fired — yields that sentence as the NOTICE, and the panel shows it
+  // in place of the localized line rather than contradicting it. A row with
+  // neither (hook blocked) shows the localized line alone. The interactive
+  // user-reject path also appends a 🚫 message, but that flow ALSO resolves
+  // a permission message as rejected — wasRejectedByPerm() takes precedence
+  // below, so a user rejection still shows red, not amber.
+  const denySibling = denySiblingContent(index, toolCallId, message)
+  const autoDenied = !!denySibling
+  const autoDenyReason = extractDenyDetail(denySibling)
+  const autoDenyNotice = extractDenyNotice(denySibling)
+
+  const e = lookupLogEntry(index, toolCallId, label)
+  if (e) {
+    const rejected = !!e.rejected || wasRejectedByPerm()
+    const isDone = e.output != null || rejected || autoDenied || !slotRunning
+    return {
+      effectiveId: e.tool_call_id || null,
+      isDone, isRejected: rejected,
+      isAutoDenied: !rejected && autoDenied,
+      autoDenyReason,
+      autoDenyNotice,
+      purpose: e.purpose || '',
+      input: e.input || '',
+      output: e.output || '',
+      // Clamp seams for the two payloads (null when nothing was cut). The
+      // panel renders the localized marker there at view time; the store
+      // holds only the offset, so a language switch re-renders it.
+      inputCut: e.input_cut ?? null,
+      outputCut: e.output_cut ?? null,
+      auto: !!e.auto,
+      ts: e.ts || 0,
+      executionStartedAt: e.execution_started_at || 0,
+      hasEntry: true,
+      // Older ACP update frames may omit is_shell; execute is the stable
+      // tool-kind value used by the transport and keeps those frames live.
+      isShell: e.is_shell === true || e.kind === 'execute' || e.text.startsWith('Running:'),
+      // Raw ACP tool kind — gates the inline diff-card promotion below
+      // (only kind === 'edit' rows promote).
+      toolKind: e.kind || '',
+      // Raw transport tool name, kept separate from the display `label`:
+      // the label is simplified/localized for humans, so gating behaviour on
+      // it would break under `useSimplifiedToolNames` or a translated UI.
+      toolName: e.text || '',
+      // Trusted identity from the transport's `_meta.kiro`, when it sent one;
+      // '' otherwise, and the title derivation falls back to parsing the title.
+      trustedToolName: e.tool_name || '',
+      mcpServer: e.mcp_server || '',
+      fromLog: true,
+    }
+  }
+  // No toolLog entry — historical message. Check permission state for rejection.
+  const rejected = wasRejectedByPerm()
+  // Backend persists `input` (when the call was issued) and `output` (when
+  // the result arrived) directly on the tool message's meta — see
+  // _tool_meta() and the EVENT_TOOL_RESULT handler in chat_runner.py.
+  // Pre-persistence messages won't have these fields and fall through to
+  // the empty-state hint inside ToolDetails.
+  const metaInput = (message.meta?.input as string | undefined) || ''
+  const metaOutput = (message.meta?.output as string | undefined) || ''
+  return {
+    effectiveId: toolCallId || null,
+    isDone: true, isRejected: rejected,
+    isAutoDenied: !rejected && autoDenied,
+    autoDenyReason,
+    autoDenyNotice,
+    purpose: (message.meta?.purpose as string) || '',
+    // Persisted meta is served whole by the server (_tool_meta caps at 1 MB,
+    // never clamps), so a historical row has no seam to mark.
+    input: metaInput, output: metaOutput, inputCut: null, outputCut: null, auto: false,
+    // ChatMessage.ts is a string (ISO timestamp) when restored from history;
+    // parse it for the meta-row time renderer. Falls to 0 if unparseable —
+    // fmtTime hides the row when ts is 0.
+    ts: typeof message.ts === 'number' ? message.ts : (message.ts ? Date.parse(String(message.ts)) || 0 : 0),
+    executionStartedAt: 0,
+    // Treat the message as having an entry when persisted I/O is available,
+    // so the empty-state copy only shows for truly bare historical messages.
+    hasEntry: !!(metaInput || metaOutput),
+    isShell: false,
+    // Persisted ACP tool kind (see _tool_meta in chat_runner.py). Rows
+    // written before the field existed read '' and never promote a card.
+    toolKind: (message.meta?.kind as string | undefined) || '',
+    // Historical rows have no log entry; the message content is the only
+    // carrier. Harmless either way — a replayed wait is never in flight.
+    toolName: message.content.replace(/^🔧\s*/, ''),
+    // Persisted by _tool_meta (chat_runner.py) since the title-derivation
+    // change; rows written before it read '' and derive from the title.
+    trustedToolName: (message.meta?.tool_name as string | undefined) || '',
+    mcpServer: (message.meta?.mcp_server as string | undefined) || '',
+    // No live tool-log entry backs this row. `isDone` above is a REPLAY
+    // default, not an observation, so anything that needs real liveness must
+    // consult server state instead of trusting it (see the wait countdown).
+    fromLog: false,
+  }
+}
+
+/** The `wait` countdown this row owns, or null. See the comment above the
+ *  countdown in ToolCallLineBody for why each guard is here. */
+function readWaitState(s: RootState, slot: string | undefined, waitSlotKey: string | null, toolCallId: string | undefined,
+  isWaitTool: boolean, hasPendingPerm: boolean, fromLog: boolean, isDone: boolean) {
+  if (!isWaitTool || hasPendingPerm) return null
+  if (fromLog && isDone) return null
+  const found = waitSlotKey ? slotRowByKey(s.dashboard.slots, waitSlotKey) : undefined
+  const ws = found?.wait_state
+  if (!ws) return null
+  // The turn must actually be running. Cheap on its own, but load-bearing for
+  // a replayed row: the historical branch cannot observe liveness, so without
+  // this an idle slot's old wait pill would count down against a deadline
+  // belonging to some other sleep the backend is tracking.
+  if (!found?.running) return null
+  const bg = slot && slot !== s.chat.activeSlot ? slot : null
+  const msgs = bg ? (s.chat.slotMessages[bg] ?? EMPTY_MESSAGES) : s.chat.messages
+  const log = bg ? (s.chat.slotActivity[bg]?.toolLog ?? EMPTY_TOOL_LOG) : s.chat.toolLog
+  // Exactly one pill owns the countdown, and it must be the transcript's
+  // newest TOOL call of any kind -- not merely its newest wait. Scanning only
+  // for waits would let a completed wait from earlier in the turn light up
+  // while the agent is busy in some later tool, which is the shape a sleep
+  // belonging to a different ACP session on this same slot would take.
+  const last = selectToolRowIndex(msgs, log).lastToolMsg
+  if (!last || last.meta?.tool_call_id !== toolCallId) return null
+  return isWaitToolTitle(last.content.replace(/^🔧\s*/, '')) ? ws : null
+}
+
+/** Every store fact a tool row draws, read in ONE subscription. Each mounted
+ *  row's selectors run on every store notification, and this used to be
+ *  thirteen subscriptions per row, which made the transcript's tool rows the
+ *  largest share of the selector calls per dispatch. Compare with
+ *  `sameToolRowView`, which keeps each fact's old equality rule. */
+function selectToolRowView(s: RootState, slot: string | undefined, message: ChatMessage, toolCallId: string | undefined, label: string) {
+  const entry = readToolEntry(s, slot, message, toolCallId, label)
+  const waitSlotKey = slot ?? s.chat.activeSlot
+  const bg = slot && slot !== s.chat.activeSlot ? slot : null
+  const msgs = slotMessagesOf(s, slot)
+  const log = slotToolLogOf(s, slot)
+  const index = selectToolRowIndex(msgs, log)
+  // MCP App (SEP-1865) render payload attached to this tool call, if any.
+  // Rendered as an inline sandboxed iframe below the tool-call row. Selected
+  // by (slot, tool_call_id) — this row's own slot — so another session's app
+  // (and its callback capability) can never mount here.
+  const mcpApp = toolCallId && waitSlotKey ? s.chat.mcpApps?.[mcpAppKey(waitSlotKey, toolCallId)] : undefined
+  // The answers card belongs to one ask occurrence; on a reused id only the newest row owns the log entry's output.
+  const isNewestRow = isNewestOccurrence(index, toolCallId, message)
+  // Every call of the edit run this row leads (see editRuns.ts), lead first;
+  // empty unless this row leads a run of two or more.
+  const runMembers = selectEditRuns(msgs, log).membersByLead.get(message) ?? NO_RUN
+  const isRun = runMembers.length > 1
+  // A person approved this call at a prompt, on the dashboard or a channel (its
+  // newest permission record says so). editRuns never merges such a call, so an approved edit can sit as its
+  // own row right after a merged run of the same file; the tag next to its
+  // chip says why it is separate. Auto-approved calls have no record and no tag.
+  const perm = toolCallId ? index.lastPermById.get(toolCallId) : undefined
+  const approvedByUser = perm ? isApprovedDecision(perm.meta?.resolved) : false
+  // A merged row is one row for several calls, so it reads as running until
+  // the last of them has returned. Followers draw nothing of their own.
+  const slotRunning = bg ? ((s.chat.slotRun[bg]?.state ?? 'idle') !== 'idle') : s.chat.slotRunning
+  const runMemberRunning = isRun && slotRunning && runMembers.slice(1).some(m => {
+    const e = index.logById.get(m.meta?.tool_call_id as string)
+    return !!e && e.output == null && !e.rejected
+  })
+  // Every member's output, lead first: its newest tool-log entry's output when
+  // the log has one, else the output persisted on the row (history). The
+  // details panel lists them all, so a later member's result stays reachable.
+  const runOutputs = isRun
+    ? runMembers.map(m => index.logById.get(m.meta?.tool_call_id as string)?.output || (m.meta?.output as string | undefined) || '')
+    : NO_OUTPUTS
+  // The tool log is authoritative here: its output/rejection/turn-running
+  // state survives the ACP initial-call → update handoff.
+  const isDone = entry.isDone && !runMemberRunning
+  // Check if this specific tool has a pending (unresolved) permission matching its tool_call_id.
+  // Only match when tool_call_id is present on both sides — prevents batched approvals from
+  // incorrectly lighting up all pills as pending approval.
+  const hasPendingPerm = !isDone && !!toolCallId && index.pendingPermIds.has(toolCallId)
+  const waitState = readWaitState(s, slot, waitSlotKey, toolCallId, isWaitToolTitle(entry.toolName), hasPendingPerm, entry.fromLog, isDone)
+  // External focus signal (e.g. ChatInput's "Jump to tool" link) aimed at this pill.
+  const focusId = s.chat.focusToolCallId
+  const focused = !!focusId && !!entry.effectiveId && focusId === entry.effectiveId
+  // The slot's project directory, so native-tool titles show paths relative
+  // to it (`Read src/a.ts`, not the absolute path). Reads THIS row's slot —
+  // a split-view pane must not borrow the active session's tree.
+  const projectDir = waitSlotKey ? (slotRowByKey(s.dashboard.slots, waitSlotKey)?.project || undefined) : undefined
+  return { ...entry, isDone, mcpApp, isNewestRow, runMembers, approvedByUser, hasPendingPerm, runOutputs, waitSlotKey, waitState, focused, projectDir }
+}
+
+type ToolRowView = ReturnType<typeof selectToolRowView>
+
+/** Field-wise equality for `selectToolRowView`: identity for every fact, except
+ *  the three the separate subscriptions compared by value. The run index
+ *  rebuilds on every transcript flush, so a fresh array of the same members or
+ *  outputs must not repaint the row, and neither must a re-sent wait state. */
+function sameToolRowView(a: ToolRowView, b: ToolRowView): boolean {
+  for (const k of Object.keys(a) as (keyof ToolRowView)[]) {
+    if (k === 'runMembers') {
+      if (!sameRows(a.runMembers, b.runMembers)) return false
+    } else if (k === 'runOutputs' || k === 'waitState') {
+      if (!shallowEqual(a[k], b[k])) return false
+    } else if (!Object.is(a[k], b[k])) return false
+  }
+  return true
+}
+
+/** Inline tool call pill. Click toggles an expanded panel below the pill that
+ *  shows purpose / input / output. A row folded into an earlier edit run of
+ *  the same file (see editRuns.ts) draws nothing: the run's lead row shows it. */
+export default memo(function ToolCallLine(props: ToolCallLineProps) {
+  const follower = useAppSelector(s => slotEditRuns(s, props.slot).followers.has(props.message))
+  return follower ? null : <ToolCallLineBody {...props} />
+})
+
+// Not memo()ized: the wrapper above is the memo boundary, and every store
+// read below subscribes on its own.
+function ToolCallLineBody({ message, running: _running, slot, onFileOpen, disclosure, disclosureKey, onDisclosureChange, appInPanel, onOpenApp, transcriptHot = false }: ToolCallLineProps) {
   // memo() bails out of the provider-level repaint; subscribe directly. The
   // generation is also a dependency of the derived-title memo below, whose
   // `i18nT` output would otherwise stay in the previous locale after a switch.
@@ -180,15 +458,6 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   const riskRecord = useMemo(() => readToolRiskRecord(toolRiskFieldOf(message)), [message])
   const simplified = useSimplifiedToolNames()
   const uiLang = useLanguage().resolved
-
-  // MCP App (SEP-1865) render payload attached to this tool call, if any.
-  // Rendered as an inline sandboxed iframe below the tool-call row. Selected
-  // by (slot, tool_call_id) — this row's own slot — so another session's app
-  // (and its callback capability) can never mount here.
-  const mcpApp = useAppSelector(s => {
-    const sk = slot ?? s.chat.activeSlot
-    return toolCallId && sk ? s.chat.mcpApps?.[mcpAppKey(sk, toolCallId)] : undefined
-  })
 
   // An auto-approved call writes TWO tool rows under one `tool_call_id` (the
   // pre-approval pill and the post-approval one), and the durable app flag is
@@ -233,150 +502,21 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // call can reassign it, which is the property the notice needs.
   const noticeServer = (message.meta?.mcp_server as string | undefined) || ''
 
-  // Pull the matching toolLog entry. Returns purpose/input/output for the inline
-  // expansion as well as completion status for the icon. All transcript scans go
-  // through the shared per-slot index (see toolRowIndex.ts): built once per
-  // (messages, toolLog) identity change, O(1) per row per dispatch.
-  const { effectiveId, isDone: logIsDone, isRejected, isAutoDenied, autoDenyReason, autoDenyNotice, purpose, input, output, inputCut, outputCut, auto, ts, executionStartedAt, hasEntry, isShell, toolKind, toolName, trustedToolName, mcpServer, fromLog } = useAppSelector(s => {
-    // Slot-aware: for a non-active slot (split-view pane) read that slot's
-    // per-slot tool log / messages / running state; `slot` undefined or equal to
-    // the active slot → active-slot globals.
-    const bg = slot && slot !== s.chat.activeSlot ? slot : null
-    const log = bg ? (s.chat.slotActivity[bg]?.toolLog ?? EMPTY_TOOL_LOG) : s.chat.toolLog
-    const slotRunning = bg ? ((s.chat.slotRun[bg]?.state ?? 'idle') !== 'idle') : s.chat.slotRunning
-    const msgs = bg ? (s.chat.slotMessages[bg] ?? EMPTY_MESSAGES) : s.chat.messages
-    const index = selectToolRowIndex(msgs, log)
+  // Every store fact this row draws, in ONE subscription (selectToolRowView).
+  const { effectiveId, isDone, isRejected, isAutoDenied, autoDenyReason, autoDenyNotice, purpose, input, output, inputCut, outputCut, auto, ts, executionStartedAt, hasEntry, isShell, toolKind, toolName, trustedToolName, mcpServer, mcpApp, isNewestRow, runMembers, approvedByUser, hasPendingPerm, runOutputs, waitSlotKey, waitState, focused, projectDir } =
+    useAppSelector(s => selectToolRowView(s, slot, message, toolCallId, label), sameToolRowView)
 
-    // Was this tool's permission resolved as rejected? Only the NEWEST
-    // permission message for the id carries the decision.
-    const wasRejectedByPerm = () => {
-      if (!toolCallId) return false
-      const perm = index.lastPermById.get(toolCallId)
-      return perm ? isRejectedDecision(perm.meta?.resolved) : false
-    }
-
-    // Auto-denied detection. When a security-policy deny rule or hook blocks a
-    // tool, the gateway appends a SECOND tool message — "🚫 <title> …" —
-    // sharing this pill's tool_call_id. That message never renders (TurnBlock
-    // hides every tool message not starting with 🔧), so the visible 🔧 pill
-    // must find its hidden sibling to know the call was blocked. Its CONTENT is
-    // used too: the row carries "— Blocked by security policy: <reason>", and the
-    // Output panel leads with its own LOCALIZED sentence and follows with the
-    // rule, so the user learns which rule fired without a translated sentence
-    // being replaced by untranslated English (extractDenyDetail yields "" for a
-    // row without that marker). A row without the marker but with the host's
-    // own "Blocked: …" sentence — the gate-crash refusal, which says no policy
-    // rule fired — yields that sentence as the NOTICE, and the panel shows it
-    // in place of the localized line rather than contradicting it. A row with
-    // neither (hook blocked) shows the localized line alone. The interactive
-    // user-reject path also appends a 🚫 message, but that flow ALSO resolves
-    // a permission message as rejected — wasRejectedByPerm() takes precedence
-    // below, so a user rejection still shows red, not amber.
-    const denySibling = denySiblingContent(index, toolCallId, message)
-    const autoDenied = !!denySibling
-    const autoDenyReason = extractDenyDetail(denySibling)
-    const autoDenyNotice = extractDenyNotice(denySibling)
-
-    const e = lookupLogEntry(index, toolCallId, label)
-    if (e) {
-      const rejected = !!e.rejected || wasRejectedByPerm()
-      const isDone = e.output != null || rejected || autoDenied || !slotRunning
-      return {
-        effectiveId: e.tool_call_id || null,
-        isDone, isRejected: rejected,
-        isAutoDenied: !rejected && autoDenied,
-        autoDenyReason,
-        autoDenyNotice,
-        purpose: e.purpose || '',
-        input: e.input || '',
-        output: e.output || '',
-        // Clamp seams for the two payloads (null when nothing was cut). The
-        // panel renders the localized marker there at view time; the store
-        // holds only the offset, so a language switch re-renders it.
-        inputCut: e.input_cut ?? null,
-        outputCut: e.output_cut ?? null,
-        auto: !!e.auto,
-        ts: e.ts || 0,
-        executionStartedAt: e.execution_started_at || 0,
-        hasEntry: true,
-        // Older ACP update frames may omit is_shell; execute is the stable
-        // tool-kind value used by the transport and keeps those frames live.
-        isShell: e.is_shell === true || e.kind === 'execute' || e.text.startsWith('Running:'),
-        // Raw ACP tool kind — gates the inline diff-card promotion below
-        // (only kind === 'edit' rows promote).
-        toolKind: e.kind || '',
-        // Raw transport tool name, kept separate from the display `label`:
-        // the label is simplified/localized for humans, so gating behaviour on
-        // it would break under `useSimplifiedToolNames` or a translated UI.
-        toolName: e.text || '',
-        // Trusted identity from the transport's `_meta.kiro`, when it sent one;
-        // '' otherwise, and the title derivation falls back to parsing the title.
-        trustedToolName: e.tool_name || '',
-        mcpServer: e.mcp_server || '',
-        fromLog: true,
-      }
-    }
-    // No toolLog entry — historical message. Check permission state for rejection.
-    const rejected = wasRejectedByPerm()
-    // Backend persists `input` (when the call was issued) and `output` (when
-    // the result arrived) directly on the tool message's meta — see
-    // _tool_meta() and the EVENT_TOOL_RESULT handler in chat_runner.py.
-    // Pre-persistence messages won't have these fields and fall through to
-    // the empty-state hint inside ToolDetails.
-    const metaInput = (message.meta?.input as string | undefined) || ''
-    const metaOutput = (message.meta?.output as string | undefined) || ''
-    return {
-      effectiveId: toolCallId || null,
-      isDone: true, isRejected: rejected,
-      isAutoDenied: !rejected && autoDenied,
-      autoDenyReason,
-      autoDenyNotice,
-      purpose: (message.meta?.purpose as string) || '',
-      // Persisted meta is served whole by the server (_tool_meta caps at 1 MB,
-      // never clamps), so a historical row has no seam to mark.
-      input: metaInput, output: metaOutput, inputCut: null, outputCut: null, auto: false,
-      // ChatMessage.ts is a string (ISO timestamp) when restored from history;
-      // parse it for the meta-row time renderer. Falls to 0 if unparseable —
-      // fmtTime hides the row when ts is 0.
-      ts: typeof message.ts === 'number' ? message.ts : (message.ts ? Date.parse(String(message.ts)) || 0 : 0),
-      executionStartedAt: 0,
-      // Treat the message as having an entry when persisted I/O is available,
-      // so the empty-state copy only shows for truly bare historical messages.
-      hasEntry: !!(metaInput || metaOutput),
-      isShell: false,
-      // Persisted ACP tool kind (see _tool_meta in chat_runner.py). Rows
-      // written before the field existed read '' and never promote a card.
-      toolKind: (message.meta?.kind as string | undefined) || '',
-      // Historical rows have no log entry; the message content is the only
-      // carrier. Harmless either way — a replayed wait is never in flight.
-      toolName: message.content.replace(/^🔧\s*/, ''),
-      // Persisted by _tool_meta (chat_runner.py) since the title-derivation
-      // change; rows written before it read '' and derive from the title.
-      trustedToolName: (message.meta?.tool_name as string | undefined) || '',
-      mcpServer: (message.meta?.mcp_server as string | undefined) || '',
-      // No live tool-log entry backs this row. `isDone` above is a REPLAY
-      // default, not an observation, so anything that needs real liveness must
-      // consult server state instead of trusting it (see the wait countdown).
-      fromLog: false,
-    }
-  }, shallowEqual)
+  const isRun = runMembers.length > 1
 
   // The tool log is authoritative here: its output/rejection/turn-running
   // state survives the ACP initial-call → update handoff, while the parent
   // `running` prop is not present on every historical/live rendering path.
-  const isDone = logIsDone
+  // `isDone` already folds in a merged run's still-running members.
   const turnRunning = !isDone
 
   // Check if this specific tool has a pending (unresolved) permission matching its tool_call_id.
   // Only match when tool_call_id is present on both sides — prevents batched approvals from
   // incorrectly lighting up all pills as pending approval.
-  const hasPendingPerm = useAppSelector(s => {
-    if (isDone || !toolCallId) return false
-    const bg = slot && slot !== s.chat.activeSlot ? slot : null
-    const msgs = bg ? (s.chat.slotMessages[bg] ?? EMPTY_MESSAGES) : s.chat.messages
-    const log = bg ? (s.chat.slotActivity[bg]?.toolLog ?? EMPTY_TOOL_LOG) : s.chat.toolLog
-    return selectToolRowIndex(msgs, log).pendingPermIds.has(toolCallId)
-  })
 
   // Shell commands do not expose a reliable total, so their live indicator is
   // deliberately indeterminate. The existing tool output remains the source
@@ -384,7 +524,15 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // details panel is collapsed after approval. Whether the line is actually
   // SHOWN is decided below, once the elapsed clock is known — see
   // SHELL_ACTIVITY_MIN_SECS.
-  const liveShellActivity = isShell && turnRunning && !hasPendingPerm
+  // A blocking ask_question is waiting on the user, so its line says so instead of Running.
+  const askToolTitle = toolName.trim().replace(/^@/, '').toLowerCase()
+  const askToolServer = /^([^/]+)\/ask_question$/.exec(askToolTitle)?.[1]
+  const isAskTool = (mcpServer ? mcpServer === ASK_QUESTION_SERVER : !askToolServer || askToolServer === ASK_QUESTION_SERVER) && (
+    isAskQuestionToolName(trustedToolName)
+    || isAskQuestionToolName(askToolTitle)
+    || askToolTitle === `${ASK_QUESTION_SERVER}/ask_question`
+  )
+  const liveShellActivity = (isShell || isAskTool) && turnRunning && !hasPendingPerm
 
   // ── `wait` countdown ──
   // Matched to this pill by tool NAME, not by id: the wait_id is minted inside
@@ -411,31 +559,6 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // The `running` and newest-tool-row guards below are containment for a session
   // identity that resolves per RUNTIME rather than per ACP session; the cure is
   // tracked in https://github.com/kirodotdev/KiroCrew/issues/2347.
-  const isWaitTool = isWaitToolTitle(toolName)
-  const waitSlotKey = useAppSelector(s => slot ?? s.chat.activeSlot)
-  const waitState = useAppSelector(s => {
-    if (!isWaitTool || hasPendingPerm) return null
-    if (fromLog && isDone) return null
-    const found = waitSlotKey ? s.dashboard.slots.find(x => x.key === waitSlotKey) : undefined
-    const ws = found?.wait_state
-    if (!ws) return null
-    // The turn must actually be running. Cheap on its own, but load-bearing for
-    // a replayed row: the historical branch cannot observe liveness, so without
-    // this an idle slot's old wait pill would count down against a deadline
-    // belonging to some other sleep the backend is tracking.
-    if (!found?.running) return null
-    const bg = slot && slot !== s.chat.activeSlot ? slot : null
-    const msgs = bg ? (s.chat.slotMessages[bg] ?? EMPTY_MESSAGES) : s.chat.messages
-    const log = bg ? (s.chat.slotActivity[bg]?.toolLog ?? EMPTY_TOOL_LOG) : s.chat.toolLog
-    // Exactly one pill owns the countdown, and it must be the transcript's
-    // newest TOOL call of any kind -- not merely its newest wait. Scanning only
-    // for waits would let a completed wait from earlier in the turn light up
-    // while the agent is busy in some later tool, which is the shape a sleep
-    // belonging to a different ACP session on this same slot would take.
-    const last = selectToolRowIndex(msgs, log).lastToolMsg
-    if (!last || last.meta?.tool_call_id !== toolCallId) return null
-    return isWaitToolTitle(last.content.replace(/^🔧\s*/, '')) ? ws : null
-  }, shallowEqual)
   const showWaitCountdown = !!waitState && waitState.deadline_ts > 0
   const [activityNow, setActivityNow] = useState(() => Date.now())
   // Seed from execution_started_at (persisted in Redux, survives remount) when
@@ -528,6 +651,9 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // the command is already past the threshold rather than waiting another
   // ten ticks.
   const showShellActivity = liveShellActivity && elapsedSeconds >= SHELL_ACTIVITY_MIN_SECS
+  const activityLabel = isAskTool
+    ? i18nT('pages.chat.toolCallLine.ask_wait_status')
+    : i18nT('pages.chat.activityViewer.running')
 
   // Remaining time on the sleeping wait. Ceil so the label reads "1s" for the
   // final fractional second instead of flashing "0s" while the tool is still
@@ -558,7 +684,13 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // (manual toggle / focus signal) so the panel stays open if the user took
   // explicit control, and only auto-collapse when the approval resolves
   // *and* we were the ones who opened it.
-  const [localExpanded, setLocalExpanded] = useState(() => hasPendingPerm)
+  //
+  // The "Tool calls start expanded" chat setting (#18254) opens every pill on
+  // first render instead. It is the initial value only: a choice the user made
+  // (held by the host's `disclosure`) still wins, and with it on there is no
+  // collapse to return to once an approval resolves.
+  const startExpanded = useToolCallsStartExpanded()
+  const [localExpanded, setLocalExpanded] = useState(() => hasPendingPerm || startExpanded)
   // Disclosure is HOST-OWNED when `disclosure` is supplied. The transcript is
   // virtualised, so this pill is unmounted whenever its row leaves the mounted
   // window, and state kept only here dies with it. `undefined` means the host
@@ -578,15 +710,21 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     const key = disclosureKeyRef.current
     if (notify && key) notify(key, next)
   }, [])
-  const [pendingAutoExpand, setPendingAutoExpand] = useState(() => hasPendingPerm)
+  // Set once the user opens or closes this pill themselves (a click or a jump),
+  // so an open state is theirs and not just the start-expanded default.
+  const [userChoseOpen, setUserChoseOpen] = useState(false)
+  const [pendingAutoExpand, setPendingAutoExpand] = useState(() => hasPendingPerm && !startExpanded)
   const prevPendingRef = useRef(hasPendingPerm)
   useEffect(() => {
     const wasPending = prevPendingRef.current
     prevPendingRef.current = hasPendingPerm
     if (hasPendingPerm && !wasPending) {
-      // Approval just became pending → auto-expand
-      applyExpanded(true)
-      setPendingAutoExpand(true)
+      // Approval just became pending → auto-expand. Only mark it as ours to
+      // undo when the row would otherwise rest collapsed. Local only: the
+      // host's disclosure holds the user's own choices, and an auto-open
+      // stored there would read as one (it never folds, see below).
+      setLocalExpanded(true)
+      setPendingAutoExpand(!startExpanded)
     } else if (!hasPendingPerm && wasPending && pendingAutoExpand) {
       // Approval just resolved (approved/rejected/cancelled) and the user
       // didn't take over → auto-collapse. Defer to the next animation frame
@@ -596,12 +734,12 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       // mid-flux height for the exit animation and the panel snaps shut
       // instead of animating cleanly.
       const raf = requestAnimationFrame(() => {
-        applyExpanded(false)
+        setLocalExpanded(false)
         setPendingAutoExpand(false)
       })
       return () => cancelAnimationFrame(raf)
     }
-  }, [hasPendingPerm, pendingAutoExpand, applyExpanded])
+  }, [hasPendingPerm, pendingAutoExpand, startExpanded])
 
   const containerRef = useRef<HTMLDivElement>(null)
 
@@ -610,15 +748,15 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // then clear the focus so subsequent re-renders don't keep firing. Treat the
   // jump as user intent — clear pendingAutoExpand so the panel stays open
   // through approval resolution.
-  const focusToolCallId = useAppSelector(s => s.chat.focusToolCallId)
   useEffect(() => {
-    if (focusToolCallId && effectiveId && focusToolCallId === effectiveId) {
+    if (focused) {
       applyExpanded(true)
       setPendingAutoExpand(false)
+      setUserChoseOpen(true)
       requestAnimationFrame(() => containerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
       dispatch(clearFocusToolCallId())
     }
-  }, [focusToolCallId, effectiveId, dispatch, applyExpanded])
+  }, [focused, dispatch, applyExpanded])
 
   // File-op tool pills (read/edit/write) get a side-panel open affordance.
   // Extract the fs path from the tool's JSON args; the chip is gated on a
@@ -646,10 +784,31 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // folded either. Density relief is per-card (the fold chip below) plus the
   // size caps in presentToolDiff.
   const denied = isRejected || isAutoDenied
-  const diffView = useMemo(
-    () => (denied ? null : presentToolDiff(toolKind, input, inputCut)),
-    [denied, toolKind, input, inputCut],
+  // Images an image-mode read looked at, previewed under the row. Not for a
+  // rejected or auto-denied call: the agent never read them, and a preview
+  // would say it had.
+  const imagePaths = useMemo(() => (denied ? [] : extractToolImagePaths(input)), [denied, input])
+  // An edit run's diffs, one per call in order, read from each member's
+  // persisted input: editRuns admitted every member on exactly that input as a
+  // card-sized, untruncated diff. A run the lead's own log entry calls denied
+  // falls back to the lead alone.
+  const runCodes = useMemo(
+    () => (isRun && !denied ? runMembers.map(m => m.meta?.input as string) : null),
+    [isRun, denied, runMembers],
   )
+  const diffView = useMemo(
+    () => (denied ? null : runCodes ? { mode: 'card' as const, code: runCodes[0] } : presentToolDiff(toolKind, input, inputCut)),
+    [denied, runCodes, toolKind, input, inputCut],
+  )
+  // Blocking `ask_question`: the user's answers are this call's RESULT and
+  // appear nowhere else in the transcript, so they render as a card below the
+  // pill — a result, not a working step, the same class as the diff card. Keyed
+  // on the backend-recorded tool name, never the model-visible title, so no
+  // other tool's output can dress itself up as the user's answers. A third-party
+  // server can name its own tool ask_question, so the server must be ours too.
+  const askAnswered =
+    !denied && isNewestRow && mcpServer === ASK_QUESTION_SERVER && isAskQuestionToolName(trustedToolName)
+    && isAskAnsweredOutput(output)
   // Per-card density control, FOLDED by default: a turn that edits several
   // files stacks a full patch per file, so the answer the reader came for
   // scrolls off. The chip still states the three facts that decide whether to
@@ -670,10 +829,14 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       return next
     })
   }, [toolCallId])
-  const cardStats = useMemo(
-    () => (diffView?.mode === 'card' ? countDiffStats(diffView.code) : null),
-    [diffView],
-  )
+  const cardStats = useMemo(() => {
+    if (diffView?.mode !== 'card') return null
+    if (!runCodes) return countDiffStats(diffView.code)
+    return runCodes.reduce((sum, code) => {
+      const s = countDiffStats(code)
+      return { added: sum.added + s.added, removed: sum.removed + s.removed }
+    }, { added: 0, removed: 0 })
+  }, [diffView, runCodes])
   const showCard = diffView?.mode === 'card' && !cardFolded
   // The chip is the one-line handle for every diff presentation and it STAYS
   // MOUNTED while the card is open: the same chip that opened the patch is
@@ -691,26 +854,17 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         ? { ...diffView, opensCard: false }
         : null
   const probeEnabled = !!filePath && isSafePath(filePath) && !!onFileOpen
-  // HEAD-probe via React Query (project guideline: no manual useState/useEffect
-  // fetch for server state). Gives request dedup across pills touching the same
-  // file and stale-while-revalidate caching so re-renders don't re-probe —
-  // replacing the manual AbortController + onFileOpenRef + setFileExists dance.
+  // The existence probe shares the transcript-wide cache and batch the markdown
+  // chips and diff headers use, so a file a chip already resolved costs no
+  // request and N pills for one path ask once.
   //
-  // The query's error is deliberately NOT read: this gates an affordance (the
-  // Open-file pill), it is not something the person asked for. A refused probe
-  // collapses to `fileExists = false` on purpose — the pill is simply not
-  // offered, which is the same outcome as the file not being there, and a
-  // failed-probe notice on every tool row would be noise about a link nobody
-  // clicked. Opening the file itself reports its own failure when pressed.
-  const { data: fileExists = false } = useQuery({
-    queryKey: ['tool-pill-file-exists', filePath],
-    queryFn: async ({ signal }) => {
-      const r = await fetch(fileReadUrl(filePath!), { method: 'HEAD', signal })
-      return r.ok
-    },
-    enabled: probeEnabled,
-    staleTime: 30_000,
-  })
+  // A refused probe collapses to "not a file" on purpose: this gates an
+  // affordance (the Open-file pill), it is not something the person asked for.
+  // The pill is simply not offered, which is the same outcome as the file not
+  // being there, and a failed-probe notice on every tool row would be noise
+  // about a link nobody clicked. Opening the file itself reports its own
+  // failure when pressed.
+  const fileExists = usePathKind(probeEnabled ? filePath : null) === 'file'
   const showFileOpen = probeEnabled && fileExists
 
   const Icon = isDone
@@ -752,6 +906,18 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       .filter(Boolean)
       .join('\n')
 
+  // A run's details output: each member's output under its "Edit N of M"
+  // label, the same label its diff card carries. Null when no member has
+  // output yet, so the panel keeps its usual empty state. editRuns admits no
+  // member whose logged output was clamped, so the joined text has no seam.
+  const runOutput = useMemo(() => {
+    void langGen // the labels are localized
+    if (!isRun || runOutputs.every(o => !o)) return null
+    return runOutputs
+      .map((o, i) => `${i18nT('pages.chat.toolCallLine.edit_n_of_m', { n: i + 1, total: runOutputs.length })}\n${o}`)
+      .join('\n\n')
+  }, [isRun, runOutputs, langGen])
+
   // The language-neutral, argument-derived title for this call — `List files
   // in src` for `ls -la src`, `Session send: <target>` for an MCP call, kiro-cli's
   // own `Reading a.rs:1-20` when nothing better can be said. Live and replayed
@@ -762,10 +928,6 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // The slot's project directory, so native-tool titles show paths relative
   // to it (`Read src/a.ts`, not the absolute path). Reads THIS row's slot —
   // a split-view pane must not borrow the active session's tree.
-  const projectDir = useAppSelector(s => {
-    const key = slot ?? s.chat.activeSlot
-    return key ? (s.dashboard.slots.find(sl => sl.key === key)?.project || undefined) : undefined
-  })
 
   const derived = useMemo(() => {
     void langGen // the localized title is a function of the catalog generation too
@@ -811,7 +973,10 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // (label was nothing but the path).
   const displayLabel = useMemo(() => {
     if (!showFileOpen || !filePath) return toolLabel
-    for (const candidate of [filePath, relDisplayPath(filePath, projectDir)]) {
+    // The derived title spells the path decoded (decodePathForDisplay), so
+    // both spellings are candidates.
+    const rel = relDisplayPath(filePath, projectDir)
+    for (const candidate of [filePath, rel, decodePathForDisplay(filePath), decodePathForDisplay(rel)]) {
       if (candidate && toolLabel.includes(candidate)) {
         const stripped = toolLabel.split(candidate).join('').replace(/\s+/g, ' ').trim()
         if (stripped) return stripped
@@ -837,6 +1002,28 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // Hover reveals the verbatim command / incoming title whenever the pill shows
   // a substitute for it — a derived title, a digest, or the purpose.
   const pillLabelTitle = pillLabelText === derived.rawTitle ? undefined : (derived.rawTitle || undefined)
+  // The label may be the transport's own title, which spells the path the
+  // way the transport received it (`Edit drafts/My%20Notes.md`). Only the
+  // path this row's input names is decoded, so a `%` anywhere else in a label
+  // (a shell command's printf format) is left alone.
+  const labelPath = chipView?.path ?? filePath
+  const shownLabel = useMemo(() => {
+    if (!labelPath) return pillLabelText
+    let out = pillLabelText
+    for (const raw of [labelPath, relDisplayPath(labelPath, projectDir)]) {
+      const decoded = decodePathForDisplay(raw)
+      if (decoded !== raw) out = out.split(raw).join(decoded)
+    }
+    return out
+  }, [pillLabelText, labelPath, projectDir])
+  // The diff chip names its file only when the row's label does not already:
+  // a derived `Edit drafts/notes.md` sits right above it, so a second copy of
+  // the name is noise, while a purpose label ("Tighten the intro") names no
+  // file and the chip is the only place it appears. Decoded for display like
+  // the title (decodePathForDisplay); the hidden name stays the button's
+  // accessible name.
+  const chipBaseName = chipView?.path ? decodePathForDisplay(pathBasename(chipView.path)) : ''
+  const chipName = chipBaseName && !shownLabel.includes(chipBaseName) ? chipBaseName : ''
   // A shell row the classifier left verbatim (`$VAR`, redirects, loops) sits
   // among prose titles; setting it in the code face says "this is the exact
   // command" instead of leaving the reader to guess why one row reads
@@ -862,7 +1049,17 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     if (hasPendingPerm) return
     applyExpanded(!expanded)
     setPendingAutoExpand(false)
+    setUserChoseOpen(true)
   }, [hasPendingPerm, expanded, applyExpanded])
+
+  // A live pill never folds into its turn's fold (see rowActivity): it is
+  // running (which covers awaiting approval: `hasPendingPerm` is false once
+  // `isDone`), hosting an MCP App, or open by a choice. The host's
+  // `disclosure` holds only choices (clicks and jumps); an open state that
+  // comes only from the "Tool calls start expanded" setting is not one, so
+  // with that setting on a finished pill still folds.
+  useReportRowActive(!isDone || !!mcpApp ||
+    (expanded && (disclosure === true || userChoseOpen || !startExpanded)))
 
   const fmtTime = (t: number) => t ? fmtDateFields(t, { hour: '2-digit', minute: '2-digit' }) : ''
 
@@ -870,6 +1067,24 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // user's intent for after the approval resolves, but the rendered panel
   // ignores it while pending.
   const effectivelyExpanded = expanded || hasPendingPerm
+  // The verbatim command / title rides in a styled bubble rather than the
+  // native `title`: the OS tooltip wrapped a long pipeline mid-word in the UI
+  // font after a ~1s delay. Folded rows only -- an opened row already shows the
+  // exact payload in its details, and a bubble over it would repeat it. The
+  // handlers stay attached while open so a leave still closes the bubble and
+  // a fold under a resting pointer brings it back where it belongs.
+  const { tip: pillTip, tipHandlers: pillTipHandlers, tipId: pillTipId } = useInstantTip()
+  const pillTipText = effectivelyExpanded ? undefined : pillLabelTitle
+  // The bubble floats 8px above with no arrow, and tool rows stack tightly, so
+  // the row it belongs to is marked while it is open: the hover fill plus a
+  // 1px inset outline in neutral `--muted`. The fill alone is near-invisible on
+  // light palettes (`--bg-hover` sits ~1.1:1 off `--bg`); the outline
+  // measures at least 2.5:1 against that fill on every palette in index.css,
+  // and above 3:1 on all but four dark ones. It is neither the accent focus
+  // ring nor a selection colour, and `.focus-ring-accent:focus-visible`
+  // (index.css) overrides the outline with its transparent one under keyboard
+  // focus, so the focus ring stays the only mark there.
+  const pillTipOpen = !!pillTip && !!pillTipText
 
   // One line while folded, full wrap once opened. See LABEL_COLLAPSED_CLASS.
   const labelWrapClass = effectivelyExpanded ? LABEL_EXPANDED_CLASS : LABEL_COLLAPSED_CLASS
@@ -999,9 +1214,10 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           writes. The file-path chip below keeps mono, where it is earned. */}
       <button
         ref={pillButtonRef}
-        className={`inline-flex ${ROW_PILL_BUTTON_CLASS} focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-hidden ${hasPendingPerm ? 'cursor-default' : 'cursor-pointer hover:brightness-110'}`}
+        className={`inline-flex ${ROW_PILL_BUTTON_CLASS} focus-ring-accent ${hasPendingPerm ? 'cursor-default' : 'cursor-pointer hover:brightness-110'}${pillTipOpen ? ` ${PILL_TIP_OPEN_CLASS}` : ''}`}
+        data-tip-open={pillTipOpen || undefined}
         aria-expanded={effectivelyExpanded}
-        title={pillLabelTitle}
+        {...(pillLabelTitle ? pillTipHandlers : {})}
         aria-label={hasPendingPerm
           ? i18nT('pages.chat.toolCallLine.aria_awaiting_approval', { label })
           : effectivelyExpanded
@@ -1026,11 +1242,16 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
             }}
             animate={{ backgroundPosition: ['100% 0%', '-50% 0%'] }}
             transition={{ duration: 2.4, repeat: Infinity, ease: 'linear' }}
-          >{pillLabelText}</motion.span>
+          >{shownLabel}</motion.span>
         ) : (
-          <span data-testid="tool-pill-label" className={`${labelWrapClass} ${pillLabelFaceClass} min-w-0 leading-5 text-muted hover:text-text transition-colors`}>{pillLabelText}</span>
+          <span data-testid="tool-pill-label" className={`${labelWrapClass} ${pillLabelFaceClass} min-w-0 leading-5 text-muted hover:text-text transition-colors`}>{shownLabel}</span>
         )}
       </button>
+      {pillTipText && (
+        <InstantTip tip={pillTip} tipId={pillTipId}>
+          <ToolCommandTip text={pillTipText} shell={derived.shell} />
+        </InstantTip>
+      )}
 
       {/* Side-panel open: a basename CHIP hugging the open-in-pane icon, as one
           clickable unit and a SIBLING of the pill (never nested) — clicking it
@@ -1050,7 +1271,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           the wrapper's 4px before. */}
       {showFileOpen && filePath && (
         <button
-          className="pi-morph shrink-0 inline-flex items-center gap-1 ms-2 px-1.5 py-0.5 rounded font-mono text-[12px] leading-5 bg-bg-hover text-muted hover:text-accent hover:bg-accent/10 cursor-pointer transition-colors focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-hidden"
+          className="pi-morph shrink-0 inline-flex items-center gap-1 ms-2 px-1.5 py-0.5 rounded font-mono text-[12px] leading-5 bg-bg-hover text-muted hover:text-accent hover:bg-accent/10 cursor-pointer transition-colors focus-ring-accent"
           style={{ marginTop: '1px' }}
           onClick={(e) => { e.stopPropagation(); onFileOpen!(filePath) }}
           title={i18nT('pages.chat.toolCallLine.open_in_side_panel', { path: filePath })}
@@ -1061,6 +1282,11 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         </button>
       )}
       </div>
+
+      {/* Image-read thumbnails: visible on the folded row, so a glance shows
+          which picture the agent read. A sibling of the pill, so a click on a
+          thumbnail opens the viewer and never toggles the details panel. */}
+      <ToolImageThumbnails paths={imagePaths} version={effectiveId || toolCallId || undefined} />
 
       {/* Diff chip: the one-line handle for every diff presentation. For a
           promoted card it folds/unfolds the card below and stays put while the
@@ -1077,8 +1303,8 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       {chipView && (
         <button
           type="button"
-          className={`mt-1 ml-3 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border text-[12px] leading-5 hover:text-text hover:border-border-strong cursor-pointer transition-colors focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-hidden ${chipView.opensCard && showCard ? 'text-text border-border-strong bg-bg-hover' : 'text-muted border-border bg-bg-elevated'}`}
-          title={chipView.path ?? undefined}
+          className={`mt-1 ml-3 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border text-[12px] leading-5 hover:text-text hover:border-border-strong cursor-pointer transition-colors focus-ring-accent ${chipView.opensCard && showCard ? 'text-text border-border-strong bg-bg-hover' : 'text-muted border-border bg-bg-elevated'}`}
+          title={chipView.path ? decodePathForDisplay(chipView.path) : undefined}
           aria-expanded={chipView.opensCard ? showCard : effectivelyExpanded}
           data-diff-toggle={chipView.opensCard ? true : undefined}
           data-testid={chipView.opensCard ? 'tool-diff-chip' : 'tool-diff-summary-chip'}
@@ -1089,7 +1315,9 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           }}
         >
           <FileDiff size={12} className="shrink-0" aria-hidden />
-          {chipView.path && <span className="font-mono max-w-[240px] truncate">{pathBasename(chipView.path)}</span>}
+          {chipName && <span className="font-mono max-w-[240px] truncate">{chipName}</span>}
+          {!chipName && chipBaseName && <span className="sr-only">{chipBaseName}</span>}
+          {runCodes && <span>{i18nT('pages.chat.toolCallLine.edit_count', { count: runCodes.length })}</span>}
           <span className="tabular-nums">
             {chipView.removed > 0 && <span className="text-danger">{chipView.truncated ? '≥' : ''}-{chipView.removed}</span>}
             {chipView.removed > 0 && chipView.added > 0 && ' '}
@@ -1107,6 +1335,20 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           )}
         </button>
       )}
+      {/* Approved tag: an edit the user approved at a prompt keeps its own row
+          (editRuns never merges it), so it can sit right under a merged run of
+          the same file and read as a duplicate. The tag names the difference.
+          Not on a rejected row: the pill already reads rejected there. */}
+      {chipView && approvedByUser && !isRejected && (
+        <span
+          className="mt-1 ml-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[12px] leading-5 text-ok-text bg-ok/10"
+          title={i18nT('pages.chat.toolCallLine.approved_tag_tip')}
+          data-testid="tool-approved-tag"
+        >
+          <CircleCheck size={12} className="shrink-0" aria-hidden />
+          {i18nT('pages.chat.toolCallLine.approved_tag')}
+        </span>
+      )}
       {/* Diff card: the full inline diff, folded by the chip above — no
           `onFold`, the chip is the card's only toggle. A sibling of the pill
           (not inside the expanded panel) — the primary display of the change;
@@ -1114,10 +1356,23 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           event fence (role="presentation"): clicks inside the card must never
           toggle a surrounding TurnBlock / collapsed-group wrapper. */}
       {showCard && diffView?.mode === 'card' && (
-        <div className="mt-1.5" role="presentation" onClick={e => e.stopPropagation()}>
-          <DiffBlock code={diffView.code} complete onFileOpen={onFileOpen} />
+        <div className="mt-1.5 flex flex-col gap-1.5" role="presentation" onClick={e => e.stopPropagation()}>
+          {/* One card per call, in order: consecutive edits are patches
+              against successive versions of the file, so their hunks cannot
+              be spliced into one diff without renumbering every line. */}
+          {(runCodes ?? [diffView.code]).map((code, i) => (
+            <div key={i} className="flex flex-col gap-0.5">
+              {runCodes && (
+                <span className="text-[12px] leading-5 text-muted" data-testid="edit-run-card-label">
+                  {i18nT('pages.chat.toolCallLine.edit_n_of_m', { n: i + 1, total: runCodes.length })}
+                </span>
+              )}
+              <DiffBlock code={code} complete onFileOpen={onFileOpen} />
+            </div>
+          ))}
         </div>
       )}
+      {askAnswered && <Suspense fallback={null}><AskAnswersResult output={output} toolCallId={toolCallId} /></Suspense>}
 
       <StatusRow show={showShellActivity} snap={transcriptHot}>
         {/* ml-5 = the pill's icon (12px) + the pill BUTTON's gap-2 (8px), so
@@ -1125,9 +1380,9 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
             does. (The outer wrapper's gap-1 is between pill and file chip —
             not the icon-to-label gap.) */}
         <div className="ml-5 mt-1 text-[12px] leading-5 text-muted" data-testid="shell-activity">
-          <span className="sr-only" aria-live="polite">{i18nT('pages.chat.activityViewer.running')}</span>
+          <span className="sr-only" aria-live="polite">{activityLabel}</span>
           <span aria-hidden="true" className="tabular-nums font-mono">
-            {i18nT('pages.chat.activityViewer.running')} · {elapsedLabel}
+            {activityLabel} · {elapsedLabel}
           </span>
         </div>
       </StatusRow>
@@ -1190,7 +1445,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
                 composer draft is persisted per slot, and an in-chat hand-off
                 opens a fresh slot rather than navigating away. */}
             {isAutoDenied && <ErrorNotice variant="inline" message={autoDenyNotice} askAgent testId="gate-crash-notice" />}
-            <ToolDetails purpose={purpose} pillLabel={toolLabel} toolName={derived.rawTitle || label} input={input} output={isAutoDenied ? denyOutput : output} inputCut={inputCut} outputCut={isAutoDenied ? null : outputCut} auto={auto} pending={hasPendingPerm} ts={ts} hasEntry={hasEntry} fmtTime={fmtTime} barColor={barStyle} layoutId={`tool-detail-${effectiveId || toolCallId || fallbackId}`} flush />
+            <ToolDetails purpose={purpose} pillLabel={toolLabel} toolName={derived.rawTitle || label} input={input} output={isAutoDenied ? denyOutput : (runOutput ?? output)} inputCut={inputCut} outputCut={isAutoDenied || isRun ? null : outputCut} auto={auto} pending={hasPendingPerm} ts={ts} hasEntry={hasEntry} fmtTime={fmtTime} barColor={barStyle} layoutId={`tool-detail-${effectiveId || toolCallId || fallbackId}`} flush />
           </motion.div>
         )}
       </AnimatePresence>
@@ -1209,7 +1464,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           <button
             type="button"
             onClick={() => { if (toolCallId) onOpenApp?.(toolCallId) }}
-            className="mt-1.5 flex items-center gap-2 px-1.5 py-0.5 -ml-1.5 rounded text-[12px] leading-5 text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none cursor-pointer transition-colors focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent"
+            className="mt-1.5 flex items-center gap-2 px-1.5 py-0.5 -ml-1.5 rounded text-[12px] leading-5 text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none cursor-pointer transition-colors focus-ring-accent"
           >
             <PanelRight size={13} aria-hidden />
             <span>{i18nT('pages.chat.toolCallLine.opened_in_the_side_panel')}</span>
@@ -1244,4 +1499,4 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         )}
     </motion.div>
   )
-})
+}

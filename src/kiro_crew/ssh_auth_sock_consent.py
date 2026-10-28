@@ -1,4 +1,10 @@
-"""Owner consent to forward the ssh-agent socket into the agent sandbox.
+"""Owner consent to forward the ssh-agent socket into a sandbox that hides ~/.ssh.
+
+Most agent spawns do not need it. The ``standard`` (``auto``), ``cc`` and
+``off`` tiers leave ``~/.ssh`` readable to the child, and there
+``sandbox._forward_ssh_auth_sock`` keeps ``SSH_AUTH_SOCK`` by default. This
+consent decides the remaining spawns: the ``strict`` tier, and an enforced
+harness whose credential mask hides ``~/.ssh``.
 
 Keeping ``SSH_AUTH_SOCK`` in the agent subprocess environment lets git commit
 signing and git-over-SSH inside the sandbox reach the ssh-agent the operator
@@ -12,8 +18,7 @@ Where the consent lives, and why not ``config.json``
 ----------------------------------------------------
 ``ssh_auth_sock_consent.json`` sits on the KEYSTONE floor
 (``security._CREW_SECRET_LEAVES``), the same placement as ``computer_use.json``,
-``aws_service_consent.json``, ``oauth_endpoints.json`` and
-``file_delivery_consent.json``, and for the same reason: this is an
+``aws_service_consent.json`` and ``oauth_endpoints.json``, and for the same reason: this is an
 authorization, not a preference. ``config.json`` is writable by any auto-approved
 agent shell, so consent stored there could be minted by a prompt-injected agent
 -- it would flip its own ``SSH_AUTH_SOCK`` forwarding on, and a subagent it spawns

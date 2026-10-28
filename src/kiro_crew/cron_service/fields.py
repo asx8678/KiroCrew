@@ -13,13 +13,19 @@ The store transaction around them -- lock, reload, save -- is the service's.
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from typing import Any
 
 from kiro_crew import cron_script
 from kiro_crew.cron_service.execution import _SUBPROC_CLEANUP_ALLOWANCE_SECS
-from kiro_crew.cron_service.model import CronJob, CronSchedule
+from kiro_crew.cron_service.model import (
+    _AUTO_PAUSE_THRESHOLD,
+    CronJob,
+    CronSchedule,
+    validate_auto_pause_after_failures,
+)
 from kiro_crew.cron_service.schedule import (
     is_valid_skip_date,
     is_valid_timezone,
@@ -40,7 +46,7 @@ _CHAT_FOLDER_NEEDS_PERSISTENT = (
 # Table-driven string-field caps for the persistence chokepoint. Every
 # caller-supplied string field persisted by _build_job/_update_job_locked
 # is listed here with its cap matching the REST/MCP boundary schemas
-# (CRON_ADD_SCHEMA / cron_update ToolSchema in validation.py). A helper
+# (CRON_ADD_SCHEMA / cron_update ToolSchema in validation_parts/cron_schemas.py). A helper
 # iterates this table so adding a field requires ONE edit, not two.
 _CRON_STRING_FIELD_CAPS: tuple[tuple[str, int], ...] = (
     ("name", MAX_SHORT_STRING),
@@ -59,6 +65,9 @@ _CRON_STRING_FIELD_CAPS: tuple[tuple[str, int], ...] = (
     ("command", 5000),
     ("script", 200),
     ("timezone", 50),
+    # Written by the app bridge alone (a sha256 hex digest); listed so the
+    # create and update gates type-check it like every other persisted string.
+    ("app_manifest_digest", MAX_SHORT_STRING),
     # Secret-grant fields have no boundary FieldSpec: the pins are sha256 hex
     # digests computed server-side by the grant endpoint / cron_secret_request
     # tool (grant validity is enforced by pin equality at fire time, not by
@@ -66,6 +75,24 @@ _CRON_STRING_FIELD_CAPS: tuple[tuple[str, int], ...] = (
     ("secret_env_pin", MAX_SHORT_STRING),
     ("secret_env_pending_pin", MAX_SHORT_STRING),
 )
+
+
+# The shape of an installer's provenance key (CronJob.managed_by). Deliberately
+# not in _CRON_STRING_FIELD_CAPS: that table also gates apply_job_update, and
+# the key is create-only. ASCII, starting with an alphanumeric, so it is never
+# confusable with a flag, never carries whitespace or a control character, and
+# always compares on bytes the way the installer that recomputes it expects.
+MANAGED_BY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}")
+
+
+def validate_managed_by(key: str) -> str:
+    """Return *key* when it is a usable installer key, else raise ``ValueError``."""
+    if not isinstance(key, str) or not MANAGED_BY_RE.fullmatch(key):
+        raise ValueError(
+            "managed-by key must be 1-200 ASCII characters from A-Z a-z 0-9 . _ : / @ + - "
+            "and start with a letter or digit"
+        )
+    return key
 
 
 def _validate_cron_string_fields(
@@ -96,6 +123,52 @@ def _validate_cron_string_fields(
                 raise ValueError(f"{field_name} must be a string")
             if len(val) > cap:
                 raise ValueError(f"{field_name} exceeds max length {cap}")
+
+
+def _check_timeout_secs_range(timeout_secs: int) -> None:
+    if not 1 <= timeout_secs <= 86400:
+        raise ValueError(f"timeout_secs must be within 1..86400, got {timeout_secs}")
+
+
+def _check_timeout_range(timeout: int) -> None:
+    if not 0 <= timeout <= 86400:
+        raise ValueError(f"timeout must be within 0..86400, got {timeout}")
+
+
+def validate_create_timeouts(
+    timeout: int, timeout_secs: int, *, command: str = "", script: str = ""
+) -> None:
+    """Refuse a create-time ``timeout``/``timeout_secs`` pair :func:`build_job` would refuse.
+
+    The one owner of the create-time rule: :func:`build_job` calls it, and so
+    does app-manifest validation, so an ``app.json`` cron is held to exactly the
+    check its job will meet at registration. ``0`` means the default for both.
+    ``timeout`` must be within 0..86400 and ``timeout_secs`` within 1..86400
+    (the same ranges :func:`apply_job_update` applies). On a command or script
+    job ``timeout_secs`` must also cover the subprocess timeout (``timeout``,
+    else 30s for a script and 300s for a command) plus the cleanup allowance.
+    Raises ``ValueError``.
+    """
+    if timeout:
+        _check_timeout_range(int(timeout))
+    if timeout_secs:
+        _check_timeout_secs_range(int(timeout_secs))
+    if timeout_secs and (command or script):
+        if timeout:
+            _eff_sub = int(timeout)
+        elif script:
+            _eff_sub = 30
+        else:
+            _eff_sub = 300
+        if int(timeout_secs) < _eff_sub + _SUBPROC_CLEANUP_ALLOWANCE_SECS:
+            raise ValueError(
+                "timeout_secs (wake budget) must cover the command/script "
+                f"subprocess timeout plus cleanup: need >= "
+                f"{_eff_sub + _SUBPROC_CLEANUP_ALLOWANCE_SECS}, got {timeout_secs}. "
+                "A shorter wake budget cancels only the executor future — "
+                "the subprocess keeps running while the next wake launches "
+                "a duplicate."
+            )
 
 
 def build_job(
@@ -129,7 +202,8 @@ def build_job(
     minimal_context: bool = True,
     timeout: int = 0,
     timeout_secs: int = 0,
-    auto_pause_after: int | None = None,
+    app_manifest_digest: str = "",
+    auto_pause_after_failures: int | None = None,
 ) -> CronJob:
     """Validate inputs and construct the :class:`CronJob` (no I/O, no lock).
 
@@ -141,6 +215,10 @@ def build_job(
     ``asyncio.wait_for`` deadline in ``_execute_with_timeout``); ``0`` means
     the ``_JOB_TIMEOUT_SECS`` default. Distinct from ``timeout``, which
     bounds only script/command subprocesses.
+
+    ``auto_pause_after_failures`` is how many consecutive failed runs pause the
+    job; ``None`` means the ``_AUTO_PAUSE_THRESHOLD`` default and ``0`` means the
+    job never auto-pauses.
 
     The optional presentation/routing fields (``agent_id``, ``model``,
     ``silent``, ``timezone``, ``strict_schedule``, ``hide_in_chat``) are set
@@ -186,47 +264,18 @@ def build_job(
             "command": command,
             "script": script,
             "timezone": timezone,
+            "app_manifest_digest": app_manifest_digest,
         },
         required=frozenset({"name", "message"}),
     )
     if chat_folder_id and not persistent_session:
         raise ValueError(_CHAT_FOLDER_NEEDS_PERSISTENT)
-    if timeout_secs and not 1 <= int(timeout_secs) <= 86400:
-        raise ValueError(f"timeout_secs must be within 1..86400, got {timeout_secs}")
-    if timeout_secs and (command or script):
-        if timeout:
-            _eff_sub = int(timeout)
-        elif script:
-            _eff_sub = 30
-        else:
-            _eff_sub = 300
-        if int(timeout_secs) < _eff_sub + _SUBPROC_CLEANUP_ALLOWANCE_SECS:
-            raise ValueError(
-                "timeout_secs (wake budget) must cover the command/script "
-                f"subprocess timeout plus cleanup: need >= "
-                f"{_eff_sub + _SUBPROC_CLEANUP_ALLOWANCE_SECS}, got {timeout_secs}. "
-                "A shorter wake budget cancels only the executor future — "
-                "the subprocess keeps running while the next wake launches "
-                "a duplicate."
-            )
-    # Per-job auto-pause threshold: None = the global default, 0 = never
-    # auto-pause. Validated HERE, beside every other creation field, so no
-    # create surface can persist an unbounded or mistyped threshold. bool is
-    # rejected explicitly: True is an int in Python but means nothing as a
-    # failure count, and a JSON schema can deliver one.
-    if auto_pause_after is not None:
-        _apa = auto_pause_after
-        if (
-            isinstance(_apa, bool)
-            or not isinstance(_apa, (int, float))
-            or (isinstance(_apa, float) and not _apa.is_integer())
-        ):
-            raise ValueError(
-                f"auto_pause_after must be a whole number or null, got {auto_pause_after!r}"
-            )
-        _apa = int(_apa)
-        if not 0 <= _apa <= 10000:
-            raise ValueError(f"auto_pause_after must be within 0..10000, got {_apa}")
+    validate_create_timeouts(timeout, timeout_secs, command=command, script=script)
+    _auto_pause = (
+        _AUTO_PAUSE_THRESHOLD
+        if auto_pause_after_failures is None
+        else validate_auto_pause_after_failures(auto_pause_after_failures)
+    )
     if timezone and not is_valid_timezone(timezone):
         raise ValueError(f"Invalid timezone: {timezone!r}")
     skip_dates = skip_dates or []
@@ -278,7 +327,8 @@ def build_job(
         minimal_context=minimal_context,
         timeout=timeout,
         timeout_secs=int(timeout_secs) if timeout_secs else seams._JOB_TIMEOUT_SECS,
-        auto_pause_after=(int(auto_pause_after) if auto_pause_after is not None else None),
+        app_manifest_digest=app_manifest_digest or "",
+        auto_pause_after_failures=_auto_pause,
     )
 
 
@@ -367,8 +417,10 @@ def apply_job_update(
             _tsecs = int(kwargs["timeout_secs"])
         except (ValueError, TypeError) as e:
             raise ValueError(f"Invalid timeout_secs: {kwargs['timeout_secs']!r}") from e
-        if not 1 <= _tsecs <= 86400:
-            raise ValueError(f"timeout_secs must be within 1..86400, got {_tsecs}")
+        _check_timeout_secs_range(_tsecs)
+    _auto_pause: int | None = None
+    if "auto_pause_after_failures" in kwargs and kwargs["auto_pause_after_failures"] is not None:
+        _auto_pause = validate_auto_pause_after_failures(kwargs["auto_pause_after_failures"])
     # Script/command subprocess timeout. MCP cron_update passes this
     # field, so a branch has to consume it here — otherwise the
     # update is accepted and silently dropped.
@@ -378,30 +430,7 @@ def apply_job_update(
             _tsub = int(kwargs["timeout"])
         except (ValueError, TypeError) as e:
             raise ValueError(f"Invalid timeout: {kwargs['timeout']!r}") from e
-        if not 0 <= _tsub <= 86400:
-            raise ValueError(f"timeout must be within 0..86400, got {_tsub}")
-    # Per-job auto-pause threshold. Same pre-mutation position as the budget
-    # checks above: a rejected value raises before any field assignment lands.
-    # An explicit None RESETS to the global default; 0 opts the job out of
-    # auto-pause entirely. Both spellings are why the sentinel is a separate
-    # flag rather than the parsed value itself.
-    _apa: int | None = None
-    _apa_set = False
-    if "auto_pause_after" in kwargs:
-        _apa_set = True
-        _apa_raw = kwargs["auto_pause_after"]
-        if _apa_raw is None:
-            _apa = None
-        else:
-            if (
-                isinstance(_apa_raw, bool)
-                or not isinstance(_apa_raw, (int, float))
-                or (isinstance(_apa_raw, float) and not _apa_raw.is_integer())
-            ):
-                raise ValueError(f"Invalid auto_pause_after: {_apa_raw!r}")
-            _apa = int(_apa_raw)
-            if not 0 <= _apa <= 10000:
-                raise ValueError(f"auto_pause_after must be within 0..10000, got {_apa}")
+        _check_timeout_range(_tsub)
     # Vault secret grant: validated with the other pre-mutation
     # checks so a rejected grant cannot strand earlier field
     # mutations. An empty dict revokes (clears the pin too); a
@@ -469,12 +498,22 @@ def apply_job_update(
                 f"need >= {_eff_sub + _SUBPROC_CLEANUP_ALLOWANCE_SECS}, "
                 f"got {_eff_secs}"
             )
+    # Resolved here, before the first assignment, because a member schedule
+    # re-resolves its member's template and that can refuse: the job must be
+    # left untouched when it does.
+    recaptured = None
+    if "agent_id" in kwargs:
+        from kiro_crew.cron_service.identity import recapture_cron_template
+
+        recaptured = recapture_cron_template(job, kwargs["agent_id"] or "")
     if "name" in kwargs and kwargs["name"]:
         job.name = kwargs["name"]
     if "message" in kwargs and kwargs["message"]:
         job.message = kwargs["message"]
     if "agent_id" in kwargs:
         job.agent_id = kwargs["agent_id"] or ""
+        if recaptured is not None:
+            job.execution_context = recaptured
     if "channel" in kwargs:
         job.channel = kwargs["channel"] or None
     if "thread_ts" in kwargs:
@@ -531,6 +570,11 @@ def apply_job_update(
         job.chat_folder_id = ""
     if "model" in kwargs:
         job.model = str(kwargs["model"] or "").strip()
+    if "app_manifest_digest" in kwargs:
+        # The app bridge's own record of the manifest entry it applied. No
+        # operator surface (dashboard, MCP, CLI) forwards this key, so the
+        # only caller is the bridge re-applying a changed ``app.json`` entry.
+        job.app_manifest_digest = str(kwargs["app_manifest_digest"] or "")
     if "secret_env" in kwargs and kwargs["secret_env"] is not None:
         job.secret_env = dict(kwargs["secret_env"])
         # Pin travels with the grant; a revoke (empty map) clears it.
@@ -555,10 +599,10 @@ def apply_job_update(
         job.timeout_secs = _tsecs
     if _tsub is not None:
         job.timeout = _tsub
-    # Per-job auto-pause threshold: the only writer after creation, so an
-    # existing job is not stuck on its creation-time value.
-    if _apa_set:
-        job.auto_pause_after = _apa
+    if _auto_pause is not None:
+        # A new limit governs the NEXT failure; it does not lift a pause the
+        # job is already in -- resuming stays the user's explicit action.
+        job.auto_pause_after_failures = _auto_pause
 
     # Schedule changes (already validated above)
     if "cron_expr" in kwargs and kwargs["cron_expr"]:

@@ -21,7 +21,9 @@ import json
 import pytest
 from chat_test_helpers import _make_state
 
+from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
 from kiro_crew.dashboard import chat_persistence as cp
+from kiro_crew.dashboard.relay_archive import relay_archive_refusal
 from kiro_crew.dashboard.slot_buffers import (
     sanitize_restored_deferred_notes,
     serialize_deferred_notes,
@@ -53,15 +55,17 @@ _POPULATED: dict = {
     "model": "model-m",
     "reasoning_effort": "high",
     "autocompact_pct": 44.0,
+    "turn_timeout_secs": 28800,
     "_dismissed_source_links": {K1, K2},
     "workspace": "ws",
     "memory_store": "silo",
     "agent_kind": "member",
+    "crew_mode_agent": "kirocrew-conductor",
+    "app_agent_owner": "pr-bulk-ops/agent-a",
     "project": "/srv/p",
     "executor": "remote",
     "instance_id": "inst-1",
     "remote_slot": "rs-1",
-    "_relay_in_flight": True,
     "_turn_in_flight_generation": 2,
     "_turn_in_flight_prompt": PROMPT,
     "mode": "focus",
@@ -71,6 +75,8 @@ _POPULATED: dict = {
     "_origin": "cron",
     "_artifact": "my-artifact",
     "pinned": True,
+    "mutes_opened": True,
+    "muted": True,
     "color_index": 3,
     "color_hex": "#abcdef",
     "color_theme": "dark",
@@ -92,7 +98,6 @@ _QUEUE = [{"id": "q-1", "content": "queued", "meta": {"sendId": "s1"}}]
 #: Fields whose value lands on ``AppliedMeta`` (the reader acts on it) rather than
 #: on the slot.
 _APPLIED = {
-    "relay_in_flight": "relay_in_flight",
     "turn_in_flight_generation": "turn_generation",
     "turn_in_flight_prompt": "turn_prompt",
 }
@@ -116,16 +121,18 @@ _BASE_LINE_ORDER = (
     "model",
     "reasoning_effort",
     "autocompact_pct",
+    "turn_timeout_secs",
     "dismissed_source_links",
     "mode",
     "workspace",
     "memory_store",
     "agent_kind",
+    "crew_mode_agent",
+    "app_agent_owner",
     "project",
     "executor",
     "instance_id",
     "remote_slot",
-    "relay_in_flight",
     "turn_in_flight_generation",
     "turn_in_flight_prompt",
     "folder_id",
@@ -135,6 +142,8 @@ _BASE_LINE_ORDER = (
     "created_by",
     "artifact",
     "pinned",
+    "mutes_opened",
+    "muted",
     "color_index",
     "color_hex",
     "color_theme",
@@ -154,6 +163,8 @@ _BASE_MERGE_ORDER = (
     "folder_id",
     "tags",
     "pinned",
+    "mutes_opened",
+    "muted",
     "mode",
     "artifact",
     "reasoning_effort",
@@ -164,6 +175,7 @@ _BASE_MERGE_ORDER = (
     "model",
     "queued_prompts",
     "autocompact_pct",
+    "turn_timeout_secs",
     "title",
     "title_origin",
     "title_refresh_mark",
@@ -172,6 +184,8 @@ _BASE_MERGE_ORDER = (
     "workspace",
     "memory_store",
     "agent_kind",
+    "crew_mode_agent",
+    "app_agent_owner",
     "project",
     "app",
     "origin",
@@ -184,7 +198,6 @@ _BASE_MERGE_ORDER = (
     "executor",
     "instance_id",
     "remote_slot",
-    "relay_in_flight",
     "tab_id",
     "auto_tagged",
     "human_seen",
@@ -213,14 +226,19 @@ def _populated(state, *, app: str = "app-1"):
     return slot
 
 
-def _purpose(purpose: str, *, name: str, member=None, listed: object = "Listed"):
+def _purpose(purpose: str, *, name: str, member=None, listed: object = "Listed", **inputs):
+    """Build *purpose*; *inputs* are extra constructor keywords (the restore inputs)."""
     if purpose == codec.RESTORE:
-        return codec.Restore(name=name, member=member)
+        return codec.Restore(name=name, member=member, **inputs)
     if purpose == codec.RECENT:
         return codec.Recent(
-            name=name, member=member, listing={"title": listed}, history_key=f"dashboard_{name}"
+            name=name,
+            member=member,
+            listing={"title": listed},
+            history_key=f"dashboard_{name}",
+            **inputs,
         )
-    return codec.Resume(member=member, history_key=f"dashboard:{name}")
+    return codec.Resume(member=member, history_key=f"dashboard:{name}", **inputs)
 
 
 def _slot_folds(slot) -> codec.SaveFolds:
@@ -260,8 +278,6 @@ def _value(slot, applied, row):
 
 
 def _expected(source, row):
-    if row.key == "relay_in_flight":
-        return True
     if row.key == "queued_prompts":
         return durable_queue_entries(source._queue)
     return _value(source, None, row) if row.key not in _APPLIED else getattr(source, row.attr)
@@ -327,10 +343,9 @@ def test_the_table_declares_every_asymmetry_the_readers_had():
         "model": ["recent", "restore"],
         "reasoning_effort": ["recent", "restore"],
         "memory_store": ["recent", "restore"],
-        "executor": ["restore"],
-        "instance_id": ["restore"],
-        "remote_slot": ["restore"],
-        "relay_in_flight": ["restore"],
+        "executor": ["recent", "restore"],
+        "instance_id": ["recent", "restore"],
+        "remote_slot": ["recent", "restore"],
         "created_by": ["recent", "restore"],
         "app": ["recent", "restore"],
         "artifact": ["recent", "restore"],
@@ -431,6 +446,7 @@ def test_the_full_save_clears_by_absence_and_the_merge_by_a_falsy_value(tmp_path
         "title": "",
         "memory_store": "",
         "agent_kind": "",
+        "app_agent_owner": "",
         "project": "",
         "turn_in_flight_generation": 0,
         "turn_in_flight_prompt": None,
@@ -528,6 +544,60 @@ def test_a_line_with_no_model_falls_back_to_the_agents_configured_model(tmp_path
     assert resume.model == ""
 
 
+#: A line saved before ``model`` was a key of the metadata line.
+_NO_MODEL_KEY = object()
+
+
+@pytest.mark.parametrize("purpose", [codec.RESTORE, codec.RECENT])
+@pytest.mark.parametrize(
+    ("line_model", "restored"),
+    [
+        (_NO_MODEL_KEY, "model-of-kirocrew"),
+        ("", ""),
+        ("model-of-kirocrew", "model-of-kirocrew"),
+        ("picked-model", "picked-model"),
+    ],
+    ids=["legacy-line", "follows-the-default", "pin-equal-to-agent-model", "pin"],
+)
+def test_a_restart_takes_the_agents_model_only_for_a_line_with_no_model_key(
+    purpose, line_model, restored, tmp_path, monkeypatch
+):
+    """Every save writes ``model``, and ``""`` there is a chat that follows the default.
+
+    Filling that in from the agent's spec would pin the chat to whatever the default
+    was at the restart. A pin comes back as it was, even when it names the same model
+    the agent's spec does.
+    """
+    state = _state(tmp_path, monkeypatch)
+    meta: dict = {"agent": "kirocrew"}
+    if line_model is not _NO_MODEL_KEY:
+        meta["model"] = line_model
+    slot, _, _ = _read_back(
+        state, meta, purpose, agent="kirocrew", model_map={"kirocrew": "model-of-kirocrew"}
+    )
+    assert slot.model == restored
+
+
+@pytest.mark.parametrize("purpose", [codec.RESTORE, codec.RECENT])
+def test_a_crewmate_thread_that_follows_the_default_stays_unpinned(purpose, tmp_path, monkeypatch):
+    """A crewmate thread resolves the legacy fallback through its crewmate's kiro agent;
+    a thread whose line says ``""`` must not get that agent's model as a pin."""
+    state = _state(tmp_path, monkeypatch)
+    cfg = KiroCrewConfig()
+    cfg.agents["mate"] = KiroCrewAgentConfig(kiro_agent="kirocrew")
+    inputs = {"cfg": cfg, "model_map": {"kirocrew": "model-of-kirocrew"}}
+    meta = {"agent": "mate", "mode": "member", "model": ""}
+    slot, _, _ = _read_back(
+        state, meta, purpose, name="member-mate", member=("mate", "member"), **inputs
+    )
+    assert (slot.agent, slot.model) == ("mate", "")
+    del meta["model"]
+    legacy, _, _ = _read_back(
+        state, meta, purpose, name="member-mate-legacy", member=("mate", "member"), **inputs
+    )
+    assert legacy.model == "model-of-kirocrew"
+
+
 @pytest.mark.parametrize(
     ("raw", "restored"),
     [("focus", "focus"), ("crew", ""), ("orchestrator", ""), (7, ""), ("member", "member")],
@@ -552,14 +622,42 @@ def test_the_restricted_mark_follows_the_line_and_resume_clears_a_stale_one(tmp_
     assert "dashboard:h" not in state._restricted_keys
 
 
-def test_an_incomplete_remote_binding_keeps_the_marker_and_cannot_have_been_mid_relay(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("instance_id", "remote_slot", "expected"),
+    [("inst-1", "rs-1", ("remote", "inst-1", "rs-1")), ("", 5, ("remote", "", ""))],
+    ids=["complete", "incomplete"],
+)
+def test_an_old_relay_line_keeps_the_archive_marker_and_ignores_its_relay_flag(
+    tmp_path, monkeypatch, instance_id, remote_slot, expected
 ):
     state = _state(tmp_path, monkeypatch)
-    meta = {"executor": "remote", "instance_id": "", "remote_slot": 5, "relay_in_flight": True}
+    meta = {
+        "executor": "remote",
+        "instance_id": instance_id,
+        "remote_slot": remote_slot,
+        "relay_in_flight": True,
+    }
     slot, applied, _ = _read_back(state, meta, codec.RESTORE)
-    assert (slot.executor, slot.instance_id, slot.remote_slot) == ("remote", "", "")
-    assert applied.relay_in_flight is False
+    assert (slot.executor, slot.instance_id, slot.remote_slot) == expected
+    assert not hasattr(applied, "relay_in_flight")
+
+
+def test_a_recent_restored_relay_chat_stays_a_read_only_archive(tmp_path, monkeypatch):
+    """The recent-sessions restore keeps the relay marker: an old relay chat comes
+    back a read-only archive, and the next save writes the binding back."""
+    state = _state(tmp_path, monkeypatch)
+    meta = {"executor": "remote", "instance_id": "inst-1", "remote_slot": "rs-1"}
+    slot, _, _ = _read_back(state, meta, codec.RECENT)
+    assert (slot.executor, slot.instance_id, slot.remote_slot) == ("remote", "inst-1", "rs-1")
+    refusal = relay_archive_refusal(slot)
+    assert refusal is not None and refusal.status == 409
+    assert json.loads(refusal.text)["code"] == "relay_archive_read_only"
+    line = codec.encode(slot, folds=_slot_folds(slot))
+    assert (line["executor"], line["instance_id"], line["remote_slot"]) == (
+        "remote",
+        "inst-1",
+        "rs-1",
+    )
 
 
 def test_a_resume_drops_a_folder_only_on_a_verdict_about_that_folder(tmp_path, monkeypatch):

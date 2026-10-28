@@ -13,8 +13,6 @@ directions, which is why both are pinned here:
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 from kiro_crew import crew_log as lg
@@ -23,6 +21,7 @@ from kiro_crew.crew_log import session_tree_projection as stp
 from kiro_crew.dashboard import state as st
 from kiro_crew.dashboard.session_memory import lineage_parents
 from kiro_crew.dashboard.state import _attach_slot_parents
+from kiro_crew.testing.wait import wait_until
 
 GATEWAY = "gateway"
 
@@ -445,6 +444,89 @@ def test_a_chain_nests_to_whatever_depth_the_creating_went():
     assert rows[2]["parent"]["key"] == "chat-2"
 
 
+# ── a creator that closed under a chain that did not ───────────────────────
+
+
+def test_workers_of_a_closed_conductor_nest_under_the_lead_that_is_still_open():
+    """The case the lane exists to answer: a lead opens a conductor, the conductor
+    opens three workers, the conductor closes, and the lead still owns the run.
+
+    The workers nest on the lead and each keeps citing the conductor, so the row says
+    both things at once: where it belongs and that its own creator is gone.
+    """
+    _unit("s-lead", "chat-lead")
+    _unit("s-mid", "chat-mid", parent="chat-lead")
+    for i in (1, 2, 3):
+        _unit(f"s-w{i}", f"chat-w{i}", parent="chat-mid")
+    _seeded()
+
+    rows = _rows("chat-lead", "chat-w1", "chat-w2", "chat-w3")  # chat-mid is closed
+    _attach_slot_parents(rows)
+
+    assert rows[0]["parent"] is None
+    for row in rows[1:]:
+        assert row["parent"] == {"slot": "chat-mid", "key": "chat-lead", "ancestor": True}
+
+
+def test_the_nearest_open_ancestor_wins_over_the_root():
+    """``lead -> A -> B -> worker`` with ``B`` closed nests the worker under ``A``."""
+    _unit("s-lead", "chat-lead")
+    _unit("s-a", "chat-a", parent="chat-lead")
+    _unit("s-b", "chat-b", parent="chat-a")
+    _unit("s-w", "chat-w", parent="chat-b")
+    _seeded()
+
+    rows = _rows("chat-lead", "chat-a", "chat-w")  # chat-b is closed
+    _attach_slot_parents(rows)
+
+    assert rows[2]["parent"] == {"slot": "chat-b", "key": "chat-a", "ancestor": True}
+
+
+def test_a_whole_closed_chain_still_leaves_an_orphan_root():
+    """Nothing above the worker is open, so the row keeps the answer it always had --
+    top level, citation intact, and no flag claiming it moved."""
+    _unit("s-lead", "chat-lead")
+    _unit("s-mid", "chat-mid", parent="chat-lead")
+    _unit("s-w", "chat-w", parent="chat-mid")
+    _seeded()
+
+    rows = _rows("chat-w")
+    _attach_slot_parents(rows)
+
+    assert rows[0]["parent"] == {"slot": "chat-mid", "key": None}
+
+
+def test_both_surfaces_re_parent_the_same_worker(tmp_path, monkeypatch):
+    """One join, so the sidebar and the Sessions table cannot disagree about where a
+    worker whose conductor closed belongs."""
+    from chat_test_helpers import _make_state
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "reparent-home"))
+    stp.reset_for_tests()
+    _unit("s-lead", "chat-lead")
+    _unit("s-mid", "chat-mid", parent="chat-lead")
+    _unit("s-w", "chat-w", parent="chat-mid")
+    _seeded()
+
+    state = _make_state(tmp_path)
+    for key in ("chat-lead", "chat-w"):
+        state.get_or_create_slot(key)
+
+    aliases = state.spend_slot_by_session()
+    wire = {p["key"]: p["parent"] for p in state.serialize_slots()}["chat-w"]
+    table = lineage_parents([{"key": key} for key in aliases], stp.projection().nodes(), aliases)[
+        next(k for k, v in aliases.items() if v == "chat-w")
+    ]
+
+    lead_session = next(k for k, v in aliases.items() if v == "chat-lead")
+
+    # Same citation, same flag, and each key resolves in its OWN payload's space.
+    assert wire["slot"] == table["slot"] == "chat-mid"
+    assert wire["ancestor"] is True and table["ancestor"] is True
+    assert wire["key"] == "chat-lead"
+    assert table["key"] == lead_session
+
+
 # ── the guard ──────────────────────────────────────────────────────────────
 
 
@@ -757,9 +839,11 @@ def test_the_frame_after_the_seed_carries_the_edge():
     _unit("s-2", "chat-2", parent="chat-1")
 
     st._request_lineage_seed()
-    deadline = time.monotonic() + 10
-    while not stp.projection().seeded_for_current_store and time.monotonic() < deadline:
-        time.sleep(0.02)
+    wait_until(
+        lambda: stp.projection().seeded_for_current_store,
+        timeout=10,
+        describe=lambda: f"seeded_for_current_store={stp.projection().seeded_for_current_store!r}",
+    )
     assert stp.projection().seeded_for_current_store is True
 
     rows = _rows("chat-1", "chat-2")

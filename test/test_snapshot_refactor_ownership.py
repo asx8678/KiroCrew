@@ -1,6 +1,6 @@
 """Who owns each snapshot rule, and that the facade hands out that owner's objects.
 
-``kiro_crew.snapshot`` is the command and API facade; the rules it applies live in four
+``kiro_crew.snapshot`` is the command and API facade; the rules it applies live in six
 owner modules. These tests pin the ownership map itself: every name is defined in
 exactly one module, the facade re-exports the owner's object rather than a copy and a
 patch on the facade reaches the owner that calls it, the owners depend on one another in
@@ -21,9 +21,18 @@ from pathlib import Path
 import pytest
 from test_snapshot import SNAPSHOT_FAMILY
 
-from kiro_crew import _sqlite_compat
+from kiro_crew import (
+    _sqlite_compat,
+)
 from kiro_crew import snapshot as snap
-from kiro_crew import snapshot_archive, snapshot_components, snapshot_merge, snapshot_restore
+from kiro_crew import (
+    snapshot_archive,
+    snapshot_build,
+    snapshot_components,
+    snapshot_merge,
+    snapshot_merge_driver,
+    snapshot_restore,
+)
 
 SRC = Path(snap.__file__).parent
 REPO_SRC = SRC.parent
@@ -74,6 +83,7 @@ OWNERS: dict[str, tuple[str, ...]] = {
         "DatabaseCopyFailed",
         "EXPORT_MANIFEST_VERSION",
         "MANIFEST_VERSION",
+        "MAX_ARCHIVE_GIB_CEILING",
         "ManifestUnreadable",
         "SKIP_DB_UNPINNED_SOURCE",
         "_ArchiveTooLarge",
@@ -84,6 +94,7 @@ OWNERS: dict[str, tuple[str, ...]] = {
         "_FIRST_VERSION_WITH_NAMED_STORES",
         "_MAX_ARCHIVE_BYTES",
         "_MAX_ARCHIVE_MEMBERS",
+        "_bound_gib",
         "_bundle_carries_named_stores",
         "_chain_is_link_free",
         "_copy_database_consistently",
@@ -91,9 +102,13 @@ OWNERS: dict[str, tuple[str, ...]] = {
         "_data_filter",
         "_dir_flags_nofollow",
         "_escape_one",
+        "_hold_reader_lock",
+        "_immutable_read_may_stand_in",
         "_manifest_components",
         "_print_manifest",
+        "_refuse_if_changed_since",
         "_refuse_oversized_archive",
+        "_refuse_oversized_tree",
         "_refuse_unsound_required_capture",
         "_rejection_recording_filter",
         "_report_skip",
@@ -102,6 +117,7 @@ OWNERS: dict[str, tuple[str, ...]] = {
         "_staging_ignore",
         "_staging_is_pinned",
         "_terminal_safe",
+        "archive_byte_bound",
     ),
     "kiro_crew.snapshot_restore": (
         "NamedStoresInUse",
@@ -141,6 +157,9 @@ OWNERS: dict[str, tuple[str, ...]] = {
         "_TERMINATORS",
         "_copy_locked",
         "_copy_tree_no_overwrite",
+        "_core_file_not_installed",
+        "_cron_rewrite_in_place",
+        "_install_core_file_if_absent",
         "_install_notifications",
         "_merge_crons",
         "_merge_memory",
@@ -148,29 +167,42 @@ OWNERS: dict[str, tuple[str, ...]] = {
         "_merge_notifications",
         "_notification_key",
         "_open_notification_file",
+        "_read_cron_store_once",
         "_report_unmerged_databases",
         "_serialise_with_notification_writes",
         "_usable_cron_shape",
         "_validate_identifier",
+        "_write_merged_crons",
     ),
-    # What the facade itself defines: the two commands, the outbound redaction seam
-    # (every redaction call name stays in this one module), the manifest writer, the
-    # merge-mode driver, and the notification copy whose docstring records the ruling
-    # for platforms without O_NOFOLLOW.
-    "kiro_crew.snapshot": (
-        "RedactionFailed",
-        "_DASHBOARD_PORT",
-        "_audit",
+    # The manifest writer and the size estimate that runs before it.
+    "kiro_crew.snapshot_build": (
         "_build_snapshot",
-        "_copy_notifications",
-        "_default_snapshot_dir",
-        "_do_merge",
         "_estimate_selected_bytes",
         "_fsize",
+    ),
+    # The merge-mode driver, and the notification copy whose docstring records the ruling
+    # for platforms without O_NOFOLLOW.
+    "kiro_crew.snapshot_merge_driver": (
+        "_copy_notifications",
+        "_do_merge",
+    ),
+    # What the facade itself defines: the two commands and the outbound redaction seam
+    # (every redaction call name stays in this one module).
+    "kiro_crew.snapshot": (
+        "EXIT_INCOMPLETE",
+        "RedactionFailed",
+        "_DASHBOARD_PORT",
+        "_MAX_ARCHIVE_GIB_HELP",
+        "_archive_bound_from_args",
+        "_audit",
+        "_cron_names",
+        "_default_snapshot_dir",
+        "_hold_back_executables",
         "_is_gateway_running",
         "_list_components",
         "_redacted_upload_copy",
         "_redactor",
+        "_report_held_back",
         "_report_redacted_bundle",
         "_report_redaction",
         "_report_unredacted_upload",
@@ -188,6 +220,8 @@ _MODULES = {
     "kiro_crew.snapshot_archive": snapshot_archive,
     "kiro_crew.snapshot_restore": snapshot_restore,
     "kiro_crew.snapshot_merge": snapshot_merge,
+    "kiro_crew.snapshot_build": snapshot_build,
+    "kiro_crew.snapshot_merge_driver": snapshot_merge_driver,
 }
 
 #: Which owners each owner may import. The facade imports all of them; nothing imports
@@ -200,6 +234,17 @@ ALLOWED_IMPORTS: dict[str, frozenset[str]] = {
     ),
     "kiro_crew.snapshot_merge": frozenset(
         {"kiro_crew.snapshot_components", "kiro_crew.snapshot_archive"}
+    ),
+    "kiro_crew.snapshot_build": frozenset(
+        {"kiro_crew.snapshot_components", "kiro_crew.snapshot_archive"}
+    ),
+    "kiro_crew.snapshot_merge_driver": frozenset(
+        {
+            "kiro_crew.snapshot_components",
+            "kiro_crew.snapshot_archive",
+            "kiro_crew.snapshot_restore",
+            "kiro_crew.snapshot_merge",
+        }
     ),
 }
 

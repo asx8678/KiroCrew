@@ -379,7 +379,7 @@ _ARTIFACT_HTML_CSP = (
 #: 'unsafe-inline'`. That path is reachable: the composer agent writes the file
 #: and a link to it in `specs/brief.md`, which the frontend renders as a real
 #: anchor. `redact()` removes credentials, not markup, so it is no defence here.
-#: `dashboard/handlers/files.py` already records the same hazard ("SVG can contain
+#: `dashboard/file_api/outbox.py` already records the same hazard ("SVG can contain
 #: scripts — never serve inline on the dashboard origin").
 _SCRIPT_CAPABLE_CONTENT_TYPES = ("text/html", "image/svg+xml")
 
@@ -692,8 +692,8 @@ def _deps_status() -> dict:
         # The one missing tool the user must install themselves, with the command
         # for THIS platform. Data for the UI to show — never run from here.
         "hints": (
-            {preview_tools.SOFFICE: preview_tools.soffice_hint()}
-            if preview_tools.SOFFICE in missing
+            {preview_tools.SOFFICE: hint}
+            if preview_tools.SOFFICE in missing and (hint := preview_tools.soffice_hint())
             else {}
         ),
     }

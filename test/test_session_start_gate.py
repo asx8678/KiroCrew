@@ -26,8 +26,9 @@ from kiro_crew.acp.runtime import (
 )
 from kiro_crew.acp.types import METHOD_MCP_SERVER_INITIALIZED, METHOD_SESSION_NEW
 from kiro_crew.start_priority import StartPriority
+from kiro_crew.testing.wait import await_until
 
-# The run.py tests below drive ``SubagentManager.spawn``, which refuses while
+# The run_turn.py tests below drive ``SubagentManager.spawn``, which refuses while
 # the host looks short of memory -- the runner's state, not this test's input.
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
@@ -440,7 +441,7 @@ async def test_a_late_adopted_session_receives_its_staged_init_frames():
         _feed(reader, _mcp_frame("late-sid", "beta"))
         await _await_collected(collector, 2)
         _feed(reader, {"id": collector.req_id, "result": {"sessionId": "late-sid"}})
-        await asyncio.wait_for(collector.settled.wait(), timeout=5.0)
+        await await_until(collector.settled, what="collector settled")
         assert collector.outcome == START_OUTCOME_ADOPTED
         assert [h.session_id for h in adopted] == ["late-sid"]
         assert adopted[0].mcp_session_report().payload()["ready"] == ["alpha", "beta"]
@@ -470,7 +471,7 @@ async def test_a_settled_collector_leaks_no_frames_into_the_next_start(answer_la
         with patch.object(rt, "terminate_session", AsyncMock()):
             if answer_late:
                 _feed(reader, {"id": collector.req_id, "result": {"sessionId": "late-sid"}})
-            await asyncio.wait_for(collector.settled.wait(), timeout=5.0)
+            await await_until(collector.settled, what="collector settled")
         assert collector.outcome == (
             START_OUTCOME_TORN_DOWN if answer_late else START_OUTCOME_ABANDONED
         )
@@ -484,7 +485,7 @@ async def test_a_settled_collector_leaks_no_frames_into_the_next_start(answer_la
         assert "no report from alpha" in str(second.value)
         assert rt._session_inits_in_flight == 0
         # Settle the second collector too, so no task outlives the test.
-        await asyncio.wait_for(second.value.collector.settled.wait(), timeout=5.0)
+        await await_until(second.value.collector.settled, what="second collector settled")
     finally:
         await _stop_reader(reader_task)
 
@@ -495,6 +496,22 @@ async def test_two_live_collectors_do_not_claim_each_others_frames():
     hold both frames -- and each adoption takes only the frames naming its own
     session."""
     rt, reader, _ = _make_runtime()
+    # The adoption this test proves is driven by frame ROUTING, not by the
+    # collect budget expiring: each collector adopts only the frames naming its
+    # own session, and that outcome is read from ``settled.wait`` /
+    # ``_dropped_frames`` below, never from the clock. ``_make_runtime``'s 0.4s
+    # collect budget is the one WALL-TIME input, and it is not a signal the
+    # production path resolves -- it is the collector's own abandon deadline. The
+    # staging + answering between the two live collectors is real work that runs
+    # ~0.37s unloaded (5x --durations, all 0.37s), ~93% of the 0.4s budget, so a
+    # loaded shard tips both collectors into ``abandoned`` and the routing
+    # assertion loses to the clock. The determinism contract wants such a budget
+    # sized as a lost-run ceiling that only ends a broken run, so use
+    # ``_SETTLE_BACKSTOP`` (30s) -- the named ceiling the ``settled.wait`` below
+    # also bounds against: >10x the ~0.37s + load worst case and well under half
+    # the suite's ``--timeout=120``, so a genuine hang still fails loudly here
+    # rather than racing the clock.
+    rt._start_collect_timeout = _SETTLE_BACKSTOP
     reader_task = await _start_reader(rt)
     adopted: dict = {}
 
@@ -521,8 +538,8 @@ async def test_two_live_collectors_do_not_claim_each_others_frames():
         await _await_collected(col_b, 2)
         _feed(reader, {"id": col_a.req_id, "result": {"sessionId": "late-a"}})
         _feed(reader, {"id": col_b.req_id, "result": {"sessionId": "late-b"}})
-        await asyncio.wait_for(col_a.settled.wait(), timeout=5.0)
-        await asyncio.wait_for(col_b.settled.wait(), timeout=5.0)
+        await await_until(col_a.settled, what="col_a settled")
+        await await_until(col_b.settled, what="col_b settled")
         assert (col_a.outcome, col_b.outcome) == (START_OUTCOME_ADOPTED, START_OUTCOME_ADOPTED)
         assert adopted["a"].mcp_session_report().payload()["ready"] == ["alpha"]
         assert adopted["b"].mcp_session_report().payload()["ready"] == ["beta"]
@@ -550,7 +567,7 @@ async def test_timeout_then_late_response_without_adopter_is_torn_down(memory_mo
             patch.object(runtime_mod.AcpSessionHandle, "cleanup_transcript_files") as cleanup,
         ):
             _feed(reader, {"id": collector.req_id, "result": {"sessionId": "late-sid"}})
-            await asyncio.wait_for(collector.settled.wait(), timeout=2.0)
+            await await_until(collector.settled, what="collector settled")
             term.assert_awaited_once_with("late-sid")
             kill.assert_not_awaited()
             if memory_mode == "persistent":
@@ -579,7 +596,7 @@ async def test_adopter_declining_tears_the_late_session_down():
         collector = ei.value.collector
         with patch.object(rt, "terminate_session", AsyncMock()) as term:
             _feed(reader, {"id": collector.req_id, "result": {"sessionId": "late-sid"}})
-            await asyncio.wait_for(collector.settled.wait(), timeout=2.0)
+            await await_until(collector.settled, what="collector settled")
             term.assert_awaited_once_with("late-sid")
         assert collector.outcome == START_OUTCOME_TORN_DOWN
         assert gate.releases == 1
@@ -599,7 +616,7 @@ async def test_collector_deadline_abandons_the_attempt_and_releases_gate_once():
         with pytest.raises(AcpSessionStartTimeout) as ei:
             await rt.create_session(cwd="/w", mcp_servers=[])
         collector = ei.value.collector
-        await asyncio.wait_for(collector.settled.wait(), timeout=2.0)
+        await await_until(collector.settled, what="collector settled")
         assert collector.outcome == START_OUTCOME_ABANDONED
         assert collector.req_id not in rt._pending_requests
         assert rt._start_collectors == {}
@@ -624,7 +641,7 @@ async def test_runtime_death_settles_collector_without_teardown():
         await _await_collected(collector, 1)
         with patch.object(rt, "terminate_session", AsyncMock()) as term:
             rt._mark_dead("test: process exited")
-            await asyncio.wait_for(collector.settled.wait(), timeout=2.0)
+            await await_until(collector.settled, what="collector settled")
             term.assert_not_awaited()
         assert collector.outcome == runtime_mod.START_OUTCOME_RUNTIME_DEAD
         assert gate.releases == 1
@@ -659,7 +676,7 @@ async def test_a_death_the_collector_timeout_beat_is_still_runtime_dead():
         rt._dead = True
         collector.timeout = 0.01
         with patch.object(rt, "terminate_session", AsyncMock()) as term:
-            await asyncio.wait_for(collector.settled.wait(), timeout=2.0)
+            await await_until(collector.settled, what="collector settled")
             term.assert_not_awaited()
         assert collector.outcome == runtime_mod.START_OUTCOME_RUNTIME_DEAD
     finally:
@@ -712,7 +729,7 @@ def test_pending_requests_adopt_keeps_entry_until_response():
         loop.close()
 
 
-# ── run.py: congestion never falls back to a dedicated process ────────────────
+# ── run_turn.py: congestion never falls back to a dedicated process ───────────
 
 
 class _FakeCollector:
@@ -831,9 +848,13 @@ async def test_a_gate_queued_claim_already_counts_as_initializing():
     """
     rt, _reader, _ = _make_runtime()
     admitted = asyncio.Event()
+    queued = asyncio.Event()
 
     class _BlockingGate:
         async def acquire(self, priority=None):
+            # The claim is now queued behind the gate: the product reached its
+            # own gate call, which comes AFTER the init scope opens.
+            queued.set()
             await admitted.wait()
             raise RuntimeError("not admitted in this test")
 
@@ -842,10 +863,17 @@ async def test_a_gate_queued_claim_already_counts_as_initializing():
 
     with patch.object(runtime_mod, "session_start_gate", _fake_gate):
         start = asyncio.create_task(rt.create_session(cwd="/w"))
-        for _ in range(200):
-            if rt._session_inits_in_flight:
-                break
-            await asyncio.sleep(0.005)
+        # Wait for the claim to be QUEUED -- the gate's own ``acquire`` entry --
+        # not for a fixed number of loop turns. Everything before the gate
+        # (roster resolution and the control-plane mount, both ``to_thread``
+        # hops) runs on the default executor, which a loaded shard schedules
+        # late; a turn-counted poll closes before the claim gets there and
+        # reads the scope as never opened. ``_SETTLE_BACKSTOP`` only turns a
+        # genuine hang into this test's failure instead of pytest's --timeout.
+        try:
+            await asyncio.wait_for(queued.wait(), timeout=_SETTLE_BACKSTOP)
+        except asyncio.TimeoutError:
+            raise AssertionError("queued claim never reached the admission gate") from None
         try:
             assert rt._session_inits_in_flight == 1, "queued claim never opened its init scope"
             assert rt.has_active_or_initializing_sessions(), (
@@ -882,7 +910,12 @@ async def test_a_cancelled_gate_wait_closes_the_init_scope():
 
     with patch.object(runtime_mod, "session_start_gate", _fake_gate):
         start = asyncio.create_task(rt.create_session(cwd="/w"))
-        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        # Wait for the task to reach gate.acquire() -- not a fixed number of loop
+        # turns. Two asyncio.to_thread hops (roster resolution and the control-plane
+        # mount) run before the gate; a loaded CI shard schedules them late and a
+        # short fixed timeout races against that delay. await_until() uses half the
+        # test's own timeout as a lost-run bound and only names a genuine hang.
+        await await_until(entered, what="gate entered")
         assert rt._session_inits_in_flight == 1
         start.cancel()
         with pytest.raises(asyncio.CancelledError):

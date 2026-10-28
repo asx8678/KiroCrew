@@ -34,11 +34,15 @@ Error model:
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
+from typing import Any, Awaitable, Callable
+
+from kiro_crew.edition import is_enterprise
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +199,10 @@ class NotPublishedError(PublishError):
     """Precondition failure — the artifact is not published (→ 409)."""
 
 
+class PublishDeniedError(PublishError):
+    """The publish policy refused this send at dispatch (→ 403)."""
+
+
 class DriveNotFound(PublishError):
     """The destination this publication is bound to could not be resolved.
 
@@ -347,8 +355,10 @@ class PublishProvider(ABC):
     #: internet, which is the truth for a public web destination and a falsehood
     #: for one that stores content privately behind a login. Shown where it is
     #: false, the gate trains the user to click past it where it is true.
-    #: The publish flow always requests ``visibility: PUBLIC``, so ``False`` is
-    #: a statement about that request: even a publication the provider files as
+    #: The publish flow requests ``visibility: PUBLIC`` unless the user picks
+    #: Private, which is offered only on a first publish whose sharing model
+    #: supports both, and shows neither the warning nor the acknowledgment. So ``False`` is
+    #: a statement about a PUBLIC request: even a publication the provider files as
     #: PUBLIC is served only to an authenticated reader. A provider whose PUBLIC
     #: publications are readable by anyone must leave this ``True``.
     #: Default ``True`` -- the failure mode of a wrong default is a missing
@@ -515,7 +525,16 @@ class PublishProvider(ABC):
         return SyncModel()
 
     def discovery_model(self) -> DiscoveryModel:
-        """Which discovery primitives the browse UI can offer (design §2.5)."""
+        """Which discovery primitives the browse UI can offer (design §2.5).
+
+        A provider that keeps the base :meth:`list_remote` cannot list any
+        scope, so it advertises no listing; the browse UI then never asks it
+        for one. A provider that implements ``list_remote`` gets the default
+        mine + shared + public shape, and overrides this method when it lists
+        only some of those scopes.
+        """
+        if type(self).list_remote is PublishProvider.list_remote:
+            return DiscoveryModel(list_mine=False, list_shared_with_me=False, list_public=False)
         return DiscoveryModel()
 
     # ── discovery (optional — default returns None = unsupported) ─────────
@@ -526,8 +545,11 @@ class PublishProvider(ABC):
         """List remote items for a discovery ``scope`` (mine/shared/public).
 
         Returns ``{"artifacts": list[RemoteListing-as-dict], "next_page_token":
-        str | None}`` or ``None`` when the provider can't list for that scope.
-        Powers the provider-routed browse UI. Best-effort: must not raise.
+        str | None}`` or ``None`` when the provider does not list that scope at
+        all. Powers the provider-routed browse UI, which treats ``None`` as
+        "skip this scope" rather than as a failure. A failure to list a scope
+        the provider does support (expired credentials, an unreachable remote)
+        raises instead, so the browse UI shows its reason.
         """
         return None
 
@@ -605,8 +627,50 @@ def get_provider(name: str = DEFAULT_PROVIDER) -> PublishProvider:
     if factory is None:
         raise PublishUnavailableError(f"unknown publish provider: {name!r}")
     inst = factory()
+    if is_enterprise():
+        _gate_sends(inst, name)
     _INSTANCES[name] = inst
     return inst
+
+
+#: The provider methods that send bytes or text to the destination, or widen who
+#: can see it there. Reads and withdrawals (``unpublish``) are not gated: refusing
+#: a withdrawal would strand content that is already out.
+_SEND_METHODS = (
+    "publish",
+    "push_version",
+    "update_sharing",
+    "post_comment",
+    "reply_comment",
+    "mark_review",
+    "delete_comment",
+    "edit_comment",
+)
+
+
+def _gate_sends(inst: PublishProvider, name: str) -> None:
+    """Enterprise: make every send method of ``inst`` ask the publish policy first.
+
+    This is the one point every artifact send passes, whichever handler started it
+    and however often it re-read the artifact's ``meta.json`` before. The check
+    names ``name``, the registry key this instance serves, which is the
+    destination the bytes go to. A refusal raises :class:`PublishDeniedError`
+    before the provider runs.
+    """
+    from kiro_crew.publish_governance import dispatch_denied_reason
+
+    def gated(method: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+        @functools.wraps(method)
+        async def send(*args: Any, **kwargs: Any) -> Any:
+            reason = await asyncio.to_thread(dispatch_denied_reason, name)
+            if reason is not None:
+                raise PublishDeniedError(reason)
+            return await method(*args, **kwargs)
+
+        return send
+
+    for attr in _SEND_METHODS:
+        setattr(inst, attr, gated(getattr(inst, attr)))
 
 
 def reset_providers() -> None:

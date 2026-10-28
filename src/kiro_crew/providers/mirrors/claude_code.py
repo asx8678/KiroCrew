@@ -91,13 +91,20 @@ class ClaudeCodeMirror(AgentConfigMirror):
             ),
             Concern.MODEL: Ruling(
                 _D.DELIVERED,
-                "settings.local.json `model` when the session pinned one, plus the "
+                "settings.local.json `model` when the session pinned one and the "
+                "provider-advertised model cache is warm (omitted, with "
+                "availableModels, on a cold cache), plus the "
                 "session/set_config_option verb. DEFAULT_MODEL ('auto') is omitted "
-                "so the adapter picks the allowlist head",
+                "so the adapter takes the user's own model setting",
             ),
             Concern.MODEL_ALLOWLIST: Ruling(
                 _D.DELIVERED,
-                "settings.local.json `availableModels` from model_registry. Not "
+                "settings.local.json `availableModels` from "
+                "model_registry.seed_available_models: the provider-advertised ids, "
+                "never the static registry. The key is written only when that cache "
+                "is warm AND another settings source (user, project or managed) "
+                "defines availableModels, since a specific id disables the family "
+                "alias wildcard; otherwise it is omitted. Not "
                 "cosmetic: the adapter merges availableModels across every settings "
                 "source, so a user ~/.claude carrying a short list collapses a "
                 "versioned [1m] id back to the 200K window",
@@ -231,26 +238,28 @@ class ClaudeCodeMirror(AgentConfigMirror):
 
         ``denied_tools`` stays empty: the deny channel is the settings file, not
         a client-side refusal. ``kwargs`` may carry ``session_key`` /
-        ``channel_id``, which this backend ignores -- a claude MCP child inherits
-        the adapter's process env, so identity needs no element-level carry.
+        ``channel_id``; only the key is read, and only to find a crewmate's worker
+        spec -- a claude MCP child inherits the adapter's process env, so identity
+        needs no element-level carry.
 
         Same blocking allowance and the same wiring obligation as
         :meth:`session_params` (H13).
         """
-        del kwargs
         projection = session_mcp_projection(
             agent,
             stub_server_names=stub_server_names,
             work_dir=work_dir,  # type: ignore[arg-type]
+            # A crewmate's worker reads its own spec by its session's record.
+            session_key=str(kwargs.get("session_key") or ""),
         )
         if not permission_surface_owned:
             logger.warning(
                 "session MCP: withholding the whole mcpServers array, pooled broker stubs "
-                "included -- Crew does not own this session's settings.local.json, so a "
-                "permissions.allow entry there could pre-approve a Crew tool and skip "
-                "session/request_permission entirely. This session runs without Crew's MCP "
-                "tools; the client's own warning names why the file could not be left out. "
-                "Removing or renaming the project's .claude/settings.local.json restores them.",
+                "included -- Crew does not govern this session's .claude/settings.local.json, "
+                "and a tool approved in a file Crew does not govern would never reach Crew's "
+                "permission check. This session runs without Crew's MCP tools. The ACP "
+                "client's log lines for that file name the cause and its fix; removing the "
+                "file does not help while another Crew session holds it.",
             )
             return SessionProjection(params={"mcpServers": []}, zero_tools=projection.zero_tools)
         out: list[dict[str, Any]] = list(projection.servers)
@@ -279,4 +288,5 @@ class ClaudeCodeMirror(AgentConfigMirror):
             disabled_servers=projection.disabled_servers,
             derived_spec_snapshot=projection.derived_spec_snapshot,
             zero_tools=projection.zero_tools,
+            agent_spec=projection.agent_spec,
         )

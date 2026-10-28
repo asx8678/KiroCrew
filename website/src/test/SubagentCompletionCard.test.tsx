@@ -244,6 +244,22 @@ describe('SubagentCompletionCard rendering', () => {
     expect(screen.getByText(`${'x'.repeat(120)}…`)).toBeTruthy()
   })
 
+  it('keeps an emoji whole when the headline cut lands mid-surrogate-pair', () => {
+    // 119 ASCII + 😀 (two UTF-16 units) straddles the 120-unit cap: a plain
+    // .slice(0, 120) keeps the emoji's lone high surrogate, which renders as
+    // U+FFFD. sliceCodePoints moves the end edge back off the pair, so the cut
+    // lands at 119 and the label ends cleanly in '…'.
+    const task = 'x'.repeat(119) + '😀' + 'y'.repeat(20)
+    const emojiTask = SINGLE.replace('Add TWO short UI labels to the GERMAN (de) catalog', task)
+    renderWithProviders(<SubagentCompletionCard message={msg(emojiTask)} />, { store: store() })
+    const shown = screen.getByText(`${'x'.repeat(119)}…`)
+    expect(shown).toBeTruthy()
+    // No lone surrogate reached the DOM.
+    const hasLoneSurrogate = (s: string) =>
+      /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(s)
+    expect(hasLoneSurrogate(shown.textContent || '')).toBe(false)
+  })
+
   it('leaves a task that fits unmarked', () => {
     renderWithProviders(<SubagentCompletionCard message={msg()} />, { store: store() })
     expect(screen.getByText('Add TWO short UI labels to the GERMAN (de) catalog')).toBeTruthy()
@@ -504,12 +520,11 @@ describe('card containment', () => {
     // Focusable is not enough: pre-fix the only indicator was the UA
     // :focus-visible outline, which the card root's overflow-hidden clips to
     // a hairline on the top edge alone — an INSET ring is the one indicator
-    // its own clipping cannot swallow (WCAG 2.4.7). Each class is pinned
-    // literally — dropping any one silently removes the indicator.
-    expect(body.classList.contains('focus-visible:outline-hidden')).toBe(true)
-    expect(body.classList.contains('focus-visible:ring-2')).toBe(true)
-    expect(body.classList.contains('focus-visible:ring-inset')).toBe(true)
-    expect(body.classList.contains('focus-visible:ring-accent')).toBe(true)
+    // its own clipping cannot swallow (WCAG 2.4.7). The shared
+    // `focus-ring-accent-inset` utility paints that inset ring plus an opaque
+    // `--text-strong` hairline so it also clears WCAG 1.4.11's 3:1 non-text
+    // contrast in every theme (issue #4428); dropping it removes the indicator.
+    expect(body.classList.contains('focus-ring-accent-inset')).toBe(true)
   })
 })
 

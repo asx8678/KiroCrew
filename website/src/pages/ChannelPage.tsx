@@ -277,7 +277,7 @@ function AgentControlRow({ agent, onDismiss, onListenChange, onClearContext }: {
   // keyboard contract moves focus INTO the menu on open, and the row holding
   // it is unmounted by the close — without a restore, focus would be orphaned
   // on <body>. Outside-click dismissal is left alone (the browser routes focus
-  // per the click target), matching the MicSourceMenu posture (#6267).
+  // per the click target), matching the MicSourceMenu posture.
   const triggerRef = useRef<HTMLButtonElement>(null)
   // The role="menu" element itself — narrower than `menuRef` (which wraps the
   // trigger too) so item discovery never picks up the trigger button.
@@ -286,7 +286,7 @@ function AgentControlRow({ agent, onDismiss, onListenChange, onClearContext }: {
 
   // role="menu" promises the WAI-ARIA menu keyboard contract (arrow-key row
   // navigation with wrap, Home/End, Tab containment). The shared hook owns it
-  // for all role="menu" surfaces rather than re-spelled here (#6231, #6269).
+  // for all role="menu" surfaces rather than re-spelled here.
   // The rows are native <button>s (`Btn`), so the hook's item discovery finds
   // them with no extra markup. Escape stays owned by the dismiss effect below:
   // what "close" means here — menu state, focus restore — is this host's
@@ -549,7 +549,6 @@ function AddAgentForm({ onAdd, onCancel }: { onAdd: (role: string, task: string,
   return (
     <div className="p-2 space-y-2 border-t border-border">
       <div>
-        <span className="text-[11px] text-muted font-medium mb-1 block">{i18nT('pages.channelPage.agent')}</span>
         <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent || defaultAgent} onChange={setAgent} rosterFailure={rosterFailure} />
       </div>
       <Input value={role} onChange={e => setRole(e.target.value)} placeholder={i18nT('pages.channelPage.role_e_g_logs_agent')} aria-label={i18nT('pages.channelPage.role')} autoFocus
@@ -671,7 +670,7 @@ export default function ChannelPage() {
     }).catch(e => fail('pages.channelPage.failed_to_load_channel', e))
   }, [activeId, fail])
 
-  // Channel WS events dispatched via existing useWebSocket in App.tsx
+  // Channel WS events dispatched via existing useWebSocket in shell/appShell.tsx
   // Listen for custom events on window
   useEffect(() => {
     const handler = (e: Event) => {
@@ -829,7 +828,7 @@ export default function ChannelPage() {
         <div className="flex-1 overflow-y-auto p-2 space-y-1">
           {/* An empty list is only "no channels yet" when the read succeeded:
               under a load failure the onboarding copy would claim zero channels. */}
-          {channels.length === 0 && !listFailed && <EmptyState icon={<MessageSquare className="lucide-inline" />} title={i18nT('pages.channelPage.no_channels_yet')} subtitle={i18nT('pages.channelPage.click_new_to_create_one')} />}
+          {channels.length === 0 && !listFailed && <EmptyState icon={<MessageSquare className="lucide-inline" />} title={i18nT('pages.channelPage.no_channels_yet')} />}
           {channels.map(ch => (
             <ChannelListItem key={ch.id} ch={ch} active={ch.id === activeId} onClick={() => { setActiveId(ch.id); openDetail() }} />
           ))}

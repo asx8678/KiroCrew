@@ -20,24 +20,26 @@ const MAX_KIRO_BONUS_DAYS_LEFT = 3_650
  */
 export type KiroUsageState =
   | KiroCreditUsage
+  | KiroAccountOnly
   | 'none'
-  | KiroApiKeyUsage
+  | 'api-key'
   | 'signin-required'
   | null
 
 /**
- * API-key auth: the account limit is never reported, but the local usage store
- * still holds today's rows. `localCreditsToday` is `null` when the gateway did not
- * send a figure, so the modal shows the plain notice alone.
+ * A sign-in with no balance (`reason: account_unproven`): the whoami names
+ * the provider and no user, so only the account type is known. The gateway
+ * publishes this state only when email and start URL are absent, so the type
+ * is the one field it carries.
  */
-export interface KiroApiKeyUsage {
-  readonly kind: 'api-key'
-  readonly localCreditsToday: number | null
+export interface KiroAccountOnly {
+  accountOnly: true
+  accountType?: string
 }
 
-/** True for the API-key sentinel, so callers never compare the object by identity. */
-export const isApiKeyUsage = (usage: unknown): usage is KiroApiKeyUsage =>
-  typeof usage === 'object' && usage !== null && (usage as { kind?: unknown }).kind === 'api-key'
+/** True for the signed-in-account-without-a-balance state. */
+export const isAccountOnly = (state: unknown): state is KiroAccountOnly =>
+  typeof state === 'object' && state !== null && (state as { accountOnly?: unknown }).accountOnly === true
 
 export function parseKiroUsagePayload(d: { usage?: KiroUsagePayload } | undefined): KiroUsageState {
   const u: KiroUsagePayload = d?.usage || {}
@@ -115,12 +117,12 @@ export function parseKiroUsagePayload(d: { usage?: KiroUsagePayload } | undefine
   // credential -> also terminal, with its remedy named: sign in again. Empty
   // cache (Kiro warming) -> spinner.
   if (u.available === false) {
-    if (u.reason === 'api_key_auth') {
-      const local = u.local_credits_today
-      const localCreditsToday = typeof local === 'number' && Number.isFinite(local) ? local : null
-      return { kind: 'api-key', localCreditsToday } satisfies KiroApiKeyUsage
-    }
+    if (u.reason === 'api_key_auth') return 'api-key' as const
     if (u.reason === 'signin_required') return 'signin-required' as const
+    if (u.reason === 'account_unproven') {
+      const type = u.account_type
+      return { accountOnly: true, accountType: typeof type === 'string' && type ? type : undefined }
+    }
     return 'none' as const
   }
   return null

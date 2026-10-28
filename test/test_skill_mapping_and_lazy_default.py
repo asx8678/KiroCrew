@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -343,7 +344,6 @@ class TestScopedDiscovery:
     async def test_gateway_list_and_exact_read_share_the_session_mapping(
         self, tmp_path, monkeypatch, opened
     ):
-        import json
         from types import SimpleNamespace
         from urllib.parse import urlencode
 
@@ -375,6 +375,7 @@ class TestScopedDiscovery:
         page = await call(action="list", limit=2)
         assert [row["key"] for row in page["matches"]] == ["team/s0", "team/s1"]
         assert page["next_offset"] == 2
+        assert page["scoped"] is True
         tail = await call(action="list", limit=2, offset=2)
         assert [row["key"] for row in tail["matches"]] == ["team/s2"]
         assert tail["next_offset"] is None
@@ -383,8 +384,50 @@ class TestScopedDiscovery:
         # Clearing the custom mapping must not widen any discovery surface.
         paths.clear()
         assert (await call(action="list"))["matches"] == []
-        assert (await call(action="search", q="outside"))["matches"] == []
+        cleared = await call(action="search", q="outside")
+        assert cleared["matches"] == []
+        assert cleared["scoped"] is True
         assert (await call(action="read", key="outside"))["matches"] == []
+
+    @pytest.mark.asyncio
+    async def test_gateway_wildcard_mapping_reports_scope_without_a_count(
+        self, tmp_path, monkeypatch, opened
+    ):
+        """One `skill://.../*/SKILL.md` glob maps many skills, so the route must
+        say the search was scoped without counting glob entries as skills."""
+        from types import SimpleNamespace
+        from urllib.parse import urlencode
+
+        from aiohttp import web
+        from aiohttp.test_utils import make_mocked_request
+
+        from kiro_crew.dashboard.handlers import prompts
+
+        root = tmp_path / "skills"
+        for n in range(3):
+            _skill(root, f"team/s{n}")
+        loader = _loader(tmp_path, opened=opened)
+        monkeypatch.setattr(prompts, "_read_session_key", lambda request: "dashboard:scoped")
+        monkeypatch.setattr(prompts, "_deny_foreign_app_skill_slot", lambda *args: None)
+        monkeypatch.setattr(prompts, "_get_skills", lambda state: loader)
+        monkeypatch.setattr(prompts, "requesting_slot_project", lambda *args: None)
+        monkeypatch.setattr(prompts, "_named_slot", lambda *args: SimpleNamespace(agent="custom"))
+        wildcard = [str(root / "team" / "*" / "SKILL.md")]
+        monkeypatch.setattr(prompts, "session_skill_globs", lambda *args, **kw: wildcard)
+        app = web.Application()
+        app["state"] = SimpleNamespace(sessions=None)
+
+        async def call(**query):
+            request = make_mocked_request(
+                "GET", "/api/skills?" + urlencode({"q": "", **query}), app=app
+            )
+            return json.loads((await prompts.api_skills(request)).body)
+
+        listed = await call(action="list")
+        assert len(listed["matches"]) == 3
+        missed = await call(action="search", q="zzz-nothing")
+        assert missed["matches"] == []
+        assert missed["scoped"] is True
 
     def test_mapping_bounds_every_surface_and_keeps_the_tail_loadable(self, tmp_path, opened):
         root = tmp_path / "skills"
@@ -574,6 +617,15 @@ async def test_installed_post_exact_read_long_keys_and_scope_errors(tmp_path, mo
                 {**payload, "scope": "registry"},
             ):
                 assert (await client.post("/api/skills/-/discover", json=bad)).status == 400
+            # JSON reads 1e999 as an infinite float: the paging 400, never a 500.
+            for field in ("offset", "limit", "capacity"):
+                for raw in ("1e999", "-1e999"):
+                    infinite = json.loads(f'{{"{field}": {raw}}}')
+                    response = await client.post(
+                        "/api/skills/-/discover", json={**payload, **infinite}
+                    )
+                    assert response.status == 400, (field, raw)
+                    assert (await response.json())["code"] == "invalid_limit"
             assert len(seen) == 1
             install = await client.post("/api/skills/-/discover/install", json={})
             assert install.status == 403

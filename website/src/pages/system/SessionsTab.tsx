@@ -7,7 +7,7 @@
  * `Group by` folds rows on an ATTRIBUTE (agent, channel). Sorting, expansion,
  * grouping, and aggregation come from `@tanstack/react-table`.
  */
-import { type MutableRefObject, useCallback, useEffect, useMemo, useState } from 'react'
+import { type MutableRefObject, type ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -30,6 +30,7 @@ import { Btn, Card, ContentSkeleton, EmptyState, IconButton, SearchInput } from 
 import { Popover, PopoverContent, PopoverTrigger } from '../../components/ui/popover'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../components/ui/table'
 import InfoTip from '../../components/InfoTip'
+import { SettingRef } from '../../components/settingRef/SettingRef'
 import SegmentedControl, { type Segment } from '../../components/SegmentedControl'
 import { fmtNumber, fmtPercent } from '../../i18n/format'
 import {
@@ -155,8 +156,28 @@ export default function SessionsTab({ planeStateRef }: Props) {
   }, [sessions])
   const creatorOf = (r: SessionRow): string | null => {
     if (r.kind !== 'session' || r.parent == null) return null
-    return (r.parent.key != null ? nameOf.get(r.parent.key) : undefined) ?? nameOf.get(r.parent.slot) ?? r.parent.slot
+    // `key` names the CREATOR only on an ordinary edge. On a re-parented row it is
+    // the nearest open ancestor, and naming that one here would credit the creating
+    // to a session that did not do it -- so the citation falls back to `slot`, which
+    // is the creator either way.
+    const named = r.parent.key != null && r.parent.ancestor !== true
+      ? nameOf.get(r.parent.key)
+      : undefined
+    // Only a readable NAME, never the raw slot id. `nameOf` is built from the live
+    // rows in this payload, so a creator that has CLOSED resolves to nothing here --
+    // the id it leaves is one no reader recognises, which explains the nesting no
+    // better than silence. The caller renders a graceful "a closed session" label
+    // for that case instead (see the `created_by*_unnamed` strings below).
+    return named ?? nameOf.get(r.parent.slot) ?? null
   }
+
+  // Whether this row hangs from a creator at all -- the gate for the explanatory
+  // line, kept separate from `creatorOf` because the line is needed EXACTLY when
+  // the creator has closed and no name resolves: that is the re-parented row whose
+  // nesting the line exists to explain. Gating the line on a resolved name instead
+  // would hide it on the one row that needs it most.
+  const citesCreator = (r: SessionRow): boolean =>
+    r.kind === 'session' && r.parent != null && typeof r.parent.slot === 'string' && r.parent.slot !== ''
 
   const columns = useMemo(
     () => [
@@ -341,7 +362,7 @@ export default function SessionsTab({ planeStateRef }: Props) {
       {isError && data && (
         <div
           data-testid="sessions-stale"
-          className="flex items-center gap-2 px-3.5 py-2 border-b border-border bg-warn-subtle text-[11.5px] text-warn"
+          className="flex items-center gap-2 px-3.5 py-2 border-b border-border bg-warn-subtle text-[11.5px] text-warn-text"
         >
           <TriangleAlert size={13} aria-hidden="true" className="lucide-inline shrink-0" />
           <span>{i18nT('pages.sessionsTab.could_not_refresh')}</span>
@@ -689,16 +710,41 @@ export default function SessionsTab({ planeStateRef }: Props) {
                             {/* A created row sitting under its creator needs no
                                 citation: its place in the tree is one, and the
                                 creator's expander names the relation. A created
-                                row that could not be nested (creator not running,
-                                a cycle) says who opened it here, as visible text
-                                and not a title: a keyboard or touch reader never
-                                sees a native tooltip, and this row has nothing
-                                else that says it. `nested` comes from buildTree,
-                                not from the row tree: under a fold a top-level
-                                row's parent row is a group row. */}
-                            {!grouped && creatorOf(r) != null && !r.nested && (
+                                row that could not be nested (nothing open above
+                                it, a cycle) says who opened it here, as visible
+                                text and not a title: a keyboard or touch reader
+                                never sees a native tooltip, and this row has
+                                nothing else that says it. `nested` comes from
+                                buildTree, not from the row tree: under a fold a
+                                top-level row's parent row is a group row.
+
+                                A row placed on an `ancestor` edge is the one
+                                nested row that still needs the line, and the
+                                reason is the rule above: its place in the tree
+                                is NOT its creator. It hangs from the nearest
+                                open ancestor, so the expander above it names a
+                                session that did not open it, and without this
+                                line nothing on screen says the creator closed. */}
+                            {!grouped && citesCreator(r) && (!r.nested || r.parent?.ancestor === true) && (
                               <span className="block whitespace-normal break-words leading-tight text-[10.5px] text-muted cursor-default">
-                                {i18nT('pages.sessionsTab.created_by', { name: creatorOf(r) })}
+                                {(() => {
+                                  // Never the raw slot id: a resolved name reads
+                                  // `created_by`, and a closed creator with no
+                                  // name in this payload reads the graceful
+                                  // `created_by_closed_unnamed` label instead of an
+                                  // id nobody knows. The orphan and ancestor rows
+                                  // share that label: the user-facing fact is the
+                                  // same ("the creator has closed"), and where the
+                                  // row sits is already visible in the tree. A name
+                                  // resolves only when the creator is live, which an
+                                  // ancestor edge never is, so a resolved name is
+                                  // always a top-level created row.
+                                  const name = creatorOf(r)
+                                  if (name == null) {
+                                    return i18nT('pages.sessionsTab.created_by_closed_unnamed')
+                                  }
+                                  return i18nT('pages.sessionsTab.created_by', { name })
+                                })()}
                               </span>
                             )}
                           </span>
@@ -753,12 +799,15 @@ export default function SessionsTab({ planeStateRef }: Props) {
             a label that names logs on disk, since the strip already counts
             sessions, task sessions and session procs; the hint names the cap
             itself, because it opens away from the value it explains. Shown
-            only when there is something to say. */}
+            only when there is something to say. The retention command sits
+            beside the stat as a SettingRef, not in the hint: a hint is a
+            tooltip, and a command a reader has to copy cannot live in one. */}
         {totals?.lineage_over_cap === true && (
           <FooterStat
             label={i18nT('pages.sessionsTab.footer_lineage_over_cap')}
             value={`${fmtNumber(totals.lineage_cap)}+`}
             hint={i18nT('pages.sessionsTab.footer_lineage_over_cap_hint', { cap: fmtNumber(totals.lineage_cap) })}
+            action={<SettingRef configKey="session.archive_retention_days" valuePlaceholder="7" />}
           />
         )}
       </div>
@@ -785,12 +834,15 @@ function FooterStat({
   value,
   warn,
   hint,
+  action,
 }: {
   label: string
   value: string
   warn?: boolean
   /** The page's "?" hint (the column-header pattern), for a stat a reader cannot act on from its label alone. */
   hint?: string
+  /** An interactive affordance for the stat, rendered after the value; never inside the hint's tooltip. */
+  action?: ReactNode
 }) {
   // An inline-flex row: the hint's button is a flex box of its own, and inline
   // text beside a block would break the stat over two lines.
@@ -803,6 +855,7 @@ function FooterStat({
       <span className={`font-mono tabular-nums text-[12px] font-medium ${warn ? 'text-warn' : 'text-text-strong'}`}>
         {value}
       </span>
+      {action}
     </span>
   )
 }

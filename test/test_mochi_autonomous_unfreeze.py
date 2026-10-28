@@ -29,6 +29,7 @@ import pytest
 
 from kiro_crew.apps.builtins.mochi import hooks
 from kiro_crew.apps.builtins.mochi.queue_poller import QueuePoller
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 
 class TestOwnerLoopNeverAwaitsPoll:
@@ -65,7 +66,7 @@ class TestOwnerLoopNeverAwaitsPoll:
 
         now["ms"] += 10 * 60_000  # past any spawn deadline
         poller.tick(now["ms"])
-        await asyncio.wait_for(wait_task, timeout=1)
+        await await_until(wait_task, what="the spawn watch check unfreezing")
 
 
 class TestSpawnCompletionWatcher:
@@ -81,7 +82,12 @@ class TestSpawnCompletionWatcher:
                 return True
 
         runtime.watch_spawn_completion("id-1", _Spawn())
-        await asyncio.sleep(0.1)
+        # Wait on the watcher's observable result, not a fixed sleep: the probe
+        # runs on its own task, and a slow runner may not have reached it yet.
+        await async_wait_until(
+            lambda: released == ["id-1"],
+            describe=lambda: f"released={released!r}",
+        )
         assert released == ["id-1"]
 
     @pytest.mark.asyncio

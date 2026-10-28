@@ -5,6 +5,8 @@ import reducer, {
   sseConnected,
   sseDisconnected,
   sseSlots,
+  sseSlotsPartial,
+  sseSlotListHolds,
   touchSlotActivity,
   sseSlotTitle,
   addSlotOptimistic,
@@ -12,14 +14,15 @@ import reducer, {
   triggerRefresh,
   markSlotUnread,
   markSlotRead,
+  remoteSlotRead,
   fetchSlots,
   selectUnreadByMode,
-  sseSubagentStatus,
-  sseSubagentText,
   patchSlotLink,
   dropSlotLinks,
 } from '../store/dashboardSlice'
 import type { StatusData, ChatSlot } from '../types'
+import { sharedItem } from './unreadStorageTestUtils'
+import { SHARED_UNREAD_FLUSH_MS, flushSharedUnread } from '../store/dashboard/unread'
 
 vi.mock('../api/client', () => ({
   api: { chatSlots: vi.fn(), chatMode: vi.fn() },
@@ -212,12 +215,285 @@ describe('dashboardSlice', () => {
   })
 
   it('fetchSlots.fulfilled reconciles unreadSlots against live slots', () => {
-    let state = reducer(initial, sseSlots([slot1, slot2]))
+    // A complete slots frame has released the boot-time unread hold.
+    let state = reducer(initial, sseSlotsPartial(false))
+    state = reducer(state, sseSlots([slot1, slot2]))
     state = reducer(state, markSlotUnread('chat-1'))
     state = reducer(state, markSlotUnread('chat-2'))
     // Simulate fetchSlots returning only slot2 (slot1 was deleted remotely)
     state = reducer(state, fetchSlots.fulfilled([slot2], 'requestId'))
     expect(state.unreadSlots).toEqual(['chat-2'])
+  })
+
+  describe('unread drain hold (partial slot list)', () => {
+    // A gateway mid-restart labels its slots frames `slotsPartial` while
+    // sessions are still being restored. A session not yet restored is absent
+    // from such a list without having been deleted, so the drain that clears a
+    // remotely deleted slot's badge must wait for a complete list.
+    it('holds the drain from boot until a complete frame arrives', () => {
+      expect(initial.unreadDrainHeld).toBe(true)
+      const released = reducer(initial, sseSlotsPartial(false))
+      expect(released.unreadDrainHeld).toBe(false)
+      expect(reducer(released, sseSlotsPartial(true)).unreadDrainHeld).toBe(true)
+    })
+
+    it('re-arms the hold on every connect', () => {
+      const released = reducer(initial, sseSlotsPartial(false))
+      expect(reducer(released, sseConnected()).unreadDrainHeld).toBe(true)
+    })
+
+    it('a complete list drains other unread keys but preserves held keys', () => {
+      const slot3 = { ...slot1, key: 'chat-3', title: 'Chat 3' }
+      let state = reducer(initial, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot1, slot2, slot3]))
+      state = reducer(state, markSlotUnread('chat-1'))
+      state = reducer(state, markSlotUnread('chat-3'))
+      state = reducer(state, sseSlotListHolds({ heldKeys: ['chat-1'], holdChannels: false }))
+
+      state = reducer(state, sseSlots([slot2]))
+
+      expect(state.unreadSlots).toEqual(['chat-1'])
+    })
+
+    it('a channel-wide hold preserves channel unread keys while draining ordinary keys', () => {
+      const channel = { ...slot1, key: 'slack_1.1', title: 'Slack thread' }
+      let state = reducer(initial, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([channel, slot1]))
+      state = reducer(state, markSlotUnread('slack_1.1'))
+      state = reducer(state, markSlotUnread('chat-1'))
+      state = reducer(state, sseSlotListHolds({ heldKeys: [], holdChannels: true }))
+
+      state = reducer(state, sseSlots([]))
+
+      expect(state.unreadSlots).toEqual(['slack_1.1'])
+    })
+
+    it('an embedded instance relays an unread count without held orphans', () => {
+      const posted: Array<{ type?: string; count?: number }> = []
+      const realParent = Object.getOwnPropertyDescriptor(window, 'parent')
+      Object.defineProperty(window, 'parent', {
+        value: { postMessage: (m: { type?: string; count?: number }) => { posted.push(m) } },
+        configurable: true,
+      })
+      try {
+        const channel = { ...slot1, key: 'slack_1.1', title: 'Slack thread' }
+        const lastCount = () => posted.filter(m => m.type === 'mc-unread-slots').at(-1)?.count
+        let state = reducer(initial, sseSlotsPartial(false))
+        state = reducer(state, sseSlots([slot1, slot2, channel]))
+        state = reducer(state, markSlotUnread('chat-1'))
+        state = reducer(state, markSlotUnread('chat-2'))
+        state = reducer(state, markSlotUnread('slack_1.1'))
+        expect(lastCount()).toBe(3)
+
+        // chat-1 and the channel thread go absent but are held: kept, not counted.
+        state = reducer(state, sseSlotListHolds({ heldKeys: ['chat-1'], holdChannels: true }))
+        state = reducer(state, sseSlots([slot2]))
+        expect(state.unreadSlots).toEqual(expect.arrayContaining(['chat-1', 'slack_1.1']))
+        expect(lastCount()).toBe(1)
+
+        // chat-1 is listed again, so it counts again.
+        state = reducer(state, sseSlots([slot1, slot2]))
+        expect(lastCount()).toBe(2)
+      } finally {
+        if (realParent) Object.defineProperty(window, 'parent', realParent)
+      }
+    })
+
+    it('an embedded instance recounts held unread sessions when reconnect clears the holds', () => {
+      const posted: Array<{ type?: string; count?: number }> = []
+      const realParent = Object.getOwnPropertyDescriptor(window, 'parent')
+      Object.defineProperty(window, 'parent', {
+        value: { postMessage: (m: { type?: string; count?: number }) => { posted.push(m) } },
+        configurable: true,
+      })
+      try {
+        const lastCount = () => posted.filter(m => m.type === 'mc-unread-slots').at(-1)?.count
+        let state = reducer(initial, sseSlotsPartial(false))
+        state = reducer(state, sseSlots([slot1, slot2]))
+        state = reducer(state, markSlotUnread('chat-1'))
+        state = reducer(state, markSlotUnread('chat-2'))
+        state = reducer(state, sseSlotListHolds({ heldKeys: ['chat-1'], holdChannels: false }))
+        state = reducer(state, sseSlots([slot2]))
+        expect(lastCount()).toBe(1)
+
+        state = reducer(state, sseConnected())
+
+        expect(state.slotsHeldKeys).toEqual([])
+        expect(lastCount()).toBe(2)
+      } finally {
+        if (realParent) Object.defineProperty(window, 'parent', realParent)
+      }
+    })
+
+    it('an embedded instance recounts a held unread session on an optimistic add', () => {
+      const posted: Array<{ type?: string; count?: number }> = []
+      const realParent = Object.getOwnPropertyDescriptor(window, 'parent')
+      Object.defineProperty(window, 'parent', {
+        value: { postMessage: (m: { type?: string; count?: number }) => { posted.push(m) } },
+        configurable: true,
+      })
+      try {
+        const lastCount = () => posted.filter(m => m.type === 'mc-unread-slots').at(-1)?.count
+        let state = reducer(initial, sseSlotsPartial(false))
+        state = reducer(state, sseSlots([slot1, slot2]))
+        state = reducer(state, markSlotUnread('chat-1'))
+        state = reducer(state, markSlotUnread('chat-2'))
+        state = reducer(state, sseSlotListHolds({ heldKeys: ['chat-1'], holdChannels: false }))
+        state = reducer(state, sseSlots([slot2]))
+        expect(lastCount()).toBe(1)
+
+        reducer(state, addSlotOptimistic(slot1))
+
+        expect(lastCount()).toBe(2)
+      } finally {
+        if (realParent) Object.defineProperty(window, 'parent', realParent)
+      }
+    })
+
+    it('an embedded instance recounts a held unread session on a fulfilled create', () => {
+      const posted: Array<{ type?: string; count?: number }> = []
+      const realParent = Object.getOwnPropertyDescriptor(window, 'parent')
+      Object.defineProperty(window, 'parent', {
+        value: { postMessage: (m: { type?: string; count?: number }) => { posted.push(m) } },
+        configurable: true,
+      })
+      try {
+        const lastCount = () => posted.filter(m => m.type === 'mc-unread-slots').at(-1)?.count
+        let state = reducer(initial, sseSlotsPartial(false))
+        state = reducer(state, sseSlots([slot1, slot2]))
+        state = reducer(state, markSlotUnread('chat-1'))
+        state = reducer(state, markSlotUnread('chat-2'))
+        state = reducer(state, sseSlotListHolds({ heldKeys: ['chat-1'], holdChannels: false }))
+        state = reducer(state, sseSlots([slot2]))
+        expect(lastCount()).toBe(1)
+
+        reducer(state, { type: 'chat/createSlot/fulfilled', payload: slot1 })
+
+        expect(lastCount()).toBe(2)
+      } finally {
+        if (realParent) Object.defineProperty(window, 'parent', realParent)
+      }
+    })
+
+    it('an embedded instance recounts a tab reopened under the partial label with nothing held', () => {
+      const posted: Array<{ type?: string; count?: number }> = []
+      const realParent = Object.getOwnPropertyDescriptor(window, 'parent')
+      Object.defineProperty(window, 'parent', {
+        value: { postMessage: (m: { type?: string; count?: number }) => { posted.push(m) } },
+        configurable: true,
+      })
+      try {
+        const lastCount = () => posted.filter(m => m.type === 'mc-unread-slots').at(-1)?.count
+        let state = reducer(initial, sseSlotsPartial(false))
+        state = reducer(state, sseSlots([slot1, slot2]))
+        state = reducer(state, markSlotUnread('chat-1'))
+        state = reducer(state, markSlotUnread('chat-2'))
+        expect(lastCount()).toBe(2)
+
+        // An unreadable tab registry: the list is partial and names no held keys.
+        state = reducer(state, sseSlotsPartial(true))
+        state = reducer(state, sseSlots([slot2]))
+        expect(lastCount()).toBe(1)
+
+        // chat-1 reopens while the label is still on: it counts again at once.
+        reducer(state, sseSlots([slot1, slot2]))
+        expect(lastCount()).toBe(2)
+      } finally {
+        if (realParent) Object.defineProperty(window, 'parent', realParent)
+      }
+    })
+
+    it('an identical holds frame leaves the dashboard state untouched', () => {
+      let state = reducer(initial, sseSlotListHolds({ heldKeys: ['chat-1'], holdChannels: true }))
+      const again = reducer(state, sseSlotListHolds({ heldKeys: ['chat-1'], holdChannels: true }))
+      expect(again).toBe(state)
+      state = reducer(state, sseSlotListHolds({ heldKeys: ['chat-1', 'chat-2'], holdChannels: true }))
+      expect(state.slotsHeldKeys).toEqual(['chat-1', 'chat-2'])
+    })
+
+    it('an HTTP list cannot clear hold state delivered by the WebSocket', () => {
+      const slot3 = { ...slot1, key: 'chat-3', title: 'Chat 3' }
+      let state = reducer(initial, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot1, slot2, slot3]))
+      state = reducer(state, markSlotUnread('chat-1'))
+      state = reducer(state, markSlotUnread('chat-3'))
+      state = reducer(state, sseSlotListHolds({ heldKeys: ['chat-3'], holdChannels: false }))
+
+      state = reducer(state, fetchSlots.fulfilled([slot2], 'held-keys-response'))
+
+      expect(state.unreadSlots).toEqual(['chat-3'])
+    })
+
+    it('a GET started after disconnect cannot drain an absent unread key', () => {
+      let state = reducer(initial, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot1, slot2]))
+      state = reducer(state, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:00Z' }))
+      expect(state.unreadDrainHeld).toBe(false)
+
+      state = reducer(state, sseDisconnected())
+      state = reducer(state, fetchSlots.pending('disconnected-request', undefined))
+      state = reducer(state, fetchSlots.fulfilled([slot2], 'disconnected-request', undefined))
+
+      expect(state.unreadSlots).toEqual(['chat-1'])
+      expect(state.unreadSince['chat-1']).toBe('2026-01-01T00:00:00Z')
+    })
+
+    it('a GET reply during the hold does not drain an absent key', () => {
+      // The reply was requested on connect and can land before the connect
+      // snapshot says whether the list is complete; the hold set by
+      // `sseConnected` covers it.
+      let state = reducer(initial, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot1, slot2]))
+      state = reducer(state, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:00Z' }))
+      state = reducer(state, sseConnected())
+      state = reducer(state, fetchSlots.fulfilled([slot2], 'requestId'))
+      expect(state.slots.map(s => s.key)).toEqual(['chat-2'])
+      expect(state.unreadSlots).toEqual(['chat-1'])
+      expect(state.unreadSince['chat-1']).toBe('2026-01-01T00:00:00Z')
+      expect(Object.keys(JSON.parse(sharedItem('mc-unread-shared') ?? '{}'))).toContain('chat-1')
+      // The first complete frame drains what is genuinely gone.
+      state = reducer(state, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot2]))
+      expect(state.unreadSlots).toEqual([])
+      expect(state.unreadSince['chat-1']).toBeUndefined()
+      expect(Object.keys(JSON.parse(sharedItem('mc-unread-shared') ?? '{}'))).not.toContain('chat-1')
+    })
+
+    it('a GET started during the hold cannot drain after a complete frame releases it', () => {
+      localStorage.clear()
+      let state = reducer(initial, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot1, slot2]))
+      state = reducer(state, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:00Z' }))
+      state = reducer(state, sseConnected())
+      state = reducer(state, fetchSlots.pending('held-request', undefined))
+      state = reducer(state, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot1, slot2]))
+      expect(state.unreadDrainHeld).toBe(false)
+
+      state = reducer(state, fetchSlots.fulfilled([slot2], 'held-request', undefined))
+
+      expect(state.unreadSlots).toEqual(['chat-1'])
+      expect(state.unreadSince['chat-1']).toBe('2026-01-01T00:00:00Z')
+      expect(JSON.parse(sharedItem('mc-unread-shared') ?? '{}')).toMatchObject({
+        'chat-1': '2026-01-01T00:00:00Z',
+      })
+      expect(state.slotFetchWriteMark['held-request']).toBeUndefined()
+    })
+
+    it('a GET started after the hold clears still drains an absent key', () => {
+      localStorage.clear()
+      let state = reducer(initial, sseSlotsPartial(false))
+      state = reducer(state, sseSlots([slot1, slot2]))
+      state = reducer(state, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:00Z' }))
+      state = reducer(state, fetchSlots.pending('unheld-request', undefined))
+
+      state = reducer(state, fetchSlots.fulfilled([slot2], 'unheld-request', undefined))
+
+      expect(state.unreadSlots).toEqual([])
+      expect(state.unreadSince['chat-1']).toBeUndefined()
+      expect(JSON.parse(sharedItem('mc-unread-shared') ?? '{}')).not.toHaveProperty('chat-1')
+      expect(state.slotFetchWriteMark['unheld-request']).toBeUndefined()
+    })
   })
 
   it('triggerRefresh increments counter', () => {
@@ -283,12 +559,13 @@ describe('dashboardSlice', () => {
 
       try {
         reducer(initial, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:00Z' }))
+        flushSharedUnread()
       } finally {
         spy.mockRestore()
       }
 
       // The shared record survived because the write reclaimed space first.
-      expect(JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}')).toEqual({
+      expect(JSON.parse(sharedItem('mc-unread-shared') ?? '{}')).toEqual({
         'chat-1': '2026-01-01T00:00:00Z',
       })
       // Disposable cache was the thing sacrificed, not the record.
@@ -330,6 +607,7 @@ describe('dashboardSlice', () => {
 
       try {
         reducer(initial, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:00Z' }))
+        flushSharedUnread()
       } finally {
         spy.mockRestore()
       }
@@ -338,12 +616,101 @@ describe('dashboardSlice', () => {
       // past it. Two persisted records that disagree is worse than neither
       // being written: `restoreUnreadSince` trusts the record while older tabs
       // and the hub relay read the projection.
-      expect(localStorage.getItem('mc-unread-shared')).toBeNull()
-      expect(JSON.parse(localStorage.getItem('mc-unread-slots') ?? '[]')).toEqual([
+      expect(sharedItem('mc-unread-shared')).toBeNull()
+      expect(JSON.parse(sharedItem('mc-unread-slots') ?? '[]')).toEqual([
         'chat-1',
         'chat-2',
         'chat-3',
       ])
+    })
+
+    // A background slot re-marks itself on every arriving row. The reducer
+    // queues the shared write instead of doing it, and one flush writes every
+    // queued arrival in a single record write.
+    it('queues arrivals and writes them in one record write', () => {
+      localStorage.clear()
+      const spy = vi.spyOn(Storage.prototype, 'setItem')
+      vi.useFakeTimers()
+      try {
+        let s = reducer(initial, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:05Z' }))
+        s = reducer(s, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:09Z' }))
+        s = reducer(s, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:01Z' }))
+        s = reducer(s, markSlotUnread({ slot: 'chat-2' }))
+        expect(spy.mock.calls.filter(([k]) => k.startsWith('mc-unread-'))).toEqual([])
+        vi.advanceTimersByTime(SHARED_UNREAD_FLUSH_MS)
+        expect(spy.mock.calls.map(([k]) => k)).toEqual(['mc-unread-shared', 'mc-unread-slots'])
+        expect(JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}')).toEqual({
+          'chat-1': '2026-01-01T00:00:09Z',
+          'chat-2': '',
+        })
+        expect(s.unreadSlots).toEqual(['chat-1', 'chat-2'])
+      } finally {
+        spy.mockRestore()
+        vi.useRealTimers()
+      }
+    })
+
+    // When the live record already holds the badge at that watermark, the
+    // flush must not rewrite the record or its projection.
+    it('skips the storage write when the live record already covers the arrival', () => {
+      localStorage.clear()
+      let s = reducer(initial, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:05Z' }))
+      flushSharedUnread()
+      const spy = vi.spyOn(Storage.prototype, 'setItem')
+      try {
+        s = reducer(s, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:05Z' }))
+        s = reducer(s, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:01Z' }))
+        s = reducer(s, markSlotUnread({ slot: 'chat-1' }))
+        flushSharedUnread()
+        expect(spy.mock.calls.filter(([k]) => k.startsWith('mc-unread-'))).toEqual([])
+      } finally {
+        spy.mockRestore()
+      }
+      expect(s.unreadSlots).toEqual(['chat-1'])
+    })
+
+    // A sibling window that read the message cleared the shared record before
+    // this window's queued arrival was written. The relayed read must drop the
+    // queued arrival it covers, even when this window keeps its own badge (a
+    // manual reminder here), and keep a queued arrival newer than the read.
+    it('a relayed read drops the queued arrival it covers', () => {
+      localStorage.clear()
+      let s = reducer(initial, markSlotUnread('chat-1'))
+      s = reducer(s, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:05Z' }))
+      s = reducer(s, markSlotUnread({ slot: 'chat-2', ts: '2026-01-01T00:00:09Z' }))
+      s = reducer(s, remoteSlotRead({ slot: 'chat-1', readTs: '2026-01-01T00:00:05Z' }))
+      s = reducer(s, remoteSlotRead({ slot: 'chat-2', readTs: '2026-01-01T00:00:05Z' }))
+      flushSharedUnread()
+      expect(JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}')).toEqual({ 'chat-2': '2026-01-01T00:00:09Z' })
+      // The manual reminder answers only to a local read, so its badge stays.
+      expect(s.unreadSlots).toEqual(['chat-1', 'chat-2'])
+    })
+
+    // A read in this window right after an arrival must judge the record with
+    // that arrival in it, or the queued write would land after the clear and
+    // bring the badge back for sibling windows.
+    it('writes queued arrivals before a local read clears the record', () => {
+      localStorage.clear()
+      let s = reducer(initial, sseSlots([{ key: 'chat-1', last_ts: '2026-01-01T00:00:09Z' } as never]))
+      s = reducer(s, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:09Z' }))
+      s = reducer(s, markSlotRead('chat-1'))
+      flushSharedUnread()
+      expect(JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}')).toEqual({})
+      expect(s.unreadSlots).toEqual([])
+    })
+
+    // The skip reads the live record, so a sibling window that cleared the
+    // shared entry still gets it back on this window's next arrival, even one
+    // at the same watermark.
+    it('re-publishes an arrival after a sibling cleared the shared entry', () => {
+      localStorage.clear()
+      let s = reducer(initial, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:05Z' }))
+      localStorage.setItem('mc-unread-shared', '{}')
+      localStorage.setItem('mc-unread-slots', '[]')
+      s = reducer(s, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:05Z' }))
+      expect(JSON.parse(sharedItem('mc-unread-shared') ?? '{}')).toEqual({ 'chat-1': '2026-01-01T00:00:05Z' })
+      expect(JSON.parse(sharedItem('mc-unread-slots') ?? '[]')).toEqual(['chat-1'])
+      expect(s.unreadSlots).toEqual(['chat-1'])
     })
   })
 
@@ -385,6 +752,58 @@ describe('dashboardSlice', () => {
       expect(selectUnreadByMode('')(state)).toBe(2)
     })
 
+    it('keeps an unheld orphan in the chat badge but leaves a held orphan out', () => {
+      // An unheld orphan is about to be drained by the next reconcile, so it
+      // keeps counting. A held one (a tab the restore could not reopen) is never
+      // drained by a list, so counting it would show a session the sidebar
+      // cannot display. Its unread entry stays, for when the tab comes back.
+      const live: ChatSlot = { key: 'chat-1', title: 'C', messages: 0, running: false, mode: '' }
+      const base = buildState([live], ['chat-1', 'chat-9-gone', 'chat-8-orphan'])
+      const held = {
+        dashboard: { ...base.dashboard, slotsHeldKeys: ['chat-9-gone'] },
+      } as typeof base
+      expect(selectUnreadByMode('')(base)).toBe(3)
+      expect(selectUnreadByMode('')(held)).toBe(2)
+      expect(held.dashboard.unreadSlots).toContain('chat-9-gone')
+    })
+
+    it('leaves channel orphans out of the badge while every channel key is held', () => {
+      const unread = ['slack_1785370133.085469']
+      const base = buildState([], unread)
+      const holding = {
+        dashboard: { ...base.dashboard, slotsHoldChannels: true },
+      } as typeof base
+      expect(selectUnreadByMode('')(base)).toBe(1)
+      expect(selectUnreadByMode('')(holding)).toBe(0)
+    })
+
+    it('leaves every orphan out of the badge while the gateway labels its list partial', () => {
+      // The gateway cannot name a tab it has not restored yet, so slotsHeldKeys
+      // is empty mid-restore; the drain is still held, so the badge must skip it.
+      const live: ChatSlot = { key: 'chat-1', title: 'C', messages: 0, running: false, mode: '' }
+      let state = reducer(initial, sseSlotsPartial(true))
+      state = reducer(state, sseSlots([live]))
+      state = { ...state, unreadSlots: ['chat-1', 'chat-2-restoring'] }
+      expect(selectUnreadByMode('')({ dashboard: state } as unknown as Parameters<ReturnType<typeof selectUnreadByMode>>[0])).toBe(1)
+      // An unlabelled hold (boot, reconnect before the first frame) skips nothing,
+      // so dots restored from storage still count.
+      const booting = buildState([live], ['chat-1', 'chat-2-restoring'])
+      expect(booting.dashboard.unreadDrainHeld).toBe(true)
+      expect(selectUnreadByMode('')(booting)).toBe(2)
+      // The label clears and the orphan counts again until it drains.
+      state = reducer(state, sseSlotsPartial(false))
+      expect(state.slotsListPartial).toBe(false)
+    })
+
+    it('counts a held key again once its slot is listed', () => {
+      const back: ChatSlot = { key: 'chat-9-gone', title: 'B', messages: 0, running: false, mode: '' }
+      const base = buildState([back], ['chat-9-gone'])
+      const held = {
+        dashboard: { ...base.dashboard, slotsHeldKeys: ['chat-9-gone'] },
+      } as typeof base
+      expect(selectUnreadByMode('')(held)).toBe(1)
+    })
+
     it('returns the same selector instance on repeated calls (memoization)', () => {
       // Stable reference matters because consumers (selectSurfaceBadgeCount,
       // selectAllSurfacesAttention) call this on every render — recreating
@@ -416,47 +835,6 @@ describe('dashboardSlice', () => {
       // Existing unread preserved, no new ones spuriously added
       expect(state.unreadSlots).toEqual(['chat-1'])
       expect(state.slotsLoaded).toBe(true)
-    })
-  })
-
-  describe('subagent SSE prototype-pollution guards', () => {
-    // Both `slot` and `id` are untrusted keys from the SSE payload. A value of
-    // __proto__/constructor/prototype must never reach an assignment that would
-    // write through Object.prototype. Note the subagentRunning[slot] check does
-    // NOT stop slot="__proto__" on its own — it resolves truthily through the
-    // prototype chain — so isUnsafeKey(slot) is the real guard.
-    const polluted = () => ({} as Record<string, unknown>).polluted
-
-    it('sseSubagentStatus ignores a __proto__ slot without polluting the prototype', () => {
-      const state = reducer(
-        initial,
-        sseSubagentStatus({ slot: '__proto__', running: 1, agents: [] }),
-      )
-      // `['__proto__']` always returns the prototype object; the real check is
-      // that no OWN property was created and the prototype was not polluted.
-      expect(Object.prototype.hasOwnProperty.call(state.subagentRunning, '__proto__')).toBe(false)
-      expect(polluted()).toBeUndefined()
-    })
-
-    it('sseSubagentText ignores a __proto__ slot and does not pollute', () => {
-      // Prime a legit slot so the reducer would otherwise proceed.
-      const primed = reducer(initial, sseSubagentStatus({ slot: 'chat-1', running: 1 }))
-      reducer(primed, sseSubagentText({ slot: '__proto__', id: 'a', text: 'x' }))
-      expect(({} as Record<string, unknown>)['a']).toBeUndefined()
-      expect(polluted()).toBeUndefined()
-    })
-
-    it('sseSubagentText ignores a __proto__ id and does not pollute', () => {
-      let state = reducer(initial, sseSubagentStatus({ slot: 'chat-1', running: 1 }))
-      state = reducer(state, sseSubagentText({ slot: 'chat-1', id: '__proto__', text: 'x' }))
-      expect(state.subagentText['chat-1']?.['__proto__']).toBeUndefined()
-      expect(({} as Record<string, unknown>).polluted).toBeUndefined()
-    })
-
-    it('sseSubagentText still stores text for a normal slot+id', () => {
-      let state = reducer(initial, sseSubagentStatus({ slot: 'chat-1', running: 1 }))
-      state = reducer(state, sseSubagentText({ slot: 'chat-1', id: 'sub-1', text: 'hello' }))
-      expect(state.subagentText['chat-1']['sub-1']).toBe('hello')
     })
   })
 
@@ -595,15 +973,14 @@ describe('dashboardSlice', () => {
   })
 })
 
-describe('dashboardSlice per-slot sub-agent teardown', () => {
+describe('dashboardSlice per-slot unread teardown', () => {
   const seeded = () => {
     const base = reducer(undefined, { type: '@@INIT' })
     return {
       ...base,
       slots: [{ key: 'chat-1', messages: 0, running: false }, { key: 'chat-2', messages: 0, running: false }] as ChatSlot[],
-      subagentRunning: { 'chat-1': 1, 'chat-2': 2 },
-      subagentDetails: { 'chat-1': [], 'chat-2': [] },
-      subagentText: { 'chat-1': {}, 'chat-2': {} },
+      // Steady state: a complete slots frame has released the boot-time hold.
+      unreadDrainHeld: false,
     }
   }
 
@@ -616,8 +993,8 @@ describe('dashboardSlice per-slot sub-agent teardown', () => {
     const next = reducer(before, sseSlots([{ key: 'chat-1', messages: 0, running: false }] as ChatSlot[]))
 
     expect(next.unreadSlots).toEqual(['chat-1'])
-    expect(Object.keys(JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}'))).toEqual(['chat-1'])
-    expect(JSON.parse(localStorage.getItem('mc-unread-slots') ?? '[]')).toEqual(['chat-1'])
+    expect(Object.keys(JSON.parse(sharedItem('mc-unread-shared') ?? '{}'))).toEqual(['chat-1'])
+    expect(JSON.parse(sharedItem('mc-unread-slots') ?? '[]')).toEqual(['chat-1'])
   })
 
   it('leaves unread state alone when the frame still lists every unread slot', () => {
@@ -631,32 +1008,7 @@ describe('dashboardSlice per-slot sub-agent teardown', () => {
 
     expect(next.unreadSlots).toEqual(['chat-1', 'chat-2'])
     // Not rewritten, because this reducer runs on every slots frame.
-    expect(localStorage.getItem('mc-unread-slots')).toBeNull()
-  })
-
-  /** Optimistic removal runs before the delete is confirmed, and a slot whose
-   *  delete fails comes back via the next authoritative frame. Evicting here
-   *  would leave it alive but mute, because sseSubagentText drops frames for a
-   *  slot with no subagentRunning entry. */
-  it('keeps sub-agent state on optimistic removal, before the delete is confirmed', () => {
-    const next = reducer(seeded(), removeSlotOptimistic('chat-2'))
-    expect(next.subagentRunning['chat-2']).toBe(2)
-    expect(next.subagentDetails['chat-2']).toBeDefined()
-    expect(next.subagentText['chat-2']).toBeDefined()
-  })
-
-  it('drops a slot the live slots frame no longer carries', () => {
-    const next = reducer(seeded(), sseSlots([{ key: 'chat-1', messages: 0, running: false }] as ChatSlot[]))
-    expect(next.subagentRunning['chat-2']).toBeUndefined()
-    expect(next.subagentDetails['chat-2']).toBeUndefined()
-    expect(next.subagentText['chat-2']).toBeUndefined()
-    expect(next.subagentRunning['chat-1']).toBe(1)
-  })
-
-  it('treats an empty slots frame as a no-op before the list has loaded, since a reconnect delivers one first', () => {
-    const next = reducer(seeded(), sseSlots([]))
-    expect(next.subagentRunning['chat-1']).toBe(1)
-    expect(next.subagentRunning['chat-2']).toBe(2)
+    expect(sharedItem('mc-unread-slots')).toBeNull()
   })
 
   it('reconciles an empty frame once loaded, which is the last slot being deleted', () => {
@@ -664,29 +1016,17 @@ describe('dashboardSlice per-slot sub-agent teardown', () => {
 
     const next = reducer(loaded, sseSlots([]))
 
-    expect(next.subagentRunning['chat-1']).toBeUndefined()
-    expect(next.subagentRunning['chat-2']).toBeUndefined()
     expect(next.unreadSlots).toEqual([])
   })
 
-  it('withholds eviction from a fetch reply once the stream is live, but still drains unread', () => {
-    // The reply can be older than the live frames it raced, so eviction (not
-    // recoverable) is withheld while the unread drain (self-healing) still runs.
+  it('drains unread from a fetch reply once the stream is live', () => {
+    // The reply can be older than the live frames it raced; the unread drain
+    // still runs because it self-heals on the next unread event.
     const loaded = { ...seeded(), slotsLoaded: true, unreadSlots: ['chat-1', 'chat-2'] }
     const payload = [{ key: 'chat-1', messages: 0, running: false }] as ChatSlot[]
 
     const next = reducer(loaded, { type: fetchSlots.fulfilled.type, payload })
 
-    expect(next.subagentRunning['chat-2']).toBe(2)
     expect(next.unreadSlots).toEqual(['chat-1'])
-  })
-
-  it('drops a slot the authoritative refetch no longer carries', () => {
-    const payload = [{ key: 'chat-1', messages: 0, running: false }] as ChatSlot[]
-    const next = reducer(seeded(), { type: fetchSlots.fulfilled.type, payload })
-    expect(next.subagentRunning['chat-2']).toBeUndefined()
-    expect(next.subagentDetails['chat-2']).toBeUndefined()
-    expect(next.subagentText['chat-2']).toBeUndefined()
-    expect(next.subagentRunning['chat-1']).toBe(1)
   })
 })

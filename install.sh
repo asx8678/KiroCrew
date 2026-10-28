@@ -11,6 +11,11 @@
 #
 # Options:
 #   --voice   Install optional voice extras (pip install -e .[voice])
+#   --kas     Download the KAS engine this release pins (kirocrew kas install)
+#             so the built-in engine route can be turned on later with no
+#             download. The switch (agent.kas_bundle) is NOT turned on: the
+#             route is in shadow testing on every platform, so the default
+#             stays kiro-cli until you flip it yourself.
 #   --mise    Use mise (https://mise.jdx.dev) for Python and Node.js
 #             instead of system package managers. Does not modify your
 #             global mise config.
@@ -33,10 +38,12 @@ unset PYTHONPATH PYTHONHOME
 # ── Parse arguments ──
 USE_MISE=0
 WITH_VOICE=0
+WITH_KAS=0
 for _arg in "$@"; do
     case "$_arg" in
         --mise)  USE_MISE=1 ;;
         --voice) WITH_VOICE=1 ;;
+        --kas)   WITH_KAS=1 ;;
         *) echo "Error: unknown argument '$_arg'" >&2; exit 1 ;;
     esac
 done
@@ -58,7 +65,9 @@ NODE_VERSION="24"
 NODE_MIN_VERSION="22.12.0"
 PYTHON_VERSION="3.12"
 KIROCREW_PORT="${KIROCREW_PORT:-5476}"
-ACP_NPM_PKG="@agentclientprotocol/claude-agent-acp"
+# ACP_NPM_PKG and acp_adapter_spec (the exact pinned version).
+# shellcheck source=scripts/lib/acp-adapter-pin.sh
+. "$KIROCREW_APP_DIR/scripts/lib/acp-adapter-pin.sh"
 
 # ── Colors & Formatting ──
 if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
@@ -153,6 +162,17 @@ node_supported() {
     [ "$_pat" -ge "$_fpat" ] 2>/dev/null
 }
 
+# Install a supported Node through ensure-node.sh (pinned, checksum-verified
+# mise or glibc-217 build; an existing nvm is reused), then put the node it
+# recorded on this shell's PATH. Never pipes a remote installer into a shell.
+install_node_via_ensure() {
+    bash "$KIROCREW_APP_DIR/ensure-node.sh" || true
+    if [ -s "$KIROCREW_DATA_DIR/node-bin-dir" ]; then
+        PATH="$(cat "$KIROCREW_DATA_DIR/node-bin-dir"):$PATH"
+        export PATH
+    fi
+}
+
 # ── Pre-flight ──
 
 banner
@@ -176,7 +196,10 @@ step "Dependencies"
 if [ "$USE_MISE" -eq 1 ]; then
     if ! has mise; then
         info "Installing mise…"
-        curl -fsSL https://mise.run | sh || true
+        # A pinned release checked against a recorded sha256, never a piped script.
+        # shellcheck source=scripts/lib/pinned-mise.sh
+        . "$KIROCREW_APP_DIR/scripts/lib/pinned-mise.sh"
+        MISE_INSTALL_PATH="$HOME/.local/bin/mise" install_pinned_mise || true
         export PATH="$HOME/.local/bin:$PATH"
         has mise || die "mise installation failed. Install manually: https://mise.jdx.dev/installing-mise.html"
     fi
@@ -339,17 +362,9 @@ elif has node; then
         brew install node >/dev/null 2>&1 || true
     fi
     if ! node_supported; then
-        # Distro package still too old (the common case on AL2023/Debian):
-        # nvm is the only channel that reliably provides a current Node.
-        info "Installing Node.js $NODE_VERSION via nvm…"
-        if [ ! -d "$HOME/.nvm" ]; then
-            curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash 2>/dev/null
-        fi
-        export NVM_DIR="$HOME/.nvm"
-        # shellcheck disable=SC1091
-        [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-        nvm install "$NODE_VERSION" >/dev/null 2>&1
-        nvm alias default "$NODE_VERSION" >/dev/null 2>&1
+        # Distro package still too old (the common case on AL2023/Debian).
+        info "Installing Node.js $NODE_VERSION via ensure-node.sh…"
+        install_node_via_ensure
     fi
     node_supported \
         && ok "Node.js $(node --version) now active" \
@@ -367,20 +382,13 @@ elif has brew; then
     brew install node >/dev/null 2>&1
     has node && ok "Node.js $(node --version) installed via brew" || warn "Node.js install failed — run: brew install node"
 else
-    info "Installing Node.js via nvm…"
-    if [ ! -d "$HOME/.nvm" ]; then
-        curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash 2>/dev/null
-    fi
-    export NVM_DIR="$HOME/.nvm"
-    # shellcheck disable=SC1091
-    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-    nvm install "$NODE_VERSION" >/dev/null 2>&1
-    nvm alias default "$NODE_VERSION" >/dev/null 2>&1
+    info "Installing Node.js via ensure-node.sh…"
+    install_node_via_ensure
     if has node; then
-        ok "Node.js $(node --version) installed via nvm"
+        ok "Node.js $(node --version) installed"
     else
         warn "Node.js install failed — frontend build will be skipped"
-        detail "Install manually: nvm install $NODE_VERSION"
+        detail "Install Node.js $NODE_VERSION (LTS): https://nodejs.org"
     fi
 fi
 fi # USE_MISE -eq 0 (Node.js)
@@ -407,19 +415,29 @@ step "Optional Agent Backend"
 if has claude-agent-acp; then
     ok "claude-agent-acp ($( which claude-agent-acp ))"
 elif has npm; then
-    info "Installing $ACP_NPM_PKG via npm…"
-    if npm install -g "$ACP_NPM_PKG" >/dev/null 2>&1; then
-        ok "claude-agent-acp installed"
+    if ! ACP_NPM_SPEC="$(acp_adapter_spec "$KIROCREW_APP_DIR")"; then
+        warn "Could not read the pinned $ACP_NPM_PKG version (packaging/acp-adapters/package.json) — skipping"
+        detail "npm i -g $ACP_NPM_PKG@<version>"
     else
-        warn "Global npm install failed — install it manually before first run:"
-        detail "npm i -g $ACP_NPM_PKG"
+        info "Installing $ACP_NPM_SPEC via npm…"
+        if npm install -g "$ACP_NPM_SPEC" >/dev/null 2>&1; then
+            ok "claude-agent-acp installed"
+        else
+            warn "Global npm install failed — install it manually before first run:"
+            detail "npm i -g $ACP_NPM_SPEC"
+        fi
     fi
 else
     warn "npm not available — install the agent backend later:"
     detail "npm i -g $ACP_NPM_PKG"
 fi
-warn "The default Kiro agent requires Kiro CLI; this installer does not install or sign in to it."
-detail "Install it separately from https://kiro.dev/cli/ and run: kiro-cli login"
+if [ "$WITH_KAS" -eq 1 ]; then
+    info "The built-in KAS engine will be downloaded (--kas); the switch stays off until you turn it on."
+else
+    warn "The default Kiro agent requires Kiro CLI; this installer does not install or sign in to it."
+    detail "Install it separately from https://kiro.dev/cli/ and run: kiro-cli login"
+    detail "Or re-run with --kas to download the built-in engine instead (no kiro-cli)."
+fi
 
 # ══════════════════════════════════════════════════════════════════════
 # Step 3: Build
@@ -779,6 +797,19 @@ if [ -n "$_kirocrew" ]; then
     KIROCREW_PROJECT_DIR="$KIROCREW_APP_DIR" "$_kirocrew" setup --agent-only \
         && ok "Agent config installed" \
         || warn "kirocrew setup --agent-only failed (run manually after install)"
+    if [ "$WITH_KAS" -eq 1 ]; then
+        # The engine this release pins, fetched from the project's CDN and
+        # verified against the pin baked into this checkout. The switch is left
+        # alone on purpose: the route is in shadow testing, so turning it on is
+        # the user's own step (Settings → Agent Harness, or `kirocrew config set
+        # agent.kas_bundle true`), never the installer's.
+        info "Downloading the built-in KAS engine (kirocrew kas install)…"
+        if "$_kirocrew" kas install; then
+            ok "Built-in KAS engine installed (switch it on: kirocrew config set agent.kas_bundle true)"
+        else
+            warn "kirocrew kas install failed — run it again after install"
+        fi
+    fi
 fi
 
 ok "Run ${CYAN}kirocrew setup${RESET} to configure agent, workspace, and integrations"
@@ -810,6 +841,10 @@ echo ""
 echo "    ${CYAN}2.${RESET} Set up the default Kiro agent (skip if you selected another ACP backend):"
 echo "       ${GREEN}Install Kiro CLI from https://kiro.dev/cli/${RESET}"
 echo "       ${GREEN}kiro-cli login${RESET}"
+if [ "$WITH_KAS" -eq 1 ]; then
+echo "       To try the built-in KAS engine instead (shadow testing, off by default):"
+echo "       ${GREEN}kirocrew config set agent.kas_bundle true${RESET}  then sign in from the dashboard"
+fi
 echo ""
 echo "    ${CYAN}3.${RESET} Run the setup wizard:"
 echo "       ${GREEN}kirocrew setup${RESET}"

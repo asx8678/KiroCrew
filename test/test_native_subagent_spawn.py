@@ -293,6 +293,13 @@ class TestNativeSubagentCloseAll:
         _native_subagent_close_all(state, slot, tracker)
         assert _ws_calls(state)["subagent_done"][0]["result"] == "(output in chat)"
 
+    def test_close_all_carries_the_given_error(self):
+        state = _make_state()
+        tracker = {"s1": {"started": 0.0, "done": False, "agent": "w", "task": "t1"}}
+        _native_subagent_close_all(state, _make_slot(), tracker, error="interrupted")
+        assert _ws_calls(state)["subagent_done"][0]["error"] == "interrupted"
+        assert tracker["s1"]["error"] == "interrupted"
+
 
 class TestEmptyTaskSkip:
     """Cards with empty initialQuery/sessionName are skipped entirely."""
@@ -1054,8 +1061,8 @@ class TestNativeAutoApproveLogSanitization:
     request stream, which is impractical to stand up in a unit test. Instead
     this exercises the PRODUCTION helper ``_safe_native_crew_debug_title`` that
     the handler applies to the tool title before logging, plus the ``%r``
-    formatting at the log call site. Reverting the redaction in chat_runner.py
-    therefore breaks these assertions.
+    formatting at the log call site. Reverting the redaction in ``_on_permission_request``
+    (chat_turn/tool_approval.py) therefore breaks these assertions.
     """
 
     def test_newline_is_escaped_not_forged(self) -> None:

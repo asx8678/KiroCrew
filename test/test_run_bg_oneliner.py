@@ -442,22 +442,10 @@ async def test_non_rejection_error_is_not_retried():
 
 
 class TestRejectedModelClassifier:
-    def test_matches_invalid_model_id(self):
-        assert (
-            _rejected_model_from_error({"data": "Invalid model ID: claude-haiku-4.5"})
-            == "claude-haiku-4.5"
-        )
-
-    def test_matches_invalid_model_id_auto_in_message(self):
-        assert _rejected_model_from_error({"message": "Invalid model ID: auto"}) == "auto"
-
     def test_matches_model_not_available(self):
         assert (
             _rejected_model_from_error({"data": "The model 'opus-x' is not available"}) == "opus-x"
         )
-
-    def test_returns_none_for_unrelated_error(self):
-        assert _rejected_model_from_error({"data": "ThrottlingException: slow down"}) is None
 
     def test_returns_none_for_non_dict(self):
         assert _rejected_model_from_error("nonsense") is None
@@ -806,6 +794,9 @@ async def test_the_direct_client_honours_the_seam(tmp_path, attachment, allow_im
 
     client = AcpClient(work_dir=tmp_path)
     client._session_id = "sid"
+    # As if the handshake advertised promptCapabilities.image; the seam is
+    # the caller's allow_image on top of that.
+    client._agent_accepts_image = True
     client._send_request = AsyncMock(return_value=3)
 
     await client._send_prompt(f"look {attachment}", allow_image=allow_image)

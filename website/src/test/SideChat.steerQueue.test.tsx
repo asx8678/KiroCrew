@@ -11,6 +11,7 @@ import dashboardReducer from '../store/dashboardSlice'
 
 vi.mock('../api/client', () => ({
   api: {
+    sideState: vi.fn().mockResolvedValue({ open: false }),
     sideOpen: vi.fn().mockResolvedValue({ ok: true, open: true, messages: 0, last_run_id: '', created_at: new Date().toISOString() }),
     sideTurn: vi.fn().mockResolvedValue({ ok: true, run_id: 'r1', messages: 1 }),
     sideClose: vi.fn().mockResolvedValue({ ok: true, was_open: true }),
@@ -30,6 +31,13 @@ const dashInitial = { ...dashboardReducer(undefined, { type: '@@INIT' }), connec
 
 const SLOT = 'test-slot-1'
 const initial = reducer(undefined, { type: '@@INIT' })
+
+// Two tests give `sideQueueEdit` an implementation of their own, and
+// `vi.clearAllMocks()` keeps it, so the next test's edit would get their answer
+// (one never settles). Reset it and seed the default before every test.
+beforeEach(() => {
+  vi.mocked(api.sideQueueEdit).mockReset().mockResolvedValue({ ok: true, depth: 1 })
+})
 
 /** A side that is mid-turn: the answer is streaming, so a submit can only
  *  steer or queue. */
@@ -435,7 +443,7 @@ describe('chatSlice steer frame placement', () => {
   })
 
   it('repairs the card even when it arrives BEFORE the steer response resolves', async () => {
-    // The other order. `submittedRaw` is a ref, so writing it triggers no render and the
+    // The other order. Recording submitted steer text does not trigger a render, so the
     // queue effect will not re-run — the repair has to happen in `onSuccess` too. A
     // deferred response reproduces the race deterministically.
     const raw = 'rotate AKIAIOSFODNN7EXAMPLE now'
@@ -1461,6 +1469,8 @@ describe('chatSlice steer frame placement', () => {
 
     expect(screen.queryByText(/\[STEERING/)).toBeNull()
     expect(screen.getByText('Steered')).toBeInTheDocument()
+    // The summary is folded behind the chip and shown once the reader opens it.
+    fireEvent.click(screen.getByTestId('steer-ack-toggle'))
     expect(screen.getByText('switched to the new question')).toBeInTheDocument()
   })
 
@@ -1484,7 +1494,7 @@ describe('chatSlice steer frame placement', () => {
     renderWithProviders(<SideChat slot={SLOT} />, { store })
 
     // The danger treatment is the point: the same text in an assistant row proves nothing.
-    expect(screen.getByText('the backend refused')).toHaveClass('text-danger')
+    expect(screen.getByText('the backend refused')).toHaveClass('text-danger-text')
   })
 
   it('a card whose text this client never had can be neither edited nor cancelled', async () => {

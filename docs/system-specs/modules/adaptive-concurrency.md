@@ -37,6 +37,19 @@ missed the 90 s MCP readiness deadline. The gate now moves on what says its
 starts are in trouble -- memory, gate init failures, slow inits -- and a
 cut gate climbs back once those stay quiet.
 
+**Memory waits are admission's, not the controller's.** With the count bounds
+gone, memory is the pool every chat's subagents share, and the two rules that
+keep it fair live in subagent admission
+(`subagent_manager/admission/`), not here ([subagent.md](subagent.md),
+*Memory waits: event wake and the per-lane share*): a start waiting for memory
+is re-checked on the events that move memory (a run's terminal, a wait
+ending, a sampler that runs only while a start waits and also sees a warming
+row settle), each
+one host reading that starts only what now fits, instead of on a fixed poll,
+and while another chat waits for memory, a chat already running its share
+of dedicated children does not get the next memory admission. Neither reads or
+writes the effective cap, and the controller's own sampling is unchanged.
+
 ## Modules
 
 | Module | Role |
@@ -80,12 +93,16 @@ Permission denials, invalid parameters, context-length errors, deny-rule
 refusals, turn limits and cancellations are `non_congestion` and never feed the
 controller (`classify_run_outcome`). Completions are inferred each tick by
 diffing `SubagentManager._agents` (`done` transitions), so the run loop needs no
-hook; `record_completion` exists for work the manager does not track. Both
+hook. `record_start` (from `acp/runtime_start.py`) and `record_provider_throttle`
+(from the subagent run loop and chat-turn recovery) have production callers;
+`note_gate_outcome`, `record_completion` and the `on_provider_throttle` listener
+are seams with no in-tree caller, so `gate_failures` comes from the daemon
+snapshot only. Both
 spawn-gate outcome counters are the DAEMON's LIFETIME totals, so the policy
 diffs them: `failure` against the value one window old, `success` against the
 value at the last cap change. A counter that went DOWN is a daemon respawn under
 a live policy and both diffs rebase onto the fresh value -- otherwise two
-lifetime failures read as permanent pressure (the experiment's D1) and a restart
+lifetime failures read as permanent pressure and a restart
 makes the gate cap re-earn the vanished daemon's whole success total on top of
 `DEFAULT_INCREASE_SUCCESSES` before its next `+1`. Silence is not a restart: a
 failed `stats()` read arrives as the all-zero `SpawnGateStats` default, a shape a
@@ -121,7 +138,7 @@ one-increase-per-window clock.
 | **Resume** (gate) | the probe completed (completions advanced) with no signal; or the host is idle and clear for `DEFAULT_IDLE_RECOVERY_SECS` with no probe result | gate to `floor + 1` (idle: left at its floor, to earn on inits); normal AIMD resumes. A probe that meets corroborated pressure re-pauses |
 | **Fresh start** | process start | exec cap AT its ceiling (`user_max`); gate at `mcp_gateway.spawn_concurrency_initial`; the first clean window is measured from the first sample |
 | **Ceiling raised** | `user_max` rises (a hot reload of `agent.max_subagents`) while the exec cap sat at the old ceiling | the exec cap follows to the new ceiling at once; a cap below the old ceiling (a cut) keeps earning its room |
-| **Fixed** | `adaptive_concurrency_mode = "fixed"` | both caps pinned at their initial values on every tick -- the exec cap at its ceiling (Q2 reversal) |
+| **Fixed** | `adaptive_concurrency_mode = "fixed"` | both caps pinned at their initial values on every tick -- the exec cap at its ceiling |
 
 `healthy_in_flight` (running minus stalled) bounds a decrease from below because
 natural shrink cannot free what is currently working; that is what turns "10
@@ -199,13 +216,9 @@ starts, fd and process exhaustion -- are what withhold the next increase or cut
 the cap. Work that cannot be admitted yet queues on the manager and the spawn
 gate; it is never refused for a guessed number.
 
-An earlier reading clamped the climb to `min(user_max, Sample.host_cap)`, a
-figure predicted from each agent's p90 peak memory AND peak CPU (the auto-sizing
-arithmetic without its `subagent_auto_max` clamp). It was removed because it
-inverted the loop: one build-heavy agent's one-minute burst (20 cores, 9 GB)
-priced every slot at that burst, so a 32-core host with 96 GB free computed a
-CPU term of 4 and held the cap at its fresh-start value for the life of the
-process, while the controller it sat under saw nothing but clean samples. Memory
+The climb is bounded by `user_max` alone, not by a figure predicted from each
+agent's peak memory and CPU: one build-heavy agent's burst would price every slot
+at that burst and hold the cap down while the controller saw only clean samples. Memory
 over-commit is the one unrecoverable failure and it is guarded live, once, where
 the start is decided: the spawn gate defers every
 start that would not leave `spawn_min_memory_gb` free after its own price and
@@ -228,8 +241,9 @@ off);
 `agent.subagent_cpu_cost_cores` is deprecated and inert, preserved on load and
 save so an existing config is not rewritten.
 
-`probe_host` reads memory, RSS and fds only -- live signals -- and no longer
-loads config or the learned-cost store on the worker thread.
+`probe_host` reads live signals only: free memory, process RSS, process CPU
+seconds (for metrics only, never classified), fd count and the fd soft limit. It
+loads no config and no learned-cost store on the worker thread.
 `test_adaptive_policy.py::TestSlowStart::
 test_no_static_host_prediction_sits_under_the_user_ceiling`,
 `test_adaptive_controller.py::TestTick::
@@ -410,7 +424,29 @@ over. A clear hold's `reason` says what the next exec step waits for: the
 ceiling, the idle clock ("idle; restoring toward 32 in 25s"), demand at the cap,
 or the completions still owed; when only host-only evidence (loop lag, memory)
 fired, the gate's hold is named instead. Cap decreases, pauses and resumes are logged at
-WARNING (growth at INFO) so `gateway.log` keeps them.
+WARNING (growth at INFO) so `gateway.log` keeps them. So that a throttled period's
+end, and its length, are in that log too, the first cut or pause opens a period and
+one WARNING closes it, `adaptive concurrency restored: exec_cap=N gate_cap=M after
+Ss (before the cut: exec_cap=N gate_cap=M)`, when the policy's caps are back at the
+values held just before that cut (a ceiling lowered meanwhile lowers the target; a
+switch to fixed mode also closes it; with no demand left, a return to the policy's
+start caps closes it too, since idle recovery restores only that far). A decrease or pause that loop lag caused ends
+with `busy=<module.qualname>[ via <module.qualname>]`: what the loop thread was
+running while the controller's timer was late. `adaptive/busy.py`'s
+`LoopBusySampler` is one daemon thread, armed before each sample's sleep for the
+sleep plus `lag_decrease_ms`; if the controller has not woken by then it reads the
+loop thread's frame once, and the controller disarms it on waking. It names code
+only (the innermost frame, and the innermost `kiro_crew` frame below a library
+frame, each at most 120 characters), never a file path, argument or local value.
+The walk stops at asyncio's `Handle._run`; with no `kiro_crew` frame inside the
+callback the handle is running, it names that callback (the watchdog's
+`stall_enrichment._callable_name`, attributes only), which is the only name a
+native callback has.
+A punctual tick reads no frame.
+Session health publishes the same state (`slack/gateway_runtime/admission.py`):
+the exec cap (`subagents`) and the spawn gate cap (`spawn_gate`) as cap sources,
+and a degrade reason of `adaptive_pause`, `adaptive_probe` or `adaptive_decrease`
+as a pressure source, so `dashboard/session_health.py` can name why work waits.
 `resource_status.adaptive_state()` reads it from the registry and
 `adaptive_summary_lines()` renders it at the end of the `resource_status` MCP
 tool's report ("Execution cap: 64/64   MCP spawn gate: 4/32 (active)", the
@@ -421,6 +457,44 @@ its signals, throttled provider scopes, and the last five of
 ceiling and a cut is on record it adds "Last pressure cut: decrease 42s ago
 (corroborated pressure: slow_keys,timeouts); signals: ..."). Only an exec cut
 is on record: a gate cut or pause lowers no exec cap.
+
+**The chat header shows a cut while it is in force.** `GET /api/spawn/adaptive`
+(below) returns, beside the snapshot, a `throttle` reading
+(`dashboard/handlers/spawn_resume.py::throttle_view`): whether a cut is in force,
+the execution cap and the spawn gate each as `{cap, configured, cut}` (the gate
+also carries `paused`), and `queued`, the work the last sample saw waiting for an
+execution slot. A cut is a cap below the value a fresh process starts it at --
+the execution cap below the policy's `exec_start` (the user's ceiling), the gate
+paused or below `gate_start` (`spawn_concurrency_initial`). A gate below its
+ceiling is not a cut, because the gate starts at its initial capacity and grows
+from there. The Tasks & capacity card's "lowered" mark reads the same start
+value: `/api/tasks/summary` publishes it as the gate lane's `start`
+(`handlers/tasks.py::_lane_caps`, through the same `_start_caps` read), so a
+gate between its start value and its ceiling is cut on neither surface. A disabled controller and
+`fixed` mode answer `{"cut": false}`. The
+dashboard's chat header (`components/ConcurrencyCutChip.tsx`) polls it every
+15 s and, while `cut` holds, shows one chip naming the reduced cap and the queue,
+linked to the Tasks & capacity card, with a polite live region that announces
+the cut and not each move of the queued count. Next to it the open session gets a
+marker when its own subagent starts wait for a slot under a cut execution cap; a
+memory wait keeps the sidebar's memory wording instead. Both read the title row
+as a container (`@container/chathead`), so they step down with the pane, not the
+window: as the row narrows the chip's sentence gives way to "Under load: 2/8",
+then to "2/8", and the marker folds away (the subagent progress bar and the
+sidebar row still count the queue); a row that also holds the two-way
+channel-link chip steps down sooner and, narrowest, shows the gauge alone. The
+sentence stays the link's accessible name at every width, and its numbers are
+formatted in the active locale's numerals, as the narrow "2/8" is. On a phone the title
+row is not rendered, so the top bar's overflow menu carries the cut as a row
+linking to the card, with the chip's hover reassurance (waiting work keeps its
+place) as a visible second line, since a touch screen shows no hover title; its
+trigger carries a warning-toned dot, and the bar holds the live
+region. A read that fails twice renders through `ErrorNotice` on both
+surfaces, in place of the chip and the menu row, and the phone trigger's dot
+turns error-toned: the last good reading is
+withheld once the failure is reported, so no surface shows numbers it cannot
+confirm (withheld while the dashboard is disconnected, which its offline
+banner covers).
 
 **A tool server is not the gateway process,** so that registry is empty there:
 `mcp_tools/spawn.py::_live_adaptive_state` falls back to `GET
@@ -437,11 +511,25 @@ answers does the tool print `agent.max_subagents`, and then it is labelled a
 ceiling rather than the cap in force -- the number a caller sizes a fan-out from
 has to be the effective one.
 
+**`kirocrew doctor` is another process outside the gateway.** Its overload
+section prints the configured adaptive bounds, then reads the same `GET
+/api/spawn/adaptive` snapshot with the local secret resolved for the
+`127.0.0.1` listener it dials (over the gateway's unix socket when that file
+exists, TCP loopback otherwise) and prints it through
+`adaptive_summary_lines()` under "adaptive controller (running gateway on port
+N)": the mode, both caps against their ceilings, the last pressure cut while
+the exec cap is below its ceiling, the last decision, and the last five cap
+changes, newest last. With no credential for the port nothing is sent; with no
+answer, a refusal or a snapshot-less reply it prints one "not read" line naming
+why, and none of those is a doctor issue, since the Connectivity section reports
+a gateway that is down (`doctor_checks/workload.py::_doctor_adaptive_live`).
+
 The two other places the model is handed a fan-out figure -- the spawn tool
-descriptions (`mcp_tools/spawn.py::schemas`, "You can run up to N sub-agents
+descriptions (`mcp_tools/spawn_parts/schemas.py::schemas`, "You can run up to N sub-agents
 concurrently", followed in both branches by the note that each start also waits
 until host memory can hold it) and the `{{MAX_SUBAGENTS}}` prompt token
-(`context.py::_resolve_prompt_templates`) -- read the in-process registry only,
+(`context_assembly/agent_spec.py::_resolve_prompt_templates`) -- read the in-process
+registry only,
 through `resource_status.adaptive_exec_cap()`, and never the loopback API: the
 prompt token is resolved once per session -- a session start takes the reading
 and the restore of the contract after compaction reuses it, unless the memo has
@@ -462,9 +550,12 @@ test_the_prompt_figure_is_the_auto_ceiling_on_any_host` and
 
 Metrics: `kirocrew.adaptive.decisions{action}` (`metrics/events.py::ADAPTIVE_DECISIONS`)
 increments once per decision that changed a cap or the paused flag; `action` is
-the closed policy enum. Holds and fixed-mode ticks are not counted.
+the closed policy enum. Holds and fixed-mode ticks are not counted. Each tick also
+records the process RSS and CPU-utilization histograms
+(`kirocrew.process.memory.rss_sampled`, `kirocrew.process.cpu.utilization`;
+`PROCESS_RSS_SAMPLED` and `PROCESS_CPU_UTILIZATION` in `metrics/events.py`).
 
-## Dependency signals (area L seam)
+## Dependency signals
 
 Per-provider throttling stays in that provider's dependency channel: the policy
 reports `throttled_providers` and the controller calls its
@@ -473,6 +564,9 @@ The `DependencyCoordinator` of [`taskq.md`](taskq.md) is the intended subscriber
 the controller itself never lowers a host cap for a 429.
 
 ## Tests
+
+`test_adaptive_runner_lane_feed.py` pins that runner-lane load (workflow
+`ctx.agent()` and TaskRunner steps) earns an exec-cap increase, not only a cut.
 
 `test_adaptive_startup_memory.py` runs the real manager, durable pump, admission
 guard and controller with virtual time, 0.25-second starts and five-second RSS

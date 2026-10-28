@@ -1,11 +1,15 @@
 import { QueryClient, QueryObserver, skipToken } from '@tanstack/react-query'
 import {
+  MEMBERS_ROSTER_QUERY_KEY,
+  noteUserChat,
   forgetUnobservedMemberThreads,
   memberProjectionsQuery,
   memberProjectionsQueryKey,
   memberThreadQueryKey,
 } from './membersQuery'
 import { memberProjectionStore } from '../state/memberProjectionStore'
+import { listedByDefault } from '../pages/members/rosterFilter'
+import type { MemberRosterRow } from './client'
 
 /* The websocket hook forgets cached member-thread outcomes on reconnect so a
  * return visit after a gateway restart waits for the thread endpoint again.
@@ -136,5 +140,42 @@ describe('memberProjectionsQuery', () => {
 
     memberProjectionStore.apply('fresh', 'roster', { name: 'Fresh' }, 1)
     expect(memberProjectionStore.get('fresh', 'roster')).toEqual({ name: 'Fresh' })
+  })
+})
+
+describe('noteUserChat', () => {
+  it('stamps the send as the newest message on the row bound to the slot and marks the roster stale', () => {
+    const qc = new QueryClient()
+    qc.setQueryData(MEMBERS_ROSTER_QUERY_KEY, [
+      { name: 'a', slug: 'a', slot_key: 'member-a', has_dm_message: false, last_active_ts: 0 },
+      { name: 'b', slug: 'b', slot_key: 'member-b', has_dm_message: true, last_active_ts: 50 },
+    ])
+    noteUserChat(qc, 'member-a', 1000)
+    const rows = qc.getQueryData<{ name: string; has_dm_message?: boolean; last_active_ts?: number }[]>(MEMBERS_ROSTER_QUERY_KEY)!
+    expect(rows.map((r) => [r.name, r.has_dm_message, r.last_active_ts])).toEqual([['a', true, 1000], ['b', true, 50]])
+    expect(qc.getQueryState(MEMBERS_ROSTER_QUERY_KEY)?.isInvalidated).toBe(true)
+  })
+  it('marks the first person-sent message, so a row listed only after one stays listed', () => {
+    const qc = new QueryClient()
+    qc.setQueryData(MEMBERS_ROSTER_QUERY_KEY, [
+      { name: 'default', slug: 'default', slot_key: 'member-default', has_dm_message: false, has_user_dm_message: false },
+    ])
+    noteUserChat(qc, 'member-default', 1000)
+    const row = qc.getQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY)![0]
+    expect(row.has_user_dm_message).toBe(true)
+    expect(listedByDefault(row)).toBe(true)
+  })
+  it('never moves a row backwards: a late echo keeps the newer stamp', () => {
+    const qc = new QueryClient()
+    qc.setQueryData(MEMBERS_ROSTER_QUERY_KEY, [{ name: 'a', slug: 'a', slot_key: 'member-a', last_active_ts: 2000 }])
+    noteUserChat(qc, 'member-a', 1000)
+    expect(qc.getQueryData<{ last_active_ts?: number }[]>(MEMBERS_ROSTER_QUERY_KEY)![0].last_active_ts).toBe(2000)
+  })
+  it('a send to a slot no row holds (a normal chat) only marks the roster stale', () => {
+    const qc = new QueryClient()
+    qc.setQueryData(MEMBERS_ROSTER_QUERY_KEY, [{ name: 'a', slug: 'a', slot_key: 'member-a', last_active_ts: 0 }])
+    noteUserChat(qc, 'chat-1', 1000)
+    expect(qc.getQueryData<{ last_active_ts?: number }[]>(MEMBERS_ROSTER_QUERY_KEY)![0].last_active_ts).toBe(0)
+    expect(qc.getQueryState(MEMBERS_ROSTER_QUERY_KEY)?.isInvalidated).toBe(true)
   })
 })

@@ -7,7 +7,6 @@ import json
 import logging
 import math
 import re
-import time
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -39,6 +38,7 @@ MAX_DEFERRED_NOTE_CHARS = 4000
 # evicting a retained entry, because every retained entry is the only durable
 # copy of a 200-acknowledged note.
 _MAX_DURABLE_HOLD_ENTRIES = 2 * MAX_DEFERRED_NOTES
+
 
 # The source label's single bound, defined here and imported by the writer in
 # chat_handlers the way ``MAX_DEFERRED_NOTE_CHARS`` already is, so the admit
@@ -681,32 +681,6 @@ class SlotBufferCoordinator:
         return slot.release_pending_chunks()
 
     @staticmethod
-    def append_pending_context(
-        slot: Any,
-        entry: dict[str, Any],
-        *,
-        max_pending_context: int,
-        entry_expired: Callable[[dict[str, Any], float], bool],
-    ) -> bool:
-        """Append one entry; returns False when the queue is at its ceiling.
-
-        CTX-30: a full queue REFUSES the append rather than silently evicting
-        the oldest entry — a producer posting past the ceiling learns it was
-        not queued (the HTTP caller returns 429 capacity_reached), so one
-        app's burst cannot displace another producer's already-queued context.
-        """
-        now = time.time()
-        if entry_expired(entry, now):
-            return True
-        slot._pending_context[:] = [
-            current for current in slot._pending_context if not entry_expired(current, now)
-        ]
-        if len(slot._pending_context) >= max_pending_context:
-            return False
-        slot._pending_context.append(entry)
-        return True
-
-    @staticmethod
     def drop_foreign_authorized_notes(
         slot: Any,
         *,
@@ -767,8 +741,8 @@ class SlotBufferCoordinator:
         flush/save/enqueue interleaving is. A note dropped at the rebind
         seam records its id in ``slot._dropped_note_ids`` instead, and the
         next save retires it from there. A crash before the save re-delivers
-        the note on restore: at-least-once, the correct failure direction for
-        a delivery promise.
+        the note on restore: at-least-once, the correct failure direction
+        for a delivery promise.
         """
         if not slot._deferred_notes:
             return 0
@@ -802,11 +776,20 @@ class SlotBufferCoordinator:
                     # the id so the next full save retires it instead of the
                     # entry replaying (and re-dropping) after every restart
                     # until the hold's ceiling fills with garbage.
+                    #
+                    # Arm the save here: this is a durable-state mutation
+                    # (``_dropped_note_ids`` is persisted in the metadata line).
+                    # The terminal ``done`` row that queue-cycle end appends is
+                    # wire-only and does not mark the slot dirty, so without this
+                    # the retirement would wait for an unrelated durable row and
+                    # a restart could replay the dropped note first.
                     slot._dropped_note_ids.add(dropped_id)
+                    slot._dirty = True
                 continue
 
-            # Pop is a retry marker: if the visible row fails after the context
-            # was queued, the restored note must not enqueue that context twice.
+            # Pop context as a retry-idempotency marker. The except arm below
+            # restores it when ``slot.append`` raises, ensuring context is never
+            # promoted into ``_pending_context`` without its visible row.
             context = note.pop("context", None)
             note_id = note.get("id")
             row_meta: dict[str, Any] = {"noteSession": live_session}
@@ -820,13 +803,19 @@ class SlotBufferCoordinator:
             if isinstance(note_id, str) and note_id:
                 # The delivered row carries its note id, and the full save
                 # retires a durable entry exactly when the window it writes
-                # contains that id — row and retirement land in one atomic
+                # contains that id -- row and retirement land in one atomic
                 # file write, whatever the flush/save interleaving was.
                 row_meta["noteId"] = note_id
+            # Track the window length so we can tell whether slot.append adds
+            # a row before its callbacks raise (state.py: messages.append runs
+            # before _on_card_event / _on_message). A row that landed despite a
+            # callback exception is treated as written: context is promoted and
+            # the note is not retried.
+            _pre_inject_len = len(slot.messages)
             try:
-                if context is not None:
-                    context["noteSession"] = live_session
-                    slot.append_pending_context(context)
+                # Visible row first: context is never promoted before the row
+                # that gives it meaning lands, so a raise here cannot leave an
+                # orphaned context entry in the pending queue.
                 slot.append(
                     role="inject",
                     content=note["content"],
@@ -835,13 +824,49 @@ class SlotBufferCoordinator:
                     meta=row_meta,
                 )
             except Exception:
-                # New arrivals stay after this older, unwritten suffix. The
-                # durable copy still holds every note (delivered rows
-                # included) and the next full save trues it up against live
-                # state; see the docstring for why no metadata write happens
-                # here.
-                slot._deferred_notes[:0] = held[index:]
-                raise
+                if len(slot.messages) > _pre_inject_len:
+                    # Row landed before its callback raised. Treat as written:
+                    # do not restore the note. Execution falls through to
+                    # context promotion.
+                    logger.warning(
+                        "Slot %s: inject row callbacks raised after row landed; "
+                        "treating row as written and promoting context",
+                        slot.key,
+                        exc_info=True,
+                    )
+                else:
+                    # Row failed. Restore context so the retry can promote it
+                    # after the row eventually lands.
+                    if context is not None:
+                        note["context"] = context
+                    # New arrivals stay after this older, unwritten suffix.
+                    slot._deferred_notes[:0] = held[index:]
+                    raise
+
+            # Row landed; now promote the context half. A failure here is
+            # non-fatal: the visible row is already written and is not replayed,
+            # so the context is dropped with a warning rather than retried
+            # (which would duplicate the row).
+            if context is not None:
+                context["noteSession"] = live_session
+                try:
+                    if not slot.append_pending_context(context):
+                        # The pop above already retired the retry marker. The
+                        # warning is the loss signal; the normal full-queue case
+                        # is refused earlier, at /note admission, so this fires
+                        # only on a race (an unexpiring /context takes the seat
+                        # between admission and flush) or a restart edge.
+                        logger.warning(
+                            "Slot %s delivered a held note without its context: "
+                            "the pending-context queue had no seat",
+                            slot.key,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Slot %s: context add raised after note row landed; context dropped",
+                        slot.key,
+                        exc_info=True,
+                    )
             written += 1
         return written
 

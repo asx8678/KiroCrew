@@ -1,7 +1,7 @@
 """The import-source registry, and the explicit adapters it dispatches to.
 
 Every foreign agent the engine can read is an adapter module in this package --
-``codex``, ``claude_code``, ``gemini``, ``openclaw``, ``hermes`` -- plus
+``codex``, ``claude_code``, ``gemini``, ``openclaw``, ``hermes``, ``amazon_quick`` -- plus
 ``lineage``, the reader for an install of Kiro Crew's own layout that an
 edition registers through the ``ImportSourceProvider`` CPP seam. An adapter
 knows ONE layout: where its files are, which configs outrank which, and which
@@ -36,6 +36,7 @@ from kiro_crew import onboarding_scan, platform_compat
 from kiro_crew.onboarding_plan import _MAX_WORKSPACE_COMPONENT_CHARS, _deduplicate_items
 from kiro_crew.onboarding_scan import _expand_root, _Scan
 from kiro_crew.onboarding_sources import lineage
+from kiro_crew.onboarding_sources.amazon_quick import _scan_amazon_quick
 from kiro_crew.onboarding_sources.claude_code import _scan_claude
 from kiro_crew.onboarding_sources.codex import _scan_codex
 from kiro_crew.onboarding_sources.gemini import _scan_gemini
@@ -50,21 +51,20 @@ logger = logging.getLogger("kiro_crew.onboarding_import")
 
 _CORE_MANAGED_MCP_NAMES = frozenset(
     {
+        # Kiro Crew's managed servers, always-on and opt-in alike: an entry under
+        # any of these names must never be carried over from a runtime the user is
+        # migrating away from -- it would name a binary that cannot start.
         "kirocrew-core",
         "kirocrew-cron",
         "kirocrew-computer",
         "kirocrew-dashboard",
-        # The three opt-in sets. They are managed names like the four above, so an
-        # entry under any of them must never be carried over from a runtime the
-        # user is migrating away from -- it would name a binary that cannot start.
-        # The work-ledger name was missing here while this list already held every
-        # always-on server; adding the crew-log one without it would have left the
-        # same gap open next to a test that closes it.
         "kirocrew-work",
         "kirocrew-crew-log",
         "kirocrew-debug",
         "kirocrew-panel",
-        "kirocrew-ops",
+        "kirocrew-guide",
+        "kirocrew-mate",
+        # OpenClaw's own servers.
         "openclaw-core",
         "openclaw-cron",
         "openclaw-computer",
@@ -152,7 +152,8 @@ def _source_context(
 #: Ids that are never an import source, whatever a descriptor claims. ``quick`` is
 #: the first-run setup MODE — the spec requires it never appear as an import
 #: option — so accepting it here would register a source the dashboard is obliged
-#: to hide, i.e. one that imports nothing and cannot be diagnosed.
+#: to hide, i.e. one that imports nothing and cannot be diagnosed. The Amazon Quick
+#: app is a source, and is registered as ``amazon_quick`` for that reason.
 _RESERVED_SOURCE_IDS = frozenset({"quick"})
 
 
@@ -308,6 +309,13 @@ def _core_sources() -> tuple[_Builtin, ...]:
             env_vars=("HERMES_HOME", "HERMES_AGENT_HOME", "HERMES_CONFIG_DIR"),
             home_dir=".hermes",
         ),
+        # The app documents no override for its root, so it declares none.
+        _Builtin(
+            id="amazon_quick",
+            display_name="Amazon Quick",
+            scan=_scan_amazon_quick,
+            home_dir=".quickwork",
+        ),
     )
 
 
@@ -388,8 +396,8 @@ def _normalize_source(candidate: Any, *, taken: set[str], core: bool) -> _Source
     builtins cannot drift onto a laxer path than the rule they model.
 
     *core* is the trust distinction, and it governs exactly one thing: where the
-    reader comes from. A builtin brings its own (it IS engine code); a
-    contribution names a ``layout`` and the engine looks the reader up, so no
+    reader comes from. A builtin brings its own (it IS engine code); for a
+    contribution the engine supplies the lineage reader itself, so no
     out-of-tree code ever writes into the scan accumulator and the content gates
     inside the engine's readers cannot be bypassed.
     """

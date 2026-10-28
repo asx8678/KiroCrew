@@ -180,6 +180,7 @@ from kiro_crew.dashboard.handlers.files import (  # noqa: E402, F401
     api_file_diff,
     api_file_download,
     api_file_grep,
+    api_file_kinds,
     api_file_office_preview,
     api_file_raw,
     api_file_read,
@@ -194,6 +195,7 @@ from kiro_crew.dashboard.handlers.files import (  # noqa: E402, F401
     api_path_complete,
     api_project_git,
     api_project_git_log,
+    api_project_git_repos,
     api_project_git_status,
     api_project_tree,
     api_reveal_path,
@@ -265,7 +267,10 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.members import (  # noqa: E402, F401
     api_member_activity,
     api_member_briefing,
+    api_member_fresh_start,
+    api_member_greet,
     api_member_projections,
+    api_member_recap,
     api_member_rules_get,
     api_member_rules_put,
     api_member_thread,
@@ -452,6 +457,7 @@ from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     api_session_detail,
     api_session_directive,
     api_session_keepalive,
+    api_session_meta,
     api_session_tool_policy,
     api_sessions,
     api_sessions_clear,
@@ -471,7 +477,9 @@ from kiro_crew.dashboard.handlers.side import (  # noqa: E402, F401
     api_side_open,
     api_side_queue_cancel,
     api_side_queue_edit,
+    api_side_state,
     api_side_stop,
+    api_side_tools,
     api_side_turn,
 )
 
@@ -615,7 +623,7 @@ from kiro_crew.dashboard.handlers.ui_prefs import (  # noqa: E402, F401
 )
 
 # ── Updates & Logs (extracted to handlers/updates.py) ──
-# NOTE: api_stream passes update_available= to status_snapshot (see updates.py)
+# NOTE: api_stream passes update_available= to status_snapshot (see updates_streams.py)
 from kiro_crew.dashboard.handlers.updates import (  # noqa: E402, F401
     _UPDATE_CHECK_INTERVAL,
     _do_update_check,
@@ -649,6 +657,7 @@ from kiro_crew.dashboard.handlers.usage import (  # noqa: E402, F401
     api_kiro_usage,
     api_usage,
 )
+from kiro_crew.dashboard.handlers.usage_series import api_usage_series  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.wakatime import (  # noqa: E402, F401
     api_wakatime_export,
     api_wakatime_stats,
@@ -976,6 +985,13 @@ from kiro_crew.dashboard.handlers.aws_consent import (  # noqa: E402, F401
     api_aws_consent_post,
 )
 
+# Project AWS profile binding (aws.project_profiles) — the composer's project
+# chip reads and sets which named profile a project's sessions start with.
+from kiro_crew.dashboard.handlers.aws_project_profile import (  # noqa: E402, F401
+    api_aws_project_profile_get,
+    api_aws_project_profile_put,
+)
+
 # Computer use — the Settings config pair (browser, cookie-authed) plus the two
 # loopback legs: ``invoke`` (the ``kirocrew-computer`` MCP shim's forward) and
 # ``frame`` (the live-view PiP mirror of an already-captured screenshot).
@@ -1043,19 +1059,11 @@ from kiro_crew.dashboard.handlers.decisions import (  # noqa: E402, F401
     api_decisions_provider_get,
     api_decisions_provider_put,
 )
-
-# Flagged-file delivery consent — owner-gated, and the ONLY writer of
-# ``file_delivery_consent.json``. Recording is arm (owner POST) + approve
-# (host-only ``kirocrew file-delivery approve``, which consumes the nonce).
-from kiro_crew.dashboard.handlers.file_delivery_consent import (  # noqa: E402, F401
-    api_file_delivery_consent_approve,
-    api_file_delivery_consent_arm_status,
-    api_file_delivery_consent_delete,
-    api_file_delivery_consent_get,
-    api_file_delivery_consent_post,
-)
 from kiro_crew.dashboard.handlers.notifications_push import (  # noqa: E402, F401
     api_push_notification,
+    api_push_subscribe,
+    api_push_unsubscribe,
+    api_vapid_public_key,
 )
 from kiro_crew.dashboard.handlers.onboarding_import import (  # noqa: E402, F401
     api_onboarding_import_apply,

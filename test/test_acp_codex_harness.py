@@ -1134,17 +1134,23 @@ class TestTheEffortChannelIsReadFromItsOwnTable:
         )
 
     @pytest.mark.asyncio
-    async def test_the_kiro_family_still_takes_effort_from_its_overlay(self):
-        """The skip the runtime gate stands in for, held by the channel set instead."""
-        for backend in (ACP_BACKEND_KIRO, ACP_BACKEND_KAS):
-            provider = _effort_provider(backend, "claude-fable-5")
-            provider._effort_per_model = {"claude-fable-5": "high"}
-            await provider._apply_initial_effort()
-            provider._client.set_config_option.assert_not_awaited()
+    async def test_kiro_still_takes_effort_from_its_overlay(self):
+        """The skip the runtime gate stands in for, held by the channel set instead.
 
-    def test_codex_is_in_the_channel_set_and_the_kiro_family_is_not(self):
+        KAS is not part of this skip: it reads no overlay and takes effort as its
+        ``effortLevel`` config option (``test_acp_kas_effort``).
+        """
+        provider = _effort_provider(ACP_BACKEND_KIRO, "claude-fable-5")
+        provider._effort_per_model = {"claude-fable-5": "high"}
+        # A level resolves, so the missing push is the channel set's doing.
+        assert provider._resolve_effort() == "high"
+        await provider._apply_initial_effort()
+        provider._client.set_config_option.assert_not_awaited()
+
+    def test_codex_and_kas_are_in_the_channel_set_and_kiro_is_not(self):
         assert ACP_BACKEND_CODEX in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
-        assert not ({ACP_BACKEND_KIRO, ACP_BACKEND_KAS} & ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION)
+        assert ACP_BACKEND_KAS in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
+        assert ACP_BACKEND_KIRO not in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
 
 
 def _handle_on(backend: str) -> AcpSessionHandle:
@@ -1480,6 +1486,28 @@ class TestTheRuntimeSendsCodexNoAgentMode:
             await rt.create_session(cwd="/w", agent="kirocrew")
 
         assert METHOD_SET_MODE in plane.methods
+
+
+class TestTheRuntimePersistsTheAdvertisedModelCacheForCodex:
+    @pytest.mark.asyncio
+    async def test_create_session_feeds_and_persists_once(self, monkeypatch):
+        """codex is in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION, so the shared runtime
+        feeds the advertised-model cache and then offloads its persist after
+        session/new; the kiro side of the same gate is pinned in
+        test_acp_runtime_load_session.py."""
+        feed = MagicMock()
+        monkeypatch.setattr(AcpSessionHandle, "_feed_advertised_model_cache", feed)
+        spy = AsyncMock()
+        monkeypatch.setattr(AcpSessionHandle, "_persist_advertised_models_if_changed", spy)
+        rt = _codex_runtime()
+        plane = _ControlPlane(_codex_session_new_response())
+
+        with ExitStack() as stack:
+            plane.install(rt, stack)
+            await rt.create_session(cwd="/w", agent="kirocrew")
+
+        feed.assert_called_once()
+        spy.assert_awaited_once()
 
 
 class TestTheRuntimeArmsCodexPermissionRouting:

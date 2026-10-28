@@ -34,6 +34,7 @@ run, so non-ASCII would UnicodeEncodeError on Windows cp1252 pipes.
 
 from __future__ import annotations
 
+import gc
 import importlib
 import subprocess
 import sys
@@ -42,10 +43,10 @@ from typing import Callable, TypeVar
 
 # Module scope, not function-local: these are the only package imports this file
 # can safely make at import time. dep_sync and stdlib_shadow import the standard
-# library only (each asserted by a test) and `__version__` needs nothing beyond
+# library only (each asserted by a test) and `version_line` needs nothing beyond
 # the package itself (`kiro_crew.__init__` imports only the standard library), so
 # none can raise the ModuleNotFoundError this file exists to heal.
-from kiro_crew import __version__, dep_sync
+from kiro_crew import dep_sync, version_line
 from kiro_crew.stdlib_shadow import refuse_if_stdlib_shadowed
 
 _PIP_TIMEOUT_SECS = 300
@@ -122,7 +123,7 @@ def main() -> None:
     # form fast-paths so `artifact show --version N` keeps its argparse
     # semantics.
     if len(sys.argv) == 2 and sys.argv[1] == "--version":
-        print(f"kirocrew {__version__}")
+        print(version_line())
         return
     # The stdio MCP servers the gateway launches skip the full CLI import
     # (kiro_crew.mcp_entry; its module scope is stdlib-only). slim_server
@@ -135,6 +136,12 @@ def main() -> None:
     if server is not None:
         server()
         return
+    if sys.argv[1:2] == ["gateway"]:
+        # The gateway's import graph is ~150k objects, and the cyclic collector
+        # spends ~0.2 s of it in gen-2 passes over objects that all survive.
+        # Boot turns GC back on, after freezing that heap, once its socket is
+        # bound (slack/gateway_runtime/service_boot.py, run()).
+        gc.disable()
     cli_main = _load_healing(_import_cli)
     cli_main()
 

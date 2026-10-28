@@ -57,8 +57,8 @@ _SIBLING_DIR_NAME = "KiroCrewWebsite"
 # sync run at ``runtime._RUN_DEADLINE_S`` (1800s), counted from fetch -- before
 # preflight, merge, pip and `npm ci` have even reached the build. A build budget
 # at or near 1800s therefore never expires there; the watchdog kills the tree
-# first and the warning below is never emitted, which is the silent-stale-bundle
-# outage this change exists to end. So the build claims at most HALF that
+# first and the warning below is never emitted, leaving a silently stale bundle.
+# So the build claims at most HALF that
 # deadline, leaving the other half for everything the sync does before it.
 #
 # Residual, deliberately not closed here: if the steps before the build consume
@@ -372,9 +372,11 @@ def _incomplete_bundle_reason(tree: Path) -> str:
 
 
 #: Every ``/assets/*.js|css`` an index.html references, ignoring a query or hash.
+#: A sub-path build (``KIROCREW_BASE_PATH``) writes ``/<base>/assets/...``; the
+#: base segments are matched and dropped so the ref still names a file in the tree.
 #: Byte-identical to ``ASSET_REF_PATTERN`` in website/scripts/publish-dist.mjs,
 #: pinned by test_frontend_dist_resolve.py, so both gates accept the same trees.
-_ASSET_REF = r'(?:src|href)="(/assets/[^"?#]+\.(?:js|css))(?:[?#][^"]*)?"'
+_ASSET_REF = r'(?:src|href)="(?:/[A-Za-z0-9._~-]+)*(/assets/[^"?#]+\.(?:js|css))(?:[?#][^"]*)?"'
 
 
 def _live_link_target(path: Path) -> Optional[Path]:

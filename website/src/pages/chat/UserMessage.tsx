@@ -1,11 +1,12 @@
 import { memo, useState, useRef, useEffect, useCallback, type ReactNode } from 'react'
 import { motion } from 'framer-motion'
-import { Pencil, Send, Copy, Check, Link2, MessageSquare, Target, Pin, PinOff, X, Clock, Quote, MoreHorizontal } from 'lucide-react'
+import { Pencil, Send, Copy, Check, Link2, MessageSquare, Target, Pin, PinOff, X, Clock, Quote, MoreHorizontal, Undo2, ArrowUpFromLine } from 'lucide-react'
 import { copyToClipboard } from '../../utils/clipboard'
 import { copySessionLink } from '../../utils/shareUrl'
 import { ICON_ACTION_ROW_CLS } from '../../utils/touchActions'
 import { useSearchHighlight, useCurrentOcc } from '../../hooks/SearchHighlightContext'
 import { useImeGuard } from '../../hooks/useImeGuard'
+import { useReducedMotion } from '../../hooks/useReducedMotion'
 import { applySearchHighlights, clearSearchHighlights } from '../../utils/domHighlight'
 import { scrollCurrentMatchIntoView } from '../../utils/searchScroll'
 import { containedSelectionRange } from '../../utils/selectionContainment'
@@ -15,17 +16,38 @@ import { i18nT } from '../../i18n/t'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 import InfoTip from '../../components/InfoTip'
 import ErrorNotice from '../../components/ErrorNotice'
+import { Btn } from '../../components/ui'
 import SteerDecisionLine from './SteerDecisionLine'
 import QuoteCard from './QuoteCard'
 import MessageContextMenu, { type MessageMenuItem } from './MessageContextMenu'
 import { prependQuote, quoteBlock, readMessageQuote, stripQuoteBlock, type MessageQuote } from '../../chat-core/composer/messageQuote'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '../../components/ui/dropdown-menu'
 import { readSteerRecord } from './decisionRecord'
+import { revealComposer } from './composerFocus'
+import type { SteerRetractAction, SteerRetractRefusalNotice } from '../../hooks/useSteerRetract'
 // Steer bubbles play a one-shot entrance (slide-in + ring pulse) when they land.
 // The chat transcript is virtualized, so a row can remount when scrolled away and
 // back; without this guard the entrance would replay every time. Module-level set
 // persists for the app session — each steered message animates exactly once.
 const animatedSteers = new Set<string>()
+
+/* Each take-back notice names the action that was picked. The keys stay full
+ * literals so the dead-key and dynamic-key checks can see every one of them. */
+const STEER_UNSUPPORTED_KEY: Record<SteerRetractAction, string> = {
+  unsend: 'pages.chat.userMessage.steer_unsend_unsupported',
+  edit: 'pages.chat.userMessage.steer_edit_unsupported',
+  queue: 'pages.chat.userMessage.steer_queue_unsupported',
+}
+const STEER_FAILED_KEY: Record<SteerRetractAction, string> = {
+  unsend: 'pages.chat.userMessage.steer_unsend_failed',
+  edit: 'pages.chat.userMessage.steer_edit_failed',
+  queue: 'pages.chat.userMessage.steer_queue_failed',
+}
+const STEER_UNCONFIRMED_KEY: Record<SteerRetractAction, string> = {
+  unsend: 'pages.chat.userMessage.steer_unsend_unconfirmed',
+  edit: 'pages.chat.userMessage.steer_edit_unconfirmed',
+  queue: 'pages.chat.userMessage.steer_queue_unconfirmed',
+}
 
 interface UserMessageProps {
   content: string
@@ -40,7 +62,9 @@ interface UserMessageProps {
   canEdit?: boolean
   messageIndex?: number
   messageTs?: string
-  onEditResend?: (index: number, ts: string, newContent: string) => void
+  /** Returns `false` when the host could not take the edit right now: the
+   *  editor then stays open with the text, so nothing typed is lost. */
+  onEditResend?: (index: number, ts: string, newContent: string) => void | boolean
   /** Opt-in: a double-click on the read-only bubble opens the editor. Off by
    *  default because the gesture replaces native double-click word selection
    *  on the bubble. The pencil button is the edit path for everyone. Wired
@@ -67,6 +91,13 @@ interface UserMessageProps {
    *  send while the member works is a steer), the badge would label every
    *  such send with the mechanics the surface exists to hide. */
   hideSteerBadge?: boolean
+  /** Bubble colour. `default` is the single-chat page's neutral `bg-card`
+   *  surface. `accent` fills the bubble with the theme accent and sets its text
+   *  to `--accent-fg` — the iMessage pairing a crewmate's chat uses (#17839),
+   *  where the crewmate's gray bubble sits opposite. The `user-bubble-accent`
+   *  hook recolours inline code and links onto `--accent-fg` (index.css), since
+   *  the message-wide code and link colours assume the neutral surface. */
+  tone?: 'default' | 'accent'
   /** ⌘↑ / Ctrl+Up edit request: a monotonically increasing sequence
    *  number. ChatPage passes a NEW value when the keyboard requests an edit of
    *  THIS row (the session's last user message); the rising edge opens the
@@ -90,9 +121,19 @@ interface UserMessageProps {
   /** Scroll to the message this row quotes (`meta.quote`). Absent, the card is
    *  drawn but is not a control. */
   onJumpToQuote?: (quote: MessageQuote) => void
+  /** Take this steer back before the running turn reads it, by its row `mid`.
+   *  The controls are drawn only on a pending steer whose row says it can be taken
+   *  back (`meta.steerRetract`), which the gateway stamps where the harness can. */
+  onSteerAction?: (mid: string, action: SteerRetractAction) => void
+  /** The take-back in flight for this row: its controls give way to a progress line. */
+  steerActionPending?: SteerRetractAction
+  /** Why this row's last take-back did not happen. */
+  steerActionRefusal?: SteerRetractRefusalNotice
+  /** The take-back request failed before its outcome was known. */
+  steerActionRequestFailed?: boolean
 }
 
-const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, doubleClickToEdit = false, slotKey, slotTitle, mode, pinned, onTogglePin, onReplyInThread, slotRunning, hideSteerBadge, editRequest, onEditConsumed, onQuoteMessage, onJumpToQuote }: UserMessageProps) {
+const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, doubleClickToEdit = false, slotKey, slotTitle, mode, pinned, onTogglePin, onReplyInThread, slotRunning, hideSteerBadge, tone = 'default', editRequest, onEditConsumed, onQuoteMessage, onJumpToQuote, onSteerAction, steerActionPending, steerActionRefusal, steerActionRequestFailed }: UserMessageProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [editing, setEditing] = useState(false)
   const ime = useImeGuard()
@@ -156,7 +197,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   // what both doors carry -- the live `steer_push` / `queue_push` reconcile and a
   // row reloaded from history -- so the line survives a reload without a fetch.
   // Absent on every ordinary send, and that absence is what draws nothing.
-  const steerDecision = readSteerRecord((meta as { decisions_strip?: unknown } | undefined)?.decisions_strip)
+  const steerDecision = hideSteerBadge ? null : readSteerRecord((meta as { decisions_strip?: unknown } | undefined)?.decisions_strip)
   const steerState = (meta as { steerState?: string } | undefined)?.steerState
   const steerOptimistic = !!(meta as { optimistic?: boolean } | undefined)?.optimistic
   const isSteer = !hideSteerBadge
@@ -179,6 +220,14 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   // steer/queue vocabulary the steer-only surface exists to hide.
   const pendingSteer = !hideSteerBadge && steerMeta && !!slotRunning && (steerState === 'written' || (steerOptimistic && !steerState))
   const requeuedSteer = !hideSteerBadge && steerMeta && steerState === 'requeued'
+  // Taken back before the turn read it: the row keeps its place in the transcript
+  // and says what became of the text, but draws no bubble -- the agent never saw it.
+  const retractedAction = steerMeta && steerState === 'retracted'
+    ? ((meta as { steerRetractAction?: string }).steerRetractAction || 'unsend')
+    : null
+  const steerMid = typeof (meta as { mid?: unknown } | undefined)?.mid === 'string' ? (meta as { mid: string }).mid : ''
+  const steerTakeBack = pendingSteer && !!onSteerAction && !!steerMid
+    && (meta as { steerRetract?: unknown } | undefined)?.steerRetract === true
   // Fired from an EFFECT rather than a `useState` initializer, because the state
   // this depends on arrives AFTER mount. The optimistic bubble mounts with
   // `{ steer: true, optimistic: true }` and no `steerState`, so `isSteer` is
@@ -272,7 +321,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     // The block the editor hid goes back on the head, so the resent text
     // still carries the quoted message the user wrote the reply to.
     const resend = carriedQuote && content.startsWith(quoteBlock(carriedQuote)) ? prependQuote(trimmed, carriedQuote) : trimmed
-    onEditResend?.(messageIndex ?? 0, messageTs ?? '', resend)
+    if (onEditResend?.(messageIndex ?? 0, messageTs ?? '', resend) === false) return
     setEditing(false)
   }, [draft, onEditResend, messageIndex, messageTs, carriedQuote, content])
 
@@ -344,6 +393,82 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   // the read-only and editing renders.
   const handleDoubleClick = useCallback(() => { startEdit() }, [startEdit])
 
+  // A take-back settles the row in place: the bubble the person was looking at
+  // shrinks away and the note fades in at the same spot, so the row reads as one
+  // element changing. The server clears a retracted row's text, so the bubble
+  // the collapse draws is the body this row last showed while it was pending.
+  // Only a row that was mounted pending plays it; a row read back already
+  // retracted (history, reload) is drawn as the note from the start.
+  const reducedMotion = useReducedMotion()
+  const [mountedRetracted] = useState(() => !!retractedAction)
+  const [collapseDone, setCollapseDone] = useState(false)
+  const lastBubbleBodyRef = useRef(carriedQuote ? stripQuoteBlock(content, carriedQuote) : content)
+  useEffect(() => {
+    if (!retractedAction) lastBubbleBodyRef.current = carriedQuote ? stripQuoteBlock(content, carriedQuote) : content
+  }, [retractedAction, content, carriedQuote])
+
+  if (retractedAction) {
+    const settleAnimated = !mountedRetracted && !reducedMotion
+    const retractedIcon = retractedAction === 'queue'
+      ? <ArrowUpFromLine size={12} className="shrink-0" aria-hidden="true" />
+      : retractedAction === 'edit'
+        ? <Pencil size={12} className="shrink-0" aria-hidden="true" />
+        : <Undo2 size={12} className="shrink-0" aria-hidden="true" />
+    const retractedLabel = retractedAction === 'edit'
+      ? i18nT('pages.chat.userMessage.steer_retracted_edit')
+      : retractedAction === 'queue'
+        ? i18nT('pages.chat.userMessage.steer_retracted_queue')
+        : i18nT('pages.chat.userMessage.steer_retracted_unsend')
+    // Edit and Queue instead put the text somewhere the person can go: the
+    // message box, or the queue stack in the composer dock above it. The note
+    // is the way there. Unsend put it nowhere, so its note is plain text.
+    const note = retractedAction === 'unsend'
+      ? (
+        <div className="inline-flex items-center gap-1 text-[12px] leading-5 text-muted pr-1" data-testid="steer-retracted">
+          {retractedIcon}
+          {retractedLabel}
+        </div>
+      )
+      : (
+        <Btn
+          type="button"
+          onClick={revealComposer}
+          className="inline-flex items-center gap-1 border-none bg-transparent text-[12px] leading-5 font-normal text-muted hover:text-text underline decoration-dotted underline-offset-2 rounded px-1 py-0 transition-colors"
+          data-testid="steer-retracted"
+        >
+          {retractedIcon}
+          {retractedLabel}
+        </Btn>
+      )
+    return (
+      <div data-role="user" data-steer-settle={settleAnimated ? 'animated' : 'static'} className="flex flex-col items-end max-w-full">
+        {settleAnimated && !collapseDone && (
+          <motion.div
+            aria-hidden="true"
+            data-testid="steer-retract-collapse"
+            className="w-fit max-w-full overflow-hidden origin-top-right"
+            initial={{ opacity: 1, height: 'auto', scale: 1 }}
+            animate={{ opacity: 0, height: 0, scale: 0.96 }}
+            transition={{ duration: 0.28, ease: 'easeOut' }}
+            onAnimationComplete={() => setCollapseDone(true)}
+          >
+            <div className={`message-bubble mc-message-font-scope msg-content px-4 py-2 leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-full ${tone === 'accent' ? 'user-bubble user-bubble-accent bg-accent text-accent-fg' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
+              {renderContent(lastBubbleBodyRef.current, meta, messageTs || ((meta as { clientTs?: string })?.clientTs))}
+            </div>
+          </motion.div>
+        )}
+        <motion.div
+          className="flex flex-col items-end max-w-full"
+          initial={settleAnimated ? { opacity: 0 } : false}
+          animate={{ opacity: 1 }}
+          transition={{ duration: 0.2, delay: 0.16, ease: 'easeOut' }}
+        >
+          {note}
+        </motion.div>
+      </div>
+    )
+  }
+
   if (editing) {
     return (
       // `data-message-editing`: usePinnedPrompt reads this off the row it is about
@@ -384,7 +509,9 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
         </div>
         {/* Actions sit BELOW the bubble (like the read-only action row) so they
             never impose a min-width floor on the auto-sized bubble. */}
-        <div className="flex justify-end gap-2 mt-1">
+        <div className="flex justify-end items-center gap-2 mt-1">
+          {/* Send rewinds: say what it costs, beside the button that does it. */}
+          <span className="text-[12px] leading-4 text-muted">{i18nT('pages.chat.userMessage.edit_replaces_below')}</span>
           <button onClick={cancel} className="px-3 py-1 text-[13px] leading-5 text-muted hover:text-text rounded border border-border hover:bg-bg-hover transition-colors" title={i18nT('pages.chat.userMessage.cancel_esc')}>
             {i18nT('pages.chat.userMessage.cancel')}
           </button>
@@ -471,7 +598,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     // Disable is safe: the keyboard-accessible edit path is the aria-labelled
     // pencil button in the action row below, not this bubble.
     // eslint-disable-next-line jsx-a11y/no-static-element-interactions
-    <div ref={userRef} onCopy={handleCopy} onDoubleClick={dblClickEdits ? handleDoubleClick : undefined} className={`message-bubble mc-message-font-scope msg-content px-4 py-2 leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-full ${carriedQuote ? 'min-w-64' : ''} ${isSteer ? 'bg-accent-subtle text-text' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
+    <div ref={userRef} onCopy={handleCopy} onDoubleClick={dblClickEdits ? handleDoubleClick : undefined} className={`message-bubble mc-message-font-scope msg-content px-4 py-2 leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-full ${carriedQuote ? 'min-w-64' : ''} ${isSteer ? 'bg-accent-subtle text-text' : tone === 'accent' ? 'user-bubble user-bubble-accent bg-accent text-accent-fg' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
       {/* `messageTs` FIRST, `clientTs` only as a fallback. The opposite order is
           correct for the audio key above, which wants the optimistic bubble's own
           identity, but this value is COMPARED against server-clock slot mint
@@ -483,10 +610,10 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
       {renderContent(renderedBody, meta, messageTs || ((meta as { clientTs?: string })?.clientTs))}
     </div>
   )
-  // The right-click / long-press menu wraps the bubble only when Quote is
-  // offered (the menu's reason to exist); otherwise `MessageContextMenu`
+  // The right-click menu wraps the bubble only when Quote is offered (the
+  // menu's reason to exist) on a pointer device; otherwise `MessageContextMenu`
   // renders the bubble bare.
-  const bubbleWithMenu = <MessageContextMenu items={menuItems} onOpenChange={readStandIn}>{bubble}</MessageContextMenu>
+  const bubbleWithMenu = <MessageContextMenu items={menuItems} onOpenChange={readStandIn} onCopyFailed={() => setCopyFailed(true)}>{bubble}</MessageContextMenu>
 
   return (
     // Every box between the content column and the bubble is a fit-content flex
@@ -572,11 +699,66 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
                first-time users (UX review on #9037): a bare title attribute is
                hover-only and unreachable on touch or keyboard, so the
                explainer rides the focusable click-to-open pattern (#3626). */
-            <div className="inline-flex items-center gap-1 text-[12px] leading-5 font-medium text-muted mb-1 pr-1">
-              <span className="inline-flex items-center gap-1 animate-pulse">
-                <Target size={12} className="shrink-0" /> {i18nT('pages.chat.userMessage.steering')}
-              </span>
-              <InfoTip text={i18nT('pages.chat.userMessage.redirecting_the_running_turn_not_yet_confirmed')} />
+            <div className="flex flex-col items-end mb-1 pr-1">
+              <div className="inline-flex flex-wrap items-center justify-end gap-1 text-[12px] leading-5 font-medium text-muted">
+                <span className="inline-flex items-center gap-1" data-testid="steer-pending-status">
+                  <span className="inline-flex items-center gap-1 animate-pulse" role={steerActionPending ? 'status' : undefined}>
+                    {steerActionPending
+                      ? <><Undo2 size={12} className="shrink-0" aria-hidden="true" /> {i18nT('pages.chat.userMessage.steer_taking_back')}</>
+                      : <><Target size={12} className="shrink-0" /> {i18nT('pages.chat.userMessage.steering')}</>}
+                  </span>
+                  {!steerActionPending && <InfoTip text={i18nT('pages.chat.userMessage.redirecting_the_running_turn_not_yet_confirmed')} />}
+                </span>
+                {steerTakeBack && !steerActionPending && (
+                  /* Two controls: Queue instead, the redirect a person most often
+                     meant to send as a queued message, as text; Edit and Unsend one
+                     menu deep, so the row keeps its two-control limit. A take-back
+                     races the agent, so the most used one is the one-click one. The
+                     divider makes these actions a separate region from status/help. */
+                  <span className="inline-flex items-center gap-0.5 border-l border-border pl-1 ml-0.5" data-testid="steer-take-back">
+                    <Btn type="button" onClick={() => onSteerAction?.(steerMid, 'queue')} className="px-1 py-0 border-none bg-transparent text-[12px] font-medium text-muted hover:text-text hover:bg-bg-hover rounded transition-colors" data-testid="steer-queue-instead">
+                      {i18nT('pages.chat.userMessage.steer_queue_instead')}
+                    </Btn>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Btn
+                          type="button"
+                          className="p-0.5 border-none bg-transparent text-[12px] text-muted hover:text-text rounded hover:bg-bg-hover transition-colors"
+                          title={i18nT('pages.chat.userMessage.steer_take_back_more')}
+                          aria-label={i18nT('pages.chat.userMessage.steer_take_back_more')}
+                          data-testid="steer-take-back-more"
+                        >
+                          <MoreHorizontal size={14} aria-hidden="true" />
+                        </Btn>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="min-w-[180px]">
+                        <DropdownMenuItem data-testid="steer-edit" onSelect={() => onSteerAction?.(steerMid, 'edit')}>
+                          <Pencil size={14} aria-hidden="true" /> {i18nT('pages.chat.userMessage.steer_edit')}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem data-testid="steer-unsend" onSelect={() => onSteerAction?.(steerMid, 'unsend')}>
+                          <Undo2 size={14} aria-hidden="true" /> {i18nT('pages.chat.userMessage.steer_unsend')}
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </span>
+                )}
+              </div>
+              {/* No hand-off: the composer may hold a draft the person has not
+                  sent, and the hand-off's navigation would discard it (the same
+                  ruling as the copy-failure notice below). */}
+              <ErrorNotice
+                message={steerActionPending && steerActionRequestFailed
+                  ? i18nT(STEER_UNCONFIRMED_KEY[steerActionPending])
+                  : steerActionRefusal && !steerActionPending
+                    ? steerActionRefusal.refusal === 'busy'
+                      ? i18nT('pages.chat.userMessage.steer_take_back_busy')
+                      : steerActionRefusal.refusal === 'unsupported'
+                        ? i18nT(STEER_UNSUPPORTED_KEY[steerActionRefusal.action])
+                        : i18nT(STEER_FAILED_KEY[steerActionRefusal.action])
+                    : null}
+                variant="inline"
+                className="mt-1"
+              />
             </div>
           )}
           {requeuedSteer && (

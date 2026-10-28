@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from named_cases_helpers import named_cases
 from test_config_load_pipeline import _DECLARED_EXCEPTIONS, _document, _section_fields
 
 from kiro_crew.acp_backends import selectable_backends
@@ -44,6 +45,9 @@ _READ_STAGE_DEPARTURES = {
     ("agent", "session_control"): False,
     ("agent", "member_dispatch"): False,
     ("agent", "crew_panel"): False,
+    # A present but malformed harness choice is an unusable explicit choice, not
+    # an absent key: it takes the Kiro CLI floor, never the KAS product default.
+    ("agent", "acp_backend"): "",
     ("skills", "project_skills_enabled"): False,
     # Resolved by the loader's own degradation rule before the enum check runs.
     ("stt", "provider"): "off",
@@ -626,6 +630,13 @@ def _move_cases() -> list:
             "name",
         ),
         _case(
+            "dashboard.session_sort-unknown",
+            [(dashboard, "session_sort", "name-asc")],
+            {"dashboard": {"session_sort": "by colour"}},
+            lambda c: c.dashboard.session_sort,
+            "name-asc",
+        ),
+        _case(
             "dashboard.title_refresh_every_turns-malformed",
             [(dashboard, "title_refresh_every_turns", 8)],
             {"dashboard": {"title_refresh_every_turns": "often"}},
@@ -918,19 +929,22 @@ def _stub_roster_migration_cases() -> list:
 
 
 class TestAMovedFieldDefaultMovesTheBuild:
-    @pytest.mark.parametrize(("moves", "document", "read", "expected"), _move_cases())
-    def test_the_build_follows_the_field(
-        self, tmp_path, monkeypatch, moves, document, read, expected
-    ):
-        for dto, name, value in moves:
-            _move_default(monkeypatch, dto, name, value)
-        assert read(_build(tmp_path, document)) == expected
-
     @pytest.mark.parametrize(
         ("moves", "document", "read", "expected"),
-        [*_own_value_cases(), *_stub_roster_migration_cases()],
+        [
+            *named_cases(
+                "test_the_build_follows_the_field",
+                ("moves", "document", "read", "expected"),
+                _move_cases(),
+            ),
+            *named_cases(
+                "test_a_value_of_its_own_holds_when_the_default_moves",
+                ("moves", "document", "read", "expected"),
+                [*_own_value_cases(), *_stub_roster_migration_cases()],
+            ),
+        ],
     )
-    def test_a_value_of_its_own_holds_when_the_default_moves(
+    def test_a_moved_default_reads_as_expected(
         self, tmp_path, monkeypatch, moves, document, read, expected
     ):
         for dto, name, value in moves:

@@ -13,8 +13,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime
+from datetime import time as dt_time
+from datetime import timedelta
 from typing import Any
 
 # ``SLACK_NAMESPACE`` and ``CHANNEL_SESSION_NAMESPACES`` are RE-EXPORTED from
@@ -100,12 +102,13 @@ def channel_namespace_of(key: str) -> str:
 #: folds into ``"other"`` so an unrecognised key can never mint a metric series.
 #:
 #: ADDING A NAMESPACE: this tuple bounds telemetry label cardinality and nothing more,
-#: so being absent from it is not a bug on its own — ``wf-unpooled``, ``wf-worker`` and
-#: ``wf-scope`` are all live session keys that are not listed here. But a namespace whose
+#: so being absent from it is not a bug on its own — ``wf-unpooled`` and ``wf-worker``
+#: are live session keys that are not listed here. But a namespace whose
 #: transcripts reach disk also needs classifying at
-#: ``dashboard/handlers/sessions.py::_MACHINE_NAMESPACES``, which decides whether the
-#: Older-sessions pane presents it as a conversation. Unclassified means VISIBLE there,
-#: so a new machine namespace silently repopulates that pane until it is added.
+#: ``dashboard/handlers/sessions_parts/history_reads.py::_MACHINE_NAMESPACES``, which
+#: decides whether the Older-sessions pane presents it as a conversation. Unclassified
+#: means VISIBLE there, so a new machine namespace silently repopulates that pane until
+#: it is added.
 _TELEMETRY_LOCAL_PREFIXES: tuple[tuple[str, str], ...] = (
     ("dashboard", "dashboard"),
     ("cron", "cron"),
@@ -131,10 +134,11 @@ _TELEMETRY_LOCAL_PREFIXES: tuple[tuple[str, str], ...] = (
     ("channel", "channel"),
 )
 
-#: Exact keys for the two singleton sessions.
+#: Exact keys for singleton sessions.
 _TELEMETRY_EXACT_KEYS: dict[str, str] = {
     "_bg": "background",
     "_hb": "heartbeat",
+    "_consolidate": "consolidation",
     # The CLI chat session's fixed key. Present so this function is a strict
     # SUPERSET of the labels ``validation.infer_use_case`` produced: the turn
     # histogram switched to this helper to gain the background surfaces, and
@@ -218,6 +222,11 @@ class ChannelLink:
     reach its roster only through a principal, and a dashboard-born session key
     names no peer to supply one.
 
+    A key-named session's row (a channel-born key in the canonical grammar) is
+    signed even when it records no peer: its key names the audience, and the
+    admission ties the stored location to that key, so a ``channel_id`` rewritten
+    to another allow-listed user's conversation fails to verify.
+
     A HINT on its own, and an admission once signed. The session map this rides
     in is writable by in-sandbox code, so the per-send recipient check hands a
     principal to the roster only when ``admission`` -- a MAC the gateway alone can
@@ -267,13 +276,14 @@ class ChannelLink:
             "channel_id": self.channel_id,
             "thread_id": self.thread_id,
         }
-        # Emitted only when recorded, so a link that names no peer serializes
-        # exactly as one always has and a stored row is not rewritten for it. An
-        # admission is only ever meaningful beside the peer it admits.
+        # Each emitted only when recorded, so a link that names no peer and carries
+        # no admission serializes exactly as one always has. A key-named session's
+        # row carries an admission with no peer: its key names the peer, and the
+        # admission binds the location to that key.
         if self.principal:
             d["principal"] = self.principal
-            if self.admission:
-                d["admission"] = self.admission
+        if self.admission:
+            d["admission"] = self.admission
         return d
 
     @classmethod
@@ -438,7 +448,7 @@ def parse_session_key(key: str) -> ParsedSessionKey | None:
 
     Consumers must treat a ``None`` as "not addressable by grammar", never as
     an error: the dispatch pipeline itself stays address-agnostic and does not
-    call this (pinned in ``dispatch.py`` docstrings).
+    call this (pinned in ``dispatch_contract.py`` docstrings).
     """
     if not key:
         return None
@@ -542,8 +552,16 @@ def split_dm_session_key(key: str) -> tuple[str, int] | None:
 
 #: ``direct`` (1:1 DM) is the baseline; ``forum`` keys a Telegram supergroup
 #: forum Topic ``(chat_id, thread_id)`` to its own session (Slack-thread style).
+#: ``direct_topic`` keys a Telegram *private-chat* forum Topic
+#: ``(chat_id, thread_id)`` to its own session: it is still a 1:1 DM with one
+#: allow-listed user (so it keeps the owner/token-guard side of ``direct``), but
+#: it is per-topic isolated and must never collapse under ``dm_scope=unified``
+#: -- the same isolation ``forum`` has, for a different reason (not a shared
+#: space, but still several parallel conversations the user split apart). See
+#: ``docs/system-specs/modules/messaging.md`` and ``session.md``.
 CHAT_TYPE_DIRECT = "direct"
 CHAT_TYPE_FORUM = "forum"
+CHAT_TYPE_PRIVATE_TOPIC = "direct_topic"
 
 
 def build_dm_session_key(
@@ -569,10 +587,16 @@ def build_dm_session_key(
         the same person on Telegram vs WeCom stays isolated.
       * ``unified`` -- direct (1:1) DMs collapse into a single ``unified:{agent}``
         bucket for cross-surface continuity (channel and user drop out of the
-        key). Applies ONLY to direct DMs: a forum route (``chat_type ==
-        CHAT_TYPE_FORUM``) ALWAYS keeps its full
-        ``{channel}:{agent}:{chat_type}:{user}`` bucket regardless of dm_scope,
-        so private DM content can never collapse into a shared group Topic.
+        key). Applies ONLY to the baseline ``direct`` chat_type: an *isolated*
+        route -- a group forum Topic (``CHAT_TYPE_FORUM``) or a private-chat
+        forum Topic (``CHAT_TYPE_PRIVATE_TOPIC``) -- ALWAYS keeps its full
+        ``{channel}:{agent}:{chat_type}:{user}`` bucket regardless of dm_scope.
+        For ``forum`` the reason is exposure: private DM content can never
+        collapse into a shared group Topic. For ``direct_topic`` the reason is
+        different -- a private topic is NOT a shared space, it is still a 1:1 DM
+        -- but the outcome must be the same: collapsing it would merge every
+        topic back into one bucket and undo the per-topic split the user asked
+        for. Only ``CHAT_TYPE_DIRECT`` (the threadless General DM) collapses.
 
     An unrecognized ``dm_scope`` falls back to per-channel-peer (safe isolation)
     rather than raising, so a hand-edited config can never crash dispatch.
@@ -723,8 +747,16 @@ def rebind_conversation_location(
     the user, and a channel that cannot reach the state should not carry a
     handler for it.
     """
+    # Lazy: mirror_admission imports this module.
+    from kiro_crew.mirror_admission import sign_mirror_admission
+
+    # An in-channel link is the conversation's own authorized peer binding the
+    # location it writes from, so it MINTS the row's admission (see
+    # :mod:`kiro_crew.mirror_admission`), which is also how a row written before
+    # rows were signed is re-bound.
+    admitted = replace(location, admission=sign_mirror_admission(key, location) or None)
     with sessions.batched_save():
-        sessions.set_mirror_link(key, location, reason=UNBIND_REASON_ORIGIN_REBIND)
+        sessions.set_mirror_link(key, admitted, reason=UNBIND_REASON_ORIGIN_REBIND)
         sessions.set_mirror_opt_out(key, False)
         # Drop any pre-unification row so a stale binding cannot outlive the
         # rebind (reads prefer the channel key, but a leftover row would still
@@ -736,6 +768,47 @@ def rebind_conversation_location(
         "✅ Linked. Replies from the dashboard for this conversation will also "
         f"show up here. Send {unlink_command} to stop."
     )
+
+
+def _resign_own_location(
+    sessions: Any, *, key: str, existing: ChannelLink, location: ChannelLink
+) -> None:
+    """Re-sign a key-named row that already points at the conversation being read.
+
+    The inbound turn is this conversation's authorized peer writing from
+    *location*, so a stored row at that SAME location is re-bound by it: a row
+    written before key-named rows were signed heals on the user's next message
+    instead of staying refused after every restart. A row aimed anywhere else is
+    left exactly as it is (and stays refused if unsigned): a location match is
+    the only thing that vouches. The gateway's own *location* is what gets signed,
+    never the stored row's other fields. Written once per stale row; the steady
+    state is one MAC check. Never raises.
+    """
+    # Lazy: mirror_admission imports this module.
+    from kiro_crew.mirror_admission import (
+        admission_required,
+        sign_mirror_admission,
+        verify_mirror_admission,
+    )
+
+    try:
+        if existing != location or not admission_required(key):
+            return
+        if verify_mirror_admission(key, existing):
+            return
+        admitted = replace(location, admission=sign_mirror_admission(key, location) or None)
+        # Compare-and-set in the store: a rebind that landed since *existing* was
+        # read is kept, and the row's inbound flag and mute carry over. Only the
+        # row stored on the session's own key qualifies; a legacy ``dashboard:``
+        # row heals through the in-channel link, which also retires that spelling.
+        sessions.replace_mirror_link_if(key, existing, admitted)
+    except Exception:
+        logger.debug(
+            "%s: re-signing the origin mirror skipped for %s",
+            location.channel_type,
+            key,
+            exc_info=True,
+        )
 
 
 def bind_origin_mirror(sessions: Any, *, key: str, location: ChannelLink) -> bool:
@@ -808,10 +881,19 @@ def bind_origin_mirror(sessions: Any, *, key: str, location: ChannelLink) -> boo
         return False
     if sessions.mirror_opt_out(key):
         return False
-    if sessions.get_mirror_link(key) is not None:
+    existing = sessions.get_mirror_link(key)
+    if existing is not None:
+        _resign_own_location(sessions, key=key, existing=existing, location=location)
         return False
+    # Lazy: mirror_admission imports this module.
+    from kiro_crew.mirror_admission import sign_mirror_admission
+
+    # The inbound turn is the conversation's authorized peer writing from this
+    # very location, so the bind MINTS the row's admission for this key: a row
+    # in-sandbox code later rewrites to another conversation fails to verify.
     try:
-        sessions.set_mirror_link(key, location)
+        admitted = replace(location, admission=sign_mirror_admission(key, location) or None)
+        sessions.set_mirror_link(key, admitted)
     except Exception:
         logger.debug(
             "%s: origin mirror bind skipped for %s", location.channel_type, key, exc_info=True
@@ -872,11 +954,15 @@ def should_rotate_generation(
     if idle_minutes > 0 and (now - last_active) >= idle_minutes * 60:
         return True
     if 0 <= daily_reset_hour <= 23:
-        lt = time.localtime(now)
-        midnight = now - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec)
-        boundary = midnight + daily_reset_hour * 3600
+        # A DST day is 23h or 25h long, so the boundary is built from the local
+        # wall-clock date and hour. A naive datetime's timestamp() resolves the
+        # offset for that date deterministically (fold=0): a repeated hour is
+        # its first occurrence, a skipped hour lands just after the gap.
+        today = datetime.fromtimestamp(now).date()
+        reset_at = dt_time(daily_reset_hour)
+        boundary = datetime.combine(today, reset_at).timestamp()
         if boundary > now:
-            boundary -= 86400
+            boundary = datetime.combine(today - timedelta(days=1), reset_at).timestamp()
         if last_active < boundary <= now:
             return True
     return False

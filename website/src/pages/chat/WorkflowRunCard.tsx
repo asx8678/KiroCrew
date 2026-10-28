@@ -142,7 +142,7 @@ const WorkflowRunCard = memo(function WorkflowRunCard({
     // The Workflows panel is mounted for `activeSlot`, which split view never
     // moves with pane focus — so opening from a background pane must make this
     // card's session active first, or the panel belongs to another session.
-    if (slot && slot !== activeSlot) dispatch(switchSlot({ key: slot, announceOnMissing: true }))
+    if (slot && slot !== activeSlot) dispatch(switchSlot({ key: slot, announceOnMissing: true, gesture: true }))
     dispatch(openActivityToTab('workflows'))
   }
 
@@ -175,7 +175,7 @@ const WorkflowRunCard = memo(function WorkflowRunCard({
   }
 
   // Row geometry -- the px-4 gutter and the --mc-content-width clamp -- belongs to
-  // the HOST row wrapper, never to this card. ChatPage wraps every renderMessage
+  // the HOST row wrapper, never to this card. ChatTranscriptView wraps every renderMessage
   // result, and the shared registries wrap this card through ctx.row. Re-applying
   // it here nested one clamp inside another and inset the card by a second full
   // gutter, so it sat 20px right of every sibling row and 40px narrower.

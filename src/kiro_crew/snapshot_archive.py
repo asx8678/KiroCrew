@@ -6,19 +6,21 @@ database. Reading side: the member filter extraction runs through, the size boun
 before anything is extracted, and the manifest readers. A name that comes out of an
 archive is escaped here before it reaches a terminal.
 
-What a bundle RECORDS is composed by the snapshot command itself
-(:func:`kiro_crew.snapshot._build_snapshot`), which writes ``MANIFEST.json``.
+What a bundle RECORDS is composed by the snapshot build
+(:func:`kiro_crew.snapshot_build._build_snapshot`), which writes ``MANIFEST.json``.
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
 import shutil
 import stat as _stat
 import tarfile
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable
 
@@ -110,8 +112,9 @@ def _rejection_recording_filter(
 def _data_filter(info: tarfile.TarInfo, _dest: str = "") -> tarfile.TarInfo | None:
     """Equivalent to tarfile ``"data"`` filter (Python 3.12+), with 3.10 fallback.
 
-    Also rejects path traversal, symlinks, and hardlinks to eliminate TOCTOU
-    race between pre-scan and extraction.
+    Also rejects path traversal, symlinks, hardlinks, and special files
+    (FIFO and device members) to eliminate TOCTOU race between pre-scan
+    and extraction.
     Excludes sel_hmac.key (must be regenerated on restore, not shipped).
     Security-sensitive files get 0o600 permissions.
     """
@@ -142,6 +145,14 @@ def _data_filter(info: tarfile.TarInfo, _dest: str = "") -> tarfile.TarInfo | No
     # Reject symlinks and hardlinks
     if info.issym() or info.islnk():
         print(f"⚠️  Rejecting symlink/hardlink entry: {_safe_name(info.name)}")
+        return None
+    # Reject special files (FIFO, character/block device). The "data" filter
+    # this claims equivalence with refuses them, and the sibling tar filters
+    # in this repo (papyrus tectonic, pptx_maker engine_source) refuse them
+    # too. A staged FIFO blocks any later pass that opens it for reading,
+    # and bundle content is only ever regular files and directories.
+    if not (info.isreg() or info.isdir()):
+        print(f"⚠️  Rejecting special file entry: {_safe_name(info.name)}")
         return None
     # Never ship these — each must be regenerated on the restoring host, or is that
     # host's own runtime state (the host-local half of ``memory_stores/``).
@@ -351,7 +362,10 @@ def _copy_database_consistently(
     hash) and unlinked the 836 KB ``-wal``; ``mode=ro`` left both byte-identical and
     captured exactly the same rows. So a backup command was rewriting the data it was
     asked to read, and in the window before SQLite's own open a swapped-in database was
-    handed a writable handle. ``mode=ro`` refuses the write outright.
+    handed a writable handle. ``mode=ro`` refuses the write outright. When that open is
+    refused because the view cannot hold a closed WAL database's index, the database is
+    read ``immutable=1`` as well, and checked for a concurrent writer afterwards
+    (:func:`_immutable_read_may_stand_in`) under the lock an ordinary reader holds.
 
     **"Not a database" is told apart from "cannot read this database".** They are
     distinguished by probing readability separately from copying, not by matching the
@@ -392,9 +406,18 @@ def _copy_database_consistently(
             )
         return DB_UNSAFE_SOURCE
     ro_uri = f"{src.absolute().as_uri()}?mode=ro"
+    immutable_for: Exception | None = None
     try:
-        with closing(_facade().sqlite3.connect(ro_uri, uri=True)) as probe:
-            probe.execute("PRAGMA schema_version").fetchone()
+        try:
+            with closing(_facade().sqlite3.connect(ro_uri, uri=True)) as probe:
+                probe.execute("PRAGMA schema_version").fetchone()
+        except _facade().sqlite3.DatabaseError as refused:
+            if not _immutable_read_may_stand_in(src, refused):
+                raise
+            immutable_for = refused
+            ro_uri += "&immutable=1"
+            with closing(_facade().sqlite3.connect(ro_uri, uri=True)) as probe:
+                probe.execute("PRAGMA schema_version").fetchone()
     except _facade().sqlite3.DatabaseError as e:
         # `sqlite_errorname` is read defensively for 3.10 and the message is the
         # documented fallback. Either way the DEFAULT is to raise: an error this code
@@ -407,8 +430,7 @@ def _copy_database_consistently(
             raise DatabaseCopyFailed(src, e) from e
         if require_database:
             # A DECLARED component file, so this is a hard failure. The asymmetry with the
-            # tree pass below is deliberate, and an earlier revision of this change got it
-            # backwards by "unifying" the two -- review caught the consequence:
+            # tree pass below is deliberate; "unifying" the two has this consequence:
             #
             # A corrupt `memory.db` staged as bytes makes the snapshot SUCCEED. `--keep N`
             # then counts that archive as the newest backup and prunes a real one, while
@@ -436,18 +458,144 @@ def _copy_database_consistently(
         with (
             closing(_facade().sqlite3.connect(ro_uri, uri=True)) as src_conn,
             closing(_facade().sqlite3.connect(str(dst))) as dst_conn,
+            ExitStack() as reader_lock,
         ):
+            # An immutable read takes no lock, so the reader lock is held from before the
+            # copy until after the check that follows it, and the source connection stays
+            # open across both: closing any descriptor on the file releases that lock.
+            immutable_from = (
+                None
+                if immutable_for is None
+                else reader_lock.enter_context(_hold_reader_lock(src, immutable_for))
+            )
             # The file is a readable database, so a failure here means the consistent copy
             # did not happen. Absorbing it would leave the caller's byte copy -- taken
             # WITHOUT the `-wal` this module excludes -- passing for a whole database, so
             # it is raised, but typed and naming the file so the command boundary reports
             # which database failed instead of exiting on a traceback.
             src_conn.backup(dst_conn)
+            if immutable_from is not None:
+                _refuse_if_changed_since(src, immutable_from, dst)
     except _facade().sqlite3.Error as e:
         raise DatabaseCopyFailed(src, e) from e
     if require_database:
         _refuse_unsound_required_capture(src, dst)
     return DB_COPIED
+
+
+def _refuse_if_changed_since(src: Path, before: os.stat_result, dst: Path) -> None:
+    """Raise unless *src* still has the identity its immutable copy started from.
+
+    Runs while :func:`_hold_reader_lock` is still held. A writer that opened the
+    database through another view during the copy leaves a ``-wal`` or a ``-journal``
+    beside the file, and that lock keeps its last close from removing either, so the
+    sidecar check finds it whatever the file's timestamps show. A checkpoint into the
+    main file also changes its size, mtime or ctime, and the staged copy *dst* must
+    pass SQLite's ``quick_check``. Rows such a writer left only in its ``-wal`` were
+    committed after the copy began and are not owed to it.
+    """
+
+    def identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    try:
+        unchanged = identity(os.lstat(src)) == identity(before) and not any(
+            os.path.lexists(f"{src}{sidecar}") for sidecar in ("-wal", "-journal")
+        )
+    except OSError as e:
+        raise DatabaseCopyFailed(src, e) from e
+    changed = OSError("the database changed while it was being copied; run it again")
+    if not unchanged:
+        raise DatabaseCopyFailed(src, changed)
+    try:
+        with closing(_facade().sqlite3.connect(str(dst))) as check:
+            verdict = check.execute("PRAGMA quick_check").fetchone()[0]
+    except _facade().sqlite3.Error as e:
+        raise DatabaseCopyFailed(src, e) from e
+    if verdict != "ok":
+        raise DatabaseCopyFailed(src, changed)
+
+
+def _immutable_read_may_stand_in(src: Path, refused: Exception) -> bool:
+    """Whether an immutable read of *src* may stand in for the refused ordinary one.
+
+    ``mode=ro`` is not enough where this process's view refuses writes beside the file,
+    such as the read-only ``memory_stores/`` a script cron's sandbox binds. Opening a WAL
+    database needs its ``-shm`` index, which SQLite creates beside the file, so a WAL
+    database no other connection holds open refuses even a read-only open there. The
+    decision rests on that open's own result code, not on a prediction of the view's
+    writability: SQLite answers ``SQLITE_READONLY`` (its extended code names the cause),
+    ``SQLITE_CANTOPEN`` or ``SQLITE_PERM``, and every other refusal keeps its error.
+    With neither a ``-wal`` nor a ``-journal`` beside it, the main file alone holds every
+    committed row, and ``immutable=1`` reads it without the index. A ``-wal`` holds rows
+    the main file lacks and a ``-journal`` is a rollback in progress, so either keeps
+    the refusal. The copy itself also needs :func:`_hold_reader_lock`.
+    """
+    driver = _facade().sqlite3
+    code = getattr(refused, "sqlite_errorcode", None)
+    if not isinstance(code, int):
+        return False
+    if code & 0xFF not in (driver.SQLITE_READONLY, driver.SQLITE_CANTOPEN, driver.SQLITE_PERM):
+        return False
+    return not any(os.path.lexists(f"{src}{sidecar}") for sidecar in ("-wal", "-journal"))
+
+
+@contextmanager
+def _hold_reader_lock(src: Path, refused: Exception) -> Iterator[os.stat_result]:
+    """Hold on *src* the lock an ordinary SQLite reader holds, and yield its identity.
+
+    An ``immutable=1`` read takes no lock of its own, so this one is held for it from
+    before the copy until after :func:`_refuse_if_changed_since`. While it is held a
+    rollback-journal writer cannot change the file, and a WAL writer's last close
+    cannot remove its ``-wal``, so a write during the copy leaves that ``-wal`` for the
+    check to find. A writer already holding a lock that conflicts refuses the copy.
+    Where the lock cannot be taken at all -- no POSIX record locks on this platform or
+    this filesystem -- the copy has no writer exclusion, so *refused*, the ordinary
+    open's own error, stands. The identity yielded is read under the lock, after the
+    sidecar check, and is what the copy is checked against.
+
+    The lock belongs to this process and the file's inode, so closing ANY descriptor
+    this process holds on *src* releases it. The caller keeps its SQLite connection to
+    *src* open until the check has run, and opens no other.
+    """
+    if not platform_compat.IS_POSIX:
+        raise DatabaseCopyFailed(src, refused)
+    # SQLite's unix VFS locks a database with POSIX record locks on these bytes of the
+    # file. A reader read-locks the pending byte, then the shared range, then drops the
+    # pending byte; a writer write-locks the shared range before it changes the file, and
+    # a WAL connection's last close write-locks it before it removes its `-wal`.
+    pending_byte = 0x40000000
+    shared_first, shared_size = pending_byte + 2, 510
+    fcntl = platform_compat.fcntl
+    try:
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as e:
+        raise DatabaseCopyFailed(src, e) from e
+    try:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_SH | fcntl.LOCK_NB, 1, pending_byte)
+            fcntl.lockf(fd, fcntl.LOCK_SH | fcntl.LOCK_NB, shared_size, shared_first)
+            fcntl.lockf(fd, fcntl.LOCK_UN, 1, pending_byte)
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EAGAIN):
+                busy = OSError(e.errno, "a writer holds the database; run it again")
+                raise DatabaseCopyFailed(src, busy) from e
+            raise DatabaseCopyFailed(src, refused) from e
+        try:
+            held, named = os.fstat(fd), os.lstat(src)
+        except OSError as e:
+            raise DatabaseCopyFailed(src, e) from e
+        if not _stat.S_ISREG(held.st_mode) or (held.st_dev, held.st_ino) != (
+            named.st_dev,
+            named.st_ino,
+        ):
+            moved = OSError("the database changed while it was being copied; run it again")
+            raise DatabaseCopyFailed(src, moved)
+        if any(os.path.lexists(f"{src}{sidecar}") for sidecar in ("-wal", "-journal")):
+            raise DatabaseCopyFailed(src, refused)
+        yield named
+    finally:
+        os.close(fd)
 
 
 def _refuse_unsound_required_capture(src: Path, dst: Path) -> None:
@@ -602,8 +750,7 @@ def _restage_databases(
         # copy of a PRODUCT database in the bundle without its checkpointed rows, and
         # restore's strict integrity check passes such a copy: rows present only in the
         # write-ahead log are then silently gone. A recorded note does not prevent that.
-        # Failing closed is both the safe direction and what this call did before the
-        # tolerance elsewhere in this change existed. Nothing is published on the way
+        # Failing closed is the safe direction. Nothing is published on the way
         # out, so no retention pass can prune a bundle that does restore.
         try:
             src_st = src.lstat()
@@ -867,12 +1014,12 @@ def _copytree_safe(
         # rather than on the failure to write it, in a bundle reporting success.
         pinned_fs.copy_file_pinned(source, target, on_skip=report, skip_unreadable=skip_unreadable)
 
-    # `dirs_exist_ok` has to follow `must_create`, not be hardcoded. Review found the gap:
-    # `must_create` reached the pinned walk and stopped there, so on a platform that cannot
-    # pin -- Windows, the dashboard's replace -- a root recreated after the rmtree was still
-    # merged into and stale files survived a successful replace. That is the same mistake as
-    # the earlier Windows import refusal in this PR: a guard added to the pinned path and not
-    # carried to the by-name one. Every mutating path gets the gate or the gate is decorative.
+    # `dirs_exist_ok` has to follow `must_create`, not be hardcoded. If `must_create`
+    # reached only the pinned walk, then on a platform that cannot pin -- Windows, the
+    # dashboard's replace -- a root recreated after the rmtree would still be merged into
+    # and stale files would survive a successful replace: a guard added to the pinned path
+    # and not carried to the by-name one. Every mutating path gets the gate or the gate is
+    # decorative.
     # The tree's OWN directory, which `_ignore_unsafe` never sees: `copytree` lists the
     # root before consulting it. Asked HERE rather than by wrapping the call, because a
     # wrapper cannot tell the root's own refusal from a failure to CREATE the
@@ -907,7 +1054,16 @@ class ManifestUnreadable(Exception):
 
 
 class _ArchiveTooLarge(Exception):
-    """An archive declares more content than a memory bundle can justify."""
+    """An archive declares more content than a memory bundle can justify.
+
+    *kind* names the bound that refused it: ``"bytes"`` for the uncompressed-content
+    bound, which ``--max-archive-gib`` raises, or ``"entries"`` for the member-count
+    bound, which no flag moves. A caller reads it to offer only a remedy that can work.
+    """
+
+    def __init__(self, *args: object, kind: str = "bytes") -> None:
+        super().__init__(*args)
+        self.kind = kind
 
 
 # Generous next to a real memory bundle (megabytes, a few thousand members) and still
@@ -919,8 +1075,82 @@ _MAX_ARCHIVE_MEMBERS = 200_000
 
 _MAX_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024
 
+#: Highest value ``--max-archive-gib`` accepts. The override is for an install that is
+#: honestly larger than the default bound, not a way to switch the bound off: a ceiling
+#: keeps a typo (``40000``) from turning the decompression guard into no guard.
+MAX_ARCHIVE_GIB_CEILING = 1024
 
-def _refuse_oversized_archive(probe: tarfile.TarFile) -> None:
+
+def archive_byte_bound(max_archive_gib: int | None) -> int:
+    """The declared-content bound in bytes: the operator's ``--max-archive-gib`` or the default.
+
+    Read through the facade when no override is given, so a test that lowers
+    ``snapshot._MAX_ARCHIVE_BYTES`` lowers the bound every reader and the writer enforce.
+    The caller validates the override against :data:`MAX_ARCHIVE_GIB_CEILING` first.
+    """
+    if max_archive_gib is None:
+        return int(_facade()._MAX_ARCHIVE_BYTES)
+    return int(max_archive_gib) * (1024**3)
+
+
+def _bound_gib(max_bytes: int) -> str:
+    """The bound as the operator would type it, never rounding a sub-GiB test bound to 0."""
+    gib = max_bytes / (1024**3)
+    return f"{gib:.0f}" if gib >= 1 else f"{gib:.3g}"
+
+
+def _refuse_oversized_tree(stage: Path, *, max_bytes: int | None = None) -> None:
+    """Refuse a staged bundle the archive bound would refuse, BEFORE it is archived.
+
+    The writer's half of :func:`_refuse_oversized_archive`. It counts the same two
+    quantities the reader counts from the member headers -- the entries (the root
+    directory, every directory, every file) and the bytes of regular files -- so a bundle
+    this lets through is one restore accepts at the same bound. Running it on the staged
+    tree, not the finished tarball, is what keeps a refusal from costing a full
+    compression pass and from ever publishing an archive this tool cannot restore.
+
+    Links are counted as entries and never followed. The staging pass does not carry
+    them, so a count that includes one only refuses earlier, never later, than restore.
+    The message names the largest top-level entry, because that is the operator's
+    cheapest way back under the bound with ``--components``.
+    """
+    facade = _facade()
+    max_count = facade._MAX_ARCHIVE_MEMBERS
+    if max_bytes is None:
+        max_bytes = facade._MAX_ARCHIVE_BYTES
+    total = 0
+    count = 1  # the bundle's root directory is a member of its own
+    by_top: dict[str, int] = {}
+    for dirpath, dirnames, filenames in os.walk(stage):
+        count += len(dirnames) + len(filenames)
+        if count > max_count:
+            raise _ArchiveTooLarge(
+                f"This snapshot declares more than {max_count:,} entries, which "
+                "`kirocrew restore` refuses",
+                kind="entries",
+            )
+        rel_dir = Path(dirpath).relative_to(stage)
+        for fn in filenames:
+            try:
+                st = os.lstat(os.path.join(dirpath, fn))
+            except FileNotFoundError:
+                continue
+            if not _stat.S_ISREG(st.st_mode):
+                continue
+            total += st.st_size
+            top = rel_dir.parts[0] + "/" if rel_dir.parts else fn
+            by_top[top] = by_top.get(top, 0) + st.st_size
+    if total > max_bytes:
+        largest, largest_bytes = max(by_top.items(), key=lambda kv: kv[1])
+        raise _ArchiveTooLarge(
+            f"This snapshot declares more than {_bound_gib(max_bytes)} GiB of uncompressed "
+            f"content ({total / (1024**3):.2f} GiB; largest entry {_safe_name(largest)} at "
+            f"{largest_bytes / (1024**3):.2f} GiB), which `kirocrew restore` refuses at that "
+            "bound"
+        )
+
+
+def _refuse_oversized_archive(probe: tarfile.TarFile, *, max_bytes: int | None = None) -> int:
     """Refuse an archive that would not fit, before anything is extracted.
 
     A compressed archive can declare orders of magnitude more content than it occupies,
@@ -936,8 +1166,16 @@ def _refuse_oversized_archive(probe: tarfile.TarFile) -> None:
     materialising the whole index is itself the denial of service an archive with
     millions of members performs. Bailing on the member that crosses the bound means the
     work is bounded by the bound, not by what the archive claims.
+
+    *max_bytes* is the operator's explicit ``--max-archive-gib`` override in bytes, and
+    defaults to ``_MAX_ARCHIVE_BYTES``. Only the byte bound moves: the member-count bound
+    is the one that stops an index-exhaustion archive, and no install needs more than it.
+    Returns the declared regular-file total, so a caller that raised the bound can also
+    hold it to the space the extraction has.
     """
     facade = _facade()
+    if max_bytes is None:
+        max_bytes = facade._MAX_ARCHIVE_BYTES
     total = 0
     count = 0
     while (member := probe.next()) is not None:
@@ -945,18 +1183,22 @@ def _refuse_oversized_archive(probe: tarfile.TarFile) -> None:
         if count > facade._MAX_ARCHIVE_MEMBERS:
             raise _ArchiveTooLarge(
                 f"This archive declares more than {facade._MAX_ARCHIVE_MEMBERS:,} "
-                "entries, which no memory bundle produces"
+                "entries, which no memory bundle produces",
+                kind="entries",
             )
         # Only regular files carry payload; a directory or link header declares a size
         # that extraction never writes, so counting those would refuse honest archives.
         if member.isfile():
             total += max(member.size, 0)
-            if total > facade._MAX_ARCHIVE_BYTES:
+            if total > max_bytes:
                 raise _ArchiveTooLarge(
                     "This archive declares more than "
-                    f"{facade._MAX_ARCHIVE_BYTES // (1024 ** 3)} GiB of uncompressed content, "
-                    "which no memory bundle produces"
+                    f"{_bound_gib(max_bytes)} GiB of uncompressed content, "
+                    "which no memory bundle produces. If you made it with "
+                    "`kirocrew snapshot --max-archive-gib N`, pass "
+                    "--max-archive-gib N (or larger) here"
                 )
+    return total
 
 
 def _manifest_components(snap: Path) -> list[str] | None:
@@ -1046,12 +1288,8 @@ def _print_manifest(snap: Path) -> None:
         m = json.loads(mf.read_text(encoding="utf-8"))
         print("📋 Snapshot info:")
         # Every string below comes out of an archive the caller supplied, so all of them
-        # go through _terminal_safe. Review named the omission list this change added;
-        # created_at, user and hostname are the same class and pre-date this diff. They
-        # are fixed here rather than left as a matching hole three lines away, because
-        # the renderer makes each one a one-word change and shipping a function that
-        # sanitizes two of five attacker-controlled fields would be worse than either
-        # extreme. Named as a drive-by rather than smuggled in.
+        # go through _terminal_safe: a function that sanitizes two of five
+        # attacker-controlled fields would be worse than either extreme.
         print(f"  Created: {_terminal_safe(m.get('created_at', 'unknown'))}")
         print(
             f"  From: {_terminal_safe(m.get('user', 'unknown'))}"

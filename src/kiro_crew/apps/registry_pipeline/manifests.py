@@ -16,8 +16,14 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import platform_compat
+from kiro_crew.apps import official_catalog
 from kiro_crew.apps.registry_pipeline import _FACADE
-from kiro_crew.apps.registry_pipeline.caches import _read_manifest_cache, _write_manifest_cache
+from kiro_crew.apps.registry_pipeline.caches import (
+    _read_manifest_cache,
+    _read_manifest_negative_cache,
+    _write_manifest_cache,
+    _write_manifest_negative_cache,
+)
 from kiro_crew.apps.registry_pipeline.checkout import (
     _CLONE_TIMEOUT,
     _HOOKS_NEUTRALIZER_ARGV,
@@ -64,6 +70,7 @@ async def _fetch_app_manifest(
     *,
     owner_designated: bool = False,
     commit: str = "",
+    allow_remote: bool = True,
 ) -> dict[str, Any] | None:
     """Fetch app.json for an app from its source repo (lightweight).
 
@@ -81,8 +88,10 @@ async def _fetch_app_manifest(
 
     *owner_designated*: when True (same-repo credential carve-out), the
     clone uses ``minimal_env()`` + context sandbox mode instead of the
-    default anonymous+strict posture. Only set when the entry's effective
-    clone URL is byte-identical to the owner-configured registry repo URL.
+    default anonymous+strict posture, and asks to keep the ssh-agent socket
+    (``wrap_argv`` re-judges that against the tier). Only set when the entry's
+    effective clone URL is byte-identical to the owner-configured registry repo
+    URL.
 
     *commit*: a pinned commit. When set, the manifest is read from THAT tree
     rather than a branch tip, and the local fast path compares commits instead of
@@ -91,7 +100,22 @@ async def _fetch_app_manifest(
     install fetches a pinned commit would gate one tree and install another --
     and a pinned row carries no branch at all, so the branch would silently be
     the ``"main"`` default.
+
+    *allow_remote*: when False, only step 1 runs -- the local persistent clone
+    is still read, and a miss returns None without cloning. The listing passes
+    False while a failed-fetch marker is fresh, so an app that is already
+    installed keeps its manifest while the remote stays off.
     """
+
+    def _read_manifest_text(path: Path) -> str | None:
+        # Blocking: the ``is_file`` probe and the read are both filesystem calls,
+        # so each caller below runs this in ONE ``asyncio.to_thread`` hop rather
+        # than probing on the event loop. None means "not a regular file"; read
+        # errors propagate to the caller's own handler.
+        if not path.is_file():
+            return None
+        return path.read_text("utf-8")
+
     credential_target = git_url or repo
     if _git_target_is_unsupported(credential_target):
         logger.warning("registry manifest fetch refused an unsupported clone target")
@@ -126,17 +150,26 @@ async def _fetch_app_manifest(
         manifest_dir = _contained_join(clone_dir, subdirectory)
         local_manifest = manifest_dir / "app.json" if manifest_dir is not None else None
         fresh_enough = await _clone_branch_matches(clone_dir, branch)
+        # The file probe and the read share one thread hop, and run before the
+        # origin check so a missing manifest still skips that git subprocess.
+        local_content: str | None = None
+        if local_manifest is not None:
+            try:
+                local_content = await asyncio.to_thread(_read_manifest_text, local_manifest)
+            except (OSError, UnicodeDecodeError):
+                local_content = None
         if (
-            local_manifest is not None
-            and local_manifest.is_file()
+            local_content is not None
             and await _clone_origin_matches(clone_dir, git_url)
             and fresh_enough
         ):
             try:
-                content = await asyncio.to_thread(local_manifest.read_text, "utf-8")
-                return json.loads(content)
-            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                return json.loads(local_content)
+            except json.JSONDecodeError:
                 pass
+
+    if not allow_remote:
+        return None
 
     if not _looks_like_git_url(git_url):
         # Not a cloneable URL (e.g. empty or a bare name on a public machine).
@@ -163,6 +196,10 @@ async def _fetch_app_manifest(
         # carve-out: when owner_designated is True the clone URL is the
         # owner-configured registry repo itself, so the confused-deputy
         # argument does not apply — use owner credentials + context sandbox.
+        # The owner's ssh agent is one of those credentials: the pinned fetch and
+        # the plain clone below pass owner_designated as the socket request, and
+        # wrap_argv re-judges it against the tier. The credentialed branch is an
+        # HTTP fetch and needs no agent.
         if owner_designated:
             clone_env = minimal_env()
             sandbox_mode = _context_clone_sandbox_mode(git_url)
@@ -193,6 +230,7 @@ async def _fetch_app_manifest(
                 credential_target=credential_target,
                 clone_env=clone_env,
                 sandbox_mode=sandbox_mode,
+                forward_ssh_auth_sock=owner_designated,
             )
             if err is not None:
                 logger.debug(
@@ -240,7 +278,10 @@ async def _fetch_app_manifest(
                 tmp_root,
             ]
             sandboxed_cmd, _cleanup = await wrap_argv_async(
-                clone_cmd, mode=sandbox_mode, _prepare=wrap_argv
+                clone_cmd,
+                mode=sandbox_mode,
+                forward_ssh_auth_sock=owner_designated,
+                _prepare=wrap_argv,
             )
             sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
             transport_env = _git_transport_env(credential_target, git_url, clone_env)
@@ -272,10 +313,9 @@ async def _fetch_app_manifest(
             # Untrusted index subdirectory escaped the clone root (absolute,
             # ``..``, or a symlink resolving outside tmp_root) — refuse.
             return None
-        manifest_path = manifest_dir / "app.json"
-        if not manifest_path.is_file():
+        content = await asyncio.to_thread(_read_manifest_text, manifest_dir / "app.json")
+        if content is None:
             return None
-        content = await asyncio.to_thread(manifest_path.read_text, "utf-8")
         return json.loads(content)
     except (asyncio.TimeoutError, OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         logger.debug(
@@ -311,11 +351,30 @@ async def _resolve_manifest(entry: dict[str, Any]) -> dict[str, Any]:
     if cached:
         return _merge_manifest(entry, cached)
 
+    # The same switch that keeps the catalog documents off the network keeps
+    # the listing's clone off it too: a seed row with no cached manifest
+    # renders its minimal info, which is exactly the failed-fetch degradation
+    # below. The install path (``install.py``) calls ``_fetch_app_manifest``
+    # directly and is not gated here -- an install needs the network anyway.
+    if official_catalog.store_fetch_skipped():
+        logger.info("%s=1 — not fetching app.json for %s", official_catalog.SKIP_FETCH_ENV, name)
+        return entry
+
+    # A fetch for these exact source coordinates failed within
+    # ``_MANIFEST_NEGATIVE_CACHE_TTL``: skip the remote clone. The local
+    # installed clone is still read first, so an app installed since the
+    # failure keeps its manifest. The marker shares the success cache's key,
+    # so another branch, repository or subdirectory still fetches. Only the
+    # listing consults it; the install path calls ``_fetch_app_manifest``
+    # directly.
+    negative_cached = await asyncio.to_thread(_read_manifest_negative_cache, entry)
+
     # Fetch from repo
     # Same-repo credential carve-out: if the entry's clone URL matches the
     # owner-configured registry repo, use owner credentials for the manifest
     # fetch (the confused-deputy defense does not apply to the owner's own URL).
     owner_target = await asyncio.to_thread(_owner_designated_repo_target, entry)
+    fetch_kwargs: dict[str, Any] = {"allow_remote": False} if negative_cached else {}
     manifest = await _fetch_app_manifest(
         repo,
         branch,
@@ -323,15 +382,23 @@ async def _resolve_manifest(entry: dict[str, Any]) -> dict[str, Any]:
         app_name=name,
         git_url=owner_target or git_url,
         owner_designated=bool(owner_target),
+        **fetch_kwargs,
     )
     if manifest:
         await asyncio.to_thread(_write_manifest_cache, entry, manifest)
         return _merge_manifest(entry, manifest)
 
+    if negative_cached:
+        # The remote was skipped, so nothing new failed: leave the marker's
+        # age alone so it still lapses on time.
+        return entry
+
     # No manifest available — return entry as-is (minimal info). The failed
     # fetch attaches NOTHING: the source-scoped cache read above already
     # missed, and there is deliberately no name-only fallback that could
     # attach a manifest cached for another branch or repository.
+    # The negative-cache marker stops the next listings from cloning again.
+    await asyncio.to_thread(_write_manifest_negative_cache, entry)
     logger.info("Could not fetch app.json for %s — showing minimal info", name)
     return entry
 
@@ -355,7 +422,10 @@ async def _resolve_manifest(entry: dict[str, Any]) -> dict[str, Any]:
 #
 # Display fields are deliberately ABSENT: they come from the fetched
 # ``app.json`` below, so an index cannot publish display copy for an app whose
-# manifest says otherwise. Install-status and trust fields are also absent —
+# manifest says otherwise. The one exception is ``version`` on an external row,
+# which the index may RAISE after this merge (``_append_external_registry_apps``)
+# because an installed app's manifest is read from its own installed checkout.
+# Install-status and trust fields are also absent —
 # ``_enrich_with_install_status`` and ``_apply_trust_fields`` run after this
 # and stamp them server-side.
 

@@ -41,7 +41,16 @@ from kiro_crew.cli import (
     _stop_log_queue_listener,
     drain_log_queue_before_hard_exit,
 )
+from kiro_crew.cli_logging import _fd_is_regular_file as _real_fd_is_regular_file
 from kiro_crew.config import config_dir
+
+
+@pytest.fixture(autouse=True)
+def _stderr_is_not_a_file(_floor_monkeypatch):
+    """pytest's fd capture points fd 2 at a temp FILE, which a gateway reads as
+    a service manager's error file. Tests model a console unless they opt in
+    (TestSetupCliLoggingServiceErrorFile)."""
+    _floor_monkeypatch.setattr("kiro_crew.cli._fd_is_regular_file", lambda fd: False)
 
 
 @pytest.fixture(autouse=True)
@@ -171,6 +180,165 @@ class TestRedirectFdsTo:
         assert self._read(old) == b"still-old\n"
 
 
+def _open_fds_on(path: Path) -> list[str]:
+    """Descriptors of THIS process whose target is *path* (Linux ``/proc``)."""
+    fd_dir = Path("/proc/self/fd")
+    held = []
+    for entry in fd_dir.iterdir():
+        try:
+            if os.readlink(entry) == str(path):
+                held.append(entry.name)
+        except OSError:
+            continue  # the fd closed while we listed it
+    return held
+
+
+class TestAppendOnlyLogFileHandler:
+    """A process that is not the gateway must not keep ``gateway.log`` open.
+
+    Windows refuses to rename a file another process holds open, so an MCP
+    server that kept its own handle made every gateway rollover fail and the
+    gateway's file log dropped every later record until restart.
+    """
+
+    def test_no_handle_held_after_construction_or_emit(self, tmp_path):
+        log = tmp_path / "gateway.log"
+        handler = cli_mod._AppendOnlyLogFileHandler(log, encoding="utf-8")
+        try:
+            assert handler.stream is None
+            record = logging.LogRecord("kiro_crew.t", logging.WARNING, "", 0, "one", None, None)
+            handler.handle(record)
+            handler.handle(record)
+            assert handler.stream is None
+            assert log.read_text(encoding="utf-8") == "one\none\n"
+        finally:
+            handler.close()
+
+    def test_never_rotates(self, tmp_path):
+        log = tmp_path / "gateway.log"
+        log.write_text("x" * (3 * 1024 * 1024), encoding="utf-8")
+        handler = cli_mod._AppendOnlyLogFileHandler(log, encoding="utf-8")
+        try:
+            handler.handle(
+                logging.LogRecord("kiro_crew.t", logging.WARNING, "", 0, "tail", None, None)
+            )
+        finally:
+            handler.close()
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["gateway.log"]
+        assert log.read_text(encoding="utf-8").endswith("tail\n")
+
+    def test_unopenable_path_raises_at_construction(self, tmp_path):
+        # A sandbox deny must surface at setup, where the caller falls back to
+        # console-only logging, rather than as one traceback per record.
+        with pytest.raises(OSError):
+            cli_mod._AppendOnlyLogFileHandler(tmp_path / "missing-dir" / "gateway.log")
+
+    def test_failed_open_on_emit_is_reported_not_raised(self, tmp_path, monkeypatch):
+        log = tmp_path / "gateway.log"
+        handler = cli_mod._AppendOnlyLogFileHandler(log, encoding="utf-8")
+        reported = []
+        monkeypatch.setattr(handler, "handleError", reported.append)
+
+        def _deny():
+            raise PermissionError(errno.EACCES, "denied")
+
+        monkeypatch.setattr(handler, "_open", _deny)
+        record = logging.LogRecord("kiro_crew.t", logging.WARNING, "", 0, "lost", None, None)
+        handler.handle(record)  # must not raise into the caller
+        assert reported == [record]
+        handler.close()
+
+    def test_recursion_error_propagates_and_releases_the_handle(self, tmp_path, monkeypatch):
+        # Like the stdlib handlers, a RecursionError is not swallowed into
+        # handleError: it reaches the code that logged.
+        log = tmp_path / "gateway.log"
+        handler = cli_mod._AppendOnlyLogFileHandler(log, encoding="utf-8")
+        reported: list[logging.LogRecord] = []
+        monkeypatch.setattr(handler, "handleError", reported.append)
+
+        def _recurse(_record):
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(handler, "format", _recurse)
+        record = logging.LogRecord("kiro_crew.t", logging.WARNING, "", 0, "deep", None, None)
+        with pytest.raises(RecursionError):
+            handler.emit(record)
+        assert reported == []
+        assert handler.stream is None
+        handler.close()
+
+    def test_failed_close_after_emit_still_releases_the_handle(self, tmp_path, monkeypatch):
+        # The record is already written when the close fails, so the error is
+        # swallowed, and the handler must still drop the stream: holding it is
+        # what blocks the gateway's rollover on Windows.
+        log = tmp_path / "gateway.log"
+        handler = cli_mod._AppendOnlyLogFileHandler(log, encoding="utf-8")
+        reported: list[logging.LogRecord] = []
+        monkeypatch.setattr(handler, "handleError", reported.append)
+        real_open = handler._open
+        closes: list[bool] = []
+
+        def _open_with_failing_close():
+            stream = real_open()
+            real_close = stream.close
+
+            def _close():
+                closes.append(True)
+                real_close()
+                raise OSError(errno.EIO, "close failed")
+
+            stream.close = _close
+            return stream
+
+        monkeypatch.setattr(handler, "_open", _open_with_failing_close)
+        record = logging.LogRecord("kiro_crew.t", logging.WARNING, "", 0, "kept", None, None)
+        handler.handle(record)  # must not raise into the caller
+        assert closes == [True]
+        assert handler.stream is None
+        assert reported == []
+        assert log.read_text(encoding="utf-8") == "kept\n"
+        handler.close()
+
+    @pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc fd listing")
+    @pytest.mark.parametrize("command", ["mcp-core", "mcp-cron", "chat", "status"])
+    def test_non_gateway_command_holds_no_handle_on_gateway_log(self, command, monkeypatch):
+        monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: False)
+        log_file = config_dir() / "gateway.log"
+        _setup_cli_logging(command, 1)
+        logging.getLogger("kiro_crew.holder").warning("from-%s", command)
+        _stop_log_queue_listener()  # chat writes through the listener thread
+        assert f"from-{command}" in log_file.read_text(encoding="utf-8")
+        assert _open_fds_on(log_file) == []
+
+    @pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc fd listing")
+    def test_gateway_is_the_only_holder(self, monkeypatch):
+        monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: False)
+        _setup_cli_logging("gateway", 1)
+        logging.getLogger("kiro_crew.holder").warning("gateway-record")
+        listener = cli_mod._LOG_QUEUE_LISTENER
+        assert listener is not None
+        (fh,) = listener.handlers
+        assert isinstance(fh, RotatingFileHandler)
+        assert fh.maxBytes == 2 * 1024 * 1024
+
+
+class TestBootRotationFailureIsReported:
+    def test_failed_boot_rotation_logs_a_warning(self, monkeypatch):
+        monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: False)
+        log_file = config_dir() / "gateway.log"
+        log_file.write_text("previous run\n", encoding="utf-8")
+
+        def _held(self, target):
+            raise PermissionError(errno.EACCES, "held by another process")
+
+        monkeypatch.setattr(Path, "replace", _held)
+        _setup_cli_logging("gateway", 1)
+        _stop_log_queue_listener()
+        text = log_file.read_text(encoding="utf-8")
+        assert text.startswith("previous run\n")
+        assert "could not move" in text and "held by another process" in text
+
+
 class TestFdTrackingRotatingFileHandler:
     @pytest.mark.skipif(
         os.name == "nt",
@@ -273,6 +441,10 @@ class TestRolloverFailureStopsFileLogging:
             tmp_path / "gateway.log", maxBytes=64, backupCount=2, encoding="utf-8"
         )
         handler.emit(_big_record())  # fills past maxBytes: the next emit rolls
+        # Some CPython 3.12 patch releases (3.12.4 here) also roll an EMPTY file
+        # over on that first emit, re-pointing the fds once. Only the re-points
+        # after the denied reopen are under test.
+        redirects.clear()
         self._deny_reopen(handler, monkeypatch, errno.EACCES)
         for _ in range(20):
             handler.emit(_big_record())
@@ -289,6 +461,7 @@ class TestRolloverFailureStopsFileLogging:
             tmp_path / "gateway.log", maxBytes=64, backupCount=2, encoding="utf-8"
         )
         handler.emit(_big_record())
+        redirects.clear()  # see test_eacces_on_reopen_stops_file_logging
         self._deny_reopen(handler, monkeypatch, errno.ENOSPC)
         for _ in range(20):
             handler.emit(_big_record())
@@ -495,10 +668,66 @@ class TestSetupCliLoggingDetached:
         def _deny(*_a, **_k):
             raise PermissionError(1, "Operation not permitted")
 
-        monkeypatch.setattr("kiro_crew.cli.RotatingFileHandler", _deny)
+        monkeypatch.setattr("kiro_crew.cli._OwnerOnlyRotatingFileHandler", _deny)
         monkeypatch.setattr("kiro_crew.cli._FdTrackingRotatingFileHandler", _deny)
         with pytest.raises(PermissionError):
             _setup_cli_logging("gateway", 1)
+
+
+class TestFdIsRegularFile:
+    def test_true_for_a_regular_file(self, tmp_path):
+        with open(tmp_path / "gateway.err", "w") as fh:
+            assert _real_fd_is_regular_file(fh.fileno()) is True
+
+    def test_false_for_a_pipe(self):
+        r, w = os.pipe()
+        try:
+            assert _real_fd_is_regular_file(w) is False
+        finally:
+            os.close(r)
+            os.close(w)
+
+    def test_false_for_a_closed_fd(self):
+        r, w = os.pipe()
+        os.close(r)
+        os.close(w)
+        assert _real_fd_is_regular_file(w) is False
+
+
+class TestSetupCliLoggingServiceErrorFile:
+    """A gateway whose stderr is a file nothing rotates (launchd's
+    ``gateway.err``, the Desktop launch log) echoes only warnings and errors
+    there; ``gateway.log`` keeps every record at the configured level."""
+
+    @pytest.fixture(autouse=True)
+    def _service_stderr(self, _floor_monkeypatch):
+        _floor_monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: False)
+        _floor_monkeypatch.setattr("kiro_crew.cli._fd_is_regular_file", lambda fd: True)
+        _floor_monkeypatch.setattr("kiro_crew.cli._redirect_fds_to", MagicMock())
+        # pytest's own capture handler on root turns the real basicConfig into
+        # a no-op, so stand in for it with the console handler it would add.
+        self.console = io.StringIO()
+
+        def _basic_config(**_kwargs):
+            logging.getLogger().addHandler(logging.StreamHandler(self.console))
+
+        _floor_monkeypatch.setattr(logging, "basicConfig", _basic_config)
+
+    def test_gateway_echoes_only_warnings_to_the_stderr_file(self):
+        _setup_cli_logging("gateway", 1)
+        logging.getLogger("kiro_crew.test_service").info("kc-info-record")
+        logging.getLogger("kiro_crew.test_service").warning("kc-warn-record")
+        _stop_log_queue_listener()
+        assert "kc-info-record" not in self.console.getvalue()
+        assert "kc-warn-record" in self.console.getvalue()
+        text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
+        assert text.count("kc-info-record") == 1
+        assert text.count("kc-warn-record") == 1
+
+    def test_other_commands_keep_echoing_every_level(self):
+        _setup_cli_logging("status", 1)
+        logging.getLogger("kiro_crew.test_service").info("kc-info-record")
+        assert "kc-info-record" in self.console.getvalue()
 
 
 class TestSetupCliLoggingForeground:
@@ -526,9 +755,9 @@ class TestSetupCliLoggingForeground:
         for logger in (logging.getLogger(), logging.getLogger("kiro_crew")):
             assert not any(isinstance(h, RotatingFileHandler) for h in logger.handlers)
         (fh,) = cli_mod._LOG_QUEUE_LISTENER.handlers
-        # Foreground keeps the plain handler: no fds were redirected, so
-        # there is nothing to re-point on rollover.
-        assert type(fh) is RotatingFileHandler
+        # Foreground keeps the plain (owner-only) handler: no fds were redirected,
+        # so there is nothing to re-point on rollover.
+        assert type(fh) is cli_mod._OwnerOnlyRotatingFileHandler
         assert fh.level == logging.NOTSET
 
     def test_record_written_once_to_file(self):
@@ -559,12 +788,11 @@ class TestSetupCliLoggingForeground:
         def _deny(*_a, **_k):
             raise PermissionError(1, "Operation not permitted")
 
-        monkeypatch.setattr("kiro_crew.cli.RotatingFileHandler", _deny)
-        monkeypatch.setattr("kiro_crew.cli._FdTrackingRotatingFileHandler", _deny)
+        monkeypatch.setattr("kiro_crew.cli._AppendOnlyLogFileHandler", _deny)
         _setup_cli_logging("mcp-core", 0)  # must not raise
         assert cli_mod._LOG_QUEUE_LISTENER is None
         assert not any(
-            isinstance(h, RotatingFileHandler) for h in logging.getLogger("kiro_crew").handlers
+            isinstance(h, logging.FileHandler) for h in logging.getLogger("kiro_crew").handlers
         )
 
     def test_unwritable_gateway_log_still_redacts_for_long_lived(self, monkeypatch):
@@ -574,11 +802,15 @@ class TestSetupCliLoggingForeground:
             raise PermissionError(1, "Operation not permitted")
 
         redaction = MagicMock()
-        monkeypatch.setattr("kiro_crew.cli.RotatingFileHandler", _deny)
+        monkeypatch.setattr("kiro_crew.cli._OwnerOnlyRotatingFileHandler", _deny)
         monkeypatch.setattr("kiro_crew.cli._FdTrackingRotatingFileHandler", _deny)
         monkeypatch.setattr("kiro_crew.cli.install_log_redaction", redaction)
         _setup_cli_logging("gateway", 1)  # must not raise
         redaction.assert_called_once_with([])
+        assert cli_mod._LOG_QUEUE_LISTENER is None
+        assert not any(
+            isinstance(h, logging.FileHandler) for h in logging.getLogger("kiro_crew").handlers
+        )
 
 
 class TestRuntimeLevelReachesFileLog:
@@ -755,7 +987,7 @@ class TestQueueOffLoop:
         assert cli_mod._LOG_QUEUE_LISTENER is None
         kc = logging.getLogger("kiro_crew")
         assert not any(isinstance(h, _CliLogQueueHandler) for h in kc.handlers)
-        sync_fhs = [h for h in kc.handlers if isinstance(h, RotatingFileHandler)]
+        sync_fhs = [h for h in kc.handlers if isinstance(h, logging.FileHandler)]
         assert len(sync_fhs) == 1
         logging.getLogger("kiro_crew.short").warning("short-lived-record")
         for h in kc.handlers:
@@ -881,7 +1113,10 @@ class TestDrainBeforeHardExit:
         _setup_cli_logging("gateway", 1)
         real_stop = cli_mod._stop_log_queue_listener
 
+        reached: list[bool] = []
+
         def exploding_stop(timeout=None):
+            reached.append(True)
             raise RuntimeError("interpreter teardown race")
 
         cli_mod._stop_log_queue_listener = exploding_stop  # type: ignore[assignment]
@@ -889,11 +1124,12 @@ class TestDrainBeforeHardExit:
             await drain_log_queue_before_hard_exit()
         finally:
             cli_mod._stop_log_queue_listener = real_stop  # type: ignore[assignment]
+        assert reached == [True], "the drain never reached the raising stop"
 
 
 class TestEveryGatewayHardExitDrainsTheQueue:
     """Ratchet: the queue only helps if EVERY hard exit in the gateway process
-    drains it. ``src/kiro_crew/slack/gateway.py`` and ``.../events.py`` are the
+    drains it. ``src/kiro_crew/slack/gateway_runtime/exit_path.py`` and ``slack/events_slash.py`` are the
     two modules that call ``os._exit`` from inside the long-lived gateway
     process - the other ``os._exit`` sites in the tree (``sandbox.py``,
     ``_process_group_supervisor.py``) run in forked/pre-exec children that
@@ -904,7 +1140,12 @@ class TestEveryGatewayHardExitDrainsTheQueue:
 
     _MODULES = (
         Path(__file__).resolve().parents[1] / "src/kiro_crew/slack/gateway.py",
-        Path(__file__).resolve().parents[1] / "src/kiro_crew/slack/events.py",
+        *sorted(
+            (Path(__file__).resolve().parents[1] / "src/kiro_crew/slack/gateway_runtime").glob(
+                "*.py"
+            )
+        ),
+        *sorted((Path(__file__).resolve().parents[1] / "src/kiro_crew/slack").glob("events*.py")),
     )
     _DRAINS = {"_stop_log_queue_listener", "drain_log_queue_before_hard_exit"}
 

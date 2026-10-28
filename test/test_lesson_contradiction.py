@@ -621,6 +621,71 @@ class TestApiLessonsCreateSchedulesSweep:
 
 
 @pytest.mark.asyncio
+class TestApiLessonsCreateSaturatedEmbedQueue:
+    """A lesson submitted while the inference queue is saturated is still stored.
+
+    The shared embedder serves one job at a time, so the rule's embed can wait
+    behind a long prompt embed. Its default wait equals the MCP client's read
+    timeout, so the write was never reached and the lesson was dropped. The
+    embed fake below behaves like a job stuck in that queue: it records the
+    deadline it was given and returns nothing, as an embed whose deadline ran
+    out does. The route's clock is a fixed fake, so the deadline it hands the
+    embed is an exact value, not a span measured on the runner.
+    """
+
+    _RULE = "Prefer the bounded embed for explicit lesson writes"
+    _LESSON_DEADLINE = 0.2
+    _NOW = 1_000.0
+
+    async def test_lesson_is_persisted_on_the_lesson_embed_budget(self, tmp_path, monkeypatch):
+        import time
+        import types
+
+        from kiro_crew import embeddings
+        from kiro_crew.dashboard.handlers import cron
+
+        monkeypatch.setattr(cron, "_LESSON_EMBED_DEADLINE_SECS", self._LESSON_DEADLINE)
+        # Only the route's monotonic clock is fixed; every other ``time`` call it
+        # makes still reaches the real module.
+        fake_time = types.SimpleNamespace(**{n: getattr(time, n) for n in dir(time) if not n.startswith("_")})
+        fake_time.monotonic = lambda: self._NOW
+        monkeypatch.setattr(cron, "time", fake_time)
+
+        deadlines: list[float] = []
+
+        def saturated_embed(_text: str) -> list[float] | None:
+            deadlines.append(embeddings._work_for_priority(embeddings.PRIORITY_NORMAL).deadline)
+            return None
+
+        vs = VectorMemoryStore(db_path=tmp_path / "memory.db")
+        await asyncio.to_thread(vs.init)
+        try:
+            vs.embed_fn = saturated_embed
+            state = MagicMock()
+            state._background_tasks = set()
+            state.conversation_log = ConversationLog()
+            request = MagicMock()
+            request.app = {"state": state}
+            request.headers = {"X-Session-Key": "dashboard:ui"}
+            attach_body(request, {"rule": self._RULE, "category": "knowledge"})
+
+            with patch.object(cron, "_get_memory", return_value=MagicMock(vector_store=vs)), \
+                 patch.object(cron, "_is_restricted_session", return_value=False), \
+                 patch.object(cron, "_sel"), \
+                 patch.object(cron, "_resolve_and_supersede", new=AsyncMock()):
+                resp = await cron.api_lessons_create(request)
+
+            assert resp.status == 200
+            rows = await asyncio.to_thread(vs.get_lessons)
+            assert [json.loads(r["value_json"])["rule"] for r in rows] == [self._RULE]
+            # One embed, on the lesson budget: no second embed on the embedder's
+            # default wait inside the write or the contradiction scan.
+            assert deadlines == [self._NOW + self._LESSON_DEADLINE]
+        finally:
+            await asyncio.to_thread(vs.close)
+
+
+@pytest.mark.asyncio
 class TestApiLessonsCreateForwardsNegative:
     """The route must carry ``negative`` into whichever store it writes to.
 
@@ -716,7 +781,9 @@ class TestApiLessonsDeleteOffloadsRemove:
         seen: dict[str, int] = {}
 
         class _RecordingStore:
-            def remove(self, rule_sub, repo_scope=None, *, exact=False):  # noqa: ANN001 - test double
+            def remove(  # noqa: ANN001 - test double
+                self, rule_sub, repo_scope=None, *, exact=False, keep_one=False
+            ):
                 seen["remove"] = threading.get_ident()
                 return True
 
@@ -806,8 +873,8 @@ class TestWriteLessonRejectionPreflight:
 
 
 class TestSplitStored:
-    """Direct truth table for the separator matcher. Four review rounds each found one
-    more instance of this class, because the separator is stored IN-BAND and unescaped:
+    """Direct truth table for the separator matcher. The separator is stored IN-BAND and
+    unescaped:
     `A — NOT: B` is either rule `A` with clause `B`, or a bare rule containing the
     separator. The row's key (md5 of the rule at write time) is what settles it, so
     these cases are pinned in BOTH directions."""
@@ -858,8 +925,8 @@ class TestSplitStored:
 
     def test_the_prefix_matches_only_when_the_key_confirms_it(self):
         """Same text, same submitted rule, different stored key -> opposite answers. This
-        is the whole disambiguation in one pair of assertions, and it is why the two
-        contradictory review rounds can both be satisfied."""
+        is the whole disambiguation in one pair of assertions: both readings of the
+        same text are honoured."""
         stored = f"A{self.SEP}B"
         assert _split_stored(stored, "a", self._key("A")) == ("A", True)
         assert _split_stored(stored, "a", self._key(stored)) == (None, False)

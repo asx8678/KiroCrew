@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew import mcp_core, session_directive
+from kiro_crew import mcp_core, session_directive, validation
 from kiro_crew.autonudge import AutoNudgeService, NudgeLoop, runtime_budget_exceeded
 from kiro_crew.dashboard.session_directive_apply import apply_session_directive
 from kiro_crew.mcp_tools import control
@@ -34,16 +34,16 @@ _BABYSIT_SKILL = _REPO_ROOT / "src/kiro_crew/builtin_skills/kirocrew-dev/babysit
 _SYSTEM_PROMPT = _REPO_ROOT / "src/kiro_crew/config/prompt.md"
 
 
-def test_babysit_is_reachable_and_the_system_prompt_prefers_structured_watch() -> None:
+def test_babysit_is_reachable_and_the_skill_prefers_structured_watch() -> None:
     skill = _BABYSIT_SKILL.read_text(encoding="utf-8")
     prompt = _SYSTEM_PROMPT.read_text(encoding="utf-8")
 
     assert "triggers: babysit" in skill
-    assert "monitor_watch" in prompt
-    assert "Use `monitor_start`" in prompt
-    assert "only for unsupported targets" in prompt
-    assert "HEARTBEAT.md" in prompt
-    assert "kiro_crew.heartbeat.append_heartbeat_task(entry)" in prompt
+    assert "`kirocrew-dev/babysit`" in prompt
+    assert "monitor_watch" in skill
+    assert "Use a structured monitor only when its typed provider observes every fact" in skill
+    assert "HEARTBEAT.md" in skill
+    assert "kiro_crew.heartbeat.append_heartbeat_task(entry)" in skill
 
 
 def test_babysit_keeps_finite_legacy_path_for_unobserved_review_evidence() -> None:
@@ -58,9 +58,14 @@ def test_babysit_keeps_finite_legacy_path_for_unobserved_review_evidence() -> No
 
     legacy_args = session_directive.decode(legacy, "monitor_start")
     assert legacy_args is not None
-    assert legacy_args["max_cycles"] == 24
+    assert legacy_args["max_cycles"] == 48
     assert legacy_args["max_runtime_secs"] == 14_400
-    assert legacy_args["gate"] is False
+    # The runtime, not the cycle cap, ends the loop.
+    assert legacy_args["idle_secs"] * legacy_args["max_cycles"] >= legacy_args["max_runtime_secs"]
+    # Gated, with the judge off: an unchanged pull request costs no turn and any
+    # change to its reading, comments included, wakes the loop.
+    assert legacy_args["gate"] is True
+    assert validation.judge_is_off(legacy_args["judge"])
     assert "call the finite legacy path directly" in skill
 
 
@@ -72,8 +77,8 @@ def test_babysit_keeps_finite_legacy_path_when_terminal_success_must_report() ->
     assert "use the finite legacy path" in skill
 
 
-def test_prepare_pr_recipe_covers_its_poll_budget_without_provider_gating() -> None:
-    skill_path = _BABYSIT_SKILL.parent.parent / "kirocrew-prepare-pr/SKILL.md"
+def test_prepare_pr_recipe_covers_its_poll_budget_gated_with_the_judge_off() -> None:
+    skill_path = _BABYSIT_SKILL.parent.parent / "kirocrew-prepare-pr/references/monitor-loop.md"
     skill = skill_path.read_text(encoding="utf-8")
     recipe = next(
         textwrap.dedent(block).strip()
@@ -98,8 +103,11 @@ def test_prepare_pr_recipe_covers_its_poll_budget_without_provider_gating() -> N
         created_ts=1.0,
     )
     assert loop.max_runtime_secs > 0
-    assert not runtime_budget_exceeded(loop, now=loop.created_ts + loop.idle_secs * loop.max_cycles)
-    assert applied["gate"] is False
+    # Every cycle spent means the runtime is spent too, so the cycle cap never
+    # ends the loop before the 24 hours the skill states.
+    assert runtime_budget_exceeded(loop, now=loop.created_ts + loop.idle_secs * loop.max_cycles)
+    assert applied["gate"] is True
+    assert validation.judge_is_off(applied["judge"])
 
 
 def test_babysit_routes_webex_sessions_to_the_finite_legacy_path() -> None:

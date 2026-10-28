@@ -100,7 +100,7 @@ def _drop_unbacked_app_entries(
     the distinction is worth stating because the weaker claim is false. Two paths
     legitimately write a ``:``-containing key into this spec: ``_register_mcp_servers``
     builds every app bridge as ``f"{app_name}:{server_name}"``, and the MCP page's
-    ``handlers/mcp.py::_sync_mcp_to_agent_unlocked`` copies a global mcp.json server
+    ``handlers/mcp_agent_sync.py::_sync_mcp_to_agent_unlocked`` copies a global mcp.json server
     in under ``mcp_server_alias``, which returns a slash-free name UNCHANGED and so
     preserves a colon (``npm:foo`` stays ``npm:foo``). What this rule withholds is
     the ability to introduce such a name through the RAW EDITOR, where the client's
@@ -175,7 +175,7 @@ def _merge_unowned_servers(
     """Re-add ``mcpServers`` entries the submitting client does not own.
 
     MERGE-ON-WRITE. This PUT persists a whole-file snapshot the client read
-    earlier, and ``apps/bridges.py::_register_mcp_servers`` writes app MCP
+    earlier, and ``apps/bridges_mcp.py::_register_mcp_servers`` writes app MCP
     bridges into that same file under its own flock. Without the merge, a
     registration landing between the client's read and its PUT is silently
     clobbered and the app's tools stop resolving with nothing logged anywhere.
@@ -232,7 +232,7 @@ def _merge_unowned_servers(
     write (see :func:`_commit_agent_config`), and every writer of this file
     INSIDE the gateway takes that same flock -- ``_register_mcp_servers``,
     ``_deregister_mcp_servers``, ``reregister_app_mcp_servers``, the agent
-    rebuild, and ``handlers/mcp.py``'s spec syncs -- so no app registration or
+    rebuild, and ``handlers/mcp_agent_sync.py``'s spec syncs -- so no app registration or
     deregistration can interleave with this read, in either direction. That
     window is closed rather than narrowed, which matters because the
     deregistration direction does not self-heal: startup reconciliation only
@@ -430,8 +430,8 @@ def _app_declared_server_names() -> frozenset[str]:
       forever. Ownership therefore requires installed AND enabled.
     * ABSENT ``enabled`` FIELD ⇒ ENABLED. This matches ``apps.manager``'s own
       parse exactly -- ``InstalledApp.from_dict`` reads
-      ``bool(data.get("enabled", True))`` (manager.py:170) over a dataclass whose
-      default is ``enabled: bool = True`` (manager.py:114). A legacy record
+      ``bool(data.get("enabled", True))`` (manager_records.py) over a dataclass whose
+      default is ``enabled: bool = True`` (``InstalledApp.enabled``). A legacy record
       written before the field existed is treated as enabled everywhere else in
       the tree, and disagreeing here would delete the live bridges of an app the
       rest of the system considers running.
@@ -493,35 +493,22 @@ def _app_declared_server_names() -> frozenset[str]:
             # empty, and empty is what deletes its live bridges. So this is the
             # cannot-read case the metadata screen below already refuses for
             # ``installed.json``, reached one directory level up.
-            #
-            # It is also the answer ``apps.manager`` gives the same shape:
-            # ``_entry_stands_for_a_dropped_app`` counts a link-ish non-directory
-            # entry as an app the listing dropped, so ``list_apps_with_skips``
-            # reports INCOMPLETE rather than vouching for the name being free.
-            # Skipping here would make this walk the one reader that treats that
-            # shape as a definite absence.
             raise AppOwnershipUnreadable(
                 f"installed-apps entry {child.name!r} present but unresolvable: {exc}"
             ) from exc
         if stat.S_ISDIR(st.st_mode):
             entries.append(child)
             continue
-        # A non-directory that RESOLVED cleanly. ``apps.manager`` splits this same
-        # shape in two and this walk has to split it the same way, because the two
-        # halves carry opposite answers.
+        # A non-directory that RESOLVED cleanly splits in two, with opposite answers.
         #
         # LINK-ISH (symlink or junction) whose target is not a directory: the
         # resolving predicates disagree about it, since ``is_dir()`` says no while
-        # the name is plainly occupied, and
-        # ``_entry_stands_for_a_dropped_app`` returns ``entry.is_symlink() or
-        # is_link_or_junction(entry)`` for exactly this, counting it as an app the
-        # listing dropped. So what this app declares is UNKNOWN, and unknown is the
-        # one answer that must not be spelled as the empty set, because empty is
-        # what deletes its live bridges.
+        # the name is plainly occupied. So what this app declares is UNKNOWN, and
+        # unknown is the one answer that must not be spelled as the empty set,
+        # because empty is what deletes its live bridges.
         #
         # A PLAIN non-directory is the opposite answer, and skipping it is
-        # deliberate: ``_entry_stands_for_a_dropped_app`` does not count one either,
-        # because a file BESIDE the app directories is an ordinary member of a
+        # deliberate: a file BESIDE the app directories is an ordinary member of a
         # healthy apps root, and refusing it would turn every such file into a 500.
         if stat.S_ISLNK(link_st.st_mode) or is_link_or_junction(child):
             raise AppOwnershipUnreadable(

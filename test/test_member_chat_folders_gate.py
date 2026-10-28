@@ -58,6 +58,7 @@ class TestAdmittedChatRouteMethods:
             ("/api/chat/slots/chat-1-2/folder", "PATCH"),
             ("/api/chat/slots/chat-1-2/tags", "PUT"),
             ("/api/chat/slots/chat-1-2/pin", "PATCH"),  # pin own or created session
+            ("/api/chat/slots/chat-1-2/drop", "POST"),  # move own card to a column
             ("/api/chat/slots", "GET"),  # read-only session list for folder tools
         ],
     )
@@ -110,9 +111,7 @@ class TestAdmittedChatRouteMethods:
         )
 
     def test_wrong_method_on_an_admitted_path_is_not_matched(self):
-        # DELETE on the folders collection route is not admitted.
         assert "DELETE" not in _shared._admitted_chat_route_methods("/api/chat/folders")
-        # Folder {id} admits PATCH only -- never DELETE.
         assert _shared._admitted_chat_route_methods("/api/chat/folders/abc123") == frozenset(
             {"PATCH"}
         )
@@ -120,7 +119,6 @@ class TestAdmittedChatRouteMethods:
         assert _shared._admitted_chat_route_methods("/api/chat/tags") == frozenset({"GET"})
         # So is the board's column list.
         assert _shared._admitted_chat_route_methods("/api/chat/tag-columns") == frozenset({"GET"})
-        # POST on the session list is not admitted (GET only).
         assert "POST" not in _shared._admitted_chat_route_methods("/api/chat/slots")
         # reorder admits POST only.
         assert "GET" not in _shared._admitted_chat_route_methods("/api/chat/folders/reorder")

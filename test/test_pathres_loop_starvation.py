@@ -42,6 +42,7 @@ from kiro_crew import security
 from kiro_crew.agent_discovery import clear_list_agents_cache
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.skills import _iter_skill_files
+from kiro_crew.testing.wait import default_timeout
 
 
 def _refuse_candidate_resolution(expanded: str) -> set[str]:
@@ -142,9 +143,35 @@ class TestIsSensitiveResolvedPath:
         assert security.is_sensitive_resolved_path(real) is True
         assert security.is_sensitive_resolved_path(os.path.realpath(os.sep)) is False
 
-    def test_the_inline_anchors_are_the_bounded_anchors(self, monkeypatch) -> None:
+    def test_the_inline_anchors_are_the_bounded_anchors(self, tmp_path, monkeypatch) -> None:
         # Same targets from both routes, and the same cache key, so the
         # decision cannot drift between the loop's gate and the walker's.
+        #
+        # The two builds resolve the same anchors at two different moments, so
+        # the comparison is only about the ROUTE if the filesystem under those
+        # anchors cannot change in between. It can: the per-test crew
+        # home is a path the floor pins but never creates, and any thread that
+        # reaches ``config_dir()`` while this test runs creates it, because the
+        # env var is process-global. On Windows that flips ``realpath``'s first
+        # and second lookup of an anchor from "path not found" to "file not
+        # found", and ntpath then keeps the ``\\?\`` prefix on that one answer
+        # -- an extra target in whichever build straddled the mkdir. So this
+        # test owns its home and creates the directory above every anchor the
+        # build resolves BEFORE either build. A concurrent writer can then only
+        # add a missing LEAF, which ntpath resolves the same either way.
+        home = tmp_path / "crew"
+        home.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        resolved: dict[str, str | None] = {}
+        security.paths._anchor_targets(
+            security.paths._SENSITIVE_HOME_DIRS, security.paths._resolved_root_key(), resolved
+        )
+        # The build anchors on the RESOLVED home (``/var`` -> ``/private/var`` on macOS).
+        real_home = Path(os.path.realpath(home))
+        for anchor in resolved:
+            parent = Path(anchor).parent
+            if parent.is_relative_to(real_home):
+                parent.mkdir(parents=True, exist_ok=True)
         monkeypatch.setattr(security.paths, "_home_targets_cache", {})
         bounded = security.paths._home_dir_targets(security.paths._SENSITIVE_HOME_DIRS)
         monkeypatch.setattr(security.paths, "_home_targets_cache", {})
@@ -189,7 +216,7 @@ class TestIsSensitiveResolvedPath:
 _EXPECTED_GATE_CALL_SITES: dict[str, int] = {
     # ``_iter_skill_files``: one check per directory (prune) and per SKILL.md
     # (skip), each against the ``realpath`` the walk computed for loop detection.
-    "kiro_crew/skills.py": 2,
+    "kiro_crew/skills_discovery.py": 2,
     # ``_complete_path_listing`` / ``_scan_completion_dir``: the project root, the
     # directory a `./` completion token named, and every entry that directory
     # offers. Both halves of the contract hold. The argument is canonical without a
@@ -230,7 +257,12 @@ _EXPECTED_GATE_CALL_SITES: dict[str, int] = {
     # (``_read_agent_spec`` / ``read_agent_spec_strict``, each handing it the
     # ``Path.resolve(strict=True)`` result; the native skill projection reads
     # every spec under ``asyncio.to_thread``, and a stalled pool there dropped
-    # agents silently and surfaced as ``no prepared skill discovery view``).
+    # agents silently and surfaced as ``no prepared skill discovery view``), and
+    # the dashboard's file-search and listing walks (``FileIndex._walk``, the
+    # ``/api/file-search`` fallback walk, ``_browse_dirs_sync`` and
+    # ``_browse_files_sync``), each handing it the ``os.path.realpath`` computed
+    # on the same line from a worker thread; one rebuild of a large index
+    # otherwise queued a pool hop per entry ahead of the loop's own checks.
     # ``test_artifacts_pathres.py`` and ``test_agent_discovery_pathres.py`` pin
     # the canonical spelling and the thread split for each caller. The store's
     # root check and ``source_path`` pointers, and the reader module's project
@@ -251,13 +283,20 @@ _EXPECTED_CONTAINMENT_CALL_SITES: dict[str, int] = {
 
 
 def _call_sites(gate: str) -> dict[str, int]:
-    """Every call of *gate* under ``src``, by module, counting hand-offs by name."""
+    """Every call of *gate* under ``src``, by module, counting hand-offs by name.
+
+    Both shapes it counts spell *gate* as an identifier -- the called Name or
+    Attribute, or a Name passed as an argument -- so only files whose text holds it
+    are parsed. Parsing every module instead cost ~20 s of CPU per call on a fast
+    host, and one composition test makes two such calls under one timeout.
+    """
     import ast
+
+    from source_corpus import parsed_candidates
 
     src = Path(skills_mod.__file__).resolve().parents[1]
     sites: dict[str, int] = {}
-    for path in sorted(src.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+    for path, _source, tree in parsed_candidates(require_any=(gate,), skip_syntax_errors=False):
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -289,10 +328,15 @@ def _containment_claim_sites() -> dict[str, int]:
     """
     import ast
 
+    from source_corpus import parsed_candidates
+
+    # A counted call spells both the callee and the keyword as identifiers, so a
+    # file that lacks either text cannot hold one.
     src = Path(skills_mod.__file__).resolve().parents[1]
     sites: dict[str, int] = {}
-    for path in sorted(src.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+    for path, _source, tree in parsed_candidates(
+        require_all=("path_contains_sensitive", "pre_resolved"), skip_syntax_errors=False
+    ):
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -502,12 +546,12 @@ class TestNamedAgentModelReadsTheSnapshot:
         assert asyncio.run(resolve()) == ("old" if state == "stale" else "")
         _, futures = _discovery_pool
         assert len(futures) == 1
-        futures[0].result(timeout=5)
+        futures[0].result(timeout=default_timeout())
         assert log.labels_off(loop_thread) == [{"operation": "load_config", "source": "unknown"}]
         assert log.on(loop_thread) == []
         assert asyncio.run(resolve()) == "new"
         assert len(futures) == 2
-        futures[1].result(timeout=5)
+        futures[1].result(timeout=default_timeout())
         assert len(log.labels_off(loop_thread)) == 1, "a warm revalidation parsed"
         assert str(tmp_path) not in agent_discovery._PARSED_SPECS_REFRESHING
 
@@ -533,10 +577,10 @@ class TestNamedAgentModelReadsTheSnapshot:
         _, futures = _discovery_pool
         cold = asyncio.run(resolve())
         assert len(futures) == 1
-        futures[0].result(timeout=5)
+        futures[0].result(timeout=default_timeout())
         warm = asyncio.run(resolve())
         assert len(futures) == 2
-        futures[1].result(timeout=5)
+        futures[1].result(timeout=default_timeout())
         assert cold == ""
         assert warm == "m"
         assert signatures, "no directory signature was revalidated"
@@ -569,7 +613,7 @@ class TestNamedAgentModelReadsTheSnapshot:
             # Drain even if an assertion fails; never leave an in-flight mark.
             pool, _ = _discovery_pool
             for call in queued.submit.call_args_list:
-                pool.submit(*call.args, **call.kwargs).result(timeout=5)
+                pool.submit(*call.args, **call.kwargs).result(timeout=default_timeout())
         assert str(tmp_path) not in agent_discovery._PARSED_SPECS_REFRESHING
         assert KiroCrewConfig._resolve_named_agent_model("bot", agents_dir=tmp_path) == "m"
 
@@ -594,7 +638,7 @@ class TestNamedAgentModelReadsTheSnapshot:
                 # The worker swallows the failure so the fire-and-forget future
                 # never carries an unretrieved exception -- and logs it, since
                 # nothing else would surface a persistent parse failure.
-                assert futures[-1].result(timeout=5) is None
+                assert futures[-1].result(timeout=default_timeout()) is None
             assert "snapshot refresh failed" in caplog.text
             assert "snapshot unavailable" in caplog.text
             assert str(tmp_path) not in agent_discovery._PARSED_SPECS_REFRESHING

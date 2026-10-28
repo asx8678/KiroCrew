@@ -501,13 +501,32 @@ class TestCeilingProbesFailClosed:
         assert gmod.may_skip_gate("web_fetch", None) is True
 
 
+def _doctor_source() -> str:
+    """``cli_doctor``'s text joined with its ``cli_doctor_parts`` owners, whose functions
+    run on the facade's globals: the doctor's MCP repair lives in one of them."""
+    import importlib
+    import inspect
+    import pkgutil
+
+    from kiro_crew import cli_doctor, cli_doctor_parts
+
+    return "\n".join(
+        inspect.getsource(mod)
+        for mod in [cli_doctor]
+        + [
+            importlib.import_module(f"{cli_doctor_parts.__name__}.{info.name}")
+            for info in pkgutil.iter_modules(cli_doctor_parts.__path__)
+        ]
+    )
+
+
 class TestBothWritePointsConsultTheCeiling:
     """`allowedTools` is written in TWO places; one predicate governs both.
 
     Auto-approve is the only path that never reaches `hooks.on_tool_call`, so a
     list written without consulting the ceiling is a set of tools the ceiling
     cannot refuse. Closing that in app-agent materialization
-    (`apps/bridges.py`) left the OTHER writer — the host agent's shared-MCP sync
+    (`apps/bridges_agents.py`) left the OTHER writer — the host agent's shared-MCP sync
     in `agent.py` — appending every user-installed server's `@ref` unconditionally,
     so on a governed host the primary agent kept the whole bypass. These pin that
     both writers route through `governance.may_skip_gate`.
@@ -533,19 +552,31 @@ class TestBothWritePointsConsultTheCeiling:
         # reading review comments: the first two rounds fixed the two writers that
         # had been REPORTED and left the dashboard enable paths and doctor's
         # auto-fix — the most common way a grant is created — wide open.
+        # The bridges facade's code lives in its owners: read the facade with each.
+        bridges_src = "\n".join(
+            inspect.getsource(m) for m in (bridges, *map(importlib.import_module, bridges._OWNERS))
+        )
+        # So does the MCP handler facade's.
+        mcp_src = "\n".join(
+            inspect.getsource(m)
+            for m in (mcp_handler, *map(importlib.import_module, mcp_handler._OWNERS))
+        )
         for mod in (bridges, mcp_handler, cli_doctor):
-            src = inspect.getsource(mod)
+            src = bridges_src if mod is bridges else inspect.getsource(mod)
+            src = mcp_src if mod is mcp_handler else src
+            src = _doctor_source() if mod is cli_doctor else src
             assert "may_skip_gate" in src, f"{mod.__name__} must use the shared predicate"
             assert "_BUILTIN_TOOL_SCOPES" not in src, (
                 f"{mod.__name__} re-declares the builtin tool→scope map; it belongs to "
                 f"platform/governance.py (see BUILTIN_TOOL_SCOPES)"
             )
-        # agent.py's writers are composed from the agent_materialization modules:
-        # none of them may carry the map, and the one predicate they all consult
+        # agent.py's writers are composed from the agent_parts and agent_materialization
+        # modules: none of them may carry the map, and the one predicate they all consult
         # is the shared one.
         agent_parts = [agent] + [
-            importlib.import_module(f"{agent_materialization.__name__}.{info.name}")
-            for info in pkgutil.iter_modules(agent_materialization.__path__)
+            importlib.import_module(f"{package.__name__}.{info.name}")
+            for package in (agent_materialization, importlib.import_module("kiro_crew.agent_parts"))
+            for info in pkgutil.iter_modules(package.__path__)
         ]
         assert len(agent_parts) > 1, "the agent_materialization modules were not found"
         for mod in agent_parts:
@@ -821,9 +852,8 @@ class TestAutoApproveIsFilteredAtTheWriteChokepoint:
     `autoApprove` reaches a written agent config from at least four places — an
     app manifest, a per-agent MCP policy, a materialized managed ref, and an entry
     preserved from the previous file (plus an imported config from another tool).
-    Three review rounds each fixed the source that had been REPORTED and left the
-    rest, so the filter now runs once on the final map, at the position both
-    writers hand it to disk.
+    Patching one source at a time leaves the rest, so the filter runs once on the
+    final map, at the position both writers hand it to disk.
     """
 
     def test_a_governed_server_loses_the_key_and_keeps_the_server(
@@ -889,7 +919,7 @@ class TestOnlyTheOwnersOwnAutoApproveIsHonoured:
         return dict(gov.strip_ungoverned_auto_approve(servers, audit=False))
 
     def test_an_apps_own_server_is_not_the_owner(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """``apps/bridges.py`` keys an app's own servers ``<app>:<server>``."""
+        """``apps/bridges_mcp.py`` keys an app's own servers ``<app>:<server>``."""
         out = self._honoured(
             monkeypatch, {"weather:api": {"command": "w", "autoApprove": ["write_all"]}}
         )
@@ -1139,12 +1169,8 @@ class TestEveryWriterRevokesAStaleGrant:
     """
 
     def test_doctor_removes_a_grant_the_ceiling_now_denies(self) -> None:
-        import inspect
-
-        from kiro_crew import cli_doctor
-
-        src = inspect.getsource(cli_doctor)
-        assert "allowed.remove(ref)" in src, "doctor must revoke, not merely decline to add"
+        src = _doctor_source()
+        assert "allowed[:] = without_mcp_refs(allowed, (name,))" in src, "doctor must revoke, not merely decline to add"
 
     def test_no_writer_only_declines(self) -> None:
         """Each module that mints a grant must also be able to take one back."""
@@ -1156,9 +1182,9 @@ class TestEveryWriterRevokesAStaleGrant:
         from kiro_crew.apps import bridges
         from kiro_crew.dashboard.handlers import mcp as mcp_handler
 
-        # agent.py's writers are composed from the agent_materialization modules,
-        # so the agent side is judged on the whole composition; the predicate it
-        # consults is the one ``_may_auto_approve`` wraps.
+        # agent.py's writers are composed from its agent_parts owners and the
+        # agent_materialization modules; the agent side is judged on agent.py and those
+        # modules; the predicate it consults is the one ``_may_auto_approve`` wraps.
         agent_src = "\n".join(
             inspect.getsource(mod)
             for mod in [agent]
@@ -1170,8 +1196,18 @@ class TestEveryWriterRevokesAStaleGrant:
         assert "may_skip_gate" in inspect.getsource(
             agent._may_auto_approve
         ), "kiro_crew.agent must consult the ceiling"
-        sources = [(agent.__name__, agent_src)] + [
-            (mod.__name__, inspect.getsource(mod)) for mod in (cli_doctor, bridges, mcp_handler)
+        # The bridges facade's code lives in its owners: read the facade with each.
+        bridges_src = "\n".join(
+            inspect.getsource(m) for m in (bridges, *map(importlib.import_module, bridges._OWNERS))
+        )
+        # So does the MCP handler facade's.
+        mcp_src = "\n".join(
+            inspect.getsource(m)
+            for m in (mcp_handler, *map(importlib.import_module, mcp_handler._OWNERS))
+        )
+        sources = [(agent.__name__, agent_src), (cli_doctor.__name__, _doctor_source())] + [
+            (mod.__name__, bridges_src if mod is bridges else mcp_src)
+            for mod in (bridges, mcp_handler)
         ]
         for name, src in sources:
             assert "may_skip_gate" in src, f"{name} must consult the ceiling"
@@ -1302,12 +1338,15 @@ class TestTemplateGrantsAreCeilingFilteredAtBuild:
     def test_every_crew_spec_writer_filters_or_inherits(self) -> None:
         """Writer parity: the NEXT installer cannot reintroduce the gap.
 
-        Every Crew-authored agent-spec writer in ``agent.py``, or in the
-        ``agent_materialization`` modules it is composed from, must either
-        derive from ``build_agent_config`` (which filters), filter what it
-        writes through ``_may_auto_approve``, or not write an ``allowedTools``
-        key at all. ``_install_research_agent`` failed this before the fix:
-        it derived from a then-unfiltered constructor.
+        Every Crew-authored agent-spec writer in ``agent.py`` and its ``agent_parts``
+        owners, or in the ``agent_materialization`` modules it is composed from, must either
+        derive from ``build_agent_config`` (which filters), hand its own
+        assembled spec to ``_apply_allowed_tools_ceiling`` (the same filter the
+        constructor runs, pinned by the case above) or to the shared
+        ``write_governed_spec`` tail (which runs it), filter what it writes
+        through ``_may_auto_approve``, or not write an ``allowedTools`` key at
+        all. ``_install_research_agent`` failed this before the fix: it derived
+        from a then-unfiltered constructor.
         """
         import importlib
         import inspect
@@ -1334,7 +1373,9 @@ class TestTemplateGrantsAreCeilingFilteredAtBuild:
             src = inspect.getsource(fn)
             covered = (
                 "build_agent_config(" in src
+                or "_apply_allowed_tools_ceiling(" in src
                 or "_may_auto_approve(" in src
+                or "write_governed_spec(" in src
                 or "allowedTools" not in src
             )
             assert covered, (
@@ -1515,13 +1556,9 @@ class TestDoctorAuditsItsRevocation:
     same SEL trail every other writer does, not revoke silently."""
 
     def test_doctor_emits_the_withheld_event_on_revoke(self) -> None:
-        import inspect
-
-        from kiro_crew import cli_doctor
-
-        src = inspect.getsource(cli_doctor)
+        src = _doctor_source()
         assert 'operation="mcp_auto_approve_withheld"' in src
-        assert "allowed.remove(ref)" in src
+        assert "allowed[:] = without_mcp_refs(allowed, (name,))" in src
 
 
 class TestQueuedSpawnKeepsAppIdentity:

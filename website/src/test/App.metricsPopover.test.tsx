@@ -19,6 +19,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { compile } from '@tailwindcss/node'
 import { renderWithProviders } from './helpers'
+import { readIndexCss } from './indexCssSource'
 
 vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => null }))
@@ -263,6 +264,74 @@ describe('top-bar metrics control — collapsed band opens a popover', () => {
     // The dash alone says nothing; the row's detail carries the reason.
     await waitFor(() => expect(card.textContent).toContain('Memory: unavailable'))
     expect(card.textContent).toMatch(/40\/100\s*GB/)
+  })
+
+  it('names the machine the readings belong to, with its OS and core count', async () => {
+    localStorage.setItem('mc-topbar-metrics', '1')
+    // Every instance tab renders this card from its own gateway, so the card
+    // must say whose numbers they are. The FQDN is shortened on the line and
+    // kept whole in the tooltip.
+    vi.mocked(api.system).mockReset().mockResolvedValue({
+      mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0,
+      hostname: 'build-box-7.eu-west-1.example.com', os: 'Darwin 25.0.0', cpu_count: 10,
+    })
+    renderWithProviders(<App />, { route: '/chat' })
+    const readout = (await screen.findByText(/CPU 25%/)).closest('button')!
+    fireEvent.mouseEnter(readout)
+
+    const card = await screen.findByRole('tooltip', { name: /System metrics/ })
+    const host = await within(card).findByText('build-box-7')
+    expect(host.closest('[title]')?.getAttribute('title')).toBe('build-box-7.eu-west-1.example.com')
+    expect(card.textContent).toContain('macOS · 10 cores')
+    // The identity follows the readings rather than displacing them.
+    expect(card.textContent).toMatch(/40\/100\s*GB[\s\S]*build-box-7[\s\S]*macOS/)
+  })
+
+  it('keeps the tooltip on a long dotless hostname the line truncates', async () => {
+    localStorage.setItem('mc-topbar-metrics', '1')
+    // No dots means the short form is the whole name, but the line still
+    // truncates at its max width, so the tooltip is the only way to read it.
+    const longHost = 'dev-dsk-someone-big-1a-0123456789abcdef'
+    vi.mocked(api.system).mockReset().mockResolvedValue({
+      mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0,
+      hostname: longHost, os: 'Linux 6.1.0', cpu_count: 96,
+    })
+    renderWithProviders(<App />, { route: '/chat' })
+    const readout = (await screen.findByText(/CPU 25%/)).closest('button')!
+    fireEvent.mouseEnter(readout)
+
+    const card = await screen.findByRole('tooltip', { name: /System metrics/ })
+    const host = await within(card).findByText(longHost)
+    expect(host.closest('[title]')?.getAttribute('title')).toBe(longHost)
+  })
+
+  it('uses the singular form for one core and omits what the frame does not carry', async () => {
+    localStorage.setItem('mc-topbar-metrics', '1')
+    vi.mocked(api.system).mockReset().mockResolvedValue({
+      mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0,
+      os: 'Linux 6.1.0', cpu_count: 1,
+    })
+    renderWithProviders(<App />, { route: '/chat' })
+    const readout = (await screen.findByText(/CPU 25%/)).closest('button')!
+    fireEvent.mouseEnter(readout)
+
+    const card = await screen.findByRole('tooltip', { name: /System metrics/ })
+    await waitFor(() => expect(card.textContent).toContain('Linux · 1 core'))
+    expect(card.textContent).not.toContain('1 cores')
+    // No hostname in the frame: no host line, so no tooltip to carry one.
+    expect(card.querySelector('[title]')).toBeNull()
+  })
+
+  it('shows no identity footer for a frame that names no machine', async () => {
+    localStorage.setItem('mc-topbar-metrics', '1')
+    renderWithProviders(<App />, { route: '/chat' })
+    const readout = (await screen.findByText(/CPU 25%/)).closest('button')!
+    fireEvent.mouseEnter(readout)
+
+    const card = await screen.findByRole('tooltip', { name: /System metrics/ })
+    await waitFor(() => expect(card.textContent).toMatch(/40\/100\s*GB/))
+    // The rows are followed directly by the hint: no host line, no OS line.
+    expect(card.textContent).toMatch(/40\/100\s*GB\s*\d+%\s*Click to hide$/)
   })
 
   it('closes the hover card on a window resize, since its anchor is measured once', async () => {
@@ -536,7 +605,7 @@ describe('top-bar metrics control — collapsed band opens a popover', () => {
 describe('collapsed-band metrics glyph against theme accent overrides', () => {
   const WEBSITE = join(__dirname, '..', '..')
   const source = readFileSync(join(WEBSITE, 'src', 'shell', 'topbar', 'metricsReadout.tsx'), 'utf8')
-  const indexCss = readFileSync(join(WEBSITE, 'src', 'index.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '')
+  const indexCss = readIndexCss().replace(/\/\*[\s\S]*?\*\//g, '')
 
   it('mutes the unpinned glyph with a rule no theme `.text-accent` override can beat', async () => {
     const overrides = indexCss.match(/\[data-theme="[^"]+"\]\s+\.text-accent\{color:[^}]*\}/g) ?? []

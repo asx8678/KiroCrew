@@ -5,7 +5,8 @@ state before the prompt goes out, and must settle both on EVERY exit path:
 
 * the post-compaction re-injection flag, read-and-cleared before
   ``build_message`` so the compacted session gets its session-start context back
-  exactly once, and put back when the turn never lands;
+  exactly once, put back when the turn never lands, and armed when the backend
+  compacted the session during the turn;
 * the skill-body dedup writes ``build_message`` records at build time, committed
   when the prompt reached the window and rolled back when it did not.
 
@@ -40,9 +41,11 @@ logger = logging.getLogger(__name__)
 def consume_reinjection(sessions: Any, session_key: str) -> bool:
     """Read-and-clear the one-shot post-compaction re-injection flag.
 
-    ``session_compaction`` marks it after a successful in-place compaction,
-    because compaction drops the session-start context (skills index, member
-    section, response preferences). The turn that consumes it passes the value
+    ``session_compaction`` marks it after a successful in-place compaction, and
+    :func:`rearm_reinjection` marks it after a turn whose stream reported that
+    the backend compacted the session, because compaction drops the session-start
+    context (skills index, member section, response preferences). The turn that
+    consumes it passes the value
     to ``build_message`` as ``needs_reinjection`` so that context comes back
     exactly once. Every channel turn loop reads it through this one helper: a
     per-channel copy of the turn loop that skips it re-injects nothing after
@@ -92,50 +95,32 @@ def driver_turn_landed(driver: Any) -> bool:
     return stop_reason_landed(getattr(driver, "last_stop_reason", "") or "")
 
 
-def arm_reinjection_after_backend_compaction(
-    sessions: Any, session_key: str, evidence: Any
+def rearm_reinjection(
+    sessions: Any,
+    session_key: str,
+    *,
+    consumed: bool,
+    landed: bool,
+    compacted: bool = False,
 ) -> None:
-    """Arm re-injection when the backend compacted mid-turn (CTX-12).
+    """Leave the one-shot flag set for the next turn when that turn needs it.
 
-    For an engine that settles its own turn instead of using :class:`TurnBracket`:
-    call it in the turn's ``finally`` BEFORE :func:`rearm_reinjection` and
-    :func:`rollback_skill_bodies`, the order :meth:`TurnBracket.settle` uses.
-    *evidence* is the turn's driver (its ``compaction_completed``) or a bool from
-    an engine that watched ``EVENT_COMPACTION_STATUS`` itself; either is read
-    strictly (``is True``), so a stand-in arms nothing.
-    """
-    compacted = (
-        evidence if isinstance(evidence, bool) else getattr(evidence, "compaction_completed", False)
-    )
-    if compacted is True:
-        _mark_reinjection_flag(sessions, session_key)
+    Either reason is enough:
 
-
-def _mark_reinjection_flag(sessions: Any, session_key: str) -> None:
-    """Mark the one-shot re-injection flag, never raising (shared seam)."""
-    mark = getattr(sessions, "mark_needs_reinjection", None)
-    if not callable(mark):
-        return
-    try:
-        mark(session_key)
-    except Exception:
-        logger.debug(
-            "arming post-compaction re-injection failed session=%s",
-            session_key,
-            exc_info=True,
-        )
-
-
-def rearm_reinjection(sessions: Any, session_key: str, *, consumed: bool, landed: bool) -> None:
-    """Put the one-shot flag back when this turn consumed it but never landed.
-
-    The flag is cleared BEFORE ``build_message``, so a turn that then dies -- a
-    provider error, a driver fault, a cancel -- has discarded the prompt that
-    carried the re-injected context, and without this the session runs without
-    its skills index (and a member DM without its rules) until the next
-    compaction. This is the contract the dashboard runner already keeps in its
-    own ``finally`` (``chat_runner``: re-arm when consumed and not landed); the
-    channel loops share it so the two paths cannot disagree.
+    * this turn consumed the flag but never landed. The flag is cleared BEFORE
+      ``build_message``, so a turn that then dies -- a provider error, a driver
+      fault, a cancel -- has discarded the prompt that carried the re-injected
+      context, and without this the session runs without its skills index (and
+      a member DM without its rules) until the next compaction. This is the
+      contract the dashboard runner already keeps in its own ``finally``
+      (``chat_runner``: re-arm when consumed and not landed); the channel loops
+      share it so the two paths cannot disagree.
+    * ``compacted``: the backend reported a ``completed`` compaction during this
+      turn. A backend that compacts its own window (kiro-cli's automatic
+      compaction, the claude/codex twins) drops the session-start context just
+      as ``session_compaction`` does, landed or not, so the next turn must send
+      it again. The dashboard runner arms the flag the moment that status
+      arrives; the other turn loops pass what their stream reported here.
 
     ``landed`` means the turn was recorded a success. A cancelled turn is NOT
     landed: the backend drops a cancelled turn from its own transcript, so the
@@ -143,9 +128,19 @@ def rearm_reinjection(sessions: Any, session_key: str, *, consumed: bool, landed
     exit path is covered. Never raises: a failure to re-arm is logged and the
     turn's own outcome stands.
     """
-    if not consumed or landed:
+    if not compacted and (not consumed or landed):
         return
-    _mark_reinjection_flag(sessions, session_key)
+    mark = getattr(sessions, "mark_needs_reinjection", None)
+    if not callable(mark):
+        return
+    try:
+        mark(session_key)
+    except Exception:
+        logger.debug(
+            "re-arming post-compaction re-injection failed session=%s",
+            session_key,
+            exc_info=True,
+        )
 
 
 def rollback_skill_bodies(ctx_builder: Any, session_key: str, *, landed: bool) -> None:
@@ -198,9 +193,14 @@ class TurnBracket:
       for "no completion observed") through :func:`stop_reason_landed`, or a
       finished ``TurnDriver`` through :func:`driver_turn_landed`. Not called
       means not landed, which is the fail-safe reading for an exit by exception.
+    * :meth:`compacted` -- record whether the backend compacted the session
+      during the turn, from the ``TurnDriver`` that ran the latest attempt,
+      whose ``compaction_completed`` it reads. The driver keeps that field
+      current as the status arrives, so reading it in the engine's ``finally``
+      covers an exit by exception. Not called means no compaction.
     * :meth:`settle` -- re-arm the flag when it was taken and the turn did not
-      land, THEN commit or roll back the skill bodies. Only the first call acts,
-      and it never raises.
+      land, or when the backend compacted the session, THEN commit or roll back
+      the skill bodies. Only the first call acts, and it never raises.
     """
 
     def __init__(self, sessions: Any, ctx_builder: Any, session_key: str) -> None:
@@ -209,28 +209,12 @@ class TurnBracket:
         self._session_key = session_key
         self._consumed = False
         self._landed = False
+        self._compacted = False
         self._settled = False
-        #: CTX-12: a completed BACKEND compaction observed during the turn (set
-        #: from the driver evidence below, or explicitly by an engine that
-        #: settles without handing the driver to :meth:`landed`).
-        self._backend_compaction = False
 
     def take_reinjection(self) -> bool:
         self._consumed = consume_reinjection(self._sessions, self._session_key)
         return self._consumed
-
-    def observed_backend_compaction(self, evidence: Any) -> bool:
-        """Record a backend compaction reported during the turn (CTX-12).
-
-        Accepts the driver (``TurnDriver.compaction_completed``) or a plain
-        bool. Defensive on the attribute, like every other read on the driver
-        seam: a stand-in that predates the field records nothing.
-        """
-        if isinstance(evidence, bool):
-            self._backend_compaction = evidence
-        else:
-            self._backend_compaction = bool(getattr(evidence, "compaction_completed", False))
-        return self._backend_compaction
 
     def landed(self, evidence: Any) -> bool:
         if isinstance(evidence, bool):
@@ -239,23 +223,24 @@ class TurnBracket:
             self._landed = stop_reason_landed(evidence)
         else:
             self._landed = driver_turn_landed(evidence)
-            # CTX-12: the driver IS the compaction evidence for every channel
-            # loop — read the flag here so no engine needs a second call.
-            self.observed_backend_compaction(evidence)
         return self._landed
+
+    def compacted(self, evidence: Any) -> bool:
+        # ``is True``, not truthiness: a mock stand-in answers any attribute
+        # with a truthy mock, which is not a reported compaction.
+        self._compacted = getattr(evidence, "compaction_completed", False) is True
+        return self._compacted
 
     def settle(self) -> None:
         if self._settled:
             return
         self._settled = True
-        if self._backend_compaction:
-            # CTX-12: arm FIRST — the backend dropped the session-start contract
-            # mid-turn, so the next turn must restore it whatever this turn's
-            # own consumption did. rearm below only re-marks when this turn's
-            # consumed prompt never landed, and never clears, so the two agree.
-            _mark_reinjection_flag(self._sessions, self._session_key)
         rearm_reinjection(
-            self._sessions, self._session_key, consumed=self._consumed, landed=self._landed
+            self._sessions,
+            self._session_key,
+            consumed=self._consumed,
+            landed=self._landed,
+            compacted=self._compacted,
         )
         rollback_skill_bodies(self._ctx_builder, self._session_key, landed=self._landed)
 

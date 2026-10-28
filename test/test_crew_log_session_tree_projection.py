@@ -29,7 +29,7 @@ from kiro_crew import crew_log as lg
 from kiro_crew.crew_log import CrewLog, emit
 from kiro_crew.crew_log import session_tree_projection as stp
 from kiro_crew.crew_log import store as crew_store
-from kiro_crew.crew_log.session_tree import OpenedRecord
+from kiro_crew.crew_log.session_tree import TREE_UNIT_CAP, OpenedRecord
 from kiro_crew.crew_log.session_tree_projection import (
     CHECKPOINT_NAME,
     CHECKPOINT_VERSION,
@@ -488,6 +488,42 @@ def test_a_root_change_abandons_a_write_armed_for_the_previous_store(tmp_path, m
     # The worker armed before the move now wakes.
     proj._debounced_write(old_target, armed_epoch)
     assert wrote == [], "a write armed for the previous store still fired after the home moved"
+
+
+def test_a_debounced_write_resolves_no_path_when_it_wakes(tmp_path, monkeypatch):
+    """The root the payload names is decided when the write is ARMED, not when it fires.
+
+    The worker wakes a debounce later, on the maintenance pool, under whatever data home
+    the process has by then. Resolving ``_current_root()`` there would read the next
+    test's home, or with the ``KIROCREW_HOME`` override gone the operator's real one, and
+    the teardown guard would blame whichever test is running at that moment. So an
+    unseeded projection pins the root beside the target, and the worker reads neither
+    afresh.
+    """
+    armed: list[tuple] = []
+    monkeypatch.setattr(
+        "kiro_crew.executors.maintenance_executor",
+        lambda: type("_Pool", (), {"submit": staticmethod(lambda fn, *a: armed.append(a))}),
+    )
+    proj = SessionTreeProjection()  # never seeded: ``_root`` stays None
+    proj.apply(_rec("s-one", "slot-a"))
+    assert len(armed) == 1, "the dirty projection armed no write"
+    target, epoch, root = armed[0]
+    assert root == stp._current_root() and root, "the root was not pinned when armed"
+
+    wrote: list[tuple[dict, object]] = []
+    monkeypatch.setattr(
+        stp, "_save_checkpoint", lambda payload, path=None: wrote.append((payload, path)) or True
+    )
+    monkeypatch.setattr(stp, "CHECKPOINT_DEBOUNCE_SECS", 0)
+
+    def _resolves_late() -> str:
+        raise AssertionError("the worker resolved the data home when it woke")
+
+    monkeypatch.setattr(stp, "_current_root", _resolves_late)
+    proj._debounced_write(target, epoch, root)
+
+    assert [(payload["root"], path) for payload, path in wrote] == [(root, target)]
 
 
 def test_a_checkpoint_naming_another_store_is_discarded_not_trusted():
@@ -1289,3 +1325,119 @@ def test_the_edge_recorder_raises_nothing_into_the_writer_job(monkeypatch, caplo
     if failure == "arguments":
         folded = [r for r in caplog.records if "could not apply an opened record" in r.getMessage()]
         assert len(folded) == 1, "the unreadable ids never reached the projection's guard"
+
+
+# --- slot_depth: the in-memory walk the depth field is resolved from ---
+
+
+def test_slot_depth_of_a_root_is_zero():
+    proj = stp.projection()
+    proj.ensure_seeded()
+    proj.apply(_rec("s-root", "slot-a"))
+    assert stp.slot_depth("slot-a") == 0
+
+
+def test_slot_depth_of_a_child_is_one():
+    proj = stp.projection()
+    proj.ensure_seeded()
+    proj.apply(_rec("s-root", "slot-a"))
+    proj.apply(_rec("s-child", "slot-b", created=2, parent="slot-a"))
+    assert stp.slot_depth("slot-b") == 1
+
+
+def test_slot_depth_counts_each_hop_up_the_chain():
+    # slot-a <- slot-b <- slot-c. The grandchild stands two creators below the root.
+    proj = stp.projection()
+    proj.ensure_seeded()
+    proj.apply(_rec("s-a", "slot-a"))
+    proj.apply(_rec("s-b", "slot-b", created=2, parent="slot-a"))
+    proj.apply(_rec("s-c", "slot-c", created=3, parent="slot-b"))
+    assert stp.slot_depth("slot-c") == 2
+
+
+def test_slot_depth_of_an_empty_slot_is_none():
+    proj = stp.projection()
+    proj.ensure_seeded()
+    assert stp.slot_depth("") is None
+
+
+def test_slot_depth_of_an_unknown_slot_is_none():
+    proj = stp.projection()
+    proj.ensure_seeded()
+    proj.apply(_rec("s-root", "slot-a"))
+    assert stp.slot_depth("slot-missing") is None
+
+
+def test_slot_depth_is_none_when_the_chain_ends_at_an_unplaced_citation():
+    # slot-b cites slot-ghost, which has no record of its own: the fold keeps the
+    # citation but cannot place it, so slot-b is a root of the folded tree while
+    # carrying a parent. Its true depth is unknown, not zero.
+    proj = stp.projection()
+    proj.ensure_seeded()
+    proj.apply(_rec("s-child", "slot-b", created=2, parent="slot-ghost"))
+    assert stp.slot_depth("slot-b") is None
+
+
+def test_slot_depth_is_none_before_the_projection_is_seeded():
+    # A fresh projection for another store cannot answer: an unseeded read must say
+    # "not established" rather than invent a root.
+    stp.reset_for_tests()
+    assert stp.slot_depth("slot-a") is None
+
+
+# --- root_depth: the same refusal, applied to the side that needs no walk ---
+
+
+def test_root_depth_is_zero_on_a_readable_tree():
+    proj = stp.projection()
+    proj.ensure_seeded()
+    proj.apply(_rec("s-root", "slot-a"))
+    assert stp.root_depth() == 0
+
+
+def test_root_depth_is_none_before_the_projection_is_seeded():
+    stp.reset_for_tests()
+    assert stp.root_depth() is None
+
+
+def test_root_depth_is_none_when_the_seed_itself_faulted(monkeypatch):
+    # A reading the fold could not complete is `incomplete` whatever the cause, and a
+    # root's zero is withheld on the same flag a child's walk is.
+    stp.reset_for_tests()
+    monkeypatch.setattr(
+        SessionTreeProjection,
+        "_seed",
+        lambda self, live_sids: (_ for _ in ()).throw(OSError("the store could not be read")),
+    )
+    proj = stp.projection()
+    proj.ensure_seeded()
+    assert proj.reading().incomplete is True
+    assert stp.root_depth() is None
+
+
+def test_an_over_cap_tree_yields_no_root_only_distribution():
+    """The bias this censoring rule exists to remove.
+
+    Past :data:`TREE_UNIT_CAP` the reading is permanently ``incomplete``, which is the
+    state the busiest install -- the one with the most delegation -- sits in. A child's
+    depth is withheld there. If a root's zero were still written, the depth counter
+    would report almost every session at depth 0 and the roots gauge would report
+    nothing, which answers "how deep does delegation go" backwards. So both answers
+    have to go absent together.
+    """
+    proj = stp.projection()
+    proj.ensure_seeded()
+    proj.apply(_rec("s-root", "slot-a"))
+    proj.apply(_rec("s-child", "slot-b", created=2, parent="slot-a"))
+    # Both sides answer while the tree is readable.
+    assert stp.root_depth() == 0
+    assert stp.slot_depth("slot-b") == 1
+
+    # Push the population past the cap. Eviction sets `incomplete`.
+    for n in range(TREE_UNIT_CAP + 1):
+        proj.apply(_rec(f"s-fill-{n}", f"slot-fill-{n}", created=100 + n))
+    assert proj.reading().incomplete is True
+
+    # Neither side answers now: no observation at all, rather than roots only.
+    assert stp.slot_depth("slot-b") is None
+    assert stp.root_depth() is None

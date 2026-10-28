@@ -40,6 +40,9 @@ Three pools, deliberately split:
   worker for the full scan.  This gets its OWN pool so those user-triggerable
   scans can never occupy the :func:`maintenance_executor` workers the orphan
   sweeps need to recover from a wedge.
+* :func:`static_asset_executor` -- the React build's files (open, chunked
+  reads, close).  Its own pool so a default executor that other work has
+  filled cannot stop the dashboard's scripts from loading.
 * :func:`image_executor` -- Pillow decode/resize/encode for the MCP gateway's
   tool-result image budget (:mod:`kiro_crew.mcp_gateway.image_budget`).  Paced
   by whatever a brokered MCP server returns, and a single oversized raster
@@ -74,6 +77,7 @@ import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from typing import Any, Awaitable, Callable, TypeVar
 
 from kiro_crew.subprocess_pool import SubprocessPoolExecutor
@@ -90,6 +94,7 @@ __all__ = [
     "cron_executor",
     "discovery_executor",
     "embed_executor",
+    "memory_background_executor",
     "image_executor",
     "stt_executor",
     "path_resolve_executor",
@@ -99,12 +104,15 @@ __all__ = [
     "memory_preparation_executor",
     "governance_executor",
     "cron_gate_executor",
+    "tool_gate_executor",
+    "run_in_tool_gate_pool",
     "CronGateTimeout",
     "CronGateWorkTimeout",
     "run_in_cron_pool",
     "run_in_cron_gate_pool",
     "cron_gate_budget",
     "run_in_embed_pool",
+    "run_in_memory_background_pool",
     "run_with_recall_deadline",
     "recall_executor",
     "shutdown_maintenance_executor",
@@ -171,11 +179,31 @@ _CRON_QUEUE_WAIT_SECS = 900
 # the maintenance pool's orphan-sweep workers.
 _MAX_DISCOVERY_WORKERS = 4
 
+# The React build's files (``/assets``, ``/fonts``, the service worker, ...):
+# open, chunked reads and close. Each call is short, but a page load fetches
+# dozens of chunks at once and the routes answer unauthenticated GETs, so they
+# get a pool of their own: a busy default executor cannot leave the dashboard
+# blank, and a flood of asset requests queues among itself.
+_MAX_STATIC_ASSET_WORKERS = 4
+
 # Memory filesystem work and explicit embedding requests stay off the default
 # executor used by DNS. Prompt construction shares this pool but never embeds.
 # run_in_embed_pool admits work before submission, so a burst waits as cancellable
 # coroutines instead of growing ThreadPoolExecutor's unbounded work-item queue.
 _MAX_EMBED_WORKERS = 8
+
+# History consolidation and the embedding backfill are background memory work: a
+# consolidation pass can sit minutes on the memory database, and a backfill walks
+# the whole store. On the shared mc-embed pool five consolidations and a backfill
+# filled seven of its eight workers and left turn context (build_message) queued
+# behind them. They get this small pool of their own, so at worst they wait for
+# each other and mc-embed keeps its workers for interactive work.
+# Consolidation is admitted at most this many at a time.
+_MAX_MEMORY_BACKGROUND_WORKERS = 2
+# The gateway's embedding backfill (hours, paced) and member repair loop hold a
+# thread each through ``run_in_executor`` without admission; these extra threads
+# are theirs, so consolidation keeps its two workers while they run.
+_MEMORY_BACKGROUND_LOOP_THREADS = 2
 
 # Governance checks for EXTERNALLY-triggered surfaces: the per-inbound-message
 # channels gate (every Slack/Discord/Telegram/Webex/WeCom message + approval
@@ -243,6 +271,35 @@ _CRON_GATE_HEADROOM = 0.75
 # fires.  A fixed share rather than "whatever the queue left over" is what makes
 # execution's slice a floor instead of a race.
 _CRON_GATE_QUEUE_SHARE = 0.25
+
+# The tool-call security gate (``HookManager.on_tool_call``) awaited from a
+# coroutine.  Its path tier waits on the ``mc-pathres`` resolver child on the
+# calling thread for up to the resolve budget plus grace, the thread cannot be
+# interrupted once it starts, and the rate is set by agents (one call per tool
+# request across every live session).  On the loop's default executor a few
+# stalled resolutions would hold the threads the loop also uses for getaddrinfo
+# and every other ``to_thread`` caller, so the gate gets its own pool and its
+# calls queue only behind other gate calls.
+#
+# Four workers.  The resolver has :data:`_PATH_RESOLVE_WORKERS_DEFAULT` children,
+# and a gate thread beyond that count only waits inside the resolver, so a much
+# larger pool buys nothing during a stall; four leaves two workers serving
+# non-path verdicts and the degraded-mount fast refusals while both children are
+# wedged.  A healthy gate call costs milliseconds, so four is a ceiling on how
+# many calls can be stalled at once, not on throughput.  It also stays below the
+# default executor's smallest size (``min(32, cpu_count + 4)`` is at least 5), so
+# a full gate pool is never larger than the pool it is kept off.
+_MAX_TOOL_GATE_WORKERS = 4
+
+# How long one tool-gate call may wait for a ``mc-toolgate`` worker before it is
+# refused unjudged.  Bounds the WAIT only: a call a worker has claimed runs to
+# its own verdict, which the path tier already bounds.  Sized from the 100-agent
+# load run against two numbers: healthy queue waits
+# are milliseconds, so the bound never binds outside starvation, and a worker on
+# a dead mount holds at most one resolve budget plus grace (5 s) per call and
+# about 12 s per 25 s window (the per-thread allowance in ``security.paths``),
+# so a call queued behind four such workers is still served inside the bound.
+_TOOL_GATE_QUEUE_WAIT_SECS = 15.0
 
 # Pillow work for the gateway's tool-result image budget is CPU-bound (a
 # decode plus up to seven LANCZOS resize+encode passes per oversized raster,
@@ -380,12 +437,15 @@ _kiro_spawn_pool: ThreadPoolExecutor | None = None
 _mcp_probe_pool: ThreadPoolExecutor | None = None
 _cron_pool: ThreadPoolExecutor | None = None
 _discovery_pool: ThreadPoolExecutor | None = None
+_static_asset_pool: ThreadPoolExecutor | None = None
 _embed_pool: ThreadPoolExecutor | None = None
+_memory_background_pool: ThreadPoolExecutor | None = None
 _recall_pool: ThreadPoolExecutor | None = None
 _image_pool: ThreadPoolExecutor | None = None
 _stt_pool: ThreadPoolExecutor | None = None
 _governance_pool: ThreadPoolExecutor | None = None
 _cron_gate_pool: ThreadPoolExecutor | None = None
+_tool_gate_pool: ThreadPoolExecutor | None = None
 _path_resolve_pool: SubprocessPoolExecutor | None = None
 _path_probe_pool: ThreadPoolExecutor | None = None
 _path_transfer_pool: ThreadPoolExecutor | None = None
@@ -537,6 +597,26 @@ def discovery_executor() -> ThreadPoolExecutor:
                 )
                 atexit.register(shutdown_maintenance_executor)
     return _discovery_pool
+
+
+def static_asset_executor() -> ThreadPoolExecutor:
+    """Return the pool that serves the React build's files, creating it on first use.
+
+    Threads are named ``mc-static``. Kept off the default executor so the
+    dashboard's scripts and styles still load when other work holds every
+    default worker; ``/`` already resolves on :func:`discovery_executor`, and
+    without this the page would load its shell and stay blank.
+    """
+    global _static_asset_pool
+    if _static_asset_pool is None:
+        with _lock:
+            if _static_asset_pool is None:
+                _static_asset_pool = ThreadPoolExecutor(
+                    max_workers=_MAX_STATIC_ASSET_WORKERS,
+                    thread_name_prefix="mc-static",
+                )
+                atexit.register(shutdown_maintenance_executor)
+    return _static_asset_pool
 
 
 def image_executor() -> ThreadPoolExecutor:
@@ -748,6 +828,24 @@ def embed_executor() -> ThreadPoolExecutor:
     return _embed_pool
 
 
+def memory_background_executor() -> ThreadPoolExecutor:
+    """Return the background memory pool (consolidation, backfill), creating it once.
+
+    Threads are named ``mc-membg``. See :data:`_MAX_MEMORY_BACKGROUND_WORKERS` and
+    :data:`_MEMORY_BACKGROUND_LOOP_THREADS`.
+    """
+    global _memory_background_pool
+    if _memory_background_pool is None:
+        with _lock:
+            if _memory_background_pool is None:
+                _memory_background_pool = ThreadPoolExecutor(
+                    max_workers=_MAX_MEMORY_BACKGROUND_WORKERS + _MEMORY_BACKGROUND_LOOP_THREADS,
+                    thread_name_prefix="mc-membg",
+                )
+                atexit.register(shutdown_maintenance_executor)
+    return _memory_background_pool
+
+
 def governance_executor() -> ThreadPoolExecutor:
     """Return the process-wide governance-check pool, creating it on first use.
 
@@ -790,6 +888,73 @@ def cron_gate_executor() -> ThreadPoolExecutor:
                 )
                 atexit.register(shutdown_maintenance_executor)
     return _cron_gate_pool
+
+
+def tool_gate_executor() -> ThreadPoolExecutor:
+    """Return the process-wide tool-call gate pool, creating it on first use.
+
+    Threads are named ``mc-toolgate``.  Separate from the loop's default executor
+    because a gate call can hold its worker for the full path-resolve budget on a
+    stalled mount, and the default executor also serves the loop's DNS lookups.
+    See :data:`_MAX_TOOL_GATE_WORKERS`.
+    """
+    global _tool_gate_pool
+    if _tool_gate_pool is None:
+        with _lock:
+            if _tool_gate_pool is None:
+                _tool_gate_pool = ThreadPoolExecutor(
+                    max_workers=_MAX_TOOL_GATE_WORKERS,
+                    thread_name_prefix="mc-toolgate",
+                )
+                atexit.register(shutdown_maintenance_executor)
+    return _tool_gate_pool
+
+
+async def run_in_tool_gate_pool(
+    func: Callable[..., _T],
+    /,
+    *args: Any,
+    on_queue_timeout: Callable[[float], _T],
+    **kwargs: Any,
+) -> _T:
+    """Await ``func(*args, **kwargs)`` on :func:`tool_gate_executor`.
+
+    The form of the tool gate a coroutine uses:
+    ``await run_in_tool_gate_pool(hooks.on_tool_call, title, on_queue_timeout=..., **kwargs)``.
+    The gate's path tier resolves agent-supplied paths in the ``mc-pathres`` child
+    and waits for the answer on the CALLING thread, for up to the resolve budget
+    plus its grace. Called inline from a coroutine, that wait parks the whole
+    loop -- every other session's stream, the websockets and the stall watchdog.
+    On this pool the same synchronous call runs on a worker and the loop keeps
+    serving; the verdict, fail-closed refusal on a stall included, is unchanged.
+    The resolve deadline is armed on the thread that waits, so the hop is not
+    charged against the budget. Synchronous callers keep calling the gate inline.
+
+    The wait for a worker is bounded by :data:`_TOOL_GATE_QUEUE_WAIT_SECS`. A call
+    no worker claimed in that time never runs, and the caller gets
+    ``on_queue_timeout(waited)`` instead: its own refusal, because the gate never
+    judged the call and so cannot have allowed it. Required, so no caller can
+    forget the fail-closed answer. A call a worker claimed runs to its verdict
+    (:func:`run_in_cron_pool`'s two phases, which tell queued from claimed).
+
+    Copies the caller's context onto the worker the way ``asyncio.to_thread``
+    does, so context variables the gate reads (``uncounted_gate`` among them)
+    see the caller's values.
+    """
+    call = functools.partial(copy_context().run, func, *args, **kwargs)
+    try:
+        return await run_in_cron_pool(
+            call,
+            timeout=None,
+            queue_timeout=_TOOL_GATE_QUEUE_WAIT_SECS,
+            executor=tool_gate_executor(),
+        )
+    except CronQueueTimeout as exc:
+        logger.warning(
+            "tool gate refused a call unjudged: no mc-toolgate worker freed in %.1fs",
+            exc.waited,
+        )
+        return on_queue_timeout(exc.waited)
 
 
 class CronQueueTimeout(asyncio.TimeoutError):
@@ -847,7 +1012,7 @@ async def run_in_cron_pool(
     func: Callable[..., _T],
     /,
     *args: Any,
-    timeout: float,
+    timeout: float | None,
     queue_timeout: float | None = None,
     executor: ThreadPoolExecutor | None = None,
 ) -> _T:
@@ -879,6 +1044,9 @@ async def run_in_cron_pool(
     deliberately NOT derived from *timeout*: a 30s job behind a wedged worker
     should wait well past 30s and then run, not be killed on its own clock for
     something it did not do.
+
+    *timeout* ``None`` leaves the execution phase unbounded, for a caller whose
+    work bounds itself (the tool gate, :func:`run_in_tool_gate_pool`).
 
     *executor* defaults to :func:`cron_executor`.  It exists so the fire-time
     gate can reuse this two-phase discipline on its own pool
@@ -1113,17 +1281,52 @@ async def run_in_embed_pool(func: Callable[..., _T], /, *args: Any, **kwargs: An
 
     from kiro_crew.embeddings import embedding_work
 
-    loop = asyncio.get_running_loop()
     recall = embedding_work.get() is not None
-    admission_key = "_kirocrew_recall_admission" if recall else "_kirocrew_memory_admission"
+    return await _run_admitted(
+        recall_executor if recall else embed_executor,
+        "_kirocrew_recall_admission" if recall else "_kirocrew_memory_admission",
+        _MAX_EMBED_WORKERS,
+        copy_context(),
+        functools.partial(func, *args, **kwargs),
+    )
+
+
+async def run_in_memory_background_pool(
+    func: Callable[..., _T], /, *args: Any, **kwargs: Any
+) -> _T:
+    """Offload background memory work (consolidation, backfill) to ``mc-membg``.
+
+    Same admission shape as :func:`run_in_embed_pool`, with a budget of its own,
+    so a backlog of background passes waits among itself and never holds an
+    ``mc-embed`` worker that turn context needs.
+    """
+    from contextvars import copy_context
+
+    return await _run_admitted(
+        memory_background_executor,
+        "_kirocrew_memory_background_admission",
+        _MAX_MEMORY_BACKGROUND_WORKERS,
+        copy_context(),
+        functools.partial(func, *args, **kwargs),
+    )
+
+
+async def _run_admitted(
+    executor_of: Callable[[], ThreadPoolExecutor],
+    admission_key: str,
+    workers: int,
+    context: Any,
+    call: Callable[[], _T],
+) -> _T:
+    """Submit *call* once this loop's per-pool admission has a free slot."""
+    loop = asyncio.get_running_loop()
     admission = getattr(loop, admission_key, None)
     if admission is None:
-        admission = asyncio.Semaphore(_MAX_EMBED_WORKERS)
+        admission = asyncio.Semaphore(workers)
         setattr(loop, admission_key, admission)
     await admission.acquire()
     try:
-        executor = recall_executor() if recall else embed_executor()
-        future = executor.submit(copy_context().run, functools.partial(func, *args, **kwargs))
+        future = executor_of().submit(context.run, call)
     except BaseException:
         admission.release()
         raise
@@ -1146,7 +1349,10 @@ def shutdown_maintenance_executor() -> None:
     loop and shut down by asyncio when the loop closes.
     """
     global _pool, _subprocess_pool, _cron_pool, _discovery_pool, _embed_pool, _recall_pool
-    global _governance_pool, _image_pool, _cron_gate_pool, _stt_pool, _path_resolve_pool
+    global _memory_background_pool
+    global _static_asset_pool
+    global _governance_pool, _image_pool, _cron_gate_pool, _tool_gate_pool, _stt_pool
+    global _path_resolve_pool
     global _path_probe_pool, _path_transfer_pool
     global _crew_log_pool, _kiro_spawn_pool, _mcp_probe_pool, _update_pool
     with _lock:
@@ -1156,11 +1362,14 @@ def shutdown_maintenance_executor() -> None:
         mcp_probe_pool, _mcp_probe_pool = _mcp_probe_pool, None
         cron_pool, _cron_pool = _cron_pool, None
         discovery_pool, _discovery_pool = _discovery_pool, None
+        static_asset_pool, _static_asset_pool = _static_asset_pool, None
         embed_pool, _embed_pool = _embed_pool, None
+        memory_background_pool, _memory_background_pool = _memory_background_pool, None
         recall_pool, _recall_pool = _recall_pool, None
         governance_pool, _governance_pool = _governance_pool, None
         image_pool, _image_pool = _image_pool, None
         cron_gate_pool, _cron_gate_pool = _cron_gate_pool, None
+        tool_gate_pool, _tool_gate_pool = _tool_gate_pool, None
         stt_pool, _stt_pool = _stt_pool, None
         path_resolve_pool, _path_resolve_pool = _path_resolve_pool, None
         path_probe_pool, _path_probe_pool = _path_probe_pool, None
@@ -1179,8 +1388,12 @@ def shutdown_maintenance_executor() -> None:
         cron_pool.shutdown(wait=False, cancel_futures=True)
     if discovery_pool is not None:
         discovery_pool.shutdown(wait=False, cancel_futures=True)
+    if static_asset_pool is not None:
+        static_asset_pool.shutdown(wait=False, cancel_futures=True)
     if embed_pool is not None:
         embed_pool.shutdown(wait=False, cancel_futures=True)
+    if memory_background_pool is not None:
+        memory_background_pool.shutdown(wait=False, cancel_futures=True)
     if recall_pool is not None:
         recall_pool.shutdown(wait=False, cancel_futures=True)
     if governance_pool is not None:
@@ -1189,6 +1402,8 @@ def shutdown_maintenance_executor() -> None:
         image_pool.shutdown(wait=False, cancel_futures=True)
     if cron_gate_pool is not None:
         cron_gate_pool.shutdown(wait=False, cancel_futures=True)
+    if tool_gate_pool is not None:
+        tool_gate_pool.shutdown(wait=False, cancel_futures=True)
     if stt_pool is not None:
         stt_pool.shutdown(wait=False, cancel_futures=True)
     if path_resolve_pool is not None:

@@ -44,8 +44,8 @@ from typing import Any, Protocol
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.ops_mission_control.backend.models import CorruptDocumentError
-from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
+from kiro_crew.hidden_leaf_staging import publish_through_auth_store_staging
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
@@ -335,7 +335,7 @@ class KeystoneFileBackend:
         # ``from None`` leaves it on ``__context__``. Constructing the refusal
         # after the handler has exited severs the chain entirely, so no copy of
         # the store's bytes rides on the exception that crosses into route
-        # handlers and log formatters. Found in review (GPT 5.6).
+        # handlers and log formatters.
         raise CorruptDocumentError(corrupt_msg, "", 0)
 
     def _lock(self) -> "_SecretLock":
@@ -351,15 +351,21 @@ class KeystoneFileBackend:
         # ``restrict_on_error="raise"`` refuses to publish a token file it
         # cannot protect.
         #
-        # No cleanup on failure: every failure inside ``atomic_write`` —
+        # No cleanup on failure: every failure inside the publish —
         # lockdown, payload write (ENOSPC), rename — happens BEFORE the final
         # path is touched, so an unprotectable file never exists at
-        # ``self._path`` at all. The unlink the old code ran on lockdown
-        # failure existed to remove a NEW store already PUBLISHED at a wide
-        # DACL; that state is unreachable now, and keeping the unlink would
-        # instead delete the PREVIOUS, healthy, already-locked-down store —
-        # every stored provider token — on one transient lockdown failure.
-        atomic_write(self._path, payload, restrict_to_owner=True)
+        # ``self._path`` at all. An unlink on lockdown failure would only
+        # serve a NEW store already PUBLISHED at a wide DACL; that state is
+        # unreachable, and an unlink would instead delete the PREVIOUS, healthy,
+        # already-locked-down store — every stored provider token — on one
+        # transient lockdown failure.
+        #
+        # Staged in the masked auth-store staging directory, not beside the
+        # store: this file is a hidden leaf masked by its exact name, so a
+        # sibling temp would hold every provider token at a name no sandbox
+        # mask covers for the length of the write, and a crash would leave it
+        # there.
+        publish_through_auth_store_staging(self._path, payload)
 
     # -- SecretBackend -----------------------------------------------------
 

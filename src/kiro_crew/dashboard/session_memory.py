@@ -199,6 +199,14 @@ def lineage_parents(
     goes through, on a node built here, so the two cannot nest the same gateway
     differently: one join, one rule for when the creator's live key is followed.
 
+    *nodes* is handed to :func:`parent_payload` as well, which is what lets a row whose
+    own creator is CLOSED nest under the nearest ancestor still open rather than drop to
+    the top level -- the lead that owns a run stays the row its conductor's workers hang
+    from after the conductor is closed. Such a row carries ``ancestor: True`` and keeps
+    ``slot`` on the closed creator, so a surface reads the nesting off ``key`` and the
+    citation off ``slot``. Both payloads get it from this one call, so neither view can
+    place those workers where the other does not.
+
     Only the slots payload carries these two fields (``slot_projection.serialize_slot``
     writes them). The Sessions table's rows come from the session manager's runtime
     map, so they have neither and this fallback is not reached there -- that view keeps
@@ -254,7 +262,7 @@ def lineage_parents(
         node = next((nodes[s] for s in slot_spellings(key) if s in nodes), None)
         if node is None:
             node = _minted_node(row, key)
-        out[key] = parent_payload(node, live_key_of, key)
+        out[key] = parent_payload(node, live_key_of, key, nodes)
     return out
 
 
@@ -289,7 +297,7 @@ def session_title(key: str, get_slot: Callable[[str], object]) -> dict[str, obje
 
     A session key is opaque (``dashboard:chat-69-1785905004``); the chat it belongs
     to already has an LLM-generated title, and a list keyed by the raw id is
-    unreadable. The mapping is exact — ``state.py`` documents that a slot key
+    unreadable. The mapping is exact — ``state_parts/slot_directory.py`` documents that a slot key
     *becomes* the session key as ``dashboard:{slot.key}``.
 
     Reads ``slot.display_title`` rather than the persisted value, and redacts here.

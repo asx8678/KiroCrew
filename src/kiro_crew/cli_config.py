@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
+import base64
 import errno
 import json
 import os
@@ -23,6 +23,7 @@ from kiro_crew.config.loader import (
     update_config_locked,
     workspace_dir_from_entry,
 )
+from kiro_crew.config.resolution import _SECTION_KEYS_EMITTED_ELSEWHERE
 from kiro_crew.config.sections import _migrate_workspaces
 from kiro_crew.config.superseded_defaults import (
     acked_superseded,
@@ -159,6 +160,12 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
     elif action == "set":
 
         file_path = getattr(args, "file", None)
+        # ``is not None``, never truthiness: ``--value-base64=`` is the empty string and
+        # means "set empty text".
+        encoded = getattr(args, "value_base64", None)
+        if encoded is not None and file_path:
+            print("❌ --value-base64 cannot be combined with --file", file=sys.stderr)
+            sys.exit(1)
         if file_path:
             fp = Path(file_path).expanduser().resolve()
 
@@ -205,6 +212,18 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
             key = args.key
             value = args.value
             use_local = getattr(args, "local", False)
+            if encoded is not None:
+                if value is not None:
+                    print(
+                        "❌ Give the value as VALUE or as --value-base64, not both",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                try:
+                    value = _decode_value_base64(encoded)
+                except ValueError as decode_error:
+                    print(f"❌ --value-base64: {decode_error}", file=sys.stderr)
+                    sys.exit(1)
             if not key or value is None:
                 print("Usage: kirocrew config set <key> <value>", file=sys.stderr)
                 print("       kirocrew config set --local <key> <value>", file=sys.stderr)
@@ -223,10 +242,8 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                 print(f"❌ {key}: {list_error}", file=sys.stderr)
                 sys.exit(1)
             # A declared enum is checked on EVERY write, stored or not, and what is
-            # written is the enum's own spelling. The type check below runs only on
-            # a first write, because a stored value's type stands in for the
-            # declaration; an enum has no such stand-in, and the load path's answer
-            # to a value outside it is to degrade the setting with a WARNING nobody
+            # written is the enum's own spelling. The load path's answer to a
+            # value outside it is to degrade the setting with a WARNING nobody
             # reads. `stt.provider off` was accepted this way while `off` did not
             # exist, and the loader turned it into the one provider the user was
             # trying to escape (kirodotdev/KiroCrew#13179).
@@ -235,6 +252,22 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
             except ValueError as enum_error:
                 print(f"❌ {key}: {enum_error}", file=sys.stderr)
                 sys.exit(1)
+            # `stt.threads` stores an int but accepts `auto` as the spelling of 0.
+            # Refused here rather than written and degraded at load, for the same
+            # reason as the enum check above: the write is the last point where the
+            # mistake is still attributable to the command that made it.
+            if key == "stt.threads":
+                from kiro_crew.stt.limits import MAX_THREADS, parse_threads
+
+                threads = parse_threads(parsed)
+                if threads is None:
+                    print(
+                        f"❌ {key}: {parsed!r} is not 'auto', 0, or a thread count "
+                        f"from 1 to {MAX_THREADS}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                parsed = threads
             # Fourth write path to telemetry.beacon_enabled, after the dashboard
             # PATCH and `telemetry enable`. Gated here too, and BEFORE the
             # local/base split so it covers both: `--local` writes the overlay,
@@ -280,14 +313,12 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                         file=sys.stderr,
                     )
                     sys.exit(1)
+            # Both destinations take the key check, BEFORE the split: the
+            # overlay outranks config.json, so a key nothing reads written there
+            # looks like a pinned setting and silently does nothing
+            # (kirodotdev/KiroCrew#9909: `config set --local memory.enabled false`).
+            _refuse_unknown_key(key, parsed, overlay=use_local)
             if use_local:
-                top_key = key.split(".")[0]
-                _known_sections = {f.name for f in dataclasses.fields(KiroCrewConfig)}
-                if top_key not in _known_sections:
-                    print(
-                        f"⚠️  Warning: '{top_key}' is not a recognized config section",
-                        file=sys.stderr,
-                    )
                 p = config_local_path()
 
                 # NOTE: unlike the automatic/background config writers (which now
@@ -299,7 +330,12 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                 # on_corrupt="reset" handles the corrupt case inside the same
                 # lock hold: the mutate callback receives {} and writes the
                 # single key from scratch. No second critical section needed.
+                dropped: list[str] = []
+
                 def _mutate_local_overlay(_existing: dict) -> dict:
+                    # Read under the same lock as the write, so the keys named
+                    # are the ones this write really removed.
+                    dropped[:] = _overlay_keys_dropped(_dict_get(_existing, key), parsed, key)
                     _dict_set_create(_existing, key, parsed)
                     return _existing
 
@@ -321,22 +357,9 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                     resources=f"{key}={json.dumps(parsed)}",
                 )
                 print(f"✅ {key} = {json.dumps(parsed)} (saved to config.local.json)")
+                if dropped:
+                    _print_dropped_overlay_keys(key, dropped)
             else:
-                # Validate the key exists before taking the lock. A declared
-                # leaf counts as existing even when it is not stored yet, but
-                # then its value is type-checked here: this is its first write,
-                # so no stored value stands in for the declaration.
-                cfg = KiroCrewConfig.load()
-                d = cfg.to_dict()
-                if not _dict_set(d, key, parsed):
-                    declared = _declared_entry(key)
-                    if declared is None:
-                        print(f"❌ Unknown key: {key}", file=sys.stderr)
-                        sys.exit(1)
-                    type_error = _declared_type_error(declared, parsed)
-                    if type_error:
-                        print(f"❌ {key}: {type_error}", file=sys.stderr)
-                        sys.exit(1)
 
                 def _mutate_base(existing: dict) -> dict:
                     # Apply the set on the freshly-locked raw data.
@@ -696,6 +719,114 @@ def _dict_set(d: dict, key: str, value: object) -> bool:
     return True
 
 
+def _refuse_unknown_key(key: str, parsed: object, *, overlay: bool = False) -> None:
+    """Exit with ``Unknown key`` unless *key* is one the loaded config can hold.
+
+    Validated before any lock is taken. A declared leaf counts as existing even
+    when it is not stored yet. Its value is type-checked on every write, stored
+    or not: the generic parser turns ``007`` into ``7`` and ``true`` into a bool,
+    so a stored string leaf would otherwise save a non-string
+    (kirodotdev/KiroCrew#24957). A ``null`` on a stored leaf keeps passing, as
+    it always has; the type check refuses it only on a first write.
+
+    With *overlay* (``--local``) a ``<section>.<name>`` listed in
+    ``_SECTION_KEYS_EMITTED_ELSEWHERE`` is also accepted: the loader reads it
+    in that section, but ``to_dict()`` writes it from outside the section, so
+    the loaded document may not show it. Its value is still checked.
+    """
+    if overlay:
+        parts = key.split(".")
+        if len(parts) == 2 and parts[1] in _SECTION_KEYS_EMITTED_ELSEWHERE.get(
+            parts[0], frozenset()
+        ):
+            _refuse_emitted_elsewhere_value(key, parts[0], parts[1], parsed)
+            return
+    d = KiroCrewConfig.load().to_dict()
+    stored = _dict_set(d, key, parsed)
+    declared = _declared_entry(key)
+    if declared is None:
+        if stored:
+            return
+        print(f"❌ Unknown key: {key}", file=sys.stderr)
+        sys.exit(1)
+    if stored and parsed is None:
+        return
+    type_error = _declared_type_error(declared, parsed)
+    if type_error:
+        print(f"❌ {key}: {type_error}", file=sys.stderr)
+        if declared.type == "string":
+            print(
+                """   To store it as text, quote it as JSON, e.g. '"007"'.""",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
+
+def _refuse_emitted_elsewhere_value(key: str, section: str, name: str, parsed: object) -> None:
+    """Exit 1 when *parsed* does not fit the field ``to_dict()`` writes *key* from.
+
+    The registry declares these fields by their dataclass spelling
+    (``slack_dm_activation``, ``observe_max_messages``) or under the section
+    (``slack.trusted_bot_ids``), so the first row found among those spellings
+    supplies the type. ``slack.dm_activation`` also takes the loader's own
+    activation check, which would otherwise turn a bad value into ``mention``.
+    """
+    from kiro_crew.config.sections_slack import _VALID_ACTIVATIONS, _validate_activation
+
+    for path in (key, f"{section}_{name}", name):
+        entry = _declared_entry(path)
+        if entry is not None:
+            error = _declared_type_error(entry, parsed)
+            if error:
+                print(f"❌ {key}: {error}", file=sys.stderr)
+                sys.exit(1)
+            break
+    if key == "slack.dm_activation" and _validate_activation(str(parsed)) != parsed:
+        allowed = ", ".join(sorted(_VALID_ACTIVATIONS))
+        print(
+            f"❌ {key}: {parsed!r} is not one of the selectable values: {allowed}", file=sys.stderr
+        )
+        sys.exit(1)
+
+
+def _overlay_keys_dropped(old: object, new: object, prefix: str) -> list[str]:
+    """Dotted keys under *prefix* that writing *new* over *old* removes.
+
+    Only a section (a dict) can lose keys: a whole-object write keeps what the
+    object names, recursively, and drops the rest; a scalar written over a
+    section drops all of it. Nothing is dropped when *old* is not a section.
+    """
+    if not isinstance(old, dict):
+        return []
+    if not isinstance(new, dict):
+        return [f"{prefix}.{k}" for k in old]
+    out: list[str] = []
+    for k, v in old.items():
+        if k in new:
+            out.extend(_overlay_keys_dropped(v, new[k], f"{prefix}.{k}"))
+        else:
+            out.append(f"{prefix}.{k}")
+    return out
+
+
+def _print_dropped_overlay_keys(key: str, dropped: list[str]) -> None:
+    """Name the overlay keys a whole-object ``config set --local`` removed.
+
+    The replace is kept (it is the only CLI way to remove a pinned key); the
+    hint only makes it visible and names the form that keeps siblings.
+    """
+    print(
+        f"⚠️  {key} was replaced in config.local.json, so it no longer pins: "
+        f"{', '.join(dropped)}",
+        file=sys.stderr,
+    )
+    print(
+        f"   To change one key and keep the rest, set it by its dotted name: "
+        f"kirocrew config set --local {key}.<name> <value>",
+        file=sys.stderr,
+    )
+
+
 def _dict_set_create(d: dict, key: str, value: object) -> None:
     """Set a value in a nested dict, creating intermediate dicts as needed."""
     parts = key.split(".")
@@ -723,8 +854,7 @@ def _declared_entry(key: str) -> ConfigEntry | None:
     match a concrete path here, which leaves those keys exactly as they were.
 
     The entry itself is returned, not a bool, because the caller must also check
-    the value against the declared type: this is the key's FIRST write, so there
-    is no stored value whose type could stand in for the declaration.
+    the value against the declared type.
 
     Imported lazily to mirror ``config.validation``: the registry is built at
     import time, and the CLI's other verbs should not pay for it.
@@ -754,7 +884,7 @@ def _declared_enum_value(key: str, value: object) -> object:
     """*value* as the enum for *key* spells it, or *value* itself when *key* has no enum.
 
     Raises ``ValueError`` with the message to print when *value* is outside the
-    enum. Unlike :func:`_declared_type_error` this runs on every write, stored or
+    enum. Like :func:`_declared_type_error` this runs on every write, stored or
     not, because the load path degrades an out-of-enum value rather than rejecting
     it -- so the write is the last point at which the mistake is still attributable
     to the command that made it. A key that declares no enum, or is not declared at
@@ -773,6 +903,13 @@ def _declared_enum_value(key: str, value: object) -> object:
         return value
     if value in entry.enum_values:
         return value
+    if key == "stt.provider" and isinstance(value, str):
+        # The schema enum lists only the built-ins; an edition-registered
+        # provider is selectable too, by the loader's own rule.
+        from kiro_crew.config.sections_stt import valid_stt_providers
+
+        if value in valid_stt_providers():
+            return value
     if isinstance(value, str):
         if key == "stt.model":
             resolved = _stt_model_canonical(value)
@@ -810,14 +947,18 @@ def _declared_type_error(entry: ConfigEntry, value: object) -> str | None:
     ``max_sessions`` and does ``len(registry) >= max_sessions``). Refusing at the
     write is the only place the mistake is still attributable to the command.
 
-    Checked ONLY on the first write of a declared-but-unstored key, which is the
-    path :func:`_declared_entry` opens. A key that is already in the document
-    keeps its historical behaviour, type check included: widening this to every
-    ``config set`` is a larger, separate change.
+    Checked on every write of a declared key, stored or not. A scalar union
+    (``int | str``, declared ``integer`` with ``string`` in ``other_types``)
+    accepts a value of any of its types, so ``"auto"`` stays writable there.
     """
     expected = _DECLARED_VALUE_TYPES.get(entry.type)
     if expected is None:
         return None
+    for other in entry.other_types:
+        extra = _DECLARED_VALUE_TYPES.get(other)
+        if extra is None:
+            return None
+        expected = expected + extra
     if value is None and entry.nullable:
         return None
     # bool is a subclass of int, so an integer leaf would silently accept `true`.
@@ -826,6 +967,23 @@ def _declared_type_error(entry: ConfigEntry, value: object) -> str | None:
     if not isinstance(value, expected):
         return f"expected {entry.type}, got {type(value).__name__}"
     return None
+
+
+def _decode_value_base64(token: str) -> str:
+    """The UTF-8 text a ``--value-base64`` token carries, or raise ``ValueError``.
+
+    Strict standard Base64: an alphabet or padding error is refused rather than
+    skipped, so a token a shell mangled never decodes to a different value. The empty
+    token is valid and decodes to empty text.
+    """
+    try:
+        raw = base64.b64decode(token, validate=True)
+    except ValueError:  # binascii.Error is a ValueError
+        raise ValueError("not valid standard Base64 (check the padding and alphabet)") from None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("the decoded bytes are not valid UTF-8 text") from None
 
 
 def _is_list_key(key: str) -> bool:

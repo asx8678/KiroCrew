@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -415,6 +417,62 @@ def test_aws_tool_bin_refused_provenance_falls_back_to_that_tool_s_name(monkeypa
     assert engine.resolve_aws_tool_bin("session-manager-plugin") == "session-manager-plugin"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fallback branch is dead on Windows")
+def test_resolver_reports_the_candidates_this_walk_refused(monkeypatch, tmp_path):
+    """The refusal list is what lets a caller say "found but refused" instead of
+    "not installed"; it reports the walk's own decision and changes none of it."""
+    refused_dir, good_dir, empty_bin = tmp_path / "brew", tmp_path / "pkg", tmp_path / "e"
+    for d in (refused_dir, good_dir, empty_bin):
+        d.mkdir()
+    refused = refused_dir / "session-manager-plugin"
+    refused.write_text("#!/bin/sh\n")
+    refused.chmod(0o755)
+    monkeypatch.setenv("PATH", str(empty_bin))
+    monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(refused_dir), str(good_dir)))
+    monkeypatch.setattr(engine, "_REFUSED_AWS_BIN_DIRS", set())
+
+    from kiro_crew import github_runner
+
+    def _validate(candidate):
+        if candidate.startswith(str(refused_dir)):
+            raise ValueError("executable is owned by another user (uid 1501)")
+        return candidate
+
+    monkeypatch.setattr(github_runner, "validate_provider_executable", _validate)
+
+    resolved, refusals = engine.resolve_aws_tool_bin_with_refusals("session-manager-plugin")
+    assert resolved == "session-manager-plugin"
+    assert refusals == (
+        engine.AwsToolRefusal(str(refused), "executable is owned by another user (uid 1501)"),
+    )
+    assert engine._REFUSED_AWS_BIN_DIRS == {("session-manager-plugin", str(refused_dir))}
+
+    accepted = good_dir / "session-manager-plugin"
+    accepted.write_text("#!/bin/sh\n")
+    accepted.chmod(0o755)
+    resolved, refusals = engine.resolve_aws_tool_bin_with_refusals("session-manager-plugin")
+    assert resolved == str(accepted)
+    assert [r.path for r in refusals] == [str(refused)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fallback branch is dead on Windows")
+def test_resolver_refusals_come_from_this_walk_not_the_shared_set(monkeypatch, tmp_path):
+    """A candidate removed since an earlier refusal is not reported as refused."""
+    gone_dir, empty_bin = tmp_path / "brew", tmp_path / "e"
+    gone_dir.mkdir()
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
+    monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(gone_dir),))
+    monkeypatch.setattr(
+        engine, "_REFUSED_AWS_BIN_DIRS", {("session-manager-plugin", str(gone_dir))}
+    )
+
+    assert engine.resolve_aws_tool_bin_with_refusals("session-manager-plugin") == (
+        "session-manager-plugin",
+        (),
+    )
+
+
 def test_aws_spawn_env_appends_install_dirs_after_inherited_path(monkeypatch, tmp_path):
     """APPEND, never prepend: the inherited PATH keeps first claim on every name.
 
@@ -628,3 +686,82 @@ def test_partial_deploy_recovery_reuses_bucket(fake, monkeypatch):
     assert "s3api create-bucket" not in fake.actions()
     # Distribution creation + sync still ran.
     assert "cloudfront create-distribution-with-tags" in fake.actions()
+
+
+_ENGINE_SRC = Path(__file__).resolve().parent.parent / "src" / "kiro_crew" / "deploy" / "engine.py"
+
+
+class TestDeployBucketDurability:
+    """Every deploy bucket is hardened through ``_harden_bucket``, and the
+    versioning, lifecycle and access-logging controls stay out of it on purpose.
+
+    Versioning cannot be enabled until teardown is version-aware: `empty_bucket`
+    runs `s3 rm --recursive`, which leaves noncurrent versions and delete markers
+    on a versioned bucket, so `delete-bucket` would fail BucketNotEmpty after the
+    distribution is deleted and strand billable infrastructure. Access logging
+    needs a bucket-policy grant to ``logging.s3.amazonaws.com`` on these
+    ``BucketOwnerEnforced`` buckets, and ``put_oac_bucket_policy`` writes a
+    complete policy after hardening that would overwrite it.
+    """
+
+    def _argvs(self):
+        with mock.patch.object(engine, "_checked") as checked:
+            engine._harden_bucket("kirocrew-web-example", "p", "TagSet=[]")
+        return [c[0][0] for c in checked.call_args_list]
+
+    def test_baseline_controls_are_applied(self):
+        verbs = {argv[1] for argv in self._argvs()}
+        assert {
+            "put-public-access-block",
+            "put-bucket-ownership-controls",
+            "put-bucket-encryption",
+            "put-bucket-tagging",
+        } <= verbs
+
+    @pytest.mark.parametrize(
+        "verb",
+        [
+            "put-bucket-versioning",
+            "put-bucket-lifecycle-configuration",
+            "put-bucket-logging",
+        ],
+    )
+    def test_deferred_controls_stay_out(self, verb):
+        """Each of these breaks something if added alone.
+
+        versioning/lifecycle -> teardown fails BucketNotEmpty (needs a
+        version-aware purge in destroy() and the reaper, plus
+        s3:DeleteObjectVersion + s3:ListBucketVersions in the generated IAM
+        policy). logging -> no permitted destination on a BucketOwnerEnforced
+        target, and a grant added here is overwritten by put_oac_bucket_policy.
+        """
+        assert verb not in {argv[1] for argv in self._argvs()}
+
+    def test_teardown_is_not_version_aware(self):
+        """The precondition behind the deferral. If this starts failing, teardown
+        has learned about versions and the deferral can be revisited.
+
+        Scoped to the empty_bucket body -- a whole-file grep would be tripped by
+        the explanatory comment in _harden_bucket.
+        """
+        src = _ENGINE_SRC.read_text(encoding="utf-8")
+        body = src.split("def empty_bucket", 1)[1].split("\ndef ", 1)[0]
+        assert '"s3", "rm"' in body, "empty_bucket no longer uses the recursive rm"
+        assert "version" not in body.lower(), (
+            "empty_bucket looks version-aware now -- revisit enabling versioning"
+        )
+
+    @pytest.mark.parametrize(
+        "_case",
+        [
+            "test_live_deploy_path_uses_the_shared_helper",
+            "test_hardening_lives_in_one_place",
+        ],
+    )
+    def test_live_deploy_path_uses_the_shared_helper(self, _case):
+        """One hardening seam, so a control cannot be added to a copy that
+        nothing calls."""
+        src = _ENGINE_SRC.read_text(encoding="utf-8")
+        assert src.count("_harden_bucket(") >= 3, (
+            "expected the definition plus both call sites to go through one helper"
+        )

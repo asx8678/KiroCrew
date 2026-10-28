@@ -15,12 +15,12 @@ import { useGuardedLeave } from '../components/NavigationLeaveGuard'
 import { getOverviewStatCards } from './overviewStatCards'
 import { getOverviewPanel } from './overviewPanel'
 import { isOverviewBuiltinSuppressed } from './overviewBuiltins'
-import { KIRO_SIGN_IN_BACKEND, KIRO_SIGN_IN_PATH } from './developer/kiroSignInLink'
 import { UsageTab, WakaTimeTab } from './overview'
 import { useProvider } from '../providers'
 import { providerUsageQuery } from '../api/providerUsageQuery'
 
 import { i18nT } from '../i18n/t'
+import { uiLocation } from '../uiLocations/uiLocation'
 import { fmtDuration } from '../i18n/format'
 
 // The record editor and recovery tools are needed only inside this drill-in.
@@ -123,7 +123,11 @@ function WakaTimeSummaryCard({ onOpen }: { onOpen: () => void }) {
     queryKey: ['wakatime-stats', 'last_7_days'],
     queryFn: () => api.wakatimeStats('last_7_days'),
   })
-  const total = data?.stats?.total_seconds ?? 0
+  // Prefer the include-other total so this card matches the WakaTime drill-in
+  // it opens; the classified-only total_seconds drops the "Other" bucket and
+  // reads low. Fall back to total_seconds when the include-other field is null
+  // (free accounts, which do not report it).
+  const total = data?.stats?.total_seconds_including_other_language ?? data?.stats?.total_seconds ?? 0
   const fmtHm = (s: number) => {
     // Round to whole minutes first, then split, so 7199s -> 2h 0m, not 1h 60m.
     const totalMin = Math.round(Math.max(0, s) / 60)
@@ -164,7 +168,7 @@ function MemorySummaryCard({ onOpen }: { onOpen: () => void }) {
     <Card>
       <CardTitle>
         <Brain className="lucide-inline" /> {i18nT('pages.overviewPage.memory')}
-        <button onClick={onOpen} className="ml-auto inline-flex items-center gap-1 text-[12px] font-medium text-accent bg-transparent border-none cursor-pointer hover:underline">
+        <button onClick={onOpen} className="ml-auto inline-flex items-center gap-1 text-[12px] font-medium text-accent bg-transparent border-none cursor-pointer hover:underline" {...uiLocation('overview.memory-details')}>
           {i18nT('pages.overviewPage.view_details')} <ArrowRight size={12} />
         </button>
       </CardTitle>
@@ -181,7 +185,7 @@ function MemorySummaryCard({ onOpen }: { onOpen: () => void }) {
             {!data.migrated && <> {i18nT('pages.overviewPage.keeps')} {data.history_max_days ?? 90} {i18nT('pages.overviewPage.days_of_history')}</>}
             {data.migrated && <> {i18nT('pages.overviewPage.semantic_memory_active')}</>}
           </span>
-          <span>{i18nT('pages.overviewPage.memory_graph_and_store_internals_live_on_the_dev')}</span>
+          <Link to="/developer?tab=memory" className="text-accent hover:underline w-fit">{i18nT('pages.overviewPage.memory_developer_link')} <ArrowRight size={12} className="lucide-inline" /></Link>
         </div>
       )}
     </Card>
@@ -204,36 +208,6 @@ export const STAT_LABEL_KEY: Record<StatId, string> = {
   lessons: 'pages.overviewPage.stat_lessons',
 }
 
-/**
- * Signpost to the Kiro sign-in card's home, Settings > Agent Harness
- * (`KIRO_SIGN_IN_PATH`), shown only while KAS is the selected backend: those
- * users read token expiry on this page by habit, and the card now sits beside
- * the switch that picks KAS. Everyone else sees nothing -- the identity does not
- * concern the Kiro CLI or Claude backends, so a pointer would be noise for them.
- * Renders no element (not an empty wrapper) when hidden, so the layout above the
- * guided cards keeps no stray gap.
- */
-function KiroSignInMovedPointer() {
-  const cfgQ = useQuery<{ agent?: { acp_backend?: string } }>({
-    queryKey: ['kirocrewConfig'],
-    queryFn: () => api.kirocrewConfig(),
-  })
-  if (cfgQ.data?.agent?.acp_backend !== KIRO_SIGN_IN_BACKEND) return null
-  return (
-    <div className="mb-6">
-      <Link
-        to={KIRO_SIGN_IN_PATH}
-        className="text-[12px] leading-snug text-accent hover:underline"
-        data-testid="kiro-sign-in-moved"
-      >
-        {i18nT('pages.overviewPage.kiro_sign_in_moved')}
-        {' '}
-        <ArrowRight size={12} className="lucide-inline" />
-      </Link>
-    </div>
-  )
-}
-
 export default function OverviewPage() {
   const status = useAppSelector(s => s.dashboard.status)
   const connected = useAppSelector(s => s.dashboard.connected)
@@ -253,7 +227,7 @@ export default function OverviewPage() {
   if (view === 'memory') {
     const selectedStore = params.get('store') || ''
     return <DrillIn title={i18nT('pages.overviewPage.memory')} hideTitle={!!selectedStore && selectedStore !== 'default'} onBack={() => setView(null)}>
-      <Suspense fallback={<ContentSkeleton rows={6} />}><MemoryTab refreshTrigger={refreshTrigger} selectedStore={selectedStore} onStoreNavigate={store => setParams(previous => {
+      <Suspense fallback={<ContentSkeleton rows={6} />}><MemoryTab refreshTrigger={refreshTrigger} selectedStore={selectedStore} focus={params.get('focus')} onStoreNavigate={store => setParams(previous => {
         const next = new URLSearchParams(previous)
         if (store) next.set('store', store)
         else next.delete('store')
@@ -329,9 +303,6 @@ export default function OverviewPage() {
           ErrorBoundary and the spacing wrapper so a suppressed build renders no
           element at all — leaving the `mb-6` div behind would keep a 24px gap
           where the card used to be. The core suppresses nothing. */}
-      <ErrorBoundary scope="overview-kiro-sign-in-moved" fallback={null}>
-        <KiroSignInMovedPointer />
-      </ErrorBoundary>
       {!isOverviewBuiltinSuppressed('tailnet-mobile') && (
         <ErrorBoundary scope="overview-tailnet-mobile" fallback={null}>
           <div className="mb-6">

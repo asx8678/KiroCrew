@@ -28,7 +28,9 @@ import {
   useTerminalFont,
   setTerminalFontFamily,
   setTerminalFontSize,
+  setTerminalCursorStyle,
   DEFAULT_TERMINAL_FONT_SIZE,
+  TERMINAL_CURSOR_STYLES,
 } from '../../hooks/useTerminalFont'
 import { FONT_FAMILY_OPTIONS, OPENDYSLEXIC_MONO_FAMILY_NAME } from '../../utils/fontFamilyOptions'
 import { useFontOptions } from '../../hooks/useFontOptions'
@@ -40,7 +42,9 @@ import ErrorNotice from '../../components/ErrorNotice'
 import { useImeGuard } from '../../hooks/useImeGuard'
 import { useBranding } from '../../hooks/useBranding'
 import { useLiquidGlass } from '../../hooks/useLiquidGlass'
+import { useCloseAction } from '../../hooks/useCloseAction'
 import { TranslucentPanelsPreview } from './TranslucentPanelsPreview'
+import { canOpenExternalTerminal, detectExternalTerminals } from '../../lib/externalTerminal'
 /**
  * Lightweight inline spinner (no modal / progress bar — matches the "status,
  * not ceremony" preference). Colors come from theme CSS vars via Tailwind
@@ -106,7 +110,8 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
   const { uiMode, setUIMode } = useUIMode()
   const editor = useThemeEditor()
   const { liquidGlass, setLiquidGlass } = useLiquidGlass()
-  const { botName } = useBranding()
+  const { closeAction, closeActionSupported, closeActionPending, closeActionFailed, setCloseAction } = useCloseAction()
+  const { botName, directLocal } = useBranding()
   const termFont = useTerminalFont()
   // Probed families become picker rows previewed in their own family, so the
   // Powerline sample answers "will my prompt theme render" before the choice is
@@ -209,7 +214,7 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
   type KirocrewCfg = {
     dashboard?: {
       recent_tint_count?: number
-      terminal?: { shell?: string; completion?: { enabled?: boolean }; reuse_current?: boolean }
+      terminal?: { shell?: string; completion?: { enabled?: boolean }; reuse_current?: boolean; external_app?: string }
     }
   }
   const mcQ = useQuery<KirocrewCfg>({
@@ -339,6 +344,40 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
     onSupersede: () => setReuseCurrentError(null),
   }))
 
+  // The terminal app "Open in external terminal" starts
+  // (dashboard.terminal.external_app; "" = none, the default). Desktop app
+  // only, against a gateway on this machine: the launch bridge exists nowhere
+  // else, and the gateway refuses the launch from anywhere else anyway. The
+  // choices are the allowlisted apps the desktop shell finds installed, so the
+  // picker never offers an app that cannot start; a stored pick that is no
+  // longer installed shows as None. The picker waits for the desktop shell's
+  // answer: a window it answers as not capable (a remote crew reached through
+  // an SSH tunnel also reads as direct-local) shows no picker and no error,
+  // rather than one that appears and then vanishes.
+  const externalTerminalCapable = directLocal && canOpenExternalTerminal()
+  const externalAppsQ = useQuery({
+    queryKey: ['externalTerminalApps'],
+    queryFn: detectExternalTerminals,
+    enabled: externalTerminalCapable,
+  })
+  const showExternalAppPicker = externalTerminalCapable
+    && (externalAppsQ.isError || externalAppsQ.data?.capable === true)
+  const externalApps = externalAppsQ.data?.apps ?? []
+  const serverExternalApp = mcQ.data?.dashboard?.terminal?.external_app ?? ''
+  const shownExternalApp = overlay.shown('dashboard.terminal.external_app', serverExternalApp)
+  const pickedExternalApp = externalApps.some(a => a.id === shownExternalApp) ? shownExternalApp : ''
+  const [externalAppError, setExternalAppError] = useState<string | null>(null)
+  const externalAppMut = useMutation(overlay.mutationOpts<string>({
+    queryKey: ['kirocrewConfig'],
+    mutationFn: (value: string) => api.patchConfig('dashboard.terminal.external_app', value),
+    path: () => 'dashboard.terminal.external_app',
+    displayValue: v => v,
+    applyToCache: (cached, value) =>
+      setConfigPathValue(cached as KirocrewCfg, 'dashboard.terminal.external_app', value),
+    onFailure: () => setExternalAppError(i18nT('pages.settings.displayPanel.terminal_external_app_save_failed')),
+    onSupersede: () => setExternalAppError(null),
+  }))
+
   // ── Install theme (Level 0) from a local folder or a GitHub repo ──
   const [installType, setInstallType] = useState<'github' | 'local'>('github')
   const [installValue, setInstallValue] = useState('')
@@ -461,6 +500,7 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
     <SettingsSubNav
       items={railItems}
       basePath={basePath}
+      guideTargetPrefix="settings.sub.display."
       railWidth={220}
       listLabel={i18nT('settings.tabs.display.label')}
       banner={configBanner}
@@ -470,6 +510,7 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
 
         case 'view':
           return (
+      <>
       <SettingsSection title={i18nT('pages.settings.displayPanel.view')}>
         <SettingsCard>
           {/* Options are built from SUPPORTED_LANGUAGES, so shipping a new
@@ -541,6 +582,32 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
           <TranslucentPanelsPreview placeholder={i18nT('components.chatInput.message_placeholder', { bot: botName })} />
         </SettingsCard>
       </SettingsSection>
+      {/* Desktop app only: shown once the main process answers for the main
+          window's dashboard (useCloseAction), local or remote gateway. */}
+      {closeActionSupported && (
+        <SettingsSection title={i18nT('pages.settings.displayPanel.desktop_app')}>
+          <SettingsCard>
+            <SettingsToggle
+              settingId="display.keep-running-in-the-background-after-closing-the-window"
+              label={i18nT('pages.settings.displayPanel.keep_running_when_window_closed')}
+              description={i18nT('pages.settings.displayPanel.keep_running_when_window_closed_desc')}
+              checked={closeAction === 'background'}
+              disabled={closeActionPending}
+              onChange={on => setCloseAction(on ? 'background' : 'quit')}
+            />
+            {/* No hand-off: navigating away would discard `shellDraft` or
+                `installValue` further down this panel. The switch already
+                shows the unchanged value, so toggling again is the retry. */}
+            {closeActionFailed && (
+              <ErrorNotice
+                variant="inline"
+                message={i18nT('pages.settings.displayPanel.keep_running_when_window_closed_save_failed')}
+              />
+            )}
+          </SettingsCard>
+        </SettingsSection>
+      )}
+      </>
           )
 
         case 'zoom':
@@ -666,6 +733,29 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
             onDecrement={() => setTerminalFontSize(termFont.fontSize - 1)}
             onReset={() => setTerminalFontSize(DEFAULT_TERMINAL_FONT_SIZE)}
           />
+          {/* Cursor shape — a per-client xterm render option (not a host
+              setting), so it rides the same localStorage store as the font
+              above and CliPanel's font subscription repaints every open
+              terminal when it changes. Defaults to block so no one's terminal
+              changes unless they ask; bar and underline are the thin cursors
+              the request wanted and most editors use. The option labels are a
+              literal key per branch, never an assembled one, so the catalog
+              reference scanner can see each. */}
+          <SettingsButtonGroup
+            label={i18nT('pages.settings.displayPanel.terminal_cursor_style')}
+            hint={i18nT('pages.settings.displayPanel.terminal_cursor_style_desc')}
+            value={termFont.cursorStyle}
+            options={TERMINAL_CURSOR_STYLES.map(style => ({
+              value: style,
+              label:
+                style === 'block'
+                  ? i18nT('pages.settings.displayPanel.terminal_cursor_style_block')
+                  : style === 'bar'
+                    ? i18nT('pages.settings.displayPanel.terminal_cursor_style_bar')
+                    : i18nT('pages.settings.displayPanel.terminal_cursor_style_underline'),
+            }))}
+            onChange={v => setTerminalCursorStyle(v as (typeof TERMINAL_CURSOR_STYLES)[number])}
+          />
           {/* Free text with commit-on-blur, mirroring the font field above: the
               gateway host's installed shells cannot be enumerated from the
               browser (reading /etc/shells is host-side and absent on some
@@ -717,6 +807,52 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
               above — `shellDraft` and `installValue` on this panel would be
               discarded by the hand-off's navigation. */}
           <ErrorNotice message={reuseCurrentError} variant="inline" />
+          {showExternalAppPicker && (
+            <>
+              <SettingsSelect
+                label={i18nT('pages.settings.displayPanel.terminal_external_app')}
+                description={
+                  externalAppsQ.isSuccess && externalApps.length === 0
+                    ? i18nT('pages.settings.displayPanel.terminal_external_app_none_found')
+                    : i18nT('pages.settings.displayPanel.terminal_external_app_desc')
+                }
+                value={pickedExternalApp}
+                options={['', ...externalApps.map(a => a.id)]}
+                optionLabels={[i18nT('pages.settings.displayPanel.terminal_external_app_none'), ...externalApps.map(a => a.label)]}
+                onChange={v => externalAppMut.mutate(v)}
+                disabled={
+                  externalAppMut.isPending
+                  || !mcQ.isSuccess
+                  || !externalAppsQ.isSuccess
+                  || (externalApps.length === 0 && pickedExternalApp === '')
+                }
+                configKey="dashboard.terminal.external_app"
+              />
+              {/* No hand-off: same unsaved-draft reason as the toggles above. */}
+              <ErrorNotice message={externalAppError} variant="inline" />
+              {/* A failed detection is reported, never shown as "nothing
+                  installed", and carries its own Retry (as the Files tab's
+                  notice for the same check does) so it is not a dead end.
+                  No hand-off: same unsaved-draft reason. */}
+              {externalAppsQ.isError && (
+                <div className="flex items-center gap-3">
+                  <ErrorNotice
+                    message={i18nT('pages.settings.displayPanel.terminal_external_app_detect_failed')}
+                    variant="inline"
+                    testId="settings-external-terminal-detect-error"
+                  />
+                  <Btn
+                    type="button"
+                    disabled={externalAppsQ.isFetching}
+                    aria-busy={externalAppsQ.isFetching || undefined}
+                    onClick={() => { void externalAppsQ.refetch() }}
+                  >
+                    {i18nT('pages.settings.displayPanel.terminal_external_app_detect_retry')}
+                  </Btn>
+                </div>
+              )}
+            </>
+          )}
         </SettingsCard>
       </SettingsSection>
           )
@@ -931,7 +1067,6 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
           {/* Color swatches use raw buttons — circular color dots don't fit SettingsButtonGroup's text-button pattern */}
           <div className="flex flex-col gap-1.5 py-1.5" data-setting-label={i18nT('pages.settings.displayPanel.default_for_new_sessions')}>
             <span className="text-[13px] font-semibold text-text">{i18nT('pages.settings.displayPanel.default_for_new_sessions')}</span>
-            <div className="text-[12px] text-muted">{i18nT('pages.settings.displayPanel.none_auto_cycle_or_pick_a_fixed_color')}</div>
             <div className="flex flex-wrap items-center gap-1.5">
               <button type="button" aria-label={i18nT('pages.settings.displayPanel.no_color')} aria-pressed={defaultColor === null} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:brightness-125 swatch-cue ${defaultColor === null ? 'border-accent scale-110' : 'border-border'}`} style={{ background: 'var(--bg-accent)', backgroundImage: 'linear-gradient(135deg, transparent 45%, var(--danger) 45%, var(--danger) 55%, transparent 55%)' }} onClick={() => dispatch(setSessionDefaultColor(null))} title={i18nT('pages.settings.displayPanel.no_color')} />
               {colors.map((c, i) => (

@@ -1,23 +1,56 @@
 """The context a dashboard turn's input carries: the execution context's memory-mode
-fold, the pending context drain, the folder-steering gate and the appended-context split."""
+fold, the pending context drain, the folder-steering gate and the appended-context split,
+the unavailable-agent message, the DM member binding check, the memory assignment, the
+skills context restored after a compaction and the gate on embedding the first message
+ahead of its session-start build."""
 
 from __future__ import annotations
 
 import time
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
+from kiro_crew.execution_context import canonical_memory_mode, stricter_memory_mode
+
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
         _CONTEXT_FRAME_CONTRACT,
         _ChatSlot,
         _MemoryUnavailable,
-        canonical_memory_mode,
         context_entry_expired,
         logger,
         read_session_execution,
-        stricter_memory_mode,
         tighten_live_session_execution,
     )
+
+
+def _startup_query_prewarm_applies(
+    builder: Any, slot: Any, text: str, execution_context: Any
+) -> bool:
+    """Whether a turn may embed its first message before the session-start build.
+
+    The build ranks the memory it starts with against the first message, and that
+    embedding is the slow step of the build, so it can start early and run beside
+    the rest of the turn's start. Not where the build reads no learned memory: no
+    builder, an empty message, a temporary chat or execution, or a private member,
+    whose session start runs no embedding search. ``embed_startup_query`` checks the
+    rest: the config gates, the store and its embedder.
+    """
+    if builder is None or not text.strip() or slot.blocks_reads:
+        return False
+    if execution_context is None:
+        return True
+    return execution_context.member_id is None and execution_context.memory_mode != "temporary"
+
+
+def _message_rewritten_before_build(slot: Any, message: str) -> bool:
+    """Whether the turn's text changes between the session claim and the build.
+
+    An ``@prompt`` expansion replaces it, and drained sub-agent failures or pending
+    context are put in front of it. An embed of the claim-time text would then rank
+    nothing and hold the one inference thread ahead of the embed the build reads.
+    """
+    return bool(message.startswith("@") or slot._pending_subagent_failures or slot._pending_context)
 
 
 def _folder_steering_turn(
@@ -126,27 +159,14 @@ def drain_pending_context(slot: "_ChatSlot") -> str:
     shared by every producer (app-kit context inject, Slack thread backfill),
     rather than duplicated inline where a key rename could silently break a
     consumer while its producer's own tests stay green.
-
-    One drain prepends at most ``_MAX_DRAINED_CONTEXT_CHARS`` of
-    frames. The queue ceiling bounds the entry count, not their size, and the
-    prefix is part of the user's turn, outside every background budget. Live
-    entries are walked newest first and kept WHOLE until the next one would cross
-    the total; the newest live entry is always kept. The kept entries are emitted
-    in their original chronological order, and the rest are named in one
-    ``[Background context omitted: N entries from ...]`` line and logged, never
-    dropped silently.
     """
-    # Imported here, not at module level: an owner reads its names from the
-    # runner's namespace at call time, and the runner does not re-export this one.
-    from kiro_crew.dashboard.state import _MAX_DRAINED_CONTEXT_CHARS as max_chars
-
     # A note's halves resolve their destination here, not at the POST, so a slot
     # rebound since the write must not hand its content to the new session.
     slot.drop_foreign_authorized_notes()
     if not slot._pending_context:
         return ""
     now = time.time()
-    framed: list[tuple[str, str]] = []
+    ctx_parts: list[str] = []
     for entry in slot._pending_context:
         if context_entry_expired(entry, now):
             continue  # expired — silently discard
@@ -155,46 +175,14 @@ def drain_pending_context(slot: "_ChatSlot") -> str:
         # never fires and the header would render [Background context from ""],
         # an unattributed block under a "not authored by the user" claim.
         source = entry.get("source") or "app"
-        framed.append(
-            (
-                source,
-                f'[Background context from "{source}"]\n'
-                f"{_CONTEXT_FRAME_CONTRACT}\n"
-                f'{entry["content"]}\n'
-                f"[End of background context]\n",
-            )
+        ctx_parts.append(
+            f'[Background context from "{source}"]\n'
+            f"{_CONTEXT_FRAME_CONTRACT}\n"
+            f'{entry["content"]}\n'
+            f"[End of background context]\n"
         )
     slot._pending_context.clear()
-    if not framed:
-        return ""
-    # Newest first, whole entries only: the walk stops at the first entry that
-    # would cross the total, so every older one goes too and the kept set stays
-    # one contiguous, most-recent run. Each part costs its frame plus the "\n"
-    # separator the join below adds.
-    kept_from = len(framed) - 1
-    total = len(framed[-1][1]) + 1
-    while kept_from > 0 and total + len(framed[kept_from - 1][1]) + 1 <= max_chars:
-        kept_from -= 1
-        total += len(framed[kept_from][1]) + 1
-    ctx_parts = [frame for _source, frame in framed[kept_from:]]
-    omitted = framed[:kept_from]
-    if omitted:
-        sources = list(dict.fromkeys(source for source, _frame in omitted))
-        omitted_chars = sum(len(frame) for _source, frame in omitted)
-        logger.warning(
-            "pending context drain over %d chars on slot %s: omitted %d older "
-            "entries (%d chars) from sources %s; kept %d newest",
-            max_chars,
-            getattr(slot, "key", "?"),
-            len(omitted),
-            omitted_chars,
-            sources,
-            len(ctx_parts),
-        )
-        named = ", ".join(f'"{source}"' for source in sources)
-        noun = "entry" if len(omitted) == 1 else "entries"
-        ctx_parts.append(f"[Background context omitted: {len(omitted)} {noun} from {named}]\n")
-    return "\n".join(ctx_parts) + "\n"
+    return "\n".join(ctx_parts) + "\n" if ctx_parts else ""
 
 
 def _detach_appended_context(original: str, expanded: str) -> tuple[str, str]:
@@ -212,3 +200,82 @@ def _detach_appended_context(original: str, expanded: str) -> tuple[str, str]:
         return original, expanded[len(original) :]
     logger.warning("generated request context stopped honoring append-only contract")
     return original, expanded
+
+
+def unavailable_agent_message(agent_name: str) -> str:
+    """What a resumed conversation whose agent does not resolve tells its user.
+
+    A recorded skill-view name the projection cannot map back is not a Crew
+    Member the user can restore: nothing records which agent it was built
+    from, and none can be recovered (the view name is a one-way digest). The
+    remedy that works is to pick the agent again or start a new chat, so that
+    is what it says, rather than naming a generated file as a missing member.
+    """
+    if agent_name.startswith(NATIVE_SKILL_ALIAS_PREFIX):
+        return (
+            "This chat was recorded under a generated skill view from an earlier "
+            f"version ('{agent_name}'), and the agent it was built from is not "
+            "recorded. Pick the agent for this chat again, or start a new chat."
+        )
+    return f"Crew Member '{agent_name}' is unavailable; restore it or choose a member"
+
+
+def _slot_member_slug(slot_key: str) -> str:
+    """The slug a member DM slot key encodes, or ``""`` for a non-member key.
+
+    A member with a persisted identity gets an id-based slug, so its DM slot key
+    (``member-<member_id>``) carries that immutable id directly -- the one
+    identity source that survives BOTH a restart AND the removal of the original
+    member. The ``dm.json`` binding cannot serve this: ``read_dm_binding``
+    reports it absent whenever the encoded id fails to resolve in config (exactly
+    the reassignment case that matters). The transcript line is not consulted
+    either -- it is the operator-editable JSONL the pin must never re-derive
+    identity from. A legacy member's key carries a name-derived slug that equals
+    no member's id, so a caller comparing this against a resolved ``member_id``
+    only ever sees a divergence for a genuine stable-identity thread.
+    """
+    from kiro_crew import members as members_mod
+
+    return members_mod.slug_from_dm_slot_key(slot_key) or ""
+
+
+def _dm_member_binding_changed(bound_member_id: str, slot_key: str) -> bool:
+    """Whether a DM member thread's encoded id differs from the resolved alias.
+
+    The slot KEY is the one un-plantable identity a restored session carries
+    (the session's address, not the agent-writable metadata line). A DM slot
+    key encodes the member_id; when the alias resolves to a member whose id
+    differs, the thread belongs to a member the alias does not name, so the
+    carrier-less re-selection must refuse. Returns ``False`` when the slot key
+    encodes no id (an ordinary ``chat-N`` slot) -- there is nothing to compare,
+    and the leak this guards is specific to a DM thread whose alias has been
+    reassigned to a different member.
+    """
+    slot_member_slug = _slot_member_slug(slot_key)
+    return bool(bound_member_id) and bool(slot_member_slug) and bound_member_id != slot_member_slug
+
+
+def _require_session_memory_assignment(session_key: str, memory_store: str | None) -> None:
+    """A captured execution outranks a later mutable member declaration."""
+    from kiro_crew.execution_context import read_session_execution  # noqa: F811
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    execution = read_session_execution(session_key)
+    if execution is not None and execution.store.store_id != (memory_store or "default"):
+        raise UnknownMemoryStore(
+            "This conversation retains its member memory assignment. "
+            "Restore that member binding or open a new conversation."
+        )
+
+
+def _restore_skills_context_after_compaction(turn) -> None:
+    """Re-inject the session-start skills context on the next turn."""
+    session_key = turn.session_key
+    state = turn.state
+    try:
+        state.sessions.mark_needs_reinjection(session_key)
+    except Exception:
+        logger.warning(
+            "post-compaction skills context reinjection could not be armed",
+            exc_info=True,
+        )

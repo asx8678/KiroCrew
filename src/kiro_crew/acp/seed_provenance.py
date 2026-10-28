@@ -38,7 +38,8 @@ Four properties the callers depend on:
   path a LIVE client in this process is seeding stays that client's own.
 
 The sharer registry (:func:`share` / :func:`unshare` / :func:`has_sharers`)
-interleaves with the owner lifecycle in ``acp/client.py``; these are the
+interleaves with the owner lifecycle in ``acp/client_claude_seed.py``,
+``acp/client_seed_ownership.py`` and ``acp/client_lifecycle.py``; these are the
 invariants both modules hold together, each backed by a review ruling on the
 PR that introduced it:
 
@@ -147,14 +148,28 @@ _LOCK = threading.Lock()
 # lock cannot deadlock.
 SETTLE_LOCK = threading.Lock()
 
-# Cross-process lock filename, BESIDE the sidecar rather than on it: ``atomic_write``
-# publishes by renaming a fresh inode over the sidecar, so a lock held on the
-# sidecar's own inode would guard nothing across that rename. Same placement and
-# reasoning as the ops-mission-control policy store.
+# Cross-process lock filename, a separate file rather than the sidecar itself:
+# ``atomic_write`` publishes by renaming a fresh inode over the sidecar, so a lock
+# held on the sidecar's own inode would guard nothing across that rename. It stays
+# at the data-home root, where it was before the sidecar moved into its directory,
+# so every writer keeps serializing on the same lock inode.
 _LOCK_FILENAME = ".settings_seeds.lock"
 _HOLDER_OWNERS = "owners"
 _HOLDER_SHARERS = "sharers"
 _HOLDER_KINDS = (_HOLDER_OWNERS, _HOLDER_SHARERS)
+
+
+#: The directory the sidecar lives in, and the name the sandbox seals read-only.
+#:
+#: A directory rather than the file itself because :func:`_persist` publishes through
+#: ``atomic_write``, which renames a NEW inode over the sidecar. The Linux launcher
+#: refuses a sealed name whose (dev, inode) changed after the pre-spawn pass recorded
+#: it, so a sealed FILE that Crew rewrites on every session seed or release made an
+#: unrelated sandboxed spawn fail whenever that write landed between the pass and the
+#: pin. A rename inside a directory leaves the directory's own inode alone, so the
+#: seal on it holds through every write, and a directory bind shows the live file.
+SIDECAR_DIR_NAME = "seed-provenance"
+_SIDECAR_FILENAME = "settings_seeds.json"
 
 
 def _sidecar_path() -> Path:
@@ -168,7 +183,15 @@ def _sidecar_path() -> Path:
     the host. The one writer, :func:`_persist`, creates the directory itself
     before taking its lock beside the sidecar.
     """
-    return peek_data_home() / "settings_seeds.json"
+    return peek_data_home() / SIDECAR_DIR_NAME / _SIDECAR_FILENAME
+
+
+# ``<data_home>/settings_seeds.json`` is the sidecar's legacy name. That file is
+# neither read nor written here, and its records are not carried over on purpose: a
+# process started before the upgrade keeps writing it, so copying it would leave two
+# live stores whose leases and revocations cannot see each other. A record that is
+# not read answers "not ours", the safe direction this module already takes for an
+# unreadable sidecar, so a seed left from before the move is left alone.
 
 
 def _key(path: Path | str) -> str:
@@ -546,6 +569,32 @@ def release_local(path: Path | str, owner: str) -> None:
     key = _key(path)
     if _LIVE.get(key) == owner:
         _LIVE.pop(key, None)
+
+
+def release_held(path: Path | str, owner: str) -> bool:
+    """Hand back whatever *owner* holds on *path* in this process, durably.
+
+    The teardown hand-back for a client whose ``shutdown`` never runs: its owner
+    claim goes through :func:`release`, its reader lease through :func:`unshare`,
+    and a token that holds neither performs no I/O at all. Nothing else is
+    touched -- the record and the file stay, which is the recorded-orphan shape
+    the next session adopts and repairs; a sibling's registrations under another
+    token are not read. Blocking (each withdrawal persists the sidecar), so it
+    belongs on off-loop paths. The in-process registries are read without
+    :data:`_LOCK`, as :func:`has_sharers` reads them: the read only decides
+    whether a withdrawal is owed, and each withdrawal re-reads under the lock and
+    is idempotent, so a concurrent transaction on the same path can at most make
+    this persist a hand-back that already landed. ``False`` when a durable
+    withdrawal was refused; the in-memory half is gone either way and the
+    persisted holder is reclaimable once this process exits.
+    """
+    key = _key(path)
+    done = True
+    if _LIVE.get(key) == owner:
+        done = release(path, owner) and done
+    if owner in _SHARERS.get(key, ()):
+        done = unshare(path, owner) and done
+    return done
 
 
 def held_by_another(path: Path | str, owner: str) -> bool:

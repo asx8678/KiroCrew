@@ -26,7 +26,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, Fragment, type CSSProperties } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Home, Loader2, ChevronDown, Pin, Check } from 'lucide-react'
-import { api, ApiError, type InstanceView } from '../api/client'
+import { api, type InstanceView } from '../api/client'
+import { isInstancesDisabledError } from '../utils/instancesDisabled'
 import { useAppSelector } from '../store'
 import { type WarmConn } from '../store/instancesSlice'
 import { isEmbeddedPane } from '../lib/embedded'
@@ -47,6 +48,7 @@ import {
 } from './ui/dropdown-menu'
 
 import { i18nT } from '../i18n/t'
+import { postToHost } from '../lib/hostRelay'
 import { fmtDuration as fmtDurationParts, fmtUnit, fmtNumber } from '../i18n/format'
 /**
  * Crews that get a switcher entry: sticky connect intent (`was_connected`,
@@ -1165,15 +1167,13 @@ function Switcher({
 function EmbeddedInstanceTabBar({ variant }: { variant: 'strip' | 'inline' }) {
   const host = useAppSelector(s => s.instances.host)
   const onSelect = useCallback((id: string | null) => {
-    // nosemgrep: javascript.browser.security.wildcard-postmessage-configuration.wildcard-postmessage-configuration
-    window.parent?.postMessage({ type: 'mc-switch-instance', v: 1, id }, '*')
+    postToHost({ type: 'mc-switch-instance', v: 1, id })
   }, [])
   // The pins live on the parent (one shared set across every pane); this pane
   // cannot write the parent's store from its own iframe realm, so it relays the
   // toggle up and lets the parent re-broadcast the model back down.
   const onTogglePin = useCallback((id: string) => {
-    // nosemgrep: javascript.browser.security.wildcard-postmessage-configuration.wildcard-postmessage-configuration
-    window.parent?.postMessage({ type: 'mc-set-crew-pin', v: 1, id }, '*')
+    postToHost({ type: 'mc-set-crew-pin', v: 1, id })
   }, [])
   // The stable-order preference also lives on the parent (one shared value across
   // every pane). This pane cannot write the parent's store from its own iframe
@@ -1182,8 +1182,7 @@ function EmbeddedInstanceTabBar({ variant }: { variant: 'strip' | 'inline' }) {
   // reads as "order by the default and do not offer the toggle at all".
   const hostStableOrder = host?.stableOrder ?? null
   const onToggleStableOrder = useCallback(() => {
-    // nosemgrep: javascript.browser.security.wildcard-postmessage-configuration.wildcard-postmessage-configuration
-    window.parent?.postMessage({ type: 'mc-set-stable-order', v: 1, on: !hostStableOrder }, '*')
+    postToHost({ type: 'mc-set-stable-order', v: 1, on: !hostStableOrder })
   }, [hostStableOrder])
   const entries = useMemo<SwitcherEntry[]>(() => {
     if (!host) return []
@@ -1258,7 +1257,9 @@ export default function InstanceTabBar({
   const embedded = isEmbeddedPane()
   // Shared with InstancesViewport / InstancesPanel via the React Query cache.
   const instancesQuery = useQuery({ queryKey: ['instances'], queryFn: () => api.listInstances(), enabled: !embedded })
-  const disabled = instancesQuery.error instanceof ApiError && instancesQuery.error.status === 403
+  // Only the gateway's own `instances_disabled` 403 means "feature off"; a
+  // non-owner or Slack-origin 403 is a real failure and shows as one.
+  const disabled = isInstancesDisabledError(instancesQuery.error)
   // Memoize so the `[] ` fallback doesn't produce a fresh array identity on every
   // render, which would otherwise churn the `onSelectInstance` useCallback deps.
   const instances = useMemo(() => instancesQuery.data?.instances ?? [], [instancesQuery.data?.instances])

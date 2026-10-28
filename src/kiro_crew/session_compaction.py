@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kiro_crew.messaging.commands import compact_unsupported_backend as _compact_unsupported_backend
 from kiro_crew.messaging.queue_drain import entry_channel, wake_other_drains
 from kiro_crew.metrics.events import CONTEXT_COMPACTIONS, emit_counter
 from kiro_crew.metrics.sessions import (
@@ -57,29 +58,17 @@ COMPACT_OUTCOME_RECYCLED = "recycled"
 #: missing capability there would be false about a harness that has it and merely
 #: failed once.
 COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE = "restarted_uncompactable"
-#: A compaction failed and the restart is held: sub-agents still run on this session's
-#: process, and restarting it now would end them. Sent with ``success=False``.
+#: A context restart is held -- after a failed compaction, or on a backend that has
+#: none: sub-agents still run on this session's process, and restarting it now would
+#: end them. Sent with ``success=False``. Both arms send it, so a notice for it names
+#: neither cause.
 COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS = "waiting_for_subagents"
-#: A compaction episode is exhausted: this many consecutive compactions never
-#: landed below ``threshold - warn margin``, so further attempts are declined at
-#: the gate until a reset/remove/destroy or a healthy landing clears the episode.
-_COMPACT_EPISODE_EXHAUSTED_AFTER = 2
-#: Backoff ceiling for the ineffective-compaction cooldown (seconds). The base
-#: stays ``_COMPACT_FAILURE_COOLDOWN_SECS``; each episode level doubles it.
-_COMPACT_EPISODE_BACKOFF_MAX_SECS = 900.0
-
 #: The in-flight compaction was ended by a user Stop, not by the harness. Sent with
 #: ``success=False``. A separate value because the failure arm's other destination is
 #: a RECYCLE, and a Stop the user pressed must never read as "compaction didn't
 #: succeed, so the session was restarted": the session is not recycled on this
 #: outcome, the cooldown is armed and the next threshold reading retries.
 COMPACT_OUTCOME_CANCELLED = "cancelled"
-#: The compaction episode is exhausted: consecutive compactions never got this
-#: context below ``threshold - warn margin``, so the gate declines further
-#: attempts until a reset/remove/destroy or a healthy landing clears the
-#: episode. Sent with ``success=False``, once per episode; surfaces tell the
-#: user to start a new chat or /clear.
-COMPACT_OUTCOME_EPISODE_EXHAUSTED = "episode_exhausted"
 
 #: Fired when *key* enters or leaves the compacting set, with the new membership.
 CompactingCallback = Callable[[str, bool], None]
@@ -101,21 +90,21 @@ class CompactionState:
     """Mutable state owned exclusively by the compaction boundary."""
 
     compacting: set[str] = field(default_factory=set)
+    #: The task running each in-flight compaction, keyed like ``compacting`` and
+    #: kept in step with it by ``_set_compacting``. ``compaction_waits_for_turn``
+    #: compares it with ``turn_owner`` to tell the compaction holding the turn
+    #: permit from the turn it is still waiting behind.
+    compaction_tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict)
     #: Keys whose in-flight recycle is happening because NOTHING could compact them,
     #: as opposed to because a compaction failed. Written by ``_recycle_held`` and
     #: consumed by ``_fire_compact_callback`` at the end of the same recycle, so it
     #: holds at most the handful of keys recycling right now.
     uncompactable_recycles: set[str] = field(default_factory=set)
     cooldown_until: dict[str, float] = field(default_factory=dict)
-    #: Per-key compaction episode: consecutive compactions that never landed
-    #: below ``threshold - warn margin``. At ``_COMPACT_EPISODE_EXHAUSTED_AFTER``
-    #: the gate declines further attempts (see ``_judge_compact_effect``).
-    episode_count: dict[str, int] = field(default_factory=dict)
-    #: Keys whose one-per-episode ``episode_exhausted`` callback already fired.
-    episode_fired: set[str] = field(default_factory=set)
     pending_verdict: dict[str, float] = field(default_factory=dict)
     #: Per-session threshold overrides (folded key -> pct). A key absent here
-    #: falls back to the published global (``cfg.session.autocompact_pct``).
+    #: falls back to the default its agent declares, then to the published
+    #: global (``cfg.session.autocompact_pct``).
     #: Deliberately independent of ``_sessions`` membership: an override is a
     #: user preference on the conversation, so it survives session resets and
     #: recycles, and is re-seeded from slot persistence after a restart.
@@ -157,6 +146,10 @@ class CompactionDeps:
     #: and how often it looks again while it waits.
     cotenant_wait_secs: float = 600.0
     cotenant_poll_secs: float = 2.0
+    #: The compaction threshold the agent a live session runs declares, or
+    #: ``None`` when it declares none (or there is no live session). Given the
+    #: ``_Session`` object, so this boundary needs no config import to answer.
+    agent_autocompact_pct: Callable[[Any], float | None] = lambda _session: None
 
 
 class _CompactionOwner(Protocol):
@@ -230,26 +223,6 @@ class _CompactionOwner(Protocol):
     ) -> bool: ...
 
 
-def _compact_unsupported_backend(provider: LLMProvider) -> str | None:
-    """Backend id this provider names as unable to serve ``/compact``, else None.
-
-    The same capability the manual entry points read, asked for the
-    automatic one.  The property is spelled ``manual_`` because the manual
-    command was its first consumer, but its ANSWER is a property of the
-    BACKEND -- ``ACP_BACKENDS_COMPACT`` membership -- not of the entry point,
-    so it is the right question here too: a backend that cannot act on the
-    ``/compact`` prompt cannot act on it whoever sent it.
-
-    Read with the consumption contract the ABC declares: only a non-empty
-    ``str`` counts.  That guard is load-bearing rather than defensive -- the
-    compaction suite drives this gate with bare ``object()`` and ``MagicMock``
-    providers, and a truthy attribute read on either must not be mistaken for
-    a positively named unsupported backend.
-    """
-    backend = getattr(provider, "manual_compact_unsupported_backend", None)
-    return backend if isinstance(backend, str) and backend else None
-
-
 def _compaction_unmanaged_backend(provider: LLMProvider) -> str | None:
     """Backend id this provider names as compacted by NOBODY, else None.
 
@@ -271,6 +244,18 @@ def _compaction_unmanaged_backend(provider: LLMProvider) -> str | None:
     return backend if isinstance(backend, str) and backend else None
 
 
+def _harness_managed_backend(provider: LLMProvider) -> str | None:
+    """Backend id this provider names as compacting on its own initiative.
+
+    The threshold leaves such a harness alone even when Crew could hand it a
+    manual ``/compact``: its own summarization bounds the context, and a
+    Crew compaction at ``session.autocompact_pct`` would only move that
+    point earlier. Same ``str`` contract as its siblings.
+    """
+    backend = getattr(provider, "harness_managed_compaction_backend", None)
+    return backend if isinstance(backend, str) and backend else None
+
+
 def _compaction_harness_managed(provider: LLMProvider) -> bool:
     """True when the harness POSITIVELY claims it bounds its own context.
 
@@ -288,77 +273,6 @@ def _compaction_harness_managed(provider: LLMProvider) -> bool:
     return claimed is not False
 
 
-def _provider_used_tokens_reliable(provider: Any) -> bool:
-    """Whether the provider vouches for its used-token count (CTX-1).
-
-    Optional like :func:`_provider_used_tokens`: a double without the method,
-    or one whose read raises, is treated as reliable, because its count reads 0
-    and cannot bind the absolute arm anyway.
-    """
-    fn = getattr(provider, "context_used_tokens_reliable", None)
-    if not callable(fn):
-        return True
-    try:
-        return fn() is not False
-    except Exception:
-        return True
-
-
-def _provider_used_tokens(provider: Any) -> int:
-    """The provider's used-context token reading, or 0 when it reports none.
-
-    Optional on doubles the way ``context_usage_unknown`` is: the gate is
-    driven with bare ``object()`` and ``MagicMock`` providers (see
-    ``_compact_unsupported_backend``), so the read is a guarded getattr and
-    anything that is not a positive int reads as 0 — the absolute arm cannot
-    bind on a double, which keeps it as fail-quiet as the percentage arm.
-    """
-    fn = getattr(provider, "context_used_tokens", None)
-    if not callable(fn):
-        return 0
-    try:
-        value = fn()
-    except Exception:
-        return 0
-    return value if isinstance(value, int) and value > 0 else 0
-
-
-def _provider_window_tokens(provider: Any) -> int:
-    """The provider's context-window token reading, or 0 when unknown.
-
-    Same guarded shape as :func:`_provider_used_tokens`; 0 leaves the warning
-    on the percentage arm — the trigger itself compares used tokens against
-    the cap directly, so an unknown window disarms only the warn conversion.
-    """
-    fn = getattr(provider, "context_window_tokens", None)
-    if not callable(fn):
-        return 0
-    try:
-        value = fn()
-    except Exception:
-        return 0
-    return value if isinstance(value, int) and value > 0 else 0
-
-
-def effective_compaction_threshold_pct(
-    pct_threshold: float, max_tokens: int, window_tokens: int
-) -> float:
-    """The compaction threshold as a window percentage, absolute cap included.
-
-    The shared statement of the trigger's pct face: whichever arm is reached
-    first wins, so on a large window an absolute cap below the percentage
-    threshold moves the whole threshold down with it. The ``cli_chat`` REPL,
-    which compacts outside the manager, renders its warn level from this too
-    rather than restating the rule. The cap joins as a percentage of the
-    reported window only when both are known and positive; the gate compares
-    used tokens against the cap directly, so an unknown window never disarms
-    the trigger, only this conversion.
-    """
-    if max_tokens > 0 and window_tokens > 0:
-        return min(pct_threshold, 100.0 * max_tokens / window_tokens)
-    return pct_threshold
-
-
 class CompactionCoordinator:
     """Coordinate context compaction while ``SessionManager`` remains facade."""
 
@@ -373,7 +287,9 @@ class CompactionCoordinator:
         self._deps = deps
         self.state = state
 
-    def check_context_usage(self, key: str, provider: LLMProvider) -> float:
+    def check_context_usage(
+        self, key: str, provider: LLMProvider, *, defer_compaction: bool = False
+    ) -> float:
         """Record usage and fire background compaction at the configured threshold."""
         owner = self._owner
         key = owner._fold_key(key)
@@ -385,6 +301,19 @@ class CompactionCoordinator:
             session.prompt_count += 1
             self._record_floor(key, session, provider, pct)
 
+        # Only the proactive threshold may yield to an admitted human answer.
+        # Keep the critical ceiling, unknown readings, pending verdicts and
+        # existing compactions on their ordinary path; native limits stay native.
+        if (
+            defer_compaction
+            and 0 < pct < self._deps.post_compact_reset_pct
+            and self.compaction_due_after_turn(key, provider)
+        ):
+            self._deps.logger.info(
+                "Session %s context at %.0f%% -- deferring compaction for human reply", key, pct
+            )
+            return pct
+
         # Go through the owner so patches on SessionManager._trigger_compaction
         # keep intercepting the call after this extraction.
         decline = owner._trigger_compaction(key, f"context at {pct:.0f}%", pct, provider)
@@ -393,19 +322,7 @@ class CompactionCoordinator:
             if pct > 0:
                 self._deps.logger.info("Session %s context at %.0f%% (CC-managed)", key, pct)
         elif decline == "below_threshold":
-            # The warning tracks whichever arm binds first: on a large window
-            # an absolute cap sits far below the percentage, and a warn level
-            # left on the percentage would sit ABOVE the compaction point —
-            # the dead early signal ``CONTEXT_WARN_MARGIN_PCT`` exists to
-            # prevent.
-            warn_at = (
-                effective_compaction_threshold_pct(
-                    self.effective_autocompact_pct(key),
-                    self._absolute_cap_tokens(),
-                    _provider_window_tokens(provider),
-                )
-                - self._deps.context_warn_margin_pct
-            )
+            warn_at = self.effective_autocompact_pct(key) - self._deps.context_warn_margin_pct
             if warn_at > 0 and pct >= warn_at:
                 self._deps.logger.warning("Session %s context at %.0f%%", key, pct)
             elif pct > 0:
@@ -458,6 +375,9 @@ class CompactionCoordinator:
         # There is deliberately no await between the membership check in the
         # gate and this commit; that is the event-loop dedup handshake.
         self._set_compacting(key, True)
+        current = asyncio.current_task()
+        if current is not None:
+            self.state.compaction_tasks[key] = current
         return await owner._compact_session(key, pct)
 
     def set_compact_callback(self, cb: CompactCallback | None) -> None:
@@ -476,6 +396,40 @@ class CompactionCoordinator:
         """Whether a compaction is in flight on *key* (folded or not)."""
         return key in self.state.compacting or self._owner._fold_key(key) in self.state.compacting
 
+    def compaction_waits_for_turn(self, key: str) -> bool:
+        """Whether *key*'s compaction is still waiting for a turn that holds the session.
+
+        A trigger commits the compaction (``is_compacting``) before its task has
+        the turn permit, and the task then waits up to ``compact_wait_timeout_secs``
+        for it. Until then the turn holding the permit owns the session, so a Stop
+        pressed in that window is aimed at that turn, not at a ``/compact`` turn.
+        True only when the permit is held by a live task other than the
+        compaction's own. Every other state answers False, including a compaction
+        with no recorded task, so the Stop decline keeps its old reach there.
+
+        The holder is read from ``turn_owner``, so the answer is only as good as
+        that record. Each compaction path names itself there in the step its
+        acquire returns (the Claude arm of ``_compact_session``,
+        ``_recycle_unmanaged``, ``_compact_in_place``), and every release of a
+        holding that named itself clears it in the same step
+        (``SessionManager.release``, those three paths, ``recycle_background``).
+        So the record never names a task that has let the permit go. When a turn
+        releases the permit to the parked compaction, the record names nobody
+        until the compaction's task runs, and a Stop in that hand-off is
+        declined: the permit is the compaction's from the release on. A holder
+        that has not named itself reads the same way and keeps the decline.
+        """
+        folded = self._owner._fold_key(key)
+        task = self.state.compaction_tasks.get(folded)
+        session = self._owner._sessions.get(folded)
+        if task is None or session is None or folded not in self.state.compacting:
+            return False
+        semaphore = getattr(session, "semaphore", None)
+        holder = getattr(session, "turn_owner", None)
+        if semaphore is None or not semaphore.locked() or holder is task:
+            return False
+        return isinstance(holder, asyncio.Task) and not holder.done()
+
     def _set_compacting(self, key: str, on: bool) -> None:
         """The ONE writer of ``state.compacting``: commit, then tell the observer.
 
@@ -489,6 +443,7 @@ class CompactionCoordinator:
             self.state.compacting.add(key)
         else:
             self.state.compacting.discard(key)
+            self.state.compaction_tasks.pop(key, None)
             # The markers this compaction's declines armed die with it, under
             # every spelling of the key a channel may have pressed with: the
             # next compaction, even one starting inside the window, owes its
@@ -568,44 +523,26 @@ class CompactionCoordinator:
             self.state.pct_overrides[key] = pct
 
     def effective_autocompact_pct(self, key: str) -> float:
-        """This session's compaction threshold: its override, else the global."""
-        return self.state.pct_overrides.get(
-            self._owner._fold_key(key), self._owner._cfg.session.autocompact_pct
-        )
+        """This session's compaction threshold.
 
-    def _absolute_cap_tokens(self) -> int:
-        """The configured absolute compaction cap in tokens; 0 = the arm is off.
-
-        Read off ``owner._cfg`` after the manager's sync, so a published change
-        binds on the next reading exactly as the percentage does. Guarded like
-        the provider reads below: the coordinator is driven with partial
-        doubles, and a cfg that does not carry the field reads as "off"
-        rather than raising.
+        Precedence, highest first: the session's own override (the slider),
+        then the default the session's agent declares, then the global.
         """
-        try:
-            value = int(getattr(self._owner._cfg.session, "autocompact_max_tokens", 0))
-        except (TypeError, ValueError):
-            return 0
-        return value if value > 0 else 0
+        key = self._owner._fold_key(key)
+        override = self.state.pct_overrides.get(key)
+        if override is not None:
+            return override
+        agent_pct = self.agent_autocompact_pct(key)
+        if agent_pct is not None:
+            return agent_pct
+        return self._owner._cfg.session.autocompact_pct
 
-    def _over_absolute_cap(self, provider: LLMProvider) -> bool:
-        """True when the used-token reading has reached the absolute cap.
-
-        The compare is direct rather than window-relative so the arm still
-        triggers when the window is unknown; 0 (off) or an unreported reading
-        (0 tokens) never binds.
-        """
-        cap = self._absolute_cap_tokens()
-        if cap <= 0:
-            return False
-        if not _provider_used_tokens_reliable(provider):
-            # A count derived from a percentage against a statically-sourced
-            # window can be several times the served count (the registry folds
-            # 200K aliases onto 1M). The percentage arm still guards the session;
-            # only the absolute arm stands down until the window is confirmed
-            # (CTX-1).
-            return False
-        return _provider_used_tokens(provider) >= cap
+    def agent_autocompact_pct(self, key: str) -> float | None:
+        """The threshold the agent behind *key*'s live session declares, else ``None``."""
+        session = self._owner._sessions.get(self._owner._fold_key(key))
+        if session is None:
+            return None
+        return self._deps.agent_autocompact_pct(session)
 
     def _compaction_gate_decision(self, key: str, provider: LLMProvider, pct: float) -> str | None:
         """Return the first compaction gate decline, in lifecycle order.
@@ -653,26 +590,29 @@ class CompactionCoordinator:
             # later turn's growth and is only safe for cooldown damping.
             self._owner._judge_compact_effect(key, baseline, pct)
 
+        return self._gate_rung(key, provider, pct, log=True)
+
+    def _gate_rung(self, key: str, provider: LLMProvider, pct: float, *, log: bool) -> str | None:
+        """The gate's declining rungs, in lifecycle order, with no state change.
+
+        The ONE ladder both questions read: :meth:`_compaction_gate_decision`
+        (which settles a pending verdict first, then asks here with ``log=True``)
+        and :meth:`compaction_due_after_turn` (which asks mid-turn with
+        ``log=False``, so a reading taken inside a turn writes no line the real
+        check writes again at turn end).
+        """
         if self._deps.is_cc_managed(provider):
             return "cc_managed"
-        # The trigger is whichever arm is reached first: the percentage of the
-        # window, or the absolute ``session.autocompact_max_tokens`` cap
-        # (0 = off). An over-cap reading declines exactly the way an
-        # over-threshold percentage does — it falls through to the SAME rungs
-        # below (unsupported → unconfirmed → in_progress → …), so nothing
-        # about the harness-managed paths changes: ``cc_managed`` has already
-        # returned above, and a KAS member still declines at the unsupported
-        # rung for its own summarizer to answer.
-        if pct < self.effective_autocompact_pct(key) and not self._over_absolute_cap(provider):
+        if pct < self.effective_autocompact_pct(key):
             return "below_threshold"
-        unsupported = _compact_unsupported_backend(provider)
+        unsupported = _compact_unsupported_backend(provider) or _harness_managed_backend(provider)
         if unsupported is not None and _compaction_unmanaged_backend(provider) is None:
             # Declining, not recycling, and ONLY for a harness that positively
             # claims the other side of the bargain. A member of
             # ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION`` (KAS) summarizes on its
             # own initiative and its ``summarization_completed`` frame calls
             # ``reset_after_compaction()`` on the meter
-            # (``acp/session_handle.py``), so the reading this gate just read
+            # (``acp/session_handle_kas.py``), so the reading this gate just read
             # falls back below the threshold without us acting -- the same
             # relationship ``cc_managed`` encodes for Claude-Code sessions.
             # Recycling such a session would not have been the smaller harm: it
@@ -697,10 +637,12 @@ class CompactionCoordinator:
             # ``cc_managed``'s: the key, the reading, AND which backend
             # answered. INFO, not WARNING: a standing correct condition is not
             # an anomaly, and every sibling rung is INFO too.
-            if _compaction_harness_managed(provider):
+            if not log:
+                pass
+            elif _compaction_harness_managed(provider):
                 self._deps.logger.info(
                     "Session %s context at %.0f%% -- %s manages compaction itself; "
-                    "skipping the /compact dispatch it cannot answer",
+                    "skipping Crew's /compact dispatch",
                     key,
                     pct,
                     unsupported,
@@ -725,60 +667,53 @@ class CompactionCoordinator:
                 )
             return "compact_unsupported"
         if self._deps.context_pct_is_unknown(provider):
-            self._deps.logger.info(
-                "Session %s context %.0f%% is unconfirmed for this session — "
-                "skipping compaction until telemetry reports",
-                key,
-                pct,
-            )
+            if log:
+                self._deps.logger.info(
+                    "Session %s context %.0f%% is unconfirmed for this session — "
+                    "skipping compaction until telemetry reports",
+                    key,
+                    pct,
+                )
             return "unconfirmed"
         if key in self.state.compacting:
-            self._deps.logger.info("Session %s compaction already in progress", key)
+            if log:
+                self._deps.logger.info("Session %s compaction already in progress", key)
             return "in_progress"
         cooldown_until = self.state.cooldown_until.get(key, 0.0)
         if cooldown_until > time.monotonic():
-            self._deps.logger.info(
-                "Session %s compaction skipped — cooldown active for %.0fs more",
-                key,
-                cooldown_until - time.monotonic(),
-            )
-            return "cooldown"
-        if self.state.episode_count.get(key, 0) >= _COMPACT_EPISODE_EXHAUSTED_AFTER:
-            # The cooldown expired but the episode has not: two compactions in
-            # a row could not get this context below threshold - warn margin,
-            # and a third would summarize the same oversized window the same
-            # way. Decline until a reset/remove/destroy or a healthy landing
-            # ends the episode, and tell the user once per episode. No
-            # auto-reset here: a reset ends the conversation, and resets are
-            # deliberately limited to the measured >=95% immediate verdict.
-            if key not in self.state.episode_fired:
-                self.state.episode_fired.add(key)
-                self._deps.logger.warning(
-                    "Session %s compaction exhausted — context stays at %.1f%% "
-                    "after %d compaction(s) that could not free it below the "
-                    "threshold; start a new chat or /clear",
+            if log:
+                self._deps.logger.info(
+                    "Session %s compaction skipped — cooldown active for %.0fs more",
                     key,
-                    pct,
-                    self.state.episode_count[key],
+                    cooldown_until - time.monotonic(),
                 )
-                try:
-                    task = asyncio.create_task(
-                        self._owner._fire_compact_callback(
-                            key,
-                            pct,
-                            success=False,
-                            outcome=COMPACT_OUTCOME_EPISODE_EXHAUSTED,
-                        )
-                    )
-                    self._owner._background_tasks.add(task)
-                    task.add_done_callback(self._owner._background_tasks.discard)
-                except RuntimeError:
-                    # No running loop (a sync probe): the WARNING above still
-                    # names the outcome for the operator; only the callback
-                    # fire is skipped.
-                    pass
-            return "episode_exhausted"
+            return "cooldown"
         return None
+
+    def compaction_due_after_turn(self, key: str, provider: LLMProvider) -> bool:
+        """Whether the end-of-turn check would compact *key* if the turn ended now.
+
+        For a caller still INSIDE the turn (the dashboard's "will compact after
+        this turn" notice). It reads the gate's own ladder (:meth:`_gate_rung`) and
+        changes nothing, so asking mid-turn cannot change what the real check
+        decides at turn end. Two answers are False although the ladder passes:
+
+        * a pending verdict is waiting. The gate settles it first, and that
+          settlement can arm a cooldown that declines this very compaction, so
+          nothing is promised until it has settled;
+        * the backend takes the recycle arm (it cannot be handed ``/compact`` and
+          nothing else bounds it). That restarts the session instead of
+          compacting it, so "will compact" would be false.
+        """
+        key = self._owner._fold_key(key)
+        if key in self.state.pending_verdict:
+            return False
+        if self._gate_rung(key, provider, provider.context_usage_pct(), log=False) is not None:
+            return False
+        return (
+            _compact_unsupported_backend(provider) is None
+            and _harness_managed_backend(provider) is None
+        )
 
     def _trigger_compaction(
         self, key: str, reason: str, pct: float, provider: LLMProvider
@@ -793,6 +728,7 @@ class CompactionCoordinator:
         # a second attempt in the same event-loop turn.
         self._set_compacting(key, True)
         task = asyncio.create_task(owner._compact_session(key, pct))
+        self.state.compaction_tasks[key] = task
         owner._background_tasks.add(task)
         task.add_done_callback(owner._background_tasks.discard)
         return None
@@ -895,6 +831,7 @@ class CompactionCoordinator:
                     finally:
                         if not owner.absorb_orphaned_release(key):
                             claude_session.semaphore.release()
+                            claude_session.turn_owner = None
 
                 timeout = self._deps.compact_wait_timeout_secs()
                 try:
@@ -1070,7 +1007,7 @@ class CompactionCoordinator:
                 self._deps.logger.warning("Session %s: stopping sub-agents %s", key, ids)
                 for info in runs.running:
                     if info.id in ids and not info._stop_origin:
-                        info._stop_origin = "stopped at a failed compaction's restart"
+                        info._stop_origin = "stopped at a context restart"
                 task = asyncio.ensure_future(asyncio.gather(*(runs.cancel(i) for i in ids)))
                 self._owner._background_tasks.add(task)
                 task.add_done_callback(self._owner._background_tasks.discard)
@@ -1187,12 +1124,31 @@ class CompactionCoordinator:
             await asyncio.wait_for(session.semaphore.acquire(), timeout=timeout)
         except asyncio.TimeoutError:
             return "busy"
+        # The same three guards as ``_compact_in_place``, for the same Stop. Read
+        # AFTER the permit is held: a Stop that ended the turn this waited behind
+        # is not this recycle's cancel.
+        stop_gen = self._stop_generation(key)
+        # Named where ``reset`` looks (``_orphan_turn_holder``), so a hard Stop
+        # during the wait below records this task as the holder of the permit it
+        # hands to a woken claimant.
+        session.turn_owner = asyncio.current_task()
         try:
             # The restart ends this process and every sub-agent that shares it.
-            await self._await_cotenants(key, pct)
+            if not await self._await_cotenants(
+                key, pct, stopped=lambda: self._stop_generation(key) > stop_gen
+            ):
+                # A Stop landed during the wait. A force Stop has already reset the
+                # parent and respawned its successor, so this restart is stale, and
+                # the sub-agents it would stop are the user's live work.
+                return await self._settle_cancelled(key, pct)
             await self._owner._recycle_held(key, session, pct, uncompactable=True)
         finally:
-            session.semaphore.release()
+            # Release ONLY a permit this task still owns. A hard Stop during the
+            # wait popped the session and handed its permit to a woken claimant;
+            # a second release here would raise in that claimant's own release.
+            if not self._owner.absorb_orphaned_release(key):
+                session.semaphore.release()
+                session.turn_owner = None
         return "recycled"
 
     async def _compact_in_place(self, key: str, session: Any, pct: float) -> str:
@@ -1232,16 +1188,12 @@ class CompactionCoordinator:
                 from kiro_crew.acp.types import EVENT_COMPACTION_STATUS
 
                 status: str | None = None
-                from kiro_crew.llm_helpers import metered_turn
-
-                # USE-1: a native /compact is a billed turn; one usage row, on every exit.
-                async with metered_turn(session.provider, surface="compaction", slot_key=key):
-                    async for event in session.provider.stream_command("/compact"):
-                        if event.kind == EVENT_COMPACTION_STATUS and event.text in (
-                            "completed",
-                            "failed",
-                        ):
-                            status = event.text
+                async for event in session.provider.stream_command("/compact"):
+                    if event.kind == EVENT_COMPACTION_STATUS and event.text in (
+                        "completed",
+                        "failed",
+                    ):
+                        status = event.text
                 if status is None:
                     # No special case for an inline harness HERE. This loop
                     # drives the harness through ``stream_command`` rather than
@@ -1304,6 +1256,7 @@ class CompactionCoordinator:
             # claimant parked on the permit wakes.
             if not self._owner.absorb_orphaned_release(key):
                 session.semaphore.release()
+                session.turn_owner = None
 
         escalate = self._owner._settle_compact_cooldown(key, session.provider, pct)
         self._deps.logger.info("Compacted session %s in place (context overflow)", key)
@@ -1352,30 +1305,11 @@ class CompactionCoordinator:
         return floor if isinstance(floor, (int, float)) else None
 
     def _judge_compact_effect(self, key: str, pct_before: float, pct_after: float) -> bool:
-        """Arm damping for an ineffective drop and report critical context.
-
-        An EPISODE is a run of compactions that never landed below
-        ``threshold - warn margin``. Every verdict that does not land grows the
-        episode and backs the cooldown off exponentially (base x 2**(episode-1),
-        capped at ``_COMPACT_EPISODE_BACKOFF_MAX_SECS``); at
-        ``_COMPACT_EPISODE_EXHAUSTED_AFTER`` consecutive no-landing attempts
-        the gate declines further compactions until a reset/remove/destroy or
-        a healthy landing clears the episode. The old flat cooldown cleared on
-        any 5-point drop even when the reading stayed above the threshold, so
-        a compacted floor above the threshold re-triggered every cooldown
-        window indefinitely (measured: 11 compactions in 20 turns), each pass a
-        model-generated summarization of the same oversized window.
-        """
+        """Arm damping for an ineffective drop and report critical context."""
         freed = pct_before - pct_after
-        landed = (
-            pct_after < self.effective_autocompact_pct(key) - self._deps.context_warn_margin_pct
-        )
-        if freed < self._deps.compact_min_effect_pct_points or not landed:
-            self.state.episode_count[key] = self.state.episode_count.get(key, 0) + 1
-            level = self.state.episode_count[key] - 1
-            self.state.cooldown_until[key] = time.monotonic() + min(
-                self._deps.compact_failure_cooldown_secs * (2**level),
-                _COMPACT_EPISODE_BACKOFF_MAX_SECS,
+        if freed < self._deps.compact_min_effect_pct_points:
+            self.state.cooldown_until[key] = (
+                time.monotonic() + self._deps.compact_failure_cooldown_secs
             )
             still_critical = pct_after >= self._deps.post_compact_reset_pct
             verdict = (
@@ -1413,11 +1347,7 @@ class CompactionCoordinator:
                 verdict,
             )
             return still_critical
-        # Landed below threshold - warn margin: compaction did its job — end
-        # the episode and clear the cooldown.
         self.state.cooldown_until.pop(key, None)
-        self.state.episode_count.pop(key, None)
-        self.state.episode_fired.discard(key)
         return False
 
     async def _reset_still_critical(

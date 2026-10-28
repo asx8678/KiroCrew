@@ -12,6 +12,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.handlers import knowledge as kh
 from kiro_crew.knowledge.store import KnowledgeStore
+from kiro_crew.testing.wait import await_until
 
 
 class _FakePool:
@@ -183,7 +184,7 @@ class TestKnowledgeFetchPoolWiring:
         async with TestClient(TestServer(app)) as client:
             response = await client.post(f"/api/knowledge/sources/{source_id}/sync")
             assert response.status == 200
-            await asyncio.wait_for(done.wait(), timeout=5)
+            await await_until(done, what="sync completes")
 
         assert observed["pool"] is fetch_pool
 
@@ -233,3 +234,24 @@ class TestKnowledgePoolCleanup:
 
         extraction.shutdown.assert_awaited_once()
         fetch.shutdown.assert_awaited_once()
+
+        # One pool registered under both keys is still shut down only once.
+        shared = _FakePool(pool_size=2)
+        aliased = web.Application()
+        aliased["knowledge_extraction_pool"] = shared
+        aliased["knowledge_fetch_pool"] = shared
+        await kh._shutdown_knowledge_pools(aliased)
+        assert shared.shutdown.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failing_shutdown_does_not_skip_the_next_pool(self):
+        extraction = _FakePool(pool_size=3)
+        extraction.shutdown.side_effect = RuntimeError("worker hung")
+        fetch = _FakePool(pool_size=1)
+        app = web.Application()
+        app["knowledge_extraction_pool"] = extraction
+        app["knowledge_fetch_pool"] = fetch
+
+        await kh._shutdown_knowledge_pools(app)
+
+        assert fetch.shutdown.await_count == 1

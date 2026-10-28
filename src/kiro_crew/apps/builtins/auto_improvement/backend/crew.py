@@ -12,6 +12,11 @@ from typing import Any
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.sections import KiroCrewAgentConfig
 from kiro_crew.execution_context import member_config_for_id
+from kiro_crew.member_workspace import (
+    AUTO_WORKSPACE,
+    provision_member_workspace,
+    retire_unpublished_workspace,
+)
 from kiro_crew.memory_stores import (
     persist_member_config,
     provision_member_memory,
@@ -85,16 +90,25 @@ def ensure_team() -> dict[str, str]:
             if existing is None:
                 member = KiroCrewAgentConfig(
                     kiro_agent=spec.template,
+                    workspace=AUTO_WORKSPACE,
                     description=spec.description,
                     source=store.APP_NAME,
                 )
                 config.agents[spec.name] = member
                 previous_store = member.memory_store
                 previous_id = member.member_id
+                previous_workspace = member.workspace
+                new_workspace = ""
                 try:
                     provision_member_memory(config, spec.name)
-                    persist_member_config(config, spec.name, create=True)
+                    new_workspace = provision_member_workspace(config, spec.name)
+                    persist_member_config(
+                        config, spec.name, create=True, new_workspace=new_workspace
+                    )
                 except BaseException:
+                    retire_unpublished_workspace(
+                        config, spec.name, new_workspace, previous_workspace=previous_workspace
+                    )
                     if member.memory_store != previous_store:
                         retire_unpublished_allocation(
                             config,
@@ -134,26 +148,20 @@ def attach_gateway(state: Any) -> None:
 async def on_startup(ctx: Any) -> None:
     # Startup and enable share this hook. Provisioning is off the gateway loop.
     await _await_owned(asyncio.create_task(asyncio.to_thread(ensure_team)))
+    from .runner import get_supervisor
+
+    # Built here, off the loop, rather than at the first run request: building it reads the run
+    # record back, and after an in-place restart that read is what saves the run the restart cut
+    # off as interrupted, which a stdio MCP server cannot tell on its own.
+    await _await_owned(asyncio.create_task(asyncio.to_thread(get_supervisor)))
 
 
 async def on_shutdown(ctx: Any) -> None:
-    """The app's disable/shutdown hook: stop the run supervisor AND the PR watchers.
-
-    The supervisor half predates LOOP-26; the watchers did not stop here, so
-    up to MAX_ACTIVE_WATCHERS (4) of them kept running agent passes (6 each,
-    1800 s apart) after the operator disabled the app — their only other
-    stop was the aiohttp on_cleanup at full gateway shutdown. Both stops run
-    on worker threads through the same owned-task helper, matching the
-    routes.py teardown shape.
-    """
-    from .pr_watchers import get_registry
     from .runner import get_supervisor
 
-    async def _stop_all() -> None:
-        await asyncio.to_thread(get_supervisor().stop)
-        await asyncio.to_thread(get_registry().stop_all)
-
-    await _await_owned(asyncio.create_task(_stop_all()))
+    # The lookup rides inside the hop: on first use it builds the supervisor, which reads the run
+    # record back from disk.
+    await _await_owned(asyncio.create_task(asyncio.to_thread(lambda: get_supervisor().stop())))
 
 
 def build_runner(*, stop_check, on_activity):

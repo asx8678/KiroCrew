@@ -41,13 +41,20 @@ export interface ChannelFolderBackfillReport {
   failed: number
 }
 
-export function createChatOrganizationEndpoints({ post, del, patch, j, sessionKeyHeader: _sk }: ClientTransport) {
+/** One write of the manual session order, as `POST /api/chat/manual-order` takes it. */
+export type ManualOrderWrite =
+  | { op: 'seed'; keys: string[] }
+  | { op: 'move'; key: string; after: string | null; seat?: string[]; expected_created?: string }
+  | { op: 'move'; key: string; before: string; seat?: string[]; expected_created?: string }
+  | { op: 'clear'; rev: number }
+
+export function createChatOrganizationEndpoints({ post, del, patch, j, jfetch: fetch, sessionKeyHeader: _sk }: ClientTransport) {
   const sidebar = {
     // Folders
     chatFolders: () => fetch('/api/chat/folders', { headers: { ..._sk } }).then(j),
     /** `config` carries the folder settings the create modal collects. Each is
      *  omitted when empty so the backend applies its own default. */
-    createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string; icon?: string; tags?: string[]; steering_dirs?: string[] }) =>
+    createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; default_destination_crew?: string; color?: string; icon?: string; tags?: string[]; steering_dirs?: string[] }) =>
       post('/api/chat/folders', { name, parent_id: parentId || '', ...(config ?? {}) }).then(j),
     updateChatFolder: (id: string, body: object) => patch('/api/chat/folders/' + encodeURIComponent(id), body).then(j),
     /** Set several folders' `order` in ONE atomic request. The sidebar drag
@@ -97,6 +104,25 @@ export function createChatOrganizationEndpoints({ post, del, patch, j, sessionKe
      *  an index-only null would leave a custom hex behind. */
     clearSlotColor: (slot: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', { color_index: null, color_hex: null }).then(j),
     setSlotPin: (slot: string, pinned: boolean) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/pin', { pinned }).then(j),
+    // Toggle the "mute sessions it opens" rule on a creating session.
+    setSlotMutesOpened: (slot: string, mutesOpened: boolean) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/mutes-opened', { mutes_opened: mutesOpened }).then(j),
+    // Toggle the per-row mute of this session.
+    setSlotMuted: (slot: string, muted: boolean) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/muted', { muted }).then(j),
+    /** Set the order of pinned sessions in one atomic write; answers the stored order.
+     *  `onlyIfUnset` lands the write only while no order is stored (a 409
+     *  otherwise), which is how a browser hands over its old local order. */
+    setPinnedOrder: (keys: string[], onlyIfUnset = false, expectedCreated?: Record<string, string>) => post('/api/chat/pinned-order', {
+      keys,
+      ...(onlyIfUnset ? { only_if_unset: true } : {}),
+      ...(expectedCreated && Object.keys(expectedCreated).length > 0 ? { expected_created: expectedCreated } : {}),
+    }).then(j) as Promise<{ ok: boolean; order: string[] }>,
+    /** Write the manual session order (sort "Manual"), one operation per call:
+     *  a seed of the order on screen (only while nothing is saved, a 409
+     *  `manual_order_exists` otherwise), a move of ONE session next to another,
+     *  or a clear that lands only at the revision it names. Answers the stored
+     *  order and its revision. */
+    setManualOrder: (body: ManualOrderWrite) => post('/api/chat/manual-order', body)
+      .then(j) as Promise<{ ok: boolean; order: string[]; rev: number }>,
     // Tags
     chatTags: () => fetch('/api/chat/tags', { headers: { ..._sk } }).then(j),
     createChatTag: (name: string, color?: string, status?: boolean) => post('/api/chat/tags', { name, color: color || '', status: !!status }).then(j),

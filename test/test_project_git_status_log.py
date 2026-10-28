@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from git_maintenance_helpers import git_maintenance_off_entries
 
 from conftest import make_dir_link
 from kiro_crew.dashboard.handlers import (
@@ -120,21 +121,28 @@ def outside_any_repo(tmp_path, discovery_stops_at_tmp_path) -> Path:
     return plain
 
 
+def _fixture_git_env() -> dict[str, str]:
+    """The suite's env with a fixed identity, no host config and auto maintenance off."""
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "T",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "T",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+    }
+    env.update(git_maintenance_off_entries(env))
+    return env
+
+
 def _git(cwd, *args) -> None:
     subprocess.run(
         ["git", *args],
         cwd=str(cwd),
         check=True,
         capture_output=True,
-        env={
-            **os.environ,
-            "GIT_AUTHOR_NAME": "T",
-            "GIT_AUTHOR_EMAIL": "t@example.com",
-            "GIT_COMMITTER_NAME": "T",
-            "GIT_COMMITTER_EMAIL": "t@example.com",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_SYSTEM": os.devnull,
-        },
+        env=_fixture_git_env(),
     )
 
 
@@ -863,7 +871,6 @@ class TestGitLog:
     @pytest.mark.asyncio
     async def test_limit_parameter(self, repo, mock_sel):
         """limit=1 returns only 1 commit even if there are more."""
-        # Add a second commit
         (repo / "d.txt").write_text("x\n")
         _git(repo, "add", "d.txt")
         _git(repo, "commit", "-qm", "second commit")
@@ -1589,3 +1596,60 @@ class TestListingCap:
         assert resp.status == 200
         assert data["files"] == []
         assert "truncated" not in data
+
+
+class TestConfigDefinedHooks:
+    """A ``hook.<name>.command`` in the repo's config (git 2.54+) is not reached by
+    ``core.hooksPath``; ``status`` would run ``post-index-change`` on every poll."""
+
+    @staticmethod
+    def _plant(repo: Path, marker: Path) -> None:
+        _git(repo, "config", "hook.pwn.event", "post-index-change")
+        _git(repo, "config", "hook.pwn.command", f"echo pwn >> '{marker}' #")
+
+    @staticmethod
+    def _spy(monkeypatch) -> list[list[str]]:
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        seen: list[list[str]] = []
+        inner = files_mod.sandboxed_spawn_argv
+
+        def spy(argv, *a, **kw):
+            seen.append(list(argv))
+            return inner(argv, *a, **kw)
+
+        monkeypatch.setattr(files_mod, "sandboxed_spawn_argv", spy)
+        return seen
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route, verb", [("status", "status"), ("log", "log")])
+    async def test_every_git_call_disables_the_hook(
+        self, repo, tmp_path, mock_sel, monkeypatch, route, verb
+    ):
+        marker = tmp_path / "marker"
+        self._plant(repo, marker)
+        (repo / "a.txt").write_text("changed\n")
+        seen = self._spy(monkeypatch)
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/{route}?path={repo}")
+        assert resp.status == 200
+        runs = [a for a in seen if verb in a]
+        assert runs, seen
+        for argv in runs:
+            assert "hook.pwn.enabled=false" in argv, argv
+            assert argv.index("hook.pwn.enabled=false") < argv.index(verb)
+        assert not marker.exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ["status", "log"])
+    async def test_scan_failure_is_unavailable(self, repo, mock_sel, monkeypatch, route):
+        from kiro_crew.dashboard.handlers import files as files_mod
+        from kiro_crew.git_config_hooks import ConfigHookScanError
+
+        def refuse(*a, **k):
+            raise ConfigHookScanError("refused")
+
+        monkeypatch.setattr(files_mod, "config_hook_disable_args_sandboxed", refuse)
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/{route}?path={repo}")
+        assert resp.status == 503

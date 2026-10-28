@@ -30,6 +30,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from git_maintenance_helpers import git_maintenance_off_entries
 
 from kiro_crew.platform.update_governance import _GIT_LOCATION_VARS, git_command_env
 
@@ -75,6 +76,8 @@ def _fixture_git_env() -> dict[str, str]:
     env[f"GIT_CONFIG_KEY_{count}"] = "init.templateDir"
     env[f"GIT_CONFIG_VALUE_{count}"] = ""
     env["GIT_CONFIG_COUNT"] = str(count + 1)
+    # Last, so the entry lands after the GIT_CONFIG_COUNT this helper set.
+    env.update(git_maintenance_off_entries(env))
     return env
 
 
@@ -293,6 +296,21 @@ class TestWholeTreeOverride:
         _, label = scope.changed_paths()
 
         assert scope.added_lines(label) is None
+
+    def test_base_ref_names_the_commit_each_label_diffs_against(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # check_black_formatting reads the baseline at this commit; a second
+        # copy of the label mapping there is how the two would come to disagree.
+        _set_origin_main(repo)
+        merge_base = _git(repo, "merge-base", "origin/main", "HEAD")
+        assert scope.base_ref("origin/main...HEAD") == merge_base.strip()
+        assert scope.base_ref("merge HEAD^1..HEAD") == "HEAD^1"
+        assert scope.base_ref("merge parents") == "HEAD^1"
+        assert scope.base_ref("nosuchref...HEAD") is None
+        monkeypatch.setenv(scope.WHOLE_TREE_ENV, "1")
+        _, label = scope.changed_paths()
+        assert scope.base_ref(label) is None
 
     def test_the_audit_lane_opts_in(self) -> None:
         # The wiring, not the mechanism: without this env the Main Ratchet Audit

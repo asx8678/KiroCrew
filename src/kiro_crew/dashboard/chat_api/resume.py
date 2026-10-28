@@ -47,6 +47,7 @@ if TYPE_CHECKING:
         durable_row_count,
         effective_session_key,
         is_channel_session_key,
+        load_window_off_loop,
         logger,
         members_mod,
         note_crew_log_class,
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
         read_bounded_json,
         redact_credentials,
         redact_exfiltration_urls,
+        remember_unknown_row_fields,
         sel,
         slot_history_key,
         slot_transcript_key,
@@ -174,6 +176,7 @@ async def _reconcile_slot_window(state: DashboardState, slot: "_ChatSlot") -> No
             mint_mid=False,
         )
         carry_provenance(slot.messages[-1], msg)
+        remember_unknown_row_fields(slot, msg)
         _attach_variants(slot, msg)
     # The appended rows came from the file, so drain the replay frames and
     # mark the window as persisted (not dirty) — the next save must not
@@ -252,6 +255,10 @@ async def _live_slot_for_resume(
 
 async def _live_slot_resume_payload(state, existing) -> dict:
     """The resume endpoint's dedup body: the already-open slot's live window."""
+    # The live slot a resume resolves to can be a restored sidebar row, under a
+    # name the per-slot route's own lookup did not match (``dashboard:<key>``):
+    # its window loads here, with the read off the loop, before anything reads it.
+    await load_window_off_loop(existing)
     await _reconcile_slot_window(state, existing)
     window = _collapse_wire_rows(existing.messages)
     total = len(window)
@@ -274,6 +281,7 @@ async def _live_slot_resume_payload(state, existing) -> dict:
         "memory_mode": existing.memory_mode,
         "mode": existing.mode,
         "surface": existing.mode,
+        "folder_id": existing.folder_id,
     }
 
 
@@ -399,9 +407,9 @@ def _materialise_slot_from_history(
     transcript rows. It reads nothing from the request, and — this is the
     load-bearing constraint of the fold (RFC section 7.1b) — it applies exactly
     the metadata field set resume applies and DOES NOT apply
-    ``executor`` / ``instance_id`` / ``remote_slot``. A session bound to a remote
-    instance therefore comes back LOCAL when materialised here, which is the
-    behaviour to preserve: rehydrating the remote binding is the startup restore
+    ``executor`` / ``instance_id`` / ``remote_slot``. A relay archive therefore
+    comes back LOCAL when materialised here, which is the behaviour to
+    preserve: rehydrating the archive marker is the startup restore
     path's job (``_rehydrate_slot_from_history`` in chat_persistence), not this
     one. Do not add remote-binding application here "for consistency" — that is
     the prohibited change, and it is pinned by a test.
@@ -623,7 +631,8 @@ def _hydrate_slot_from_history(
     slot._disk_older_count = max(0, disk_total - len(messages))
     # Durable-only view of the same prefix, recomputed from the on-disk rows —
     # the base absolute message positions are built over. ``islice`` avoids
-    # copying the whole prefix on the event loop. See _ChatSlot.__init__.
+    # copying the whole prefix on the event loop. See ``init_transcript_fields`` in
+    # dashboard/state_parts/slot_transcript.py.
     slot._disk_older_durable_count = durable_row_count(islice(all_messages, slot._disk_older_count))
     # Synchronous construction: rows arrive already content-redacted from the
     # caller's pre-construction pass (resume redacts its window, import redacts
@@ -658,6 +667,7 @@ def _hydrate_slot_from_history(
         # See the equivalent call in _rehydrate_slot_from_history: resume loads
         # the window that the next save re-serializes.
         carry_provenance(slot.messages[-1], m)
+        remember_unknown_row_fields(slot, m)
         _attach_variants(slot, m)
     slot.drain()
     slot._resumed_count = len(slot.messages)
@@ -736,6 +746,10 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
             "memory_mode": slot.memory_mode,
             "mode": slot.mode,
             "surface": slot.mode,
+            # The folder the session is filed in, so the client can open a
+            # collapsed folder path and show the resumed row it switched to.
+            # The slots push carries it too, but can arrive after the switch.
+            "folder_id": slot.folder_id,
         }
     )
 
@@ -754,6 +768,7 @@ async def resume_slot_from_history(
     request_title: str = "",
     containment: "Callable[[_ChatSlot], Awaitable[ResumeRefusal | None]] | None" = None,
     final_check: "Callable[[_ChatSlot], ResumeRefusal | None] | None" = None,
+    rebind_manager: bool = True,
 ) -> ResumeOutcome:
     """Load an archived (history) session back into a live slot.
 
@@ -795,6 +810,11 @@ async def resume_slot_from_history(
     immediately before the publish, for the hook's store-free answers (slot
     fields, caps); a refusal there restores the marker the deferred clear just
     dropped. Nothing is published on any refusal. A human click passes neither.
+
+    After the publish, a ``session_handoff`` record for the session is moved to the
+    new tab id (:func:`session_managers.rebind_resumed`), or its manager would lose
+    it. ``rebind_manager=False`` leaves that to the caller, which session control's
+    revive uses to write its allowed audit row first.
 
     Refusals come back as :class:`ResumeOutcome.refusal` rather than being
     raised, because the wire wrapper reproduces each one's historical body and
@@ -860,7 +880,7 @@ async def resume_slot_from_history(
         "chat_resume",
         (history_key, _history_key_for(name), slot_transcript_key(name)),
     ):
-        return ResumeOutcome(refusal=ResumeRefusal("not found", "slot_not_found", 404))
+        return ResumeOutcome(refusal=_RESUME_APP_NOT_FOUND)
 
     # Boundary for the compare-and-clear below, captured BEFORE the metadata read
     # it is compared against. Everything from here to the ``clear_closed`` call is
@@ -878,6 +898,8 @@ async def resume_slot_from_history(
     # app token, otherwise leaves it untagged, which is invisible to cross-slot
     # scopes) rather than claiming USER on a conversation we cannot attribute.
     meta = state.conversation_log.get_metadata(history_key)
+    # The archived tab id, read before anything rebuilds the slot under a new one.
+    archived_tab = str(meta.get("tab_id") or "")
 
     # An app may open only a transcript it owns, and only under a name it may
     # hold. A persisted conversation has no live slot for the per-slot checkpoint
@@ -1716,8 +1738,12 @@ async def resume_slot_from_history(
     # resume resolved it and hit the idempotency guard) but hidden from the
     # payload while under construction. End construction and push once: this is
     # the first frame any client sees, and it shows a fully hydrated session.
-    # Nothing awaits between here and the return.
     state.end_slot_construction(slot.key)
     _sync_dashboard_slots(state)
     state.push_slots_update()
+    if rebind_manager:
+        from kiro_crew.dashboard import session_managers
+
+        # Shielded: a request cancelled here must not leave the record on the old tab.
+        await asyncio.shield(session_managers.rebind_resumed(slot, archived_tab))
     return ResumeOutcome(slot=slot, total=total)

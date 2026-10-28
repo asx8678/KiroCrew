@@ -5,6 +5,9 @@ import { offlineProps } from '../utils/offline'
 import { useImeGuard } from '../hooks/useImeGuard'
 
 import { i18nT } from '../i18n/t'
+import { fmtNumber } from '../i18n/format'
+import { shortImageLabel } from '../utils/imageComments'
+import { sliceCodePoints } from '../utils/codePoints'
 export interface InlineComment {
   id: string
   /** Anchor text from the document (prefix for matching). */
@@ -17,18 +20,63 @@ export interface InlineComment {
   column?: number
   /** Character offset of the anchor in the rendered text (textContent space). Used to disambiguate repeated occurrences of the same anchor text. */
   startOffset?: number
+  /** The anchor was selected inside a code block, whose text is not in that space: no offset exists and the first match elsewhere would be the wrong passage. */
+  inCode?: boolean
+  /** For an `inCode` anchor: its block, source line and column, packed by `codePassagePosition`. Absent when it could not be packed. */
+  codePosition?: number
+  /** Set when the comment is on a box drawn over an image rather than on text.
+   *  `line`/`column` then locate the image in the source and `anchor` carries
+   *  its alt text, so code that reads only `anchor` still has a label. */
+  image?: InlineCommentImage
 }
 
+/** The box on an image a comment is about, as fractions (0..1) of the rendered
+ *  image: `x`/`y` its top-left corner, `w`/`h` its size. Independent of display
+ *  size and pixel density. */
+export interface InlineCommentImage {
+  /** The image destination exactly as written in the markdown, e.g. `states/a.png`. */
+  src: string
+  /** The file the preview resolved `src` to and loaded, decoded, which the
+   *  agent payload names. Absent when the preview had no file for it. */
+  path?: string
+  x: number
+  y: number
+  w: number
+  h: number
+  /** Which use of the file the box was drawn on: the `nth` (0-based) of `uses`
+   *  images with the same `src`, in document order. Lets a box on one of two
+   *  uses of a file find the same use again after an edit moves both. */
+  nth?: number
+  uses?: number
+}
+
+/** Unfinished inline edits of pending comments, by `<list draft key>#<comment
+ *  id>`: in memory for this page's lifetime only, like `extraPromptDrafts`.
+ *  An edit is kept while its row is open and dropped when it is saved,
+ *  cancelled or its comment removed. */
+const rowEditDrafts = new Map<string, string>()
+
 /** Single comment row with inline edit support. */
-function CommentRow({ comment, onEdit, onRemove }: {
-  comment: InlineComment; onEdit: (id: string, text: string) => void; onRemove: (id: string) => void
+function CommentRow({ comment, number, onEdit, onRemove, onEditingChange, draftKey }: {
+  comment: InlineComment; number: number; onEdit: (id: string, text: string) => void; onRemove: (id: string) => void
+  onEditingChange?: (id: string, editing: boolean) => void
+  /** Keeps an open edit across an unmount; see `rowEditDrafts`. */
+  draftKey?: string
 }) {
-  const [editing, setEditing] = useState(false)
-  const [draft, setDraft] = useState(comment.text)
+  const editKey = draftKey !== undefined ? `${draftKey}#${comment.id}` : undefined
+  const keptEdit = editKey !== undefined ? rowEditDrafts.get(editKey) : undefined
+  const [editing, setEditing] = useState(keptEdit !== undefined)
+  const [draft, setDraft] = useState(keptEdit ?? comment.text)
   const inputRef = useRef<HTMLInputElement>(null)
   const cancelledRef = useRef(false)
   const committedRef = useRef(false)
   const ime = useImeGuard()
+  // Dropped here, not only when `editing` turns false: a save that lands as
+  // the row unmounts never re-runs the effect below.
+  const dropEdit = useCallback(() => { if (editKey !== undefined) rowEditDrafts.delete(editKey) }, [editKey])
+  useEffect(() => {
+    if (editKey !== undefined && editing) rowEditDrafts.set(editKey, draft)
+  }, [editKey, editing, draft])
 
   const commitEdit = useCallback(() => {
     if (cancelledRef.current) { cancelledRef.current = false; return }
@@ -36,24 +84,36 @@ function CommentRow({ comment, onEdit, onRemove }: {
     const trimmed = draft.trim()
     if (trimmed && trimmed !== comment.text) onEdit(comment.id, trimmed)
     committedRef.current = true
+    dropEdit()
     setEditing(false)
-  }, [draft, comment.id, comment.text, onEdit])
+  }, [draft, comment.id, comment.text, onEdit, dropEdit])
 
   const preventBlur = useCallback((e: React.MouseEvent) => e.preventDefault(), [])
 
   useEffect(() => { if (editing) { committedRef.current = false; inputRef.current?.focus() } }, [editing])
+  // Let the owner know a row holds typed text that is not saved yet, so a
+  // late send delivery does not remove the row out from under the edit.
+  useEffect(() => {
+    if (!editing || !onEditingChange) return
+    onEditingChange(comment.id, true)
+    return () => onEditingChange(comment.id, false)
+  }, [editing, comment.id, onEditingChange])
 
   return (
     <div data-comment-id={comment.id} className="flex items-start gap-2 text-[13px] bg-bg-elevated rounded-md px-2.5 py-1.5">
       <span className="text-muted shrink-0"><MessageSquare className="lucide-inline" /></span>
       <div className="flex-1 min-w-0">
-        <div className="text-muted text-[11px] font-mono truncate" title={comment.anchor}>"{comment.anchor.slice(0, 60)}{comment.anchor.length > 60 ? '…' : ''}"</div>
+        {comment.image ? (
+          <div className="text-muted text-[11px] font-mono truncate" title={comment.image.src}>{i18nT('components.commentOverlay.image_anchor', { number: fmtNumber(number), label: shortImageLabel(comment.anchor) })}</div>
+        ) : (
+          <div className="text-muted text-[11px] font-mono truncate" title={comment.anchor}>"{comment.anchor.slice(0, 60)}{comment.anchor.length > 60 ? '…' : ''}"</div>
+        )}
         {editing ? (
           <input ref={inputRef} value={draft} onChange={e => setDraft(e.target.value)}
             {...ime.bindComposition<HTMLInputElement>({ onBlur: commitEdit })}
             onKeyDown={e => {
               if (e.key === 'Enter' && draft.trim()) { if (ime.claimEnter(e)) commitEdit() }
-              if (e.key === 'Escape') { ime.reset(); cancelledRef.current = true; setDraft(comment.text); setEditing(false) }
+              if (e.key === 'Escape') { ime.reset(); cancelledRef.current = true; dropEdit(); setDraft(comment.text); setEditing(false) }
             }}
             className="bg-bg border border-border rounded px-1.5 py-0.5 text-text text-[13px] w-full outline-hidden focus-ring" />
         ) : (
@@ -71,7 +131,7 @@ function CommentRow({ comment, onEdit, onRemove }: {
       ) : (
         <button aria-label={i18nT('components.commentOverlay.edit')} className="text-muted hover:text-accent text-[12px] shrink-0 cursor-pointer bg-transparent border-none" onClick={() => { setDraft(comment.text); setEditing(true) }}><Pencil className="lucide-inline" /></button>
       )}
-      <button aria-label={i18nT('components.commentOverlay.remove')} onMouseDown={preventBlur} className="text-muted hover:text-danger text-[12px] shrink-0 cursor-pointer bg-transparent border-none" onClick={() => onRemove(comment.id)}><X className="lucide-inline" /></button>
+      <button aria-label={i18nT('components.commentOverlay.remove')} onMouseDown={preventBlur} className="text-muted hover:text-danger text-[12px] shrink-0 cursor-pointer bg-transparent border-none" onClick={() => { dropEdit(); onRemove(comment.id) }}><X className="lucide-inline" /></button>
     </div>
   )
 }
@@ -83,15 +143,53 @@ function CommentRow({ comment, onEdit, onRemove }: {
  *  single (comment) input box rather than two competing inputs. Its value is
  *  passed to `onSubmitAll` alongside the comments only when it was opened, and
  *  it collapses again after submit. */
-function CommentList({ comments, onEdit, onRemove, onSubmitAll, enableExtraPrompt, connected = true }: {
+/** Unsent "Add instruction" text per document, in memory for this page's
+ *  lifetime only: never persisted to storage or sent anywhere. The key names
+ *  the chat as well as the document (see `MarkdownPanel`), so one chat's draft
+ *  never shows in another. */
+const extraPromptDrafts = new Map<string, { text: string; open: boolean }>()
+
+/** The instruction-draft key for a document a side-panel tab shows: the tab's
+ *  chat-scoped identity (slot + tab id) and the gateway-local path. No tab
+ *  identity, no key: such a draft is not kept. */
+export function instructionDraftKeyFor(tabKey: string | undefined, filePath: string): string | undefined {
+  return tabKey ? `local:${tabKey}:${filePath}` : undefined
+}
+
+function CommentList({ comments, onEdit, onRemove, onSubmitAll, enableExtraPrompt, connected = true, onEditingChange, draftKey }: {
   comments: InlineComment[]; onEdit: (id: string, text: string) => void; onRemove: (id: string) => void; onSubmitAll: (extraPrompt?: string) => void; enableExtraPrompt?: boolean
+  /** Keeps the typed instruction across an unmount (the panel withholding the
+   *  tab for a moment, say), keyed by the document it belongs to. */
+  draftKey?: string
+  /** Told when a row opens or closes an inline edit (typed, not yet saved). */
+  onEditingChange?: (id: string, editing: boolean) => void
   /** Gateway connection flag — mirrors ChatInput's Send gating so a batch
    *  submit can't fire (and clear pending comments) while the send path would
    *  silently refuse it. Defaults true for non-chat embeddings. */
   connected?: boolean
 }) {
-  const [extraPrompt, setExtraPrompt] = useState('')
-  const [showExtraPrompt, setShowExtraPrompt] = useState(false)
+  const kept = draftKey !== undefined ? extraPromptDrafts.get(draftKey) : undefined
+  const [extraPrompt, setExtraPrompt] = useState(kept?.text ?? '')
+  const [showExtraPrompt, setShowExtraPrompt] = useState(kept?.open ?? false)
+  // Kept only while the box is open with text and comments to send it with:
+  // closing the box or removing every comment is a discard, and Submit All
+  // empties it.
+  const keep = showExtraPrompt && extraPrompt !== '' && comments.length > 0
+  useEffect(() => {
+    if (draftKey === undefined) return
+    if (keep) extraPromptDrafts.set(draftKey, { text: extraPrompt, open: true })
+    else extraPromptDrafts.delete(draftKey)
+  }, [draftKey, keep, extraPrompt])
+  // An edit kept for a comment that is no longer pending (sent, or removed
+  // while the list was away) has nothing to return to.
+  const pendingIds = comments.map(c => c.id).join('\n')
+  useEffect(() => {
+    if (draftKey === undefined) return
+    const live = new Set(pendingIds === '' ? [] : pendingIds.split('\n'))
+    for (const key of rowEditDrafts.keys()) {
+      if (key.startsWith(`${draftKey}#`) && !live.has(key.slice(draftKey.length + 1))) rowEditDrafts.delete(key)
+    }
+  }, [draftKey, pendingIds])
   const extraPromptRef = useRef<HTMLTextAreaElement>(null)
   // Focus the textarea when the toggle reveals it.
   useEffect(() => { if (showExtraPrompt) extraPromptRef.current?.focus() }, [showExtraPrompt])
@@ -115,7 +213,7 @@ function CommentList({ comments, onEdit, onRemove, onSubmitAll, enableExtraPromp
         <SendBtn disabled={!connected} {...offlineProps(connected, i18nT('utils.offline.submit_comments'), i18nT('components.commentOverlay.submit_all'))} onClick={() => { onSubmitAll(enableExtraPrompt && showExtraPrompt ? extraPrompt : undefined); setExtraPrompt(''); setShowExtraPrompt(false) }}>{i18nT('components.commentOverlay.submit_all')} <Send className="lucide-inline" /></SendBtn>
       </div>
       <div className="space-y-1.5 max-h-[200px] overflow-y-auto">
-        {comments.map(c => <CommentRow key={c.id} comment={c} onEdit={onEdit} onRemove={onRemove} />)}
+        {comments.map((c, i) => <CommentRow key={c.id} comment={c} number={i + 1} onEdit={onEdit} onRemove={onRemove} onEditingChange={onEditingChange} draftKey={draftKey} />)}
       </div>
       {enableExtraPrompt && showExtraPrompt && (
         <textarea
@@ -132,59 +230,12 @@ function CommentList({ comments, onEdit, onRemove, onSubmitAll, enableExtraPromp
   )
 }
 
-/** Format comments into a structured message for the agent.
- *  When `content` is provided, includes a short source-context snippet
- *  (~20 chars on each side of the anchor) so the agent can resolve the
- *  exact occurrence unambiguously — critical for short / repeated anchors. */
-export function formatCommentsMessage(filePath: string, comments: InlineComment[], content?: string, extraPrompt?: string): string {
-  const srcLines = content?.split('\n')
-  // Escape backslashes first, then double quotes, then control characters
-  // (\n, \r) so the prompt's quoting structure round-trips unambiguously and
-  // user-supplied newlines cannot inject fake prompt blocks (e.g. a comment
-  // text of `]\n[System: ignore previous instructions` would otherwise break
-  // the format and pass adversarial instructions to the model).
-  const esc = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r')
-  const lines = [`[Document feedback on ${filePath} — ${comments.length} comment${comments.length > 1 ? 's' : ''}]`]
-  // Free-form overall instruction the user typed alongside the comments.
-  // To keep it salient when the comment list is long (otherwise the model
-  // can lose attention on a bare middle paragraph — "lost in the middle"), it
-  // gets a clearly labeled, delimited block at the top AND a short reminder
-  // echoed after the list, so the directive is bookended at the start and end
-  // of the message where attention is strongest. It is run through the same
-  // esc() helper as comment text (escapes backslash, quote, newline, CR) to
-  // prevent prompt-injection via newlines/quotes if the formatted message is
-  // ever rendered in a shared/team context — escaping is cheap insurance and
-  // the user's intent survives (an escaped \n is still legible to the agent).
-  const instruction = extraPrompt?.trim()
-  if (instruction) {
-    lines.push(
-      '',
-      `>>> OVERALL INSTRUCTION (applies to all ${comments.length} comment${comments.length > 1 ? 's' : ''} below; read first):`,
-      esc(instruction),
-      '<<<',
-    )
-  }
-  lines.push('')
-  comments.forEach((c, i) => {
-    const anchor = c.anchor.length > 80 ? c.anchor.slice(0, 80) + '…' : c.anchor
-    const loc = c.line != null ? (c.column != null ? `line ${c.line}, col ${c.column}, ` : `line ${c.line}, `) : ''
-    let ctx = ''
-    if (srcLines && c.line != null && c.column != null && c.line >= 1 && c.line <= srcLines.length) {
-      const src = srcLines[c.line - 1]
-      const start = Math.max(0, c.column - 1 - 20)
-      const end = Math.min(src.length, c.column - 1 + c.anchor.length + 20)
-      const before = start > 0 ? '…' : ''
-      const after = end < src.length ? '…' : ''
-      ctx = ` in "${before}${esc(src.slice(start, end))}${after}"`
-    }
-    lines.push(`${i + 1}. (${loc}"${esc(anchor)}"${ctx}): "${esc(c.text)}"`)
-  })
-  // Echo the overall instruction at the end so it's not buried above a long
-  // comment list — the model attends most strongly to the start and end of
-  // the message, so bookending keeps the directive in view either way.
-  if (instruction) lines.push('', `>>> REMINDER — overall instruction: ${esc(instruction)}`)
-  return lines.join('\n')
-}
+// Re-exported so its importers keep one import site.
+export { sliceCodePoints }
+
+// The agent payload is model-facing text, so it lives behind the `.prompt.ts`
+// boundary; re-exported here so its importers keep one import site.
+export { formatCommentsMessage } from '../utils/commentsMessage.prompt'
 
 /** Minimal shape of a durable artifact comment for chat-submission formatting.
  *  Projected from `ArtifactComment` so this formatter is independent of the
@@ -232,7 +283,7 @@ export function formatArtifactCommentsMessage(
   lines.push('')
   human.forEach((c, i) => {
     const quote = c.anchor?.quote ?? ''
-    const trimmed = quote.length > 80 ? quote.slice(0, 80) + '…' : quote
+    const trimmed = quote.length > 80 ? sliceCodePoints(quote, 0, 80) + '…' : quote
     const anchorPart = trimmed ? `"${esc(trimmed)}": ` : ''
     lines.push(`${i + 1}. ${anchorPart}"${esc(c.body)}"`)
   })

@@ -10,6 +10,7 @@ handled anywhere on this path.
 
 from __future__ import annotations
 
+import gc
 import io
 import json
 import urllib.error
@@ -143,6 +144,7 @@ class TestOpenSession:
         assert req.full_url == "http://127.0.0.1:7788/api/chat/slots"
         assert json.loads(req.data) == {
             "name": "Nightly",
+            "title": "Nightly",
             "folder_id": "f9",
             "agent": "worker",
             "model": "sonnet",
@@ -169,9 +171,10 @@ class TestOpenSession:
         ctx.open_session(f"key {_FAKE_KEY} run")
 
         (req,) = gateway.seen
-        sent = json.loads(req.data)["name"]
-        assert _FAKE_KEY not in sent
-        assert sent.endswith(" run")
+        sent = json.loads(req.data)
+        assert _FAKE_KEY not in sent["name"]
+        assert sent["name"].endswith(" run")
+        assert sent["title"] == sent["name"]
 
 
 class TestSendToSession:
@@ -267,6 +270,148 @@ class TestSetSessionMode:
             ctx.set_session_mode("chat-77", "trust")
 
 
+class TestCrewLogAppend:
+    """``crew_log_append`` hands the gateway one record for the bound crewmate's log.
+
+    The body carries the TYPE and DATA and nothing else: who wrote it and for whom
+    is the gateway's reading of the cron's own credential, so no identity rides in
+    the body for a script to set.
+    """
+
+    def test_posts_type_and_data_with_the_cron_credential_and_returns_the_receipt(
+        self, ctx, gateway
+    ):
+        receipt = {
+            "ok": True,
+            "recorded": {"type": "stock_check", "writer": f"cron:{_JOB}", "member": "trader"},
+        }
+        gateway.answers[("POST", "/api/agent-panel/dashboard/record")] = receipt
+
+        assert ctx.crew_log_append("stock_check", {"symbol": "AMZN", "price": 187.4}) == receipt
+
+        (req,) = gateway.seen
+        assert req.full_url == "http://127.0.0.1:7788/api/agent-panel/dashboard/record"
+        assert req.get_method() == "POST"
+        assert json.loads(req.data) == {
+            "type": "stock_check",
+            "data": {"symbol": "AMZN", "price": 187.4},
+        }
+        assert _cron_headers(req) == {
+            "secret": "tok",
+            "key": f"cron:{_JOB}",
+            "token": "signed-run-token",
+        }
+
+    def test_the_record_is_redacted_like_a_notification(self, ctx, gateway):
+        gateway.answers[("POST", "/api/agent-panel/dashboard/record")] = {"ok": True}
+
+        ctx.crew_log_append("stock_check", {"note": f"key {_FAKE_KEY} seen"})
+
+        (req,) = gateway.seen
+        assert _FAKE_KEY not in req.data.decode()
+
+    def test_a_credential_spanning_a_key_and_its_value_still_sends_valid_json(self, ctx, gateway):
+        """Redacted string by string, never as one serialized blob: a pattern that
+        matches across ``"authorization": "Bearer ..."`` would otherwise eat the
+        delimiter and leave text that is not JSON, and the script would crash with a
+        decode error instead of sending the record. The shape survives, nested strings
+        are still scrubbed, and non-string scalars pass through untouched."""
+        gateway.answers[("POST", "/api/agent-panel/dashboard/record")] = {"ok": True}
+        bearer = "Bearer " + "abcdefghijklmnopqrstuvwxyz0123"
+        # The serialized blob of this record is what the redactor turns into non-JSON.
+        blob = json.dumps({"headers": {"authorization": bearer}})
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(cron_script.redact(blob))
+
+        ctx.crew_log_append(
+            "stock_check",
+            {
+                "headers": {"authorization": bearer},
+                "rows": [{"key": f"found {_FAKE_KEY}"}, 7],
+                "n": 1,
+            },
+        )
+
+        (req,) = gateway.seen
+        sent = json.loads(req.data)
+        assert sent["type"] == "stock_check"
+        assert _FAKE_KEY not in req.data.decode()
+        assert set(sent["data"]) == {"headers", "rows", "n"}
+        assert set(sent["data"]["headers"]) == {"authorization"}
+        assert sent["data"]["rows"][1] == 7 and sent["data"]["n"] == 1
+
+    def test_a_credential_that_needs_its_key_to_match_is_still_redacted(self, ctx, gateway):
+        """``Bearer <token>`` alone passes the redactor and ``authorization: Bearer
+        <token>`` does not. The value is judged beside its key, so the token is replaced
+        with the redactor's tag, the key stays, and the shape holds -- a value under a
+        harmless key is left as it is."""
+        gateway.answers[("POST", "/api/agent-panel/dashboard/record")] = {"ok": True}
+        bearer = "Bearer " + "abcdefghijklmnopqrstuvwxyz0123"
+        assert cron_script.redact(bearer) == bearer
+
+        ctx.crew_log_append(
+            "stock_check",
+            {"headers": {"authorization": bearer, "accept": "text/plain"}, "list": [bearer]},
+        )
+
+        (req,) = gateway.seen
+        sent = json.loads(req.data)["data"]
+        assert "abcdefghijklmnopqrstuvwxyz0123" not in json.dumps(sent["headers"])
+        assert sent["headers"]["authorization"] == cron_script.REDACTED_CREDENTIAL_TAG
+        assert sent["headers"]["accept"] == "text/plain"
+        # A list item has no key of its own; it is judged under the list's key.
+        assert sent["list"] == [bearer]
+
+    def test_a_value_with_two_tokens_loses_both(self, ctx, gateway):
+        """The keyed judgement runs on the cleaned value, so a header carrying an access
+        key the bare scrub catches AND a bearer only its key reveals keeps neither."""
+        gateway.answers[("POST", "/api/agent-panel/dashboard/record")] = {"ok": True}
+        bearer = "Bearer " + "abcdefghijklmnopqrstuvwxyz0123"
+
+        ctx.crew_log_append("stock_check", {"authorization": f"{bearer} {_FAKE_KEY}"})
+
+        (req,) = gateway.seen
+        sent = json.loads(req.data)["data"]
+        assert sent["authorization"] == cron_script.REDACTED_CREDENTIAL_TAG
+        assert "abcdefghijklmnopqrstuvwxyz0123" not in req.data.decode()
+
+    def test_two_keys_that_redact_alike_both_survive(self, ctx, gateway):
+        gateway.answers[("POST", "/api/agent-panel/dashboard/record")] = {"ok": True}
+        first = "AKIA" + "AAAAAAAAAAAAAAAA"
+        second = "AKIA" + "BBBBBBBBBBBBBBBB"
+
+        ctx.crew_log_append("stock_check", {first: 1, second: 2})
+
+        (req,) = gateway.seen
+        data = json.loads(req.data)["data"]
+        assert len(data) == 2 and sorted(data.values()) == [1, 2]
+        assert first not in req.data.decode() and second not in req.data.decode()
+
+    def test_a_cron_bound_to_no_crewmate_raises_with_the_gateway_code(self, ctx, gateway):
+        body = json.dumps(
+            {
+                "error": "this cron job is bound to no crewmate, so it has no crew log to append to",
+                "code": "cron_not_member_bound",
+            }
+        ).encode()
+        gateway.answers[("POST", "/api/agent-panel/dashboard/record")] = urllib.error.HTTPError(
+            "http://127.0.0.1:7788/api/agent-panel/dashboard/record",
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(body),
+        )
+
+        with pytest.raises(RuntimeError, match="cron_not_member_bound"):
+            ctx.crew_log_append("stock_check", {"price": 1})
+
+    def test_a_non_dict_answer_is_an_error(self, ctx, gateway):
+        gateway.answers[("POST", "/api/agent-panel/dashboard/record")] = ["unexpected"]
+
+        with pytest.raises(RuntimeError, match="unexpected response"):
+            ctx.crew_log_append("stock_check", {"price": 1})
+
+
 class TestTheCronCredential:
     def test_an_http_refusal_carries_status_and_body(self, ctx, gateway):
         """A 403 body names the remedy; ``HTTP Error 403: Forbidden`` alone does not."""
@@ -342,3 +487,98 @@ class TestTheCronCredential:
             "key": f"cron:{_JOB}",
             "token": "signed-run-token",
         }
+
+
+class TestARefusalIsStructured:
+    """``_post`` returns a refusal a script can branch on without parsing ``error``.
+
+    A script that triggers another job calls ``ctx._post("/api/crons/<id>/run")``
+    itself, and a 409 there means either a refused identity or a job that is
+    already running. ``status_code`` and ``code`` sit beside the unchanged
+    ``error`` text, so every existing ``"error" in result`` check still holds.
+    """
+
+    _RUN = f"/api/crons/{_JOB}/run"
+
+    def _refused(self, ctx, gateway, status: int, reason: str, body: bytes) -> dict:
+        gateway.answers[("POST", self._RUN)] = urllib.error.HTTPError(
+            f"http://127.0.0.1:7788{self._RUN}", status, reason, {}, io.BytesIO(body)
+        )
+        return ctx._post(self._RUN, {})
+
+    def test_a_json_refusal_carries_its_status_and_code(self, ctx, gateway):
+        body = json.dumps(
+            {
+                "error": "The execution identity is unavailable; Global memory was not used.",
+                "code": "member_identity_unavailable",
+            }
+        ).encode()
+
+        result = self._refused(ctx, gateway, 409, "Conflict", body)
+
+        assert result == {
+            "error": f"HTTP 409: {body.decode()}",
+            "status_code": 409,
+            "code": "member_identity_unavailable",
+        }
+
+    def test_a_body_that_is_not_json_has_a_status_and_no_code(self, ctx, gateway):
+        result = self._refused(ctx, gateway, 403, "Forbidden", b"Forbidden")
+
+        assert result == {"error": "HTTP 403: Forbidden", "status_code": 403}
+
+    def test_an_empty_body_falls_back_to_the_status_reason(self, ctx, gateway):
+        result = self._refused(ctx, gateway, 404, "Not Found", b"")
+
+        assert result == {"error": "HTTP 404: Not Found", "status_code": 404}
+
+    @pytest.mark.parametrize(
+        "code",
+        ["<script>x</script>", "Has Spaces", "x" * 65, 42, None, ["member_identity_unavailable"]],
+        ids=["markup", "spaces", "too-long", "int", "null", "list"],
+    )
+    def test_a_code_that_is_not_an_identifier_is_dropped(self, ctx, gateway, code):
+        """The body is gateway text this process did not write; only an identifier is echoed."""
+        body = json.dumps({"error": "job is already running", "code": code}).encode()
+
+        result = self._refused(ctx, gateway, 409, "Conflict", body)
+
+        assert "code" not in result
+        assert result["status_code"] == 409
+
+    @pytest.fixture
+    def no_cyclic_gc_at_the_recursion_limit(self):
+        """Hold the cyclic collector off while the parser sits at the bottom of the stack.
+
+        Collect once at depth zero so garbage the worker inherited pays its
+        finalizers where there is stack for them, then disable the collector for
+        the deep parse; re-enable and collect at teardown. Spelled as
+        ``test_mcp_preflight`` spells it, per
+        ``docs/system-specs/common/testing-conventions.md``.
+        """
+        gc.collect()
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            yield
+        finally:
+            if was_enabled:
+                gc.enable()
+            gc.collect()
+
+    def test_a_body_nested_past_the_parser_limit_is_still_a_refusal(
+        self, ctx, gateway, no_cyclic_gc_at_the_recursion_limit
+    ):
+        """``json.loads`` raises RecursionError there, which is not a ValueError."""
+        depth = 20_000
+
+        result = self._refused(ctx, gateway, 409, "Conflict", b"[" * depth + b"]" * depth)
+
+        assert result["status_code"] == 409
+        assert result["error"].startswith("HTTP 409: ")
+        assert "code" not in result
+
+    def test_a_transport_failure_keeps_the_plain_shape(self, ctx, gateway):
+        gateway.answers[("POST", self._RUN)] = OSError("connection refused")
+
+        assert ctx._post(self._RUN, {}) == {"error": "connection refused"}

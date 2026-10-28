@@ -19,7 +19,7 @@ import random
 import re
 import time
 from collections.abc import Container, Iterable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -95,9 +95,12 @@ def _humanize_cron(expr: str, tz_name: str = "") -> str:
     if tz_name and len(parts) == 5 and parts[0].isdigit() and parts[1].isdigit():
         try:
             tz = ZoneInfo(tz_name)
-            # Evaluate in job timezone, same as the scheduler does
-            base = seams.datetime.now(tz)
-            next_local = croniter(expr, base).get_next(seams.datetime).astimezone(tz)
+            # Step in the job timezone's WALL clock, then attach the zone. Given
+            # an aware zoneinfo start, croniter <6 shifts a next run that lies
+            # past a DST change by the offset change a second time, so a 3 AM
+            # job read "4:00 AM PST" through the day before a fall-back.
+            base = seams.datetime.now(tz).replace(tzinfo=None)
+            next_local = croniter(expr, base).get_next(seams.datetime).replace(tzinfo=tz)
             local_time = platform_compat.strftime(next_local, "%-I:%M %p %Z")
             # cron_descriptor produces UTC-based text; replace the time portion
             utc_base = seams.datetime.now(timezone.utc)
@@ -202,8 +205,8 @@ def is_valid_skip_date(value: object) -> bool:
         return False
 
 
-def get_local_tz() -> tuple[str, ZoneInfo]:
-    """Return (tz_name, ZoneInfo) from the published config default, or UTC.
+def get_local_tz() -> tuple[str, tzinfo]:
+    """Return (tz_name, zone) from the published config default, or UTC.
 
     Reads :func:`published_config_timezone` rather than loading ``config.json``:
     prompt assembly (``context.py``), the dashboard cron handler and the
@@ -211,6 +214,10 @@ def get_local_tz() -> tuple[str, ZoneInfo]:
     stat/read/validate would be a per-call stall
     (``no-blocking-call-on-event-loop``). The snapshot is refreshed by every
     successful config load, so a settings change still reaches a running gateway.
+
+    The fallback is :data:`datetime.timezone.utc`, not ``ZoneInfo("UTC")``: a
+    host with no system zoneinfo tree and no ``tzdata`` package cannot load
+    any zone, UTC included, and prompt assembly calls this on every chat turn.
     """
     from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
 
@@ -222,7 +229,7 @@ def get_local_tz() -> tuple[str, ZoneInfo]:
             "Failed to load timezone from config, falling back to UTC",
             exc_info=True,
         )
-        return "UTC", ZoneInfo("UTC")
+        return "UTC", timezone.utc
 
 
 # Patterns for parse_time_string
@@ -245,7 +252,7 @@ _UNIT_SECS = {
 }
 
 
-def _wall_clock_resolution_error(value: datetime, tz: ZoneInfo, tz_name: str) -> str | None:
+def _wall_clock_resolution_error(value: datetime, tz: tzinfo, tz_name: str) -> str | None:
     """Return an error when a zone cannot resolve the requested wall clock."""
     clock_format = "%H:%M:%S" if value.second else "%H:%M"
     clock = value.strftime(clock_format)
@@ -300,6 +307,7 @@ def parse_time_string(s: str, tz_name: str = "") -> float | str:
     from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
 
     s = s.strip()
+    tz: tzinfo
     if tz_name:
         resolved_tz_name = tz_name
         tz = ZoneInfo(tz_name)
@@ -346,7 +354,7 @@ def parse_time_string(s: str, tz_name: str = "") -> float | str:
     return f"Error: could not parse time '{s}'. Examples: '5pm', 'in 30 minutes', 'tomorrow 9am'"
 
 
-def _job_tz(job: CronJob) -> ZoneInfo:
+def _job_tz(job: CronJob) -> tzinfo:
     """Return the job's timezone, falling back to the published default then UTC.
 
     Reads :func:`published_config_timezone` rather than loading ``config.json``.
@@ -365,7 +373,51 @@ def _job_tz(job: CronJob) -> ZoneInfo:
         return ZoneInfo(tz_name)
     except Exception:
         logger.warning("Failed to resolve timezone for job %s, using UTC", job.id, exc_info=True)
-        return ZoneInfo("UTC")
+        # Fixed UTC needs no tz database, so the Schedule page and the timer
+        # keep working on a host that has none (see get_local_tz).
+        return timezone.utc
+
+
+def backoff_delaying_next_run(job: CronJob, now: float | None = None) -> float | None:
+    """The failure-backoff end that moved this job's next run later, or ``None``.
+
+    ``None`` for a disabled job, which has no next run to move, and for a job
+    whose next scheduled slot already falls at or after the backoff end (an
+    ``every 1d`` job five failures in), whose next run the backoff leaves
+    where it was. The test is :func:`_backoff_shift`, the one
+    :func:`compute_next_run_ts` shifts by.
+    """
+    if not job.enabled:
+        return None
+    return _backoff_shift(job, _compute_next_run_ts_raw(job, now))
+
+
+def _backoff_shift(job: CronJob, unshifted: float | None) -> float | None:
+    """The backoff end when it falls after ``unshifted``, the job's next slot; else ``None``.
+
+    The one copy of the backoff-shift test, shared by :func:`compute_next_run_ts`
+    (which moves the slot) and :func:`backoff_delaying_next_run` (which reports it).
+    """
+    if unshifted is None:
+        return None
+    backoff_until = job.failure_backoff_until()
+    if backoff_until is None or unshifted >= backoff_until:
+        return None
+    return backoff_until
+
+
+def _cron_due_at_backoff_end(job: CronJob, backoff_until: float) -> bool:
+    """Whether the cron-expression ``job`` is due at its own backoff end.
+
+    The minute the backoff ends in can match the expression; the timer then wakes
+    on the end (:func:`next_wake_secs`) and the preview shows it
+    (:func:`compute_next_run_ts`). An end no datetime can hold (a hand-edited
+    store) is not due.
+    """
+    try:
+        return is_due(job, backoff_until)
+    except (ValueError, OverflowError, OSError):
+        return False
 
 
 def compute_next_run_ts(job: CronJob, now: float | None = None) -> float | None:
@@ -380,6 +432,25 @@ def compute_next_run_ts(job: CronJob, now: float | None = None) -> float | None:
     RESULT, covering every arithmetic route at the serialize site.
     """
     result = _compute_next_run_ts_raw(job, now)
+    # A cron job due at a backoff end still ahead runs then: nothing runs before
+    # the end, and next_wake_secs wakes on it. croniter's get_next is strictly
+    # after its base, so the raw lookup alone never names that end.
+    if result is not None and job.schedule.kind == "cron":
+        backoff_end = job.failure_backoff_until()
+        current = now if now is not None else time.time()
+        if (
+            backoff_end is not None
+            and backoff_end > current
+            and _cron_due_at_backoff_end(job, backoff_end)
+        ):
+            return backoff_end
+    # A failing job past the default limit: its next fire is the first slot after its backoff.
+    backoff_until = _backoff_shift(job, result)
+    if backoff_until is not None:
+        if job.schedule.kind == "cron":
+            result = _compute_next_run_ts_raw(job, backoff_until)
+        else:
+            result = backoff_until
     # Float-gated like every non-finite check in this module: a bignum int
     # result serializes as digits (valid JSON) and math.isfinite(huge_int)
     # raises OverflowError -- the exact escape this guard exists to prevent.
@@ -559,21 +630,36 @@ def compute_jitter(job: CronJob) -> float:
     return 0.0
 
 
-def is_due(job: CronJob, now: float, *, catchup_window_secs: int = 0) -> bool:
-    """Whether ``job`` is due at ``now``: its schedule has arrived and ``now`` is not a skip date.
+# Two runs of a cron job this close together that belong to one occurrence are
+# one run fired twice (see ``is_due``); adjacent minutes are at most 120 s apart.
+_SAME_OCCURRENCE_SECS = 120
 
-    ``catchup_window_secs`` (0 = off, the historical behaviour) arms the
-    CATCH-UP half for cron-expression jobs only: a boundary the host slept
-    through or the gateway was down for fires ONCE on wake, when the most
-    recent boundary is later than the job's last run and inside the window.
-    The ``last_run_ts`` comparison makes a catch-up un-double-fireable, and
-    ``skip_dates`` is evaluated against the MISSED boundary's date, not
-    today's — a skip-dated day is never caught up. An ``every``/``at`` job
-    already catches up by construction (due whenever ``now >= last_run +
-    interval`` / ``at_ts``), so the window is ignored there.
+
+def _cron_occurrence_ts(expr: str, ts: float, tz: tzinfo) -> float | None:
+    """Return the occurrence of ``expr`` that ``ts`` belongs to, or ``None``.
+
+    That is the latest occurrence at or before the end of ``ts``'s minute in
+    ``tz``, as a UTC epoch. ``None`` when croniter cannot answer, so a caller
+    never treats two unknowns as the same occurrence.
     """
     from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
 
+    try:
+        end_of_minute = seams.datetime.fromtimestamp((int(ts) // 60 + 1) * 60, tz=tz)
+        occurrence = croniter(expr, end_of_minute).get_prev(float)
+    except Exception:  # bad expression, or a timestamp out of datetime range
+        return None
+    return occurrence if isinstance(occurrence, float) else None
+
+
+def is_due(job: CronJob, now: float) -> bool:
+    """Whether ``job`` is due at ``now``: its schedule has arrived and ``now`` is not a skip date."""
+    from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
+
+    # A failing job past the default limit waits out its backoff whatever its schedule says.
+    backoff_until = job.failure_backoff_until()
+    if backoff_until is not None and now < backoff_until:
+        return False
     if job.schedule.kind == "every" and job.schedule.every_secs:
         last = job.last_run_ts or job.created_ts
         if now < last + job.schedule.every_secs:
@@ -585,28 +671,19 @@ def is_due(job: CronJob, now: float, *, catchup_window_secs: int = 0) -> bool:
         tz = _job_tz(job)
         dt = seams.datetime.fromtimestamp(now, tz=tz)
         if not seams.cron_expr_matches(job.schedule.cron_expr, dt):
-            # ── Catch-up: the current minute does not match, but a recent one
-            # might have been missed. Fire it once on wake when the boundary
-            # is inside the window and the job has not run at/after it.
-            if catchup_window_secs <= 0:
-                return False
-            prev = _prev_cron_boundary_ts(job, now)
-            if prev is None:
-                return False
-            if (job.last_run_ts or 0.0) >= prev:
-                return False  # already fired at/after that boundary
-            if now - prev > catchup_window_secs:
-                return False  # too old: today's behaviour, skip the occurrence
-            # skip_dates applies to the MISSED boundary's local date, so a
-            # skip-dated day is never caught up (evaluated against the
-            # boundary, not against today's date).
-            if job.skip_dates:
-                bnd_date = seams.datetime.fromtimestamp(prev, tz).strftime("%Y-%m-%d")
-                if bnd_date in job.skip_dates:
-                    return False
-        else:
-            # Don't re-fire within the same UTC minute (immune to DST ambiguity)
-            if job.last_run_ts and int(job.last_run_ts) // 60 == int(now) // 60:
+            return False
+        # Don't re-fire within the same UTC minute (immune to DST ambiguity)
+        if job.last_run_ts and int(job.last_run_ts) // 60 == int(now) // 60:
+            return False
+        # Nor in the next minute when both instants are one occurrence: on a
+        # spring-forward day croniter matches a skipped wall time (02:30) in two
+        # adjacent UTC minutes. The time bound keeps an occurrence that matches
+        # again much later (the repeated fall-back hour) due.
+        if job.last_run_ts and now - job.last_run_ts < _SAME_OCCURRENCE_SECS:
+            occurrence = _cron_occurrence_ts(job.schedule.cron_expr, now, tz)
+            if occurrence is not None and occurrence == _cron_occurrence_ts(
+                job.schedule.cron_expr, job.last_run_ts, tz
+            ):
                 return False
     else:
         return False
@@ -616,6 +693,29 @@ def is_due(job: CronJob, now: float, *, catchup_window_secs: int = 0) -> bool:
         if local_date in job.skip_dates:
             return False
     return True
+
+
+#: How long an enabled one-shot waits after an attempt whose fire never started.
+#: Such a job stays enabled past its ``at_ts`` so it runs once dispatch opens;
+#: keyed on ``at_ts`` alone its wake would be zero for as long as the refusal
+#: lasts, and the timer would re-fire it on every pass.
+_AT_RETRY_FLOOR_SECS = _TIMER_POLL_SECS
+
+
+def _at_next_attempt_ts(job: CronJob) -> float:
+    """When the timer should next attempt the one-shot ``job``.
+
+    Its ``at_ts``, unless an attempt already ran at or after that time. A
+    one-shot that fires, fails or is denied is parked or removed, so an enabled
+    one with such an attempt is one whose fire never started, and it is next
+    attempted one floor after that attempt. Only the wake moves: ``is_due`` is
+    unchanged, so a tick that runs for another job may still attempt it.
+    """
+    at_ts = job.schedule.at_ts or 0.0
+    last = job.last_run_ts
+    if last is not None and last >= at_ts:
+        return max(at_ts, last + _AT_RETRY_FLOOR_SECS)
+    return at_ts
 
 
 def next_wake_secs(jobs: Iterable[CronJob], claimed: Container[str], now: float) -> float | None:
@@ -632,9 +732,21 @@ def next_wake_secs(jobs: Iterable[CronJob], claimed: Container[str], now: float)
         if job.schedule.kind == "every" and job.schedule.every_secs:
             last = job.last_run_ts or job.created_ts
             next_run = last + job.schedule.every_secs
+            # Wake when the backoff ends, not on each skipped interval. A cron
+            # job keeps its boundary wakes: one landing inside the backoff is
+            # the same cheap no-op as a skip date.
+            backoff_until = job.failure_backoff_until()
+            if backoff_until is not None:
+                next_run = max(next_run, backoff_until)
             delays.append(max(0.0, next_run - now))
         elif job.schedule.kind == "at" and job.schedule.at_ts:
-            delays.append(max(0.0, job.schedule.at_ts - now))
+            # Same as `every`: a re-enabled one-shot inside its backoff would
+            # otherwise re-arm at 0 s and spin until the backoff ends.
+            next_attempt = _at_next_attempt_ts(job)
+            backoff_until = job.failure_backoff_until()
+            if backoff_until is not None:
+                next_attempt = max(next_attempt, backoff_until)
+            delays.append(max(0.0, next_attempt - now))
         elif job.schedule.kind == "cron":
             # Wake ON the next cron boundary (as `at`/`every` do), not on a
             # flat poll whose phase is unrelated to the schedule -- a phase
@@ -652,4 +764,13 @@ def next_wake_secs(jobs: Iterable[CronJob], claimed: Container[str], now: float)
                 delays.append(max(0.0, cron_next - now))
             else:
                 delays.append(_TIMER_POLL_SECS)
+            # A backoff ending inside a matching minute makes the job due at that
+            # end, which can fall between the boundary wake and the next poll.
+            backoff_until = job.failure_backoff_until()
+            if (
+                backoff_until is not None
+                and backoff_until > now
+                and _cron_due_at_backoff_end(job, backoff_until)
+            ):
+                delays.append(backoff_until - now)
     return min(delays) if delays else None

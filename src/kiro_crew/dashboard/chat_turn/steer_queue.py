@@ -1,36 +1,44 @@
-"""Steer settlement, queue entry classification and the drain's admission sweep."""
+"""Steer settlement, queue entry classification, the drain's admission sweep and the stream's
+steer arm (``_on_steer_consumed``)."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from kiro_crew.dashboard.chat_delivery import (
+    STEER_STATE_CONSUMED,
+    STEER_STATE_REQUEUED,
+    attachment_meta,
+    find_written_steer_row,
+    queued_text_for_display,
+    quote_meta,
+)
 from kiro_crew.dashboard.chat_utils import (
+    AUTOMATION_NOTICE_KIND,
     CRON_NOTIFICATION_KIND,
     MCP_APP_MESSAGE_KIND,
+    STEER_INTENT_META,
+    STEER_POSSIBLY_DELIVERED_META,
     SUBAGENT_COMPLETION_KIND,
+    _remove_queued_by_id,
+    _stamped_turn_actor,
+    is_synthetic_payload_item,
+    is_system_injection_item,
 )
+from kiro_crew.dashboard.chat_utils_injected_rows import AUTOMATION_STEER_META
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
         COMMANDS_OFF_META_KEY,
-        STEER_POSSIBLY_DELIVERED_META,
-        STEER_STATE_CONSUMED,
-        STEER_STATE_REQUEUED,
         DashboardState,
         _ChatSlot,
-        _remove_queued_by_id,
-        _stamped_turn_actor,
-        attachment_meta,
         crew_log_emit,
-        find_written_steer_row,
-        is_synthetic_payload_item,
-        is_system_injection_item,
         logger,
-        queued_text_for_display,
-        quote_meta,
+        possibly_consumed_steers,
         settle_consumed_steers,
     )
+    from kiro_crew.dashboard.chat_turn.turn_locals import _ChatTurn
 
 
 def _mark_steer_row_state(
@@ -117,7 +125,14 @@ def _settle_consumed_steers(
     # ``_refusal_notices`` settle in the same event branch, and the ``/side``
     # sidecar) settles nothing on an empty echo too.
     previous = list(slot._pending_steers)
-    remaining = settle_consumed_steers(previous, snapshot)
+    from kiro_crew.dashboard import responsive_chat
+
+    possibly_delivered = responsive_chat.settle_steers(
+        slot, previous, snapshot, possibly_consumed_steers
+    )
+    newly_possibly_delivered = set(possibly_delivered) - slot._steer_possibly_delivered
+    slot._steer_possibly_delivered.update(possibly_delivered)
+    remaining = responsive_chat.settle_steers(slot, previous, snapshot, settle_consumed_steers)
     settled_count = len(previous) - len(remaining)
     logger.debug(
         "Steer consumed for slot %s (%d settled, %d still pending)",
@@ -199,9 +214,16 @@ def _settle_consumed_steers(
             state.clear_question_pending(slot.key, blocking=False)
     slot._pending_steers[:] = remaining
     for settled_msg in set(previous) - set(remaining):
+        responsive_chat.forget_steer(slot, settled_msg)
         slot._steer_attachment_meta.pop(settled_msg, None)
+        slot._steer_act_now.discard(settled_msg)
+        slot._steer_automation.pop(settled_msg, None)
         slot._steer_decision_strips.pop(settled_msg, None)
         slot._steer_possibly_delivered.discard(settled_msg)
+    if settled_count or newly_possibly_delivered:
+        from kiro_crew.dashboard import steer_retract
+
+        steer_retract.on_settled(slot)
 
 
 def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> None:
@@ -219,9 +241,18 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
     "discard" dismisses it with one click; nothing is ever silently lost.
     A hard kill never reaches here with pending steers (the force-stop
     handler clears ``_pending_steers`` alongside ``_queue``).
+
+    A steer the person is taking back is settled first
+    (``steer_retract.on_turn_ending``): an Unsend or an Edit never reached the
+    turn, so it is not requeued, and a Queue instead is left to this requeue.
     """
+    from kiro_crew.dashboard import steer_retract
+
+    steer_retract.on_turn_ending(state, slot)
     if not slot._pending_steers:
         return
+    from kiro_crew.dashboard import responsive_chat
+
     requeued = slot._pending_steers[:]
     slot._pending_steers.clear()
     for steer_msg in reversed(requeued):
@@ -283,6 +314,19 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
         if _sid:
             _meta["sendId"] = _sid
         _meta.update(getattr(slot, "_steer_attachment_meta", {}).pop(steer_msg, {}))
+        # The composer's human asked this to act now; the turn ended before taking
+        # it. The mark lets the sub-agent hold release it rather than park it
+        # behind a wave its sender chose not to wait for.
+        _act_now: set[str] = getattr(slot, "_steer_act_now", set())
+        if steer_msg in _act_now:
+            _act_now.discard(steer_msg)
+            _meta[STEER_INTENT_META] = True
+        # An automation steer (a work-ledger wake) keeps its origin on the entry,
+        # so the drain writes it as a nudge row, alone, and never merges it into
+        # the person's own queued text.
+        _nudge = getattr(slot, "_steer_automation", {}).pop(steer_msg, None)
+        if _nudge is not None:
+            _meta[AUTOMATION_STEER_META] = _nudge
         # The decision receipt rides the entry for the same reason the two ids do:
         # the drain unions a consumed entry's meta onto the row it writes, so this is
         # the only writer a requeued steer has. Both outcomes a `message.steer`
@@ -331,6 +375,10 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
         ):
             _maybe_delivered.discard(steer_msg)
             _meta[STEER_POSSIBLY_DELIVERED_META] = True
+        responsive_meta = responsive_chat.turn_state(slot).steer_entries.get(steer_msg)
+        if responsive_meta is not None:
+            _meta.update(responsive_meta)
+            _requeue_user_origin = True
         qid = slot.queue_insert(
             0,
             steer_msg,
@@ -338,6 +386,23 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
             directive_user_origin=_requeue_user_origin,
             directive_channel_origin=_channel,
         )
+        if responsive_chat.forget_steer(slot, steer_msg):
+            entry = next(item for item in slot._queue if item["id"] == qid)
+            entry[responsive_chat.RESPONSIVE_KEY] = True
+            entry["_responsive_protected"] = True
+            responsive_chat.remember_row(
+                slot,
+                entry,
+                next(
+                    (
+                        row
+                        for row in reversed(slot.messages)
+                        if (row.get("meta") or {}).get("steer_delivery_id")
+                        == _meta.get("steer_delivery_id")
+                    ),
+                    None,
+                ),
+            )
         try:
             _push: dict = {
                 "slot": slot.key,
@@ -360,6 +425,11 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
                 # the human's own words stay as typed, anyone else's are redacted.
                 **quote_meta(_meta, user_origin=_requeue_user_origin and not _channel),
             }
+            from kiro_crew.dashboard.chat_delivery import normalize_send_id
+
+            _push_send_id = normalize_send_id(_meta.get("sendId"))
+            if _push_send_id:
+                _push_meta["sendId"] = _push_send_id
             if _push_meta:
                 _push["meta"] = _push_meta
             state.broadcast_ws("queue_push", _push)
@@ -415,6 +485,9 @@ _QUEUE_KIND_ACTORS: dict[str, str] = {
     CRON_NOTIFICATION_KIND: "cron",
     SUBAGENT_COMPLETION_KIND: "subagent",
     MCP_APP_MESSAGE_KIND: "app",
+    # A re-routed automation refusal is the monitor subsystem talking, so the
+    # turn it rides is attributed to the autonudge actor, never the person.
+    AUTOMATION_NOTICE_KIND: "autonudge",
 }
 
 
@@ -595,3 +668,45 @@ def _drop_stale_admissions(state: DashboardState, slot: _ChatSlot) -> None:
                 else ""
             ),
         )
+
+
+async def _on_steer_dropped(turn: _ChatTurn, event) -> None:
+    """kiro-cli dropped the steers it held, unread, on a take-back's clear.
+
+    A copy fanned out to every session on the process names no owner, so it
+    settles nothing here.
+    """
+    if getattr(event, "runtime_global", False):
+        return
+    from kiro_crew.dashboard import steer_retract
+
+    await steer_retract.on_dropped(turn.state, turn.slot)
+
+
+async def _on_steer_consumed(turn: _ChatTurn, event) -> None:
+    """A steer the session took in mid-turn."""
+    _person_steered_turn = turn._person_steered_turn
+    _refusal_notices = turn._refusal_notices
+    _refusal_notices_settled = turn._refusal_notices_settled
+    slot = turn.slot
+    state = turn.state
+    _had_person_steer = bool(getattr(slot, "_pending_steers", None))
+    _settle_consumed_steers(slot, event.text or "", state)
+    if _had_person_steer:
+        # A person's steer is in this turn (kiro-cli echoes
+        # consumption BEFORE the model's reply streams). Whether
+        # the quiet end has already applied or comes later, the
+        # post-terminal text drop must not eat their answer. Read
+        # before the settle, which clears the entry.
+        _person_steered_turn = True
+        turn._person_steered_turn = _person_steered_turn
+    if _refusal_notices:
+        # Same echo, same parser as the user-steer ledger: an
+        # empty echo is no evidence, and treating it as delivery
+        # would drop the fallback continuation and leave the model
+        # holding kiro-cli's "User denied tool execution"
+        # uncorrected.
+        _still_pending = settle_consumed_steers(_refusal_notices, event.text or "")
+        _refusal_notices_settled += len(_refusal_notices) - len(_still_pending)
+        turn._refusal_notices_settled = _refusal_notices_settled
+        _refusal_notices[:] = _still_pending

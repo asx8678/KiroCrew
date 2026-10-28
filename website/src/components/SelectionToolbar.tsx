@@ -1,11 +1,13 @@
 import { Fragment, useState, useEffect, useId, useLayoutEffect, useCallback, useRef } from 'react'
-import { createPortal } from 'react-dom'
+import { OverlayPortal, useLocalCrewHidden } from './overlayRoot'
 import { motion, AnimatePresence } from 'framer-motion'
 import { MessageSquareQuote, MessageCircleQuestionMark, MessageSquarePlus, X, Copy, Check, Loader2 } from 'lucide-react'
 import { copyToClipboard } from '../utils/clipboard'
 import { isTouchDevice } from '../utils/isTouchDevice'
 import { containedSelectionRange } from '../utils/selectionContainment'
+import { codePassagePosition, plainCodeFenceAtRangeStart, shadowSelectionRange } from '../utils/pierreShadow'
 import { useImeGuard } from '../hooks/useImeGuard'
+import { measureAutoGrowTextarea } from '../hooks/useAutoGrowTextarea'
 import ErrorNotice from './ErrorNotice'
 import { i18nT } from '../i18n/t'
 import { isEditableTarget } from '../utils/editableTarget'
@@ -394,16 +396,84 @@ interface SelectionToolbarProps {
   /**
    * Hide the toolbar without discarding its state. The file viewer keeps
    * inactive tabs MOUNTED (display:none), but this toolbar portals to
-   * `document.body`, so without this an open composer in a hidden tab would
+   * the body-level overlay root, so without this an open composer in a hidden tab would
    * stay on screen and submit against a file the user is no longer looking at.
    * The draft survives the suspension and comes back with the tab.
    */
   suspended?: boolean
+  /**
+   * Touch placement: instead of floating at the selection, the action row
+   * docks above the chat composer (or the bottom safe area when there is
+   * none). A touch selection carries the platform's own handles, magnifier and
+   * Copy callout around it, and a row drawn there takes the taps meant for
+   * them; the dock leaves the selection's surroundings to the platform. Plain
+   * action rows only -- a `composer` host keeps its floating box.
+   */
+  dock?: boolean
+  /**
+   * The host can anchor text selected inside a code block. Pierre draws a code
+   * block into a shadow root, where a drag reaches the document as a collapsed
+   * selection that a host's anchor resolver rejects (a remote artifact comment
+   * would post pinned at offset 0), so a host keeps ignoring such a selection
+   * until it opts in.
+   */
+  codeSelection?: boolean
+  /**
+   * Copy on select: when a MOUSE drag opens the row, run its own Copy action
+   * at once, so the selection is on the clipboard without a second click (the
+   * checkmark and a refused write show exactly as they do for a click). The
+   * row still opens, so the other actions stay one click away. Keyboard and
+   * touch selections are left alone: a Shift+Arrow walk would copy every
+   * intermediate step, and the touch platform has its own Copy callout. A row
+   * with no `copy` action copies nothing.
+   */
+  copyOnSelect?: boolean
+}
+
+/** Gap between the docked row and whatever it sits on (composer or screen edge). */
+const DOCK_GAP_PX = 8
+
+/**
+ * The composer area the docked row sits above: the visible `.input-area` (the
+ * whole composer column, so the follow-up option chips above the input box
+ * stay uncovered) whose column overlaps the selection's container, so a split
+ * view docks over its own pane. Null when no composer is on screen (the row
+ * then sits on the safe area at the bottom of the viewport).
+ */
+function dockAnchorRect(container: HTMLElement | null): DOMRect | null {
+  const c = container?.getBoundingClientRect()
+  let best: DOMRect | null = null
+  // `input-area` is the composer's stable theming hook (website/docs/theming-contract.md).
+  for (const el of Array.from(document.querySelectorAll<HTMLElement>('.input-area'))) {
+    const r = el.getBoundingClientRect()
+    if (r.width === 0 || r.height === 0) continue
+    if (c && c.width > 0 && (r.right <= c.left || r.left >= c.right)) continue
+    if (!best || r.top > best.top) best = r
+  }
+  return best
+}
+
+/** `env(safe-area-inset-bottom)` in px, read through a probe (JS cannot read env() directly). */
+function safeAreaBottomPx(): number {
+  const probe = document.createElement('div')
+  // Out of flow but never pinned to an edge: it only measures its own height.
+  probe.className = 'pointer-events-none invisible fixed h-[env(safe-area-inset-bottom,0px)]'
+  document.body.appendChild(probe)
+  const h = probe.getBoundingClientRect().height
+  probe.remove()
+  return h
 }
 
 /** Generic floating toolbar that appears when user selects text within a container.
  *  Extensible — pass any actions (quote, copy, etc.) via the `actions` prop. */
-export default function SelectionToolbar({ containerRef, actions, externalSelection, composer, suspended = false, externalOnly = false }: SelectionToolbarProps) {
+export default function SelectionToolbar({ containerRef, actions, externalSelection, composer, suspended: suspendedProp = false, externalOnly = false, dock: dockProp = false, codeSelection = false, copyOnSelect = false }: SelectionToolbarProps) {
+  // Behind a remote Crew the toolbar is hidden with its Crew (components/overlayRoot)
+  // and suspends like a hidden tab, so a key aimed at the Crew in front cannot
+  // reach it. The draft survives and returns with the Crew.
+  const crewHidden = useLocalCrewHidden()
+  const suspended = suspendedProp || crewHidden
+  // The composer is a floating annotation box by design; it never docks.
+  const dock = dockProp && !composer
   const [visible, setVisible] = useState(false)
   // Mirrors for the document listeners (bound once): whether the box is up,
   // and whether the host has hidden it.
@@ -413,6 +483,18 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
   suspendedRef.current = suspended
   const externalOnlyRef = useRef(externalOnly)
   externalOnlyRef.current = externalOnly
+  // Bumped each time `externalSelection` opens the box. A press inside the
+  // container defers its dismissal a tick; when that same press is what made
+  // the host hand over a selection (a code block's gutter button), the open
+  // can land BEFORE the deferred close — a touch tap fires mousedown, mouseup
+  // and click together — and the close must not undo it.
+  const externalOpenSeqRef = useRef(0)
+  const codeSelectionRef = useRef(codeSelection)
+  codeSelectionRef.current = codeSelection
+  const copyOnSelectRef = useRef(copyOnSelect)
+  copyOnSelectRef.current = copyOnSelect
+  // Runs the row's Copy action; set below once `handleAction` exists.
+  const autoCopyRef = useRef<() => void>(() => {})
   // The composer's draft text lives HERE, not in `ComposerBox`, so it survives
   // a suspension (the box unmounts while its tab is hidden) and comes back
   // with the tab. Reset on submit and on every close.
@@ -477,6 +559,8 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
   // The selection as text offsets in the container, saved BEFORE `onOpen` so
   // Escape can put it back (see `rangeFromTextOffset`).
   const savedSelectionRef = useRef<{ start: number; length: number } | null>(null)
+  // The live range of a selection inside a code block, which has no text offset to rebuild it from.
+  const codeRangeRef = useRef<Range | null>(null)
   // Bumped when the input auto-grows, so the clamp/flip below re-measures and
   // a box that grew past the bottom edge flips above the selection.
   const [composerGrowTick, setComposerGrowTick] = useState(0)
@@ -541,7 +625,13 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     // stays where it is until the draft is submitted or discarded.
     if (visibleRef.current && composerRef.current && composerDraftRef.current) return
     const sel = window.getSelection()
-    if (!sel || sel.isCollapsed || !sel.toString().trim()) {
+    const container = containerRef.current
+    // Text selected inside a code block's shadow root is reported collapsed (both
+    // ends move to the host's parent) while `toString()` still holds it; the
+    // composed range is where it really is. Only a host that opts in takes it, and
+    // only that odd shape pays for the lookup.
+    const inCode = codeSelectionRef.current && sel && container && sel.isCollapsed && sel.toString().trim() ? shadowSelectionRange(sel, container) : null
+    if (!sel || (sel.isCollapsed && !inCode) || !sel.toString().trim()) {
       // Only dismiss if toolbar was shown by DOM selection (not external/editor).
       // An OPEN composer is the exception: its selection is collapsed by design
       // (focus, or the host's <mark> wrapping), so an empty selection is not a
@@ -550,7 +640,6 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
       return
     }
 
-    const container = containerRef.current
     if (!container) { setVisible(false); return }
 
     // Ensure selection is within our container. Containment cannot be judged by
@@ -561,8 +650,9 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     // returns it clamped to the container: an accepted overhang's boundary point
     // would otherwise pull the next block's line box into the rect and park the
     // toolbar one line below the selection on the touch/keyboard paths.
-    const range = sel.getRangeAt(0)
-    const measureRange = containedSelectionRange(range, container)
+    // A code block's own range needs no such test: it is inside the container because
+    // its host is (`shadowSelectionRange` looked only under the container).
+    const measureRange = inCode ?? containedSelectionRange(sel.getRangeAt(0), container)
     if (!measureRange) {
       setVisible(false)
       return
@@ -621,6 +711,17 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
       } catch {
         savedSelectionRef.current = null
       }
+      // Code selections have no stable text offset in the container: a plain
+      // fallback is replaced during highlighting, and a shadow range is outside
+      // the light-DOM text. Their shared passage position keys the draft while
+      // the live range follows scroll; zero length prevents Escape rebuilding a
+      // selection over unrelated light-DOM text.
+      const inPlainCode = !inCode && codeSelectionRef.current && plainCodeFenceAtRangeStart(measureRange) != null
+      const codePosition = inCode || inPlainCode ? codePassagePosition(container, measureRange) : null
+      codeRangeRef.current = inCode ?? (inPlainCode ? measureRange : null)
+      if (inCode || inPlainCode) {
+        savedSelectionRef.current = { start: codePosition == null ? -1 : -codePosition, length: 0 }
+      }
       // A re-open over an already-open composer (the user re-selected) is a
       // fresh open for the host too: it resolves the new anchor and re-paints.
       composerClosedRef.current = false
@@ -632,6 +733,8 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
       restoreDraft(text)
     }
     setVisible(true)
+    // Tells the mouseup path a selection was actually taken (copy on select).
+    return true
   }, [containerRef, restoreDraft])
 
   // After the toolbar mounts/repositions, measure it and clamp its position so
@@ -655,6 +758,20 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     const margin = 8
     const vw = window.innerWidth
     const vh = window.innerHeight
+    if (dock) {
+      // Centred over the composer the reply belongs to, just above it; the
+      // selection's position plays no part (see `dock`).
+      const anchor = dockAnchorRect(containerRef.current)
+      const floor = anchor ? anchor.top : vh - safeAreaBottomPx()
+      const centre = anchor ? anchor.left + anchor.width / 2 : vw / 2
+      const left = Math.max(margin, Math.min(centre - w / 2, vw - margin - w))
+      const top = Math.max(margin, floor - DOCK_GAP_PX - h)
+      if (left !== clampedRef.current.x || top !== clampedRef.current.y) {
+        clampedRef.current = { x: left, y: top }
+        setClampedPos({ x: left, y: top })
+      }
+      return
+    }
     // `pos.x` is the pill's CENTRE, but the composer's LEFT edge (see checkSelection).
     const desiredLeft = composer ? pos.x : pos.x - w / 2
     // The composer stays inside its container's column when it can: a box that
@@ -696,7 +813,20 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     // `suspended` likewise: a hidden tab does not render the box, so a resize
     // while hidden leaves `pos` untouched, and resuming must re-clamp against
     // the viewport it comes back to rather than the one it left.
-  }, [visible, pos, composerGrowTick, composer, copyFailed, submitFailed, suspended, containerRef])
+  }, [visible, pos, composerGrowTick, composer, copyFailed, submitFailed, suspended, containerRef, dock])
+
+  // A docked row hangs off the composer, not the selection, so it re-measures
+  // when the viewport changes under it (rotation, the address bar collapsing).
+  useEffect(() => {
+    if (!visible || !dock) return
+    const remeasure = () => setComposerGrowTick(t => t + 1)
+    window.addEventListener('resize', remeasure)
+    window.visualViewport?.addEventListener('resize', remeasure)
+    return () => {
+      window.removeEventListener('resize', remeasure)
+      window.visualViewport?.removeEventListener('resize', remeasure)
+    }
+  }, [visible, dock])
 
   useEffect(() => {
     // Every deferred selection check has to be cancellable. These fire 0-50ms
@@ -715,13 +845,41 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
       pending.add(id)
     }
 
+    // The document selection as the last press began. Copy on select copies
+    // only when the press itself changed it: a click on a control that keeps
+    // the selection (a `preventDefault` mousedown, such as a Copy button)
+    // leaves it as it was and must not overwrite the clipboard with it again.
+    type SelectionSnapshot = { anchor: Node | null; anchorOffset: number; focus: Node | null; focusOffset: number }
+    const readSelection = (): SelectionSnapshot | null => {
+      const sel = window.getSelection()
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null
+      return { anchor: sel.anchorNode, anchorOffset: sel.anchorOffset, focus: sel.focusNode, focusOffset: sel.focusOffset }
+    }
+    let selectionAtPress: SelectionSnapshot | null = null
+    const selectionChangedSincePress = () => {
+      const now = readSelection()
+      const before = selectionAtPress
+      if (!now || !before) return !!now
+      return now.anchor !== before.anchor || now.anchorOffset !== before.anchorOffset
+        || now.focus !== before.focus || now.focusOffset !== before.focusOffset
+    }
+
     const onMouseUp = (e: MouseEvent) => {
       if (suspendedRef.current) return
       if (toolbarRef.current && toolbarRef.current.contains(e.target as Node)) return
       triggeredByMouseRef.current = true
       lastMouseRef.current = { x: e.clientX, y: e.clientY }
-      // Small delay to let selection finalize
-      defer(checkSelection, 50)
+      // Only a primary-button release can copy. A right-click on macOS selects
+      // the word under the pointer before the context menu opens, and that
+      // must not replace the clipboard.
+      const primary = e.button === 0
+      // Small delay to let selection finalize. Only a selection the check took
+      // is copied: a collapsed click, a whitespace-only drag, one outside the
+      // container, or one under a typed draft returns without it. So is one
+      // this press left untouched (see `selectionAtPress`).
+      defer(() => {
+        if (checkSelection() && primary && copyOnSelectRef.current && selectionChangedSincePress()) autoCopyRef.current()
+      }, 50)
     }
 
     const onKeyUp = (e: KeyboardEvent) => {
@@ -749,6 +907,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     }
 
     const onMouseDown = (e: MouseEvent) => {
+      selectionAtPress = readSelection()
       if (suspendedRef.current) return
       // Don't dismiss if clicking inside the toolbar
       if (toolbarRef.current && toolbarRef.current.contains(e.target as Node)) return
@@ -758,7 +917,11 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
       // Clicking inside the container clears the selection (cursor reposition) —
       // dismiss after a tick so the new (empty) selection state is readable.
       if (containerRef.current && containerRef.current.contains(e.target as Node)) {
-        defer(() => { if (!window.getSelection()?.toString().trim()) setVisible(false) }, 0)
+        const seq = externalOpenSeqRef.current
+        defer(() => {
+          if (externalOpenSeqRef.current !== seq) return
+          if (!window.getSelection()?.toString().trim()) setVisible(false)
+        }, 0)
         return
       }
       setVisible(false)
@@ -876,6 +1039,13 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     }
   }, [flashCopied])
 
+  useEffect(() => {
+    autoCopyRef.current = () => {
+      const copy = actions.find(a => a.id === 'copy')
+      if (copy) handleAction(copy)
+    }
+  }, [actions, handleAction])
+
   // Cancel a pending "copied!" reset timer on unmount so it can never fire
   // after the component (or a test's jsdom environment) is torn down.
   useEffect(() => () => {
@@ -929,6 +1099,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     selectionRectRef.current = composerRef.current ? null : new DOMRect(externalSelection.x, externalSelection.y, 0, 0)
     setPos({ x: externalSelection.x, y: externalSelection.y + 8 })
     sourceRef.current = 'external'
+    externalOpenSeqRef.current += 1
     const activeComposer = composerRef.current
     if (activeComposer) {
       // The selection lives in another document (or an editor), so there is no
@@ -936,6 +1107,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
       // one (and the scroll-follow from moving the box), while the host's
       // `start` keys the draft slot exactly as a container offset would.
       savedSelectionRef.current = { start: externalSelection.start ?? -1, length: 0 }
+      codeRangeRef.current = null
       composerClosedRef.current = false
       setComposerAutoFocus(!isTouchDevice())
       setCopyFailed(false)
@@ -1114,7 +1286,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
         const saved = savedSelectionRef.current
         const container = containerRef.current
         if (!saved || !container) return
-        const range = rangeFromTextOffset(container, saved.start, saved.length)
+        const range = codeRangeRef.current ?? rangeFromTextOffset(container, saved.start, saved.length)
         if (!range) return
         const rect = range.getBoundingClientRect()
         if (rect.width === 0 && rect.height === 0) return
@@ -1133,7 +1305,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     }
   }, [visible, composer, containerRef])
 
-  return createPortal(
+  return <OverlayPortal>
     <AnimatePresence>
       {visible && !suspended && (
         <motion.div
@@ -1169,11 +1341,14 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
               onDismissSubmitFailed={dismissSubmitFailed}
             />
           ) : (
-          <div className="flex flex-wrap items-center gap-0.5 p-0.5 rounded-lg bg-bg-elevated border border-border shadow-lg">
+          <div
+            data-testid={dock ? 'selection-dock' : undefined}
+            className={`flex flex-wrap items-center gap-0.5 p-0.5 rounded-lg bg-bg-elevated border border-border shadow-lg ${dock ? 'max-w-[calc(100vw-16px)]' : ''}`}
+          >
             {actions.map(action => (
               <Fragment key={action.id}>
                 <button
-                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-[12px] font-medium text-text hover:text-accent hover:bg-bg-hover transition-colors cursor-pointer whitespace-nowrap"
+                  className={`flex items-center gap-1.5 rounded-md font-medium text-text hover:text-accent hover:bg-bg-hover transition-colors cursor-pointer whitespace-nowrap ${dock ? 'px-3.5 min-h-10 text-[13px]' : 'px-2.5 py-1.5 text-[12px]'}`}
                   onMouseDown={e => e.preventDefault()}
                   onClick={() => handleAction(action)}
                   aria-label={action.label}
@@ -1205,9 +1380,8 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
           )}
         </motion.div>
       )}
-    </AnimatePresence>,
-    document.body
-  )
+    </AnimatePresence>
+  </OverlayPortal>
 }
 
 /** `true` below `COMPOSER_STACK_BELOW_PX`; tracks window resizes. */
@@ -1240,7 +1414,9 @@ const COMPOSER_MAX_INPUT_H = 160
  * its placeholder naming the way in (Enter), and the toolbar's document-level
  * Enter handler moves focus here.
  */
-function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAction, onSubmit, onEscape, onCopyShortcut, onGrow, text, onTextChange, copyFailed, onDismissCopyFailed, submitting, submitFailed, onDismissSubmitFailed }: {
+/** The comment box itself, exported so a box drawn on an image opens the same
+ *  composer a text selection does rather than a look-alike that drifts from it. */
+export function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAction, onSubmit, onEscape, onCopyShortcut, onGrow, text, onTextChange, copyFailed, onDismissCopyFailed, submitting, submitFailed, onDismissSubmitFailed, inputLabel }: {
   inputRef: React.RefObject<HTMLTextAreaElement>
   autoFocus: boolean
   actions: SelectionAction[]
@@ -1263,6 +1439,9 @@ function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAct
   /** The host refused the last submit: the text is still here, say so. */
   submitFailed: boolean
   onDismissSubmitFailed: () => void
+  /** The input's accessible name. Defaults to the text-selection wording; a
+   *  caller commenting on something other than selected text names its own. */
+  inputLabel?: string
 }) {
   const ime = useImeGuard()
   const stacked = useStackedComposer()
@@ -1290,10 +1469,10 @@ function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAct
   }, [autoFocus, inputRef])
 
   const autoGrow = useCallback((el: HTMLTextAreaElement) => {
-    el.style.height = 'auto'
-    const next = Math.min(el.scrollHeight, COMPOSER_MAX_INPUT_H)
-    el.style.height = next + 'px'
-    el.style.overflowY = el.scrollHeight > COMPOSER_MAX_INPUT_H ? 'auto' : 'hidden'
+    // The shared measure counts the border, which scrollHeight leaves out, so
+    // the box keeps its resting height on the first keystroke and a draft at
+    // the cap scrolls instead of clipping its last line.
+    measureAutoGrowTextarea(el, COMPOSER_MAX_INPUT_H)
     onGrow()
   }, [onGrow])
 
@@ -1307,7 +1486,10 @@ function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAct
   const iconBtn = 'flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-accent hover:bg-bg-hover transition-colors cursor-pointer bg-transparent border-none'
 
   const controls = (
-    <div className={`flex items-center gap-1 shrink-0 ${stacked ? 'justify-between' : ''}`}>
+    // In a row the controls are as tall as a ONE-line input (1px border, 6px
+    // padding, 20px line, top and bottom), so they center on it and stay
+    // level with its first line when a long draft grows the box downward.
+    <div className={`flex items-center gap-1 shrink-0 ${stacked ? 'justify-between' : 'h-[34px]'}`}>
       <button
         type="button"
         className="flex items-center gap-1.5 h-7 px-2.5 rounded-md text-[12px] font-medium text-accent hover:bg-bg-hover transition-colors cursor-pointer bg-transparent border-none whitespace-nowrap disabled:opacity-40 disabled:cursor-default"
@@ -1380,7 +1562,7 @@ function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAct
     >
       <textarea
         ref={inputRef}
-        aria-label={i18nT('components.selectionToolbar.comment_input')}
+        aria-label={inputLabel ?? i18nT('components.selectionToolbar.comment_input')}
         placeholder={focused || autoFocus
           ? i18nT('components.commentOverlay.write_a_comment')
           : isTouchDevice() ? i18nT('components.selectionToolbar.tap_to_comment') : i18nT('components.selectionToolbar.press_enter_to_comment')}

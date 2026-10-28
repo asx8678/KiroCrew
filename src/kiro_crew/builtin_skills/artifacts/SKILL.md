@@ -123,16 +123,16 @@ about style when the user delegated that choice.
 | `artifact_versions` | List version numbers for a slug |
 | `artifact_delete` | Permanently remove |
 | `artifact_move` | File an existing artifact into a folder, or unfile it |
-| `artifact_folder(action="list")` | Read the folder tree — ids, paths, item counts |
-| `artifact_folder(action="create")` | Create a folder (`name`, `parent`); missing path segments are auto-created |
-| `artifact_folder(action="rename")` | Rename a folder (`folder`, `name`) |
-| `artifact_folder(action="move")` | Reparent a folder (`folder`, `new_parent`; cycle-guarded) |
-| `artifact_folder(action="delete")` | Remove a folder; safe by default, destructive with `delete_contents=true` |
-| `artifact_comment(action="list")` | Read every comment thread on an artifact; pass `exclude_resolved` to skip threads already resolved |
-| `artifact_comment(action="post")` | Open a thread (`text`, `scope`), optionally anchored to a quoted span |
-| `artifact_comment(action="reply")` | Reply in an existing thread (`parent_id`, `text`) |
-| `artifact_comment(action="mark_review")` | Advance a thread to REVIEW (`comment_id`) — addressed, awaiting human check |
-| `artifact_comment(action="delete")` | Delete a thread you demonstrably applied (`comment_id`); requires a `reason` |
+| `artifact_folder_list` | Read the folder tree — ids, paths, item counts |
+| `artifact_folder_create` | Create a folder; missing path segments are auto-created |
+| `artifact_folder_rename` | Rename a folder |
+| `artifact_folder_move` | Reparent a folder (cycle-guarded) |
+| `artifact_folder_delete` | Remove a folder; safe by default, destructive with `delete_contents=true` |
+| `artifact_get_comments` | Read every comment thread on an artifact; pass `exclude_resolved` to skip threads already resolved |
+| `artifact_post_comment` | Open a document-level thread (`slug`, `text`, optional `scope`); the tool takes no anchor — only the dashboard can anchor a comment to a span |
+| `artifact_reply_comment` | Reply in an existing thread |
+| `artifact_mark_review` | Advance a thread to REVIEW — addressed, awaiting human check |
+| `artifact_delete_comment` | Delete a thread you demonstrably applied; requires a reason |
 | `deploy_artifact` | Preview-only deploy of a static artifact (`widget`/`html`/`markdown`) or a local built directory; a `kind=webapp` slug is rejected |
 
 All under the `@kirocrew-core` MCP server. `artifact_comment` and `artifact_folder` take one
@@ -333,7 +333,8 @@ Rules:
 
 When the user asks "what have we built?" / "what artifacts do we have?" /
 "show me my widgets", call `artifact_list` and present the results — slug,
-name, kind, version, updated_at. Group by tag if that aids comprehension.
+name, kind, version and tags (it lists newest first; `artifact_get` gives
+`updated_at`). Group by tag if that aids comprehension.
 
 `artifact_list` accepts `tag`, `kind`, and `q` (name substring) filters.
 Use them to narrow when the user gives constraints.

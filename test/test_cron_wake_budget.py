@@ -25,6 +25,7 @@ import pytest
 
 from kiro_crew.acp.client import AcpError
 from kiro_crew.cron import _JOB_TIMEOUT_SECS, CronJob, CronSchedule, CronService
+from kiro_crew.testing.wait import finished
 
 
 class TestWakeBudgetKnob:
@@ -103,7 +104,7 @@ class TestWakeBudgetKnob:
         svc._on_job = _slow
 
         async def _run() -> None:
-            await asyncio.wait_for(svc._execute_with_timeout(target), timeout=10)
+            await finished(svc._execute_with_timeout(target), "the job's own 2 s timeout firing")
 
         asyncio.run(_run())
         assert target.last_status == "error"
@@ -326,7 +327,7 @@ class TestCronTransientRetry:
         """A transient error AFTER prompt dispatch must not resubmit the turn.
 
         Tools may already have executed; a whole-callback retry would repeat
-        their side effects (GPT review finding on the first revision).
+        their side effects.
         """
         stream_calls = 0
 

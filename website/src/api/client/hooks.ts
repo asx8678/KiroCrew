@@ -15,7 +15,8 @@ import type { ClientTransport } from './transport'
 export type WebhookFreshness = 'fresh' | 'stale' | 'expired'
 
 export type WebhookOutcome =
-  | 'completed' | 'timeout' | 'error' | 'rejected_capacity' | 'unauthorized' | 'disabled'
+  | 'completed' | 'degraded' | 'timeout' | 'error' | 'rejected_capacity' | 'unauthorized'
+  | 'disabled'
 
 export interface WebhookTokenEntry {
   id: string
@@ -109,7 +110,7 @@ export interface WebhookTestResult {
   error?: string
 }
 
-export function createHooksEndpoints({ post, put, del, j }: ClientTransport) {
+export function createHooksEndpoints({ post, put, del, j, jfetch: fetch }: ClientTransport) {
   const triggers = {
     // Hooks
     hooks: () => fetch('/api/hooks').then(j),

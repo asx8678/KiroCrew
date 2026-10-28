@@ -59,12 +59,16 @@ one this must not spend. A subscriber that raises, a full socket, a client that 
 each leaves the memo ahead of the consumer, and the next lazy read serves the current value.
 The publish is currency, never the record.
 
-WHAT IT IS NOT. Durable for a slot. A session fold has its savepoint beside the unit's
-file and the warm memo brings it forward; a slot memo lives in this process, so a
-restart folds a slot cold. A savepoint for a SLOT fold would be a store of its own, keyed by slot rather than by
-unit, with its own admission rules about the unit vector it was folded over. That is
-not this module's, and :func:`~kiro_crew.session_ledger._fold_checkpoint` already says
-so about the same cell.
+WHAT IT IS NOT. A second place a slot fold's durability lives. A session fold has its
+savepoint beside the unit's file; a slot fold has its own savepoint beside the slot's
+NEWEST unit (``kiro_crew.crew_log.checkpoint.SLOT_CHECKPOINT_DIR``), admitted on the
+same conditions the warm memo already checks before trusting a continuation
+(``_continuable`` and ``_folded_prefix_holds`` in
+:mod:`~kiro_crew.crew_log.projection_slot_memo`). Either way, a restart finds this
+process's in-memory memo empty and resumes from THAT savepoint rather than folding the
+whole unit vector cold -- this module owns neither file, it only drives the read path
+that reads them, and :func:`~kiro_crew.session_ledger._fold_checkpoint` already says so
+about the same cell.
 """
 
 from __future__ import annotations
@@ -72,9 +76,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections import OrderedDict
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from typing import Any, Final, NamedTuple
 
@@ -100,11 +106,40 @@ _WAKE_TYPES: Final[frozenset[str]] = frozenset(
     {
         _CLOSED_TYPE,
         "work/recorded",
+        # The project report reads the charges the gateway relays into a board's log.
+        "work/charged",
         "panel/published",
         "ledger/recorded",
         "radar/recorded",
+        "dashboard/agentic_value",
+        "dashboard/agentic_refused",
+        "dashboard/goal_recorded",
+        "dashboard/waiting_changed",
+        "dashboard/custom_value",
+        # The ``workers`` fold: a crewmate's creates, and each worker's own turns,
+        # replies and end, which it reads from the worker's log and routes to the
+        # crewmate's cell (:func:`_creator_slot`).
+        "session/spawned",
+        "session/released",
+        "session/adopted",
+        "turn/started",
+        "message/received",
+        "message/sent",
+        # The project report's fold costs each task by its worker's spend, so it reads
+        # the opener that names a unit's session and the three closers that carry a
+        # charge. The widest set here, and the reason is that the spend is in the
+        # worker's own entries and nowhere else.
+        "session/opened",
+        "turn/completed",
+        "subagent/completed",
+        "subagent/failed",
+        "background/completed",
     }
 )
+
+#: The slot fold whose cell lives under the creating session's slot, not the entry's.
+_WORKERS_FOLD: Final[str] = "workers"
+
 
 #: How long the worker waits for a wake before looping, so a stop is noticed.
 _POLL_SECONDS: Final[float] = 0.5
@@ -120,9 +155,9 @@ class _Wake(NamedTuple):
     ``board`` is the slot whose fold this entry belongs to, and it has to be carried
     rather than derived. A unit's HEADER names the slot that unit ran under, which for a
     conductor's own entry is the board -- but a worker's ``work/recorded`` names the
-    CONDUCTOR's board in its own ``slot`` field and reaches that fold only by joining it
-    (``_work_units``). Resolving the header instead advances the worker's own board and
-    leaves the conductor's -- the one a dashboard reads -- exactly as stale as before. The
+    CONDUCTOR's board in its own ``slot`` field, and the gateway writes the board's own
+    copy of it into the conductor's unit. Resolving the header for the worker's copy
+    would advance the worker's own board rather than the one a dashboard reads. The
     emitter holds the entry, so it is the one place the board is free to read; empty means
     "the unit's header names it", which is true of every type that carries no board of its
     own.
@@ -300,8 +335,30 @@ def _enqueue(wake: _Wake) -> None:
         _queued += 1
 
 
+def dropped_wakes() -> int:
+    """How many wakes the full queue could not hold since the last reset.
+
+    NOT a hole in any log: a dropped wake leaves one memo behind the file and the
+    next READ carries it forward, so the folds stay correct and a dashboard sees
+    the value later than the entry landed. Read by the telemetry callback that
+    reports ``kirocrew.crew_log.write.lost{cause=wake_dropped}``, which exists so
+    that lateness is visible without this path gaining any work: the count is
+    already kept here, and the callback runs on the metrics reader's own thread.
+    O(1), and the append path is not involved in the read.
+    """
+    with _lock:
+        return _dropped
+
+
 def _count_drop(unit_id: str, entry_type: str) -> None:
-    """Record one dropped wake. Logged at DEBUG: the COUNT is the signal, not the line."""
+    """Record one dropped wake. Logged at DEBUG: the COUNT is the signal, not the line.
+
+    NO METRIC IS RECORDED HERE, deliberately. This runs on the APPEND thread --
+    :func:`note_commit`'s ``queue.Full`` branch is its only caller -- and that
+    path is the one a turn waits on, so it keeps doing what it already did:
+    increment a counter the telemetry side READS later from another thread (see
+    :func:`dropped_wakes`). ``test_crew_log_health_threads.py`` pins it.
+    """
     global _dropped
     with _lock:
         _dropped += 1
@@ -315,6 +372,32 @@ def _count_drop(unit_id: str, entry_type: str) -> None:
             unit_id,
             entry_type,
         )
+
+
+def queue_depth() -> "int | None":
+    """How many wakes are waiting to be folded right now, or ``None``.
+
+    ``None`` when no queue exists in this process -- nothing has committed an eager
+    entry, so there is no fold thread and no queue -- which is a DIFFERENT fact from an
+    empty queue and must not be reported as a zero.
+
+    Reads the module global directly and never calls :func:`_ensure_worker`: a caller
+    asking how deep the queue is must not be the thing that creates it and starts the
+    fold thread. Takes no lock either, so it cannot contend with the append path: the
+    rebind of ``_queue`` is atomic, and ``qsize`` is already only a snapshot of a
+    number that moves while it is read.
+
+    The one reader is the crew log health gauge
+    (:mod:`kiro_crew.metrics.crew_log_health`), which observes it on a metrics reader
+    thread.
+    """
+    pending = _queue
+    if pending is None:
+        return None
+    try:
+        return pending.qsize()
+    except Exception:  # pragma: no cover - qsize is unimplemented on no platform we ship
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -350,6 +433,88 @@ def _ensure_worker() -> "queue.Queue[_Wake]":
         return _queue
 
 
+def _claim_thread_for_metrics() -> None:
+    """Let this thread record the crew log's fold metrics, and only this one.
+
+    ``fold.apply`` and ``fold.start`` count EAGER folding. The same fold code is
+    reached from a dashboard read, a CLI and a test, so the record sites ask
+    whether they are on this thread rather than recording whatever called them --
+    and this is where that answer is installed, once per worker.
+
+    Function-local import and swallowed failure, for the two reasons the rest of
+    this module gives: the import is the boot-path gate (the metrics package
+    reaches the OTEL SDK), and a telemetry package that will not load must cost
+    the fold worker nothing but its metrics.
+    """
+    try:
+        # boot-path import gate: see this module's docstring and ``_projection``.
+        from kiro_crew.metrics.crew_log_health import claim_fold_worker_thread
+
+        claim_fold_worker_thread()
+    except Exception:  # pragma: no cover - a broken install loses the metric only
+        # Through :func:`_log_exc`, never ``exc_info``: this module's rule, and it
+        # binds here for the reason that function gives -- a retained traceback
+        # reaches this frame's CALLERS through ``f_back``, and the fold worker's
+        # stack binds open ``CrewLog`` handles whose leases a finalizer releases.
+        _log_exc(logging.DEBUG, "crew log fold metrics unavailable")
+
+
+def _health() -> Any:
+    """The crew log health metrics module, imported on first use.
+
+    Function-local for the reason :func:`_projection` is: this module is reachable
+    from the gateway's boot path and the metrics package is not.
+    """
+    # boot-path import gate: see this module's docstring and ``_projection``.
+    from kiro_crew.metrics import crew_log_health
+
+    return crew_log_health
+
+
+def _begin_pass() -> "float | None":
+    """Open a fold pass for the metrics side. ``None`` when metrics will not load.
+
+    One ``monotonic()`` on the worker thread, plus clearing the thread's stamps so
+    a pass can only report its own start branch. ``None`` only when the metrics
+    package will not import, and then :func:`_close_pass` records nothing.
+    """
+    try:
+        return _health().begin_fold_pass()
+    except Exception:  # pragma: no cover - a broken install loses the metric only
+        return None
+
+
+def _close_pass(*, slot: bool, folds: "Iterable[str]", started: "float | None") -> None:
+    """Record what the pass that began at *started* started from and applied.
+
+    *slot* picks the scope: ``True`` for a slot fold, ``False`` for a session
+    fold. The scope strings themselves are read from the metrics module, which
+    owns them, so there is one spelling of each.
+
+    Called OUTSIDE the fold's own locks, which is why the fold branches only leave
+    a thread-local mark: a first ``get_recorder()`` builds the telemetry provider
+    synchronously, and doing that under a per-cell fold lock would hold up a
+    dashboard read waiting on the same cell.
+
+    Never raises: a fold must not fail because a counter did.
+    """
+    if started is None:
+        # :func:`_begin_pass` could not load the metrics module, so there is no
+        # pass to close.
+        return
+    try:
+        health = _health()
+        scope = health.SCOPE_SLOT if slot else health.SCOPE_SESSION
+        health.note_fold_pass(scope, folds, started)
+    except Exception:  # pragma: no cover - telemetry must never cost a fold
+        # :func:`_log_exc` rather than ``exc_info``, and here it is load-bearing
+        # rather than stylistic: this runs in ``_advance``'s ``finally``, whose
+        # own frame and whose callees bind open ``CrewLog`` handles, so a record
+        # carrying the traceback would pin those handles -- and their write
+        # leases -- for as long as a record-keeping handler held it.
+        _log_exc(logging.DEBUG, "crew log fold pass metric failed")
+
+
 def _settle(count: int) -> None:
     """Record that *count* more wakes have been folded."""
     global _settled
@@ -367,6 +532,7 @@ def _run() -> None:
     reaches. So a batch is COALESCED -- the newest seq per (unit, board, type) wins -- and
     each affected (slot, fold) is folded once.
     """
+    _claim_thread_for_metrics()
     while not _stopping.is_set():
         first = _await_wake()
         if first is None:
@@ -408,9 +574,20 @@ def paused() -> Iterator[bool]:
     else:
         timeout = 0.0
     held = _fold_gate.acquire(timeout=timeout) if timeout > 0 else _fold_gate.acquire(False)
+    # A background prime (``slot_prime``) reads unit files off this worker, under its own
+    # gate so it never holds up a wake: the caller waits for it the same bounded way.
+    primes = sys.modules.get("kiro_crew.crew_log.slot_prime")
+    prime_gate = getattr(primes, "_fold_gate", None)
+    prime_held = False
+    if held and prime_gate is not None:
+        prime_held = (
+            prime_gate.acquire(timeout=timeout) if timeout > 0 else prime_gate.acquire(False)
+        )
     try:
-        yield held
+        yield held and (prime_gate is None or prime_held)
     finally:
+        if prime_held and prime_gate is not None:
+            prime_gate.release()
         if held:
             _fold_gate.release()
 
@@ -535,8 +712,30 @@ def _fold_batch(
         if _outranked_by_a_closer(wake, slot, closed, own_slots):
             continue
         for name in touches_slot:
+            if name == _WORKERS_FOLD and wake.entry_type != "session/spawned":
+                # Only a create moves the crewmate's own cell. Every other type it reads
+                # is a WORKER's entry, routed to the creator below; advancing every
+                # session's own cell on every turn would fold for nobody.
+                continue
             key = (slot, name)
             work[key] = max(work.get(key, 0), wake.seq)
+        if _WORKERS_FOLD in touches_slot and wake.entry_type != "session/spawned":
+            # A worker's entry is in the WORKER's log, whose header names the worker's
+            # slot -- but the cell a page reads is its creator's. The worker is the
+            # HEADER's slot, never the board: a worker's report names its conductor's
+            # board, and that board's creator is not the worker's.
+            creator = _creator_slot(_slot_of(wake.unit_id))
+            if creator:
+                key = (creator, _WORKERS_FOLD)
+                work[key] = max(work.get(key, 0), wake.seq)
+    for unit_id, seq in closed.items():
+        # A worker closing is a row its creator's page draws (``closed``), and the
+        # closer's own wake skips the routing above. Its creator's cell is not one the
+        # drops below touch, so advancing it after them folds the closer in.
+        creator = _creator_slot(own_slots.get(unit_id, ""))
+        if creator:
+            key = (creator, _WORKERS_FOLD)
+            work[key] = max(work.get(key, 0), seq)
     for slot in closed_slots:
         # The savepoint story for a slot fold is the memo, so dropping it costs the next
         # read one cold fold of a unit that has stopped growing -- and holds nothing for
@@ -547,12 +746,21 @@ def _fold_batch(
         # or one worker unit of a LIVE crew, would take that crew's other cells with it.
         for eager_name in projection.EAGER_SLOT_FOLD_NAMES:
             projection.forget_slot_folds(slot=slot, name=eager_name)
+        # The memo cell is gone, so the next value is a rebuild: publish it as
+        # ``snapshot_needed`` rather than a delta against a board nobody will extend.
+        _forget_published(slot)
     for slot, name in work:
         if projection.slot_fold_over_ceiling(slot, name):
             # The last pass could not keep this cell -- its charge is above the whole
             # ceiling (``radar`` at its caps is) -- so advancing it now would fold every
             # unit the slot ran under and throw the result away. Left to the read path,
             # which folds it when a reader asks.
+            continue
+        if not _slot_fold_wanted(slot, name):
+            # Nobody subscribes to this cell (the dashboard exporter holds keyed
+            # subscriptions for the boards its tabs watch, and neither
+            # ``conductor_wake`` nor a live page asks for it), so the read and the
+            # render would be for no one. The read path folds it when someone reads.
             continue
         _advance(slot, name)
     # Every woken unit, once: its session folds share one pass over its one file, and
@@ -563,9 +771,47 @@ def _fold_batch(
             projection.forget_session_folds(unit_id)
 
 
+def _slot_fold_wanted(slot: str, name: str) -> bool:
+    """Whether a bus subscriber wants *slot*'s *name*; ``True`` unless on-demand mode.
+
+    See :func:`kiro_crew.crew_log.bus.slot_fold_wanted`. Never raises: a failure to
+    ask folds the cell, which is what this path did before it asked.
+    """
+    # boot-path import gate: see this module's docstring and ``_projection``.
+    from kiro_crew.crew_log import bus
+
+    try:
+        return bus.slot_fold_wanted(slot, name)
+    except Exception:  # pragma: no cover - defensive; the bus lookup does not raise
+        return True
+
+
+def _creator_slot(slot: str) -> str:
+    """The slot that created *slot* with ``session_create``, or ``""``. No I/O.
+
+    From the tree's creation records, so a worker its creator let go still moves the
+    creator's ``workers`` cell, which shows it ``released``.
+    """
+    if not slot:
+        return ""
+    from kiro_crew.crew_log import session_tree_projection
+
+    return session_tree_projection.creator_of(slot)
+
+
 def _advance_session(unit_id: str) -> None:
-    """Continue *unit_id*'s session folds, then publish each one that moved."""
+    """Continue *unit_id*'s session folds, then publish each one that moved.
+
+    The pass is TIMED and each fold it moved is counted
+    (``kirocrew.crew_log.fold.apply``). One pass covers every session fold of the
+    unit in one walk of its file, so the duration is the pass's and is attributed
+    to each fold that moved -- there is no per-fold duration to attribute,
+    because there is no per-fold pass. A pass that moved nothing counts nothing:
+    it applied nothing.
+    """
     projection = _projection()
+    started = _begin_pass()
+    warm = None
     try:
         warm = projection.fold_session_warm(unit_id)
     except CrewLogError as exc:
@@ -574,6 +820,11 @@ def _advance_session(unit_id: str) -> None:
     except Exception:
         _log_exc(logging.WARNING, "crew log eager session fold failed for %s", unit_id)
         return
+    finally:
+        # In a ``finally`` so a pass that refused or raised still reports the start
+        # it chose, with no apply. That difference IS the failing-fold signal, and
+        # it would be invisible if the start were recorded only on success.
+        _close_pass(slot=False, folds=getattr(warm, "changed", ()) or (), started=started)
     if not warm.changed:
         return
     # boot-path import gate: see this module's docstring and ``_projection``.
@@ -628,10 +879,24 @@ def _advance(slot: str, name: str) -> None:
 
     Still on THIS thread and not on the append path. The bus contract says a subscriber
     hands real work to its own loop, exactly as the emitter's growth listener does.
+
+    The pass is TIMED and counted (``kirocrew.crew_log.fold.apply``) once it has
+    folded. A refusal and a failure count nothing: neither applied the fold, and
+    ``fold.start`` above ``fold.apply`` is how that shows up.
     """
     projection = _projection()
+    started = _begin_pass()
+    folded = None
     try:
-        folded = projection.read_slot_projection(slot, name)
+        # Never COLD here: a cell with no warm state and no usable savepoint would fold
+        # every unit the slot ran under on this one worker, stalling every wake behind
+        # it. That fold goes to one background prime per cell, which publishes itself.
+        folded = projection.read_slot_projection(slot, name, cold=False)
+    except projection.SlotFoldNotReady:
+        from kiro_crew.crew_log import slot_prime
+
+        slot_prime.schedule(slot, name)
+        return
     except CrewLogError:
         # A refusal is about the record, not about this path: the read route raises the
         # same thing for the same slot, and inventing a value here would serve one the
@@ -641,6 +906,10 @@ def _advance(slot: str, name: str) -> None:
     except Exception:
         _log_exc(logging.WARNING, "crew log eager fold failed for %s/%s", slot, name)
         return
+    finally:
+        # In a ``finally`` for the reason ``_advance_session`` gives: a refused or
+        # raised pass still reports the start it chose, and no apply.
+        _close_pass(slot=True, folds=(name,) if folded is not None else (), started=started)
     _publish_fold(slot, name, folded)
 
 
@@ -668,19 +937,159 @@ def _publish_fold(slot: str, name: str, folded: Any) -> None:
     if not isinstance(value, dict):  # pragma: no cover - the read path always renders one
         return
     # boot-path import gate: see this module's docstring and ``_projection``.
-    from kiro_crew.crew_log import bus
+    from kiro_crew.crew_log import bus, fold_delta
 
-    bus.publish(
-        bus.FOLD_ADVANCED,
-        bus.FoldAdvanced(
-            scope=bus.SCOPE_SLOT,
-            key=slot,
-            fold=name,
-            revision=revision,
-            value=value,
-            seq=int(getattr(folded, "seq", 0) or 0),
-        ),
+    seq = int(getattr(folded, "seq", 0) or 0)
+    if name not in fold_delta.DELTA_FOLDS:
+        bus.publish(
+            bus.FOLD_ADVANCED,
+            bus.FoldAdvanced(
+                scope=bus.SCOPE_SLOT, key=slot, fold=name, revision=revision, value=value, seq=seq
+            ),
+        )
+        return
+    # Under the lock from the diff to the publish, so the fold worker and a background
+    # prime publishing the same cell cannot hand a subscriber two deltas off one base.
+    with _published_lock:
+        if not bus.delta_wanted(slot):
+            # No open tab that applies deltas watches this board, so nothing reads a
+            # delta the carried value does not already replace. Hold no base (a whole
+            # board render) and publish the plain value, exactly as before deltas.
+            # When a watcher arrives, the first publish has no base and is
+            # ``snapshot_needed``, which is what that tab starts from anyway.
+            _published.pop((slot, name), None)
+            event = bus.FoldAdvanced(
+                scope=bus.SCOPE_SLOT, key=slot, fold=name, revision=revision, value=value, seq=seq
+            )
+        else:
+            event = _delta_event(slot, name, revision, value, seq)
+        bus.publish(bus.FOLD_ADVANCED, event)
+
+
+#: The last render published per (slot, delta fold), as ``(revision, value)``: the base
+#: the next delta is computed against. Bounded LRU, because each entry holds a whole
+#: board render (up to a few MB on the largest board measured). A board pushed out, or
+#: dropped on its ``session/closed``, gets ``snapshot_needed`` on its next publish, which
+#: is the same answer a fresh process gives -- correct, and one snapshot pull dearer.
+_PUBLISHED_CAP = 64
+_published: "OrderedDict[tuple[str, str], tuple[int, dict[str, Any]]]" = OrderedDict()
+# Re-entrant: a subscriber that publishes the same cell on this thread must not deadlock.
+_published_lock = threading.RLock()
+
+
+def _delta_event(slot: str, name: str, revision: int, value: dict[str, Any], seq: int) -> Any:
+    """The event for one publish of a delta fold, recording *value* as the next base.
+
+    Caller holds ``_published_lock``. A diff that raises falls back to
+    ``snapshot_needed``: a receiver that pulls once is always right, and a wrong delta
+    would draw a wrong board until the next reload.
+    """
+    from kiro_crew.crew_log import bus, fold_delta
+
+    base = _published.get((slot, name))
+    kind = fold_delta.KIND_SNAPSHOT_NEEDED
+    base_revision = 0
+    ops: "dict[str, Any]"
+    if base is None:
+        ops = {"reason": fold_delta.REASON_NO_BASE}
+    elif revision <= base[0]:
+        # An older or repeated revision: a receiver holding the base drops it as a
+        # duplicate. The recorded base stays the newer one.
+        ops = {"reason": fold_delta.REASON_REVISION}
+    else:
+        reason = fold_delta.snapshot_reason(base[1], value)
+        if reason:
+            ops = {"reason": reason}
+        else:
+            try:
+                ops = fold_delta.diff_work(base[1], value)
+                kind = fold_delta.KIND_DELTA
+                base_revision = base[0]
+            except Exception:
+                _log_exc(logging.WARNING, "crew log delta failed for %s/%s", slot, name)
+                ops = {"reason": fold_delta.REASON_SHAPE}
+    if base is None or revision > base[0]:
+        _published[(slot, name)] = (revision, value)
+        _published.move_to_end((slot, name))
+        while len(_published) > _PUBLISHED_CAP:
+            _published.popitem(last=False)
+    return bus.FoldAdvanced(
+        scope=bus.SCOPE_SLOT,
+        key=slot,
+        fold=name,
+        revision=revision,
+        value=value,
+        seq=seq,
+        kind=kind,
+        base_revision=base_revision,
+        delta=ops,
     )
+
+
+def published_revision(slot: str, name: str) -> int:
+    """The revision of the last publish of *slot*'s delta fold *name*, 0 when none.
+
+    The base the next delta applies on. A snapshot labels itself through
+    :func:`read_labelled`, which reads the value and this number under one lock. No I/O.
+    """
+    with _published_lock:
+        base = _published.get((slot, name))
+        return base[0] if base is not None else 0
+
+
+def read_labelled(slot: str, name: str, read: "Callable[[], Any]") -> "tuple[Any, int]":
+    """``(folded, label)``: a snapshot of *slot*'s *name* and the base its next delta uses.
+
+    *read* folds the cell (the caller's own read path, possibly cold) and runs OUTSIDE
+    ``_published_lock``, so a slow fold never stalls a publish of any board. The lock is
+    then taken only to compare the value's revision with the recorded base:
+
+    - equal: the value is the last publish; label it with that revision;
+    - newer: the read folded past the last publish, so that render is PUBLISHED here as
+      a delta on the recorded base (a diff, no read) before the lock is released, and
+      labelled with its own revision. A publish the fold worker read earlier and sends
+      later is then older than the recorded base and goes out as ``snapshot_needed``
+      (reason ``revision_not_rising``), which a receiver holding this snapshot drops as
+      stale -- never a delta applied on a newer value;
+    - older: a publish landed while *read* ran. Read once more (the cell is warm now);
+      if it is still older, label the value with its own revision, so the next delta,
+      whose base is not that revision, reaches the receiver as a gap.
+
+    So the label is always the revision of the value returned (0 when it has none).
+    """
+    from kiro_crew.crew_log import bus, fold_delta
+
+    folded: Any = None
+    revision = 0
+    for _attempt in range(2):
+        folded = read()
+        revision = max(int(getattr(folded, "revision", 0) or 0), 0)
+        value = getattr(folded, "value", None)
+        if name not in fold_delta.DELTA_FOLDS or revision <= 0:
+            return folded, revision
+        with _published_lock:
+            base = _published.get((slot, name))
+            if base is None or revision == base[0]:
+                return folded, revision
+            if revision > base[0]:
+                if isinstance(value, dict) and bus.delta_wanted(slot):
+                    seq = int(getattr(folded, "seq", 0) or 0)
+                    bus.publish(bus.FOLD_ADVANCED, _delta_event(slot, name, revision, value, seq))
+                return folded, revision
+    return folded, revision
+
+
+def _forget_published(slot: str) -> None:
+    """Drop *slot*'s recorded bases; its next publish is ``snapshot_needed``."""
+    with _published_lock:
+        for key in [key for key in _published if key[0] == slot]:
+            del _published[key]
+
+
+def reset_published_for_tests() -> None:
+    """Forget every recorded base."""
+    with _published_lock:
+        _published.clear()
 
 
 def _slot_of(unit_id: str) -> str:
@@ -709,17 +1118,21 @@ def drain(timeout: float = 5.0) -> bool:
     worker has TAKEN the last wake, which is not the same as having folded it, and a
     waiter that stopped there would read a value the fold had not reached yet.
     """
-    if _queue is None:
-        return True
     deadline = time.monotonic() + max(timeout, 0.0)
-    with _progress:
-        while True:
-            if _settled >= _queued:
-                return True
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return _settled >= _queued
-            _progress.wait(min(remaining, _POLL_SECONDS))
+    if _queue is not None:
+        with _progress:
+            while _settled < _queued:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                _progress.wait(min(remaining, _POLL_SECONDS))
+    # A wake whose cell was cold handed its fold to a background prime, which also writes
+    # into the data home: the barrier covers it too. Looked up rather than imported, so a
+    # process that never primed loads nothing here.
+    primes = sys.modules.get("kiro_crew.crew_log.slot_prime")
+    if primes is not None:
+        return bool(primes.drain(max(deadline - time.monotonic(), 0.0)))
+    return True
 
 
 #: How long :func:`stop_for_tests` waits for the worker to leave its batch. Generous
@@ -776,6 +1189,12 @@ def retire_for_tests() -> "BaseException | None":
         stop_for_tests()
     except TimeoutError as exc:
         return exc
+    # A wake or a baseline may have handed a cold fold to a background prime, which
+    # resolves the data home when it folds: wait it out while the pin still holds, and
+    # forget its state so the next test starts with none. Looked up, not imported.
+    primes = sys.modules.get("kiro_crew.crew_log.slot_prime")
+    if primes is not None:
+        primes.reset_for_tests()
     return None
 
 
@@ -837,3 +1256,4 @@ def stop_for_tests() -> None:
         _queued = 0
         _settled = 0
         _progress.notify_all()
+    reset_published_for_tests()

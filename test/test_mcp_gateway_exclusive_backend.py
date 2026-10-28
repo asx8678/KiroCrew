@@ -23,6 +23,7 @@ import pytest
 
 from kiro_crew.mcp_gateway.backend import Backend
 from kiro_crew.mcp_gateway.pool import BackendPool, PoolAtCapacity, PoolKey
+from kiro_crew.testing.wait import finished
 
 pytestmark = pytest.mark.xdist_group("mcp_gateway")
 
@@ -375,7 +376,7 @@ async def test_private_backends_appear_in_lifecycle_enumerators() -> None:
     lifecycle.
 
     ``all_backends()`` feeds the shutdown drain predicate and the abort handler;
-    ``live_backend_pids()`` feeds the pidfile that stops a SIGKILLed gatewayd
+    ``live_backend_identities()`` feeds the pidfile that stops a SIGKILLed gatewayd
     orphaning children. A private backend missing from either gets its pending
     reply discarded, its in-flight calls left uncancellable, or its process
     leaked.
@@ -386,7 +387,7 @@ async def test_private_backends_appear_in_lifecycle_enumerators() -> None:
     await pool.acquire_exclusive(key, "stub-a", _spawner(private))
 
     assert private in pool.all_backends()
-    assert 4242 in pool.live_backend_pids()
+    assert 4242 in [pid for pid, _ in pool.live_backend_identities()]
 
 
 @pytest.mark.asyncio
@@ -540,7 +541,7 @@ async def _drive_handler(monkeypatch: pytest.MonkeyPatch, *, poolable: bool) -> 
     monkeypatch.setattr(gw, "_acquire_backend", _fake_acquire)
     monkeypatch.setattr(gw, "_drain_inbox_to_stub", _fake_drain)
 
-    await asyncio.wait_for(
+    await finished(
         gw._handle_connection(
             _FrameReader([_register_frame(poolable=poolable), _TOOL_CALL]),
             _NullWriter(),
@@ -549,7 +550,7 @@ async def _drive_handler(monkeypatch: pytest.MonkeyPatch, *, poolable: bool) -> 
             socket_path=Path("/tmp/ex.sock"),
             hot_keys=None,
         ),
-        timeout=5.0,
+        "the connection handler draining its frames",
     )
     return pool
 

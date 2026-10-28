@@ -4,7 +4,6 @@ The context builder reads a session's own transcript in :mod:`kiro_crew.context`
 (the transcript-plumbing reads stay there) and hands the rows here. This module
 owns what those rows become: the per-role row quotas, the delivery-identity merge
 of a disk snapshot with the live window, the tail-heavy replay budget, the
-deterministic overview of the older rows that budget cannot carry, the
 thread-history fallback, and the cancelled- and interrupted-turn restores. It never
 opens a log and never redacts; the caller applies redaction to what it returns.
 
@@ -16,7 +15,6 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict, deque
-from collections.abc import Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 
 from kiro_crew.context_assembly import budget as _budgets
@@ -84,6 +82,35 @@ def _compress_assistant_message(text: str) -> str:
 # walked past.
 _TURN_OPENER_ROLES = frozenset({"user", "nudge", "subagent"})
 
+# Prefix that marks a mid-turn steer inside a restored turn's partial output.
+_STEER_LABEL = "[Steered mid-turn]"
+
+# The ``meta.steerState`` of a steer the turn never took: its teardown moved it to
+# the queue, where it runs as its own turn (``STEER_STATE_REQUEUED`` in the
+# dashboard's chat delivery). Spelled here because this layer does not import the
+# dashboard; a test pins the two together.
+_STEER_STATE_REQUEUED = "requeued"
+# The ``meta.steerState`` of a steer the person took back before the turn read it
+# (``STEER_STATE_RETRACTED``, same reason for the spelling): it never reached the
+# turn either.
+_STEER_STATE_RETRACTED = "retracted"
+_STEER_STATES_NOT_TAKEN = frozenset({_STEER_STATE_REQUEUED, _STEER_STATE_RETRACTED})
+
+
+def _is_steer_row(row: dict) -> bool:
+    """Whether *row* is a mid-turn steer: a ``user`` row whose ``meta.steer`` is True,
+    or a ``nudge`` row with it (a monitor loop's wake steered into the turn).
+
+    A steer is delivered into a turn that is already running, so it never opens a
+    turn even though its role is one that otherwise does.
+    """
+    meta = row.get("meta")
+    return (
+        row.get("role") in ("user", "nudge")
+        and isinstance(meta, dict)
+        and meta.get("steer") is True
+    )
+
 
 def _interrupted_opener_kind(row: dict) -> str:
     """A short name for the automated delivery that opened an interrupted turn."""
@@ -124,6 +151,11 @@ def build_interrupted_turn_preamble(
     turn-in-flight marker restores its opener after a restart). Walk back from
     *current* -- the resume row this turn is running, excluded -- to the row that
     opened the interrupted turn, collecting the assistant text it had streamed.
+    A mid-turn steer (:func:`_is_steer_row`) is walked past rather than taken as
+    the opener, and is carried in the partial output, in the order it was sent,
+    under ``[Steered mid-turn]`` -- unless its ``steerState`` is ``requeued``,
+    which means the turn never took it and it runs as its own turn, or
+    ``retracted``, which means the person took it back before the turn read it.
     Returns "" when no opener is found. The caller mints the result AFTER the
     prompt's egress scrub (its markers are in ``_STRUCTURAL_MARKER_RES``); the
     payload is scrubbed here instead.
@@ -138,7 +170,7 @@ def build_interrupted_turn_preamble(
     for i in range(end - 1, -1, -1):
         role = messages[i].get("role")
         meta = messages[i].get("meta")
-        if role in _TURN_OPENER_ROLES or (
+        if (role in _TURN_OPENER_ROLES and not _is_steer_row(messages[i])) or (
             role == "inject"
             and isinstance(meta, dict)
             and meta.get("injectKind") in opener_inject_kinds
@@ -150,16 +182,46 @@ def build_interrupted_turn_preamble(
     user_text = str(messages[opener_idx].get("content") or "").strip()
     if not user_text:
         return ""
-    assistant_parts = [
-        str(m.get("content") or "").strip()
-        for m in messages[opener_idx + 1 : end]
-        if m.get("role") == "assistant" and str(m.get("content") or "").strip()
-    ]
+    # *assist_cap* bounds the assistant text alone, measured as if its chunks were
+    # joined on their own, so a turn with no steer is cut exactly where it always
+    # was. A steer line never spends that budget: a redirect the user sent after a
+    # long stream is the line the model most needs, and a head cut would drop it.
+    assistant_parts: list[str] = []
+    assist_used = 0
+    assist_full = False
+    last_assist = -1
+    for m in messages[opener_idx + 1 : end]:
+        text = str(m.get("content") or "").strip()
+        if not text:
+            continue
+        if m.get("role") == "assistant":
+            if assist_full:
+                continue
+            start = assist_used + (1 if last_assist >= 0 else 0)
+            if start + len(text) <= assist_cap:
+                assistant_parts.append(text)
+                assist_used = start + len(text)
+                last_assist = len(assistant_parts) - 1
+                continue
+            assist_full = True
+            keep = assist_cap - start
+            if keep >= 0:
+                assistant_parts.append(text[:keep] + "… [truncated]")
+            else:
+                # The cap fell on the separator itself: the kept text ends with the
+                # previous chunk, so the marker closes that chunk.
+                assistant_parts[last_assist] += "… [truncated]"
+        elif _is_steer_row(m) and m["meta"].get("steerState") not in _STEER_STATES_NOT_TAKEN:
+            # A requeued steer did not redirect this turn: it waits in the queue as
+            # its own turn, or the user dismissed it. Carrying it would have the
+            # model act on it here and again when it drains. A taken-back steer
+            # never reached the turn at all.
+            if len(text) > user_cap:
+                text = text[:user_cap] + "… [truncated]"
+            assistant_parts.append(f"{_STEER_LABEL} {text}")
     assistant_text = "\n".join(assistant_parts)
     if len(user_text) > user_cap:
         user_text = user_text[:user_cap] + "… [truncated]"
-    if len(assistant_text) > assist_cap:
-        assistant_text = assistant_text[:assist_cap] + "… [truncated]"
     # The frame is minted outside the prompt's egress scrub, so its payload is
     # scrubbed here: a transcript row must not carry a structural marker past it.
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
@@ -202,17 +264,12 @@ _REPLAY_BUDGET_CHARS = (
     80_000  # 80K chars ≈ 20K tokens — fits alongside system context in 200K window
 )
 
-# Per-row ceiling for EVERY row inside a replay, mirroring
-# ``thread_history_text``'s scaled ``per_message`` cap. Conversation rows were
-# uncapped here, and the budget loop's ``and lines`` exemption admitted the
-# NEWEST row whole whatever its size — measured: a 300,000-char newest row
-# produced a 300,006-char replay against an 80,000 budget (16,000 on a 200K
-# window), and a large OLDER row ended the scan, keeping only the three rows
-# after it. Capped per row, one big row is clipped instead of evicting the
-# rest, and the inject rows below keep their own lower ceiling.
-_REPLAY_PER_ROW_CAP_CHARS = _budgets._PER_MESSAGE_CAP
-
-# Per-row ceiling for ``inject`` content inside a replay.
+# Per-row ceiling for ``inject`` content inside a replay. Conversation rows are
+# uncapped here: they are the signal the replay exists to carry. An inject row
+# only has to say that a cron ran or a note was left, so a breadcrumb is enough,
+# and without a ceiling one chatty producer spends the whole tail-heavy budget on
+# itself and evicts real history. Sized above the p75 real inject row so typical
+# breadcrumbs pass through whole and only the outsized dumps are clipped.
 _REPLAY_INJECT_CAP_CHARS = 2_000
 
 # Share of the replay budget ``inject`` rows may spend between them. Conversation
@@ -230,6 +287,17 @@ _REPLAY_INJECT_MAX_ROWS = (
 ) // _REPLAY_INJECT_CAP_CHARS
 
 _REPLAY_CONVERSATION_MAX_ROWS = 500
+
+#: ``meta.notice`` on a conductor context cap notice row. A trim writes none
+#: (``dashboard/chat_turn/context_cap.py``), but a transcript may still hold one, and
+#: no replay carries it: the trimmed session learns of its trim from its seed.
+CONTEXT_CAP_NOTICE = "context_cap"
+
+
+def is_context_cap_notice(row: dict) -> bool:
+    """Whether *row* is the conductor context cap's notice row."""
+    meta = row.get("meta")
+    return isinstance(meta, dict) and meta.get("notice") == CONTEXT_CAP_NOTICE
 
 
 def _replay_identity(row: dict) -> tuple | None:
@@ -285,6 +353,8 @@ _RECALL_FALLBACK_MAX_ROWS = 20
 def _quota_tail(messages: list[dict], *, conv_max: int, inject_max: int) -> list[dict]:
     """The newest rows under separate conversation and ``inject`` row quotas, oldest first.
 
+    A steer the person took back (``steerState: retracted``) is left out.
+
     A role-filtered tail slice lets a run of ``inject`` rows longer than the bound be
     the entire read, so conversation disappears. Counting the two quotas separately
     lets notes reach the model without competing with user/assistant turns for the
@@ -299,35 +369,14 @@ def _quota_tail(messages: list[dict], *, conv_max: int, inject_max: int) -> list
     """
     from kiro_crew.image_refs import strip_image_refs
 
-    return [
-        {
-            "role": messages[position]["role"],
-            "content": strip_image_refs(messages[position]["content"]),
-        }
-        for position in _quota_tail_positions(messages, conv_max=conv_max, inject_max=inject_max)
-    ]
-
-
-def _quota_tail_positions(
-    messages: list[dict],
-    *,
-    conv_max: int,
-    inject_max: int,
-    skip: Callable[[dict], bool] | None = None,
-) -> list[int]:
-    """Positions in *messages* of the rows :func:`_quota_tail` keeps, oldest first.
-
-    The session replay needs the positions rather than the projected rows, because
-    the rows the tail does NOT keep are what its overview describes. A row *skip*
-    accepts is passed over before any quota is counted, so it spends no slot.
-    """
-    kept: list[int] = []
+    kept: list[dict] = []
     conv = inj = 0
-    for position in range(len(messages) - 1, -1, -1):
-        m = messages[position]
-        if skip is not None and skip(m):
-            continue
+    for m in reversed(messages):
         role = m["role"]
+        if _is_steer_row(m) and m["meta"].get("steerState") == _STEER_STATE_RETRACTED:
+            # Taken back before the turn read it: it was never part of the
+            # conversation, and its text was cleared when it was taken back.
+            continue
         if role == "inject":
             if inj >= inject_max:
                 continue
@@ -340,56 +389,33 @@ def _quota_tail_positions(
             conv += 1
         else:
             continue
-        kept.append(position)
+        kept.append({"role": role, "content": strip_image_refs(m["content"])})
     kept.reverse()
     return kept
 
 
-def replay_text(messages: list[dict], model_window: int | None) -> str:
+def replay_text(
+    messages: list[dict], model_window: int | None, *, budget_chars: int = _REPLAY_BUDGET_CHARS
+) -> str:
     """The tail-heavy replay of *messages* within the window-scaled replay budget.
 
     Keeps as many recent messages as fit, newest first. ``inject`` rows are clipped
     to a per-row ceiling and spend their own share of the budget, so conversation is
     never starved by breadcrumbs. Returned unredacted; the caller redacts.
+
+    *budget_chars* is the budget at the reference window: ``_REPLAY_BUDGET_CHARS``
+    for every cold start but the conductor context cap's trim, which passes a
+    larger one.
     """
-    return _tail_select(messages, model_window)[0]
-
-
-def _replay_factor(model_window: int | None) -> float:
-    """The window scale every replay allowance shares.
-
-    Replay is a separate, existing tail-history allowance, not background
-    capacity. Preserve small-window replay limits; larger windows cannot
-    enlarge it beyond the reference allowance.
-    """
-    return max(
+    # Replay is a separate, existing tail-history allowance, not background
+    # capacity. Preserve small-window replay limits; larger windows cannot
+    # enlarge it beyond the reference allowance.
+    factor = max(
         0.2,
         min(1.0, _budgets._effective_window(model_window) / _budgets._REFERENCE_WINDOW_TOKENS),
     )
-
-
-def _tail_select(
-    messages: list[dict], model_window: int | None, *, replay_budget: int | None = None
-) -> tuple[str, int]:
-    """:func:`replay_text`'s text, plus the position of the oldest row it kept.
-
-    *replay_budget* replaces the window-scaled budget -- the session replay hands its
-    verbatim tail what remains after the overview's share -- and every per-row
-    ceiling below is bounded by the budget actually in force. The position is
-    ``len(messages)`` when nothing was kept.
-    """
-    factor = _replay_factor(model_window)
-    if replay_budget is None:
-        replay_budget = round(_REPLAY_BUDGET_CHARS * factor)
+    replay_budget = round(budget_chars * factor)
     inject_cap = max(1, min(replay_budget, round(_REPLAY_INJECT_CAP_CHARS * factor)))
-    # Per-row ceiling that scales WITH the budget (mirroring
-    # thread_history_text), so a big row clips instead of eating the replay:
-    # bounded at the budget minus its own line framing, which also guarantees
-    # the newest row always fits.
-    per_row_cap = min(
-        round(_REPLAY_PER_ROW_CAP_CHARS * factor),
-        replay_budget - len("User: ") - len("…[truncated]"),
-    )
 
     # Reserved so conversation cannot be starved by breadcrumbs: inject rows spend
     # their own share and older ones are skipped, while the scan keeps looking for
@@ -400,467 +426,23 @@ def _tail_select(
     lines: list[str] = []
     total = 0
     inject_total = 0
-    oldest = len(messages)
-    for position in range(len(messages) - 1, -1, -1):
-        m = messages[position]
+    for m in reversed(messages):
         role = m["role"].title()
         content = m.get("content", "")
-        if len(content) > per_row_cap:
-            content = content[:per_row_cap] + "…[truncated]"
         if m["role"] == "inject" and len(content) > inject_cap:
             content = content[:inject_cap] + "…[truncated]"
         line = f"{role}: {content}"
         if m["role"] == "inject" and inject_total + len(line) > inject_budget and lines:
             continue
-        # No ``and lines`` exemption: with every row clipped below the budget
-        # the newest row always fits, so the scan ends on budget rather than
-        # admitting one oversized row whole.
-        if total + len(line) > replay_budget:
+        if total + len(line) > replay_budget and lines:
             break
         lines.append(line)
-        oldest = position
         total += len(line) + 2  # +2 for separator
         if m["role"] == "inject":
             inject_total += len(line) + 2
 
     lines.reverse()
-    return "\n\n".join(lines), oldest
-
-
-# ── Deterministic overview of the rows a session replay cannot carry ──
-#
-# A fresh harness session -- after a context recycle, a provider switch or a process
-# death -- is seeded from Kiro Crew's own transcript. The tail above keeps the NEWEST
-# rows verbatim; every older row used to be dropped whole, and the only trace of them
-# was the harness's compaction notice riding along as if the assistant had said it.
-# Once a history no longer fits, the replay spends a fixed share of its budget on a
-# bounded overview of those older rows instead. The shape is pi-fabric's
-# deterministic compactor, applied where Kiro Crew owns the text:
-#
-# * No model call. A pure function of the rows: the same rows always render the same
-#   text, at no cost and no latency.
-# * Rebuilt from the transcript every time, never from an earlier overview, so
-#   errors cannot compound across recycles. The harness's own compaction summary is
-#   one labelled, derived section -- never something the assistant said.
-# * Typed fields only: row roles, ``meta.kind`` / ``meta.tool_name`` /
-#   ``meta.tool_call_id`` on tool rows, the ``path`` of ``meta.file_changes`` entries
-#   and the target paths of a read, edit, delete or move call's JSON arguments. No
-#   prose is interpreted, quoted text is the original wording clipped, and no tool
-#   input or output is carried verbatim.
-# * Bounded: every section has a ceiling and the overview fits its share.
-
-#: Share of the replay budget the overview may spend once older rows exist. The
-#: verbatim tail keeps the rest, so the replay as a whole never grows.
-_OVERVIEW_SHARE = 0.25
-
-#: Between the overview and the verbatim tail, so the model can tell a mechanical
-#: account of older rows from the rows themselves.
-_VERBATIM_TAIL_HEADING = "MOST RECENT MESSAGES (verbatim, oldest first):"
-
-#: The newest requests among the older rows, quoted with the reply each answered.
-_OVERVIEW_PROTECTED_REQUESTS = 3
-#: One-line requests listed before those: the earliest (the first is the original
-#: objective) and the latest, with the gap between them counted.
-_OVERVIEW_EARLIEST_REQUESTS = 3
-_OVERVIEW_LATEST_REQUESTS = 9
-_OVERVIEW_LINE_CHARS = 160
-_OVERVIEW_PATH_CHARS = 200
-_OVERVIEW_MAX_PATHS = 20
-#: A tool row's arguments are parsed for target paths only up to this size: a larger
-#: input is a diff or a payload, not a path-bearing argument object.
-_OVERVIEW_MAX_INPUT_CHARS = 64_000
-
-#: Ceiling per quoted block, as (share of the overview budget, floor in chars): the
-#: work ledger, each quoted request, each reply it answered, the harness summary.
-_OVERVIEW_CEILINGS: dict[str, tuple[float, int]] = {
-    "ledger": (0.15, 400),
-    "request": (0.08, 200),
-    "reply": (0.04, 120),
-    "summary": (0.20, 300),
-}
-
-_OVERVIEW_SPEECH_ROLES = frozenset({"user", "assistant"})
-_OVERVIEW_CHANGE_KINDS = frozenset({"edit", "delete", "move"})
-
-
-def _overview_ceiling(block: str, budget: int) -> int:
-    share, floor = _OVERVIEW_CEILINGS[block]
-    return max(floor, round(budget * share))
-
-
-class _OverviewTurn:
-    """One request in the older rows: what the user wrote, the reply it answered,
-    and the tool calls made for it (label -> count)."""
-
-    __slots__ = ("request", "reply", "tools")
-
-    def __init__(self, request: str, reply: str) -> None:
-        self.request = request
-        self.reply = reply
-        self.tools: dict[str, int] = {}
-
-
-def _row_text(row: Mapping) -> str:
-    value = row.get("content")
-    return value if isinstance(value, str) else ""
-
-
-def _row_meta(row: Mapping) -> Mapping:
-    meta = row.get("meta")
-    return meta if isinstance(meta, Mapping) else {}
-
-
-def _one_line(text: str, limit: int) -> str:
-    flat = " ".join(text.split())
-    return flat if len(flat) <= limit else flat[: limit - 3].rstrip() + "..."
-
-
-def _excerpt(text: str, limit: int) -> str:
-    """*text* up to *limit* chars with its line breaks, the cut counted rather than hidden."""
-    body = text.strip()
-    if len(body) <= limit:
-        return body
-    return body[:limit].rstrip() + f" ...[{len(body) - limit} more chars]"
-
-
-def _indented(text: str, prefix: str = "    ") -> str:
-    return "\n".join(prefix + line if line.strip() else "" for line in text.splitlines())
-
-
-def _path_label(path: str) -> str:
-    """*path* on one clipped line, never in a form the prompt builder inlines.
-
-    ``build_prompt_blocks`` attaches every readable image path it finds anywhere in
-    the outgoing message, so a listed screenshot would ride along as a picture. The
-    glued ``file:`` form is one its grammar cannot match -- the answer
-    ``session_ledger.render_snapshot`` gives its artifacts too.
-    """
-    from kiro_crew import image_refs
-
-    label = _one_line(path, _OVERVIEW_PATH_CHARS)
-    if image_refs._ANY_IMAGE_SUFFIX_RE.search(label):
-        label = f"file:{label}"
-    return label
-
-
-def _input_paths(raw: str) -> list[str]:
-    """The target paths in a tool row's JSON arguments, by the gate's own walk."""
-    body = raw.strip()
-    if not body.startswith("{") or len(body) > _OVERVIEW_MAX_INPUT_CHARS:
-        return []
-    try:
-        params = json.loads(body)
-    except (ValueError, RecursionError):
-        return []
-    if not isinstance(params, dict):
-        return []
-    from kiro_crew.platform.tool_paths import target_paths
-
-    return [path for path in target_paths(params) if path.strip()]
-
-
-def _file_change_paths(meta: Mapping) -> list[str]:
-    entries = meta.get("file_changes")
-    if not isinstance(entries, list):
-        return []
-    return [
-        entry["path"]
-        for entry in entries
-        if isinstance(entry, Mapping)
-        and isinstance(entry.get("path"), str)
-        and entry["path"].strip()
-    ]
-
-
-def _tool_label(kind: str, name: str) -> str:
-    if kind and kind != "other":
-        return kind
-    return _one_line(name, 40) if name else (kind or "other")
-
-
-def _newest_first(paths: dict[str, int]) -> list[str]:
-    """Paths by the position they were last touched at, newest first; a tie keeps
-    first-touch order, so the result is a function of the rows alone."""
-    return sorted(paths, key=lambda path: -paths[path])
-
-
-def _walk_older_rows(rows: Sequence[Mapping]) -> tuple[list[_OverviewTurn], list[str], list[str]]:
-    """The turns, the changed paths and the read paths in *rows*, by typed fields alone.
-
-    A turn opens on a non-empty ``user`` row and carries the reply it answered: the
-    newest non-empty ``assistant`` text since the turn before. One logical tool call
-    reaches the transcript as up to three ``tool`` rows sharing a ``tool_call_id``
-    (dispatch, approval, result), so calls are folded by id first -- each field the
-    first non-empty value, as ``compaction.keep`` folds them -- and a row without an
-    id is a call of its own. Changed paths come from ``meta.file_changes`` and from an
-    edit/delete/move call's arguments; read paths from a read call's arguments.
-    """
-    turns: list[_OverviewTurn] = []
-    reply = ""
-    calls: dict[str, dict] = {}
-    changed: dict[str, int] = {}
-    read: dict[str, int] = {}
-    for position, row in enumerate(rows):
-        role = row.get("role")
-        meta = _row_meta(row)
-        if role == "user":
-            text = _row_text(row)
-            if text.strip():
-                turns.append(_OverviewTurn(text, reply))
-                reply = ""
-            continue
-        if role == "assistant":
-            text = _row_text(row)
-            if text.strip():
-                reply = text
-            for path in _file_change_paths(meta):
-                changed[path] = position
-            continue
-        if role != "tool":
-            continue
-        call_id = meta.get("tool_call_id")
-        key = call_id if isinstance(call_id, str) and call_id else f"row:{position}"
-        call = calls.get(key)
-        if call is None:
-            call = calls[key] = {
-                "turn": len(turns) - 1,
-                "position": position,
-                "kind": "",
-                "name": "",
-                "input": "",
-            }
-        for field, source in (("kind", "kind"), ("name", "tool_name"), ("input", "input")):
-            value = meta.get(source)
-            if not call[field] and isinstance(value, str) and value.strip():
-                call[field] = value if field == "input" else value.strip()
-    for call in calls.values():
-        kind = call["kind"].lower()
-        if call["turn"] >= 0:
-            tools = turns[call["turn"]].tools
-            label = _tool_label(kind, call["name"])
-            tools[label] = tools.get(label, 0) + 1
-        if kind == "read" or kind in _OVERVIEW_CHANGE_KINDS:
-            target = read if kind == "read" else changed
-            for path in _input_paths(call["input"]):
-                target[path] = max(target.get(path, -1), call["position"])
-    changed_paths = _newest_first(changed)
-    changed_set = set(changed_paths)
-    return turns, changed_paths, [path for path in _newest_first(read) if path not in changed_set]
-
-
-def _tools_phrase(tools: dict[str, int]) -> str:
-    counts = sorted(tools.items(), key=lambda item: (-item[1], item[0]))
-    return ", ".join(f"{label} {count}" for label, count in counts)
-
-
-def _request_line(turn: _OverviewTurn) -> str:
-    from kiro_crew.image_refs import strip_image_refs
-
-    line = "- " + _one_line(strip_image_refs(turn.request), _OVERVIEW_LINE_CHARS)
-    if turn.tools:
-        line += f" (tools: {_tools_phrase(turn.tools)})"
-    return line
-
-
-def _path_section(title: str, paths: list[str]) -> str:
-    shown = [_path_label(path) for path in paths[:_OVERVIEW_MAX_PATHS]]
-    more = len(paths) - len(shown)
-    return (
-        f"{title} (most recent first): " + ", ".join(shown) + (f" (+{more} more)" if more else "")
-    )
-
-
-def _clip_lines(text: str, room: int) -> str:
-    """*text* cut at a line boundary to fit *room*, marked; ``""`` when nothing fits."""
-    marker = "\n...[clipped to fit]"
-    limit = room - len(marker)
-    if limit <= 0:
-        return ""
-    cut = text.rfind("\n", 0, limit)
-    body = text[:cut] if cut > 0 else text[:limit]
-    return body.rstrip() + marker
-
-
-def _overview(older: Sequence[Mapping], *, budget: int, ledger: str, harness_summary: str) -> str:
-    """The overview of *older* rows within *budget* chars, or ``""`` when it would say
-    nothing beyond its own heading.
-
-    Sections in priority order, each with its own ceiling: the work ledger, the newest
-    requests quoted with the replies they answered, the earlier requests one line each,
-    the files changed, the harness's compaction summary, the files read. The header
-    and footer are always kept; each section goes in whole while it fits, the first
-    that does not is cut at a line boundary, and nothing follows it.
-    """
-    from kiro_crew.image_refs import strip_image_refs
-
-    rows = [row for row in older if isinstance(row, Mapping)]
-    turns, changed, read = _walk_older_rows(rows)
-    quote_cap = _overview_ceiling("request", budget)
-    reply_cap = _overview_ceiling("reply", budget)
-    sections: list[str] = []
-    if ledger.strip():
-        sections.append("Work ledger:\n" + _excerpt(ledger, _overview_ceiling("ledger", budget)))
-    protected = turns[-_OVERVIEW_PROTECTED_REQUESTS:]
-    if protected:
-        parts = ["Last requests before the verbatim part (oldest first):"]
-        for turn in protected:
-            if turn.reply.strip():
-                parts.append("- The assistant had said (an earlier reply, not a verified outcome):")
-                parts.append(_indented(_excerpt(strip_image_refs(turn.reply), reply_cap)))
-                parts.append("  The user then wrote:")
-            else:
-                parts.append("- The user wrote:")
-            parts.append(_indented(_excerpt(strip_image_refs(turn.request), quote_cap)))
-            if turn.tools:
-                parts.append(f"  Tools used for it: {_tools_phrase(turn.tools)}")
-        sections.append("\n".join(parts))
-    earlier = turns[:-_OVERVIEW_PROTECTED_REQUESTS]
-    if earlier:
-        listed = _OVERVIEW_EARLIEST_REQUESTS + _OVERVIEW_LATEST_REQUESTS
-        lines = ["Earlier requests (one line each, oldest first):"]
-        if len(earlier) <= listed:
-            lines += [_request_line(turn) for turn in earlier]
-        else:
-            lines += [_request_line(turn) for turn in earlier[:_OVERVIEW_EARLIEST_REQUESTS]]
-            lines.append(f"- ... {len(earlier) - listed} more requests ...")
-            lines += [_request_line(turn) for turn in earlier[-_OVERVIEW_LATEST_REQUESTS:]]
-        sections.append("\n".join(lines))
-    if changed:
-        sections.append(_path_section("Files changed", changed))
-    if harness_summary.strip():
-        sections.append(
-            "Compaction summary the agent harness reported earlier (written by the "
-            "harness, not by Kiro Crew; it may be incomplete or out of date):\n"
-            + _excerpt(strip_image_refs(harness_summary), _overview_ceiling("summary", budget))
-        )
-    if read:
-        sections.append(_path_section("Files read", read))
-    if not sections:
-        return ""
-
-    spoken = sum(
-        1 for row in rows if row.get("role") in _OVERVIEW_SPEECH_ROLES and _row_text(row).strip()
-    )
-    header = "EARLIER IN THIS CONVERSATION -- an overview, not a transcript."
-    if spoken:
-        header += (
-            f"\n{spoken} older messages are not repeated word for word below. Kiro Crew "
-            "assembled this overview mechanically from the conversation log; no model "
-            "wrote it. Quoted text is the original wording, clipped. It records what was "
-            "asked and which tools and files were involved, not what was verified."
-        )
-    footer = (
-        "The full earlier wording is still in this session's history: search_chat_history "
-        "and get_chat_session can read it when those tools are available to you."
-    )
-    if len(header) + len(footer) + 4 >= budget:
-        return ""
-    out = [header]
-    used = len(header) + 2 + len(footer)
-    for section in sections:
-        room = budget - used - 2
-        if len(section) <= room:
-            out.append(section)
-            used += len(section) + 2
-            continue
-        clipped = _clip_lines(section, room)
-        if clipped:
-            out.append(clipped)
-        break
-    if len(out) == 1:
-        return ""
-    out.append(footer)
-    return "\n\n".join(out)
-
-
-def _speech_boundary(tail: list[dict], oldest: int, positions: list[int], total: int) -> int:
-    """Position in the transcript of the oldest user or assistant row the tail kept.
-
-    Not simply the oldest row it kept: once the conversation quota is full the quota
-    walk still admits older ``inject`` rows, so the oldest kept row can sit before
-    conversation the quota dropped. Every user and assistant row after this position
-    is in the tail -- the budget loop skips only ``inject`` rows -- so the speech
-    before it is exactly the speech the tail dropped. *total* when none was kept.
-    """
-    for index in range(oldest, len(tail)):
-        if tail[index]["role"] in _OVERVIEW_SPEECH_ROLES:
-            return positions[index]
-    return total
-
-
-def _older_speech(rows: list[dict], boundary: int, notice: Callable[[dict], bool]) -> bool:
-    """Whether any user or assistant row before *boundary* is speech the tail dropped."""
-    return any(
-        row.get("role") in _OVERVIEW_SPEECH_ROLES and _row_text(row).strip() and not notice(row)
-        for row in rows[:boundary]
-    )
-
-
-def session_replay_text(
-    rows: list[dict],
-    model_window: int | None,
-    *,
-    ledger: Callable[[], str] | None = None,
-) -> str | None:
-    """The session replay of *rows*, or ``None`` when no row qualifies for it.
-
-    *rows* are the session's transcript rows, merged and chronological. System notices
-    (``dashboard.system_notices``) are status rather than speech, so none of them
-    enters the verbatim tail; the newest compaction summary among them is shown in the
-    overview instead, labelled as the harness's. *ledger* renders the session's
-    work-ledger snapshot and is called only when the overview covers dropped
-    conversation, because it reads files.
-
-    A history that fits, with no compaction summary in it, comes back exactly as
-    :func:`replay_text` renders it. Otherwise the overview takes
-    :data:`_OVERVIEW_SHARE` of the budget and the verbatim tail the rest, so the
-    replay never grows; an overview with nothing to say gives its share back.
-    """
-    from kiro_crew.dashboard.system_notices import compaction_notice_summary, is_system_notice
-    from kiro_crew.image_refs import strip_image_refs
-
-    def notice(row: dict) -> bool:
-        return is_system_notice(row.get("role"), row.get("meta"))
-
-    positions = _quota_tail_positions(
-        rows,
-        conv_max=_REPLAY_CONVERSATION_MAX_ROWS,
-        inject_max=_REPLAY_INJECT_MAX_ROWS,
-        skip=notice,
-    )
-    if not positions:
-        return None
-    tail = [
-        {"role": rows[position]["role"], "content": strip_image_refs(rows[position]["content"])}
-        for position in positions
-    ]
-    text, oldest = _tail_select(tail, model_window)
-    harness_summary = ""
-    for row in reversed(rows):
-        harness_summary = compaction_notice_summary(
-            row.get("role"), row.get("content"), row.get("meta")
-        )
-        if harness_summary:
-            break
-    boundary = _speech_boundary(tail, oldest, positions, len(rows))
-    if not harness_summary and not _older_speech(rows, boundary, notice):
-        return text
-    budget = round(_REPLAY_BUDGET_CHARS * _replay_factor(model_window))
-    share = round(budget * _OVERVIEW_SHARE)
-    short, short_oldest = _tail_select(
-        tail, model_window, replay_budget=budget - share - len(_VERBATIM_TAIL_HEADING) - 4
-    )
-    boundary = _speech_boundary(tail, short_oldest, positions, len(rows))
-    covers_speech = _older_speech(rows, boundary, notice)
-    overview = _overview(
-        [row for row in rows[:boundary] if not notice(row)],
-        budget=share,
-        ledger=ledger() if ledger is not None and covers_speech else "",
-        harness_summary=harness_summary,
-    )
-    if not overview:
-        return text
-    return f"{overview}\n\n{_VERBATIM_TAIL_HEADING}\n\n{short}"
+    return "\n\n".join(lines)
 
 
 def thread_history_text(recent: list[dict], caps: _budgets._ResolvedCaps) -> str:
@@ -940,7 +522,9 @@ def cancelled_turn_preamble(recent: list[dict], *, user_cap: int, assist_cap: in
     """The ``[PREVIOUS TURN WAS CANCELLED …]`` restore for *recent* rows, or ``""``.
 
     Scans backwards for a ``stop_event`` marker, then takes the user message
-    immediately before it plus any assistant text in between.
+    immediately before it plus any assistant text in between. A steer the person
+    took back (``steerState: retracted``) keeps its row with its text cleared and
+    is stepped past, so *recent* must carry each row's ``meta``.
     """
     if not recent:
         return ""
@@ -971,9 +555,13 @@ def cancelled_turn_preamble(recent: list[dict], *, user_cap: int, assist_cap: in
     search_end = stop_idx if stop_idx >= 0 else len(recent)
     user_idx = -1
     for i in range(search_end - 1, -1, -1):
-        if recent[i].get("role") == "user":
-            user_idx = i
-            break
+        row = recent[i]
+        if row.get("role") != "user":
+            continue
+        if _is_steer_row(row) and row["meta"].get("steerState") == _STEER_STATE_RETRACTED:
+            continue
+        user_idx = i
+        break
     if user_idx < 0:
         return ""
     # Collect any assistant text between user_idx and the boundary.

@@ -7,7 +7,8 @@ import type { PayloadAction } from '@reduxjs/toolkit'
 import type { ChatMessage } from '../../types'
 import { isRejectedDecision } from '../../utils/approvalDecision'
 import type { ChatState } from './state'
-import { isUnsafeKey, safeKey } from './wire'
+import { isUnsafeKey, normalizeQueueEntries, safeKey } from './wire'
+import { hydrateQueuedBubbles } from './queue'
 import { RECONCILE_WINDOW, ensureMsgId, finalizeTrailingStreaming, mintMsgId, tailNotInPage } from './transcript'
 import { isOutOfBandRow, isTurnBoundaryUser, mergePreservedThinking } from './thinking'
 import { retainServerTotal, setPagingCursor, writeSlotPage } from './slotCache'
@@ -87,7 +88,7 @@ export const messageReducers = {
         if (m.role !== 'user') continue
         const rowSid = typeof m.meta?.sendId === 'string' && m.meta.sendId ? m.meta.sendId : ''
         if (echoSid && rowSid === echoSid && !m.meta?.optimistic) return
-        if (!m.meta?.optimistic || !m.meta?.steer) continue
+        if (!m.meta?.optimistic || (!m.meta?.steer && !(echoSid && m.meta?.responsiveSend))) continue
         if (echoSid) {
           // Id-bearing echo: the match is exact or there is no match.
           if (rowSid === echoSid) { target = m; break }
@@ -126,7 +127,7 @@ export const messageReducers = {
     }
     // Optimistic steer bubble from a pane-scoped composer: same freeze as the
     // appendMessage (active-slot) path.
-    if (message.role === 'user' && message.meta?.steer && message.meta?.optimistic) {
+    if (message.role === 'user' && ((message.meta?.steer && message.meta?.optimistic) || message.meta?.responsiveSend)) {
       finalizeTrailingStreaming(msgs)
     }
     // Mark non-steer user bubbles as optimistic so the sseChatMessage
@@ -271,16 +272,25 @@ export const messageReducers = {
     if (!resolve(state.messages)) resolve(state.slotMessages[safeKey(slot)])
   },
   removeByApprovalId(state: ChatState, action: PayloadAction<string>) { state.messages = state.messages.filter(m => m.meta?.approval_id !== action.payload) },
-  resolveByApprovalId(state: ChatState, action: PayloadAction<{ id: string; slot?: string; decision?: string; registry?: string }>) {
-    const { id, slot, registry } = action.payload
+  resolveByApprovalId(state: ChatState, action: PayloadAction<{ id: string; slot?: string; decision?: string; registry?: string; allPending?: boolean; mid?: string; answer?: Record<string, unknown> }>) {
+    const { id, slot, registry, allPending, mid, answer } = action.payload
     if (!slot || isUnsafeKey(slot)) return
     const messages = slot === state.activeSlot
       ? state.messages
       : state.slotMessages[safeKey(slot)]
     const matches = messages?.filter(message => message.meta?.approval_id === id)
-    const m = (registry
-      ? matches?.find(message => message.meta?.registry === registry)
-      : undefined) ?? matches?.[0]
+    // `mid` names the exact row the server stamped. An ACP request id is
+    // connection-scoped and a backend may reuse it, so by id alone the OLDEST
+    // row would win and a later card with the same id would stay pending. A
+    // frame that NAMES a mid therefore never falls back to another row: a
+    // miss means the row is not in this store (not loaded yet), and stamping
+    // a sibling would resolve the wrong card.
+    const m = mid
+      ? matches?.find(message => message.meta?.mid === mid)
+      : (registry
+        ? matches?.find(message => message.meta?.registry === registry)
+        : undefined)
+        ?? matches?.[0]
     const decision = action.payload.decision || 'approved'
     // A 'stale' retirement carries no outcome (an expired wait, a 404, or a
     // reconcile snapshot that no longer lists the id), so it may only settle
@@ -292,6 +302,17 @@ export const messageReducers = {
     // write downgraded the decision. The reverse direction stays open: a
     // real decision landing after 'stale' is new information and overwrites.
     if (m?.meta && !(decision === 'stale' && m.meta.resolved)) m.meta.resolved = decision
+    // An elicitation's accepted answer rides the same frame; the card reads
+    // `meta.answer` for its summary, which a transcript reload would otherwise
+    // be the first to supply.
+    if (m?.meta && answer && decision !== 'stale') m.meta.answer = answer
+    // `allPending`: a bare-id 404 proves NO request is pending under this id
+    // (`resolve_approval` checks the state and slot registries), yet a
+    // chat-runner row and a coordinator row can carry it. Settling only
+    // `matches[0]` left the other row up, so the bar stayed under its
+    // "expired" notice. A successful decide does not pass this: it answered
+    // ONE request, and another row may still be live.
+    if (allPending) for (const other of matches ?? []) if (other.meta && !other.meta.resolved) other.meta.resolved = decision
     // If rejected, mark the matching toolLog entry so the pill can show a rejection icon.
     // Every rejection token counts: a reject-once that missed this would leave
     // the pill unmarked, and ToolCallLine then reads its 🚫 sibling as an
@@ -361,8 +382,8 @@ export const messageReducers = {
    *  unbounded one. The reverse is refused, and a superseded slot cannot upgrade
    *  again, so this cannot loop.
    *  No-op for the active slot (its mirror is already live). */
-  hydrateSlotMessages(state: ChatState, action: PayloadAction<{ slot: string; messages: ChatMessage[]; hasMore?: boolean; bounded?: boolean; total?: number; running?: boolean; nextBefore?: number }>) {
-    const { slot, messages, hasMore, bounded, total, running, nextBefore } = action.payload
+  hydrateSlotMessages(state: ChatState, action: PayloadAction<{ slot: string; messages: ChatMessage[]; queue?: unknown; hasMore?: boolean; bounded?: boolean; total?: number; running?: boolean; nextBefore?: number }>) {
+    const { slot, messages, queue, hasMore, bounded, total, running, nextBefore } = action.payload
     if (isUnsafeKey(slot)) return
     if (slot === state.activeSlot) return
     const k = safeKey(slot)
@@ -386,12 +407,16 @@ export const messageReducers = {
     const cur = state.slotMessages[slot] ?? []
     if (!state.slotHydrated) state.slotHydrated = {}
     state.slotHydrated[k] = true
+    const removedQueueIds = new Set(state.slotPaneRemovedQueueIds?.[k])
+    delete state.slotPaneRemovedQueueIds?.[k]
     // Only a page write records a marker, so its presence means `cur` is a
     // loaded transcript, and prepending a bounded tail onto that reorders it.
     if (state.slotPaneHasMore?.[k] !== undefined) return
     // Seeded frames are NEWER rows appended after the page, so the page's
     // has-more still describes what precedes it; dropping it hid the marker.
-    writeSlotPage(state, slot, [...messages, ...cur], hasMore, bounded ? messages.length : undefined, nextBefore)
+    const queued = normalizeQueueEntries(queue).filter(q => !removedQueueIds.has(q.queueId))
+    const hydrated = hydrateQueuedBubbles([...messages, ...tailNotInPage(cur, messages)], queued, true)
+    writeSlotPage(state, slot, hydrated, hasMore, bounded ? messages.length : undefined, nextBefore)
     retainServerTotal(state, slot, total, running)
   },
   sseChatMessageUpdate(state: ChatState, action: PayloadAction<{ slot: string; tool_call_id?: string; ts?: string; content?: string; meta?: Record<string, unknown> }>) {
@@ -484,28 +509,35 @@ export const messageReducers = {
    *  the text. The tool is then the turn's latest step, so the burst that
    *  preceded it is closed and the new one belongs after it — appending is the
    *  only placement that satisfies both, and it is what stops a post-tool
-   *  burst being concatenated into the pre-tool block. */
+   *  burst being concatenated into the pre-tool block.
+   *
+   *  A NON-active slot accumulates into `slotMessages[slot]`, the array a pane
+   *  rendering that slot reads (a split-view or session-grid pane): those hosts never move `activeSlot`, and their
+   *  answer text already streams there via the non-active chunk path, so
+   *  reasoning must land beside it. A crewmate's chat still drops these rows
+   *  at render time (`filterCrewmateChat`, #18238). */
   sseThinkingChunk(state: ChatState, action: PayloadAction<{ slot: string; content: string }>) {
     const { slot, content } = action.payload
-    if (slot !== state.activeSlot || !content) return
-    let at = state.messages.length
-    for (let i = state.messages.length - 1; i >= 0; i--) {
-      if (state.messages[i].role === 'streaming') { at = i; break }
+    if (!slot || !content || isUnsafeKey(slot)) return
+    const msgs = slot === state.activeSlot ? state.messages : (state.slotMessages[safeKey(slot)] ??= [])
+    let at = msgs.length
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === 'streaming') { at = i; break }
     }
-    for (let i = at; i < state.messages.length; i++) {
-      if (state.messages[i].role === 'tool') { at = state.messages.length; break }
+    for (let i = at; i < msgs.length; i++) {
+      if (msgs[i].role === 'tool') { at = msgs.length; break }
     }
     // Extend the burst the model is still emitting: an out-of-band row (an
     // approval, a queued bubble) and a confirmed steer both interrupt it
     // without ending it, so look through them for the open block.
     let prev = at
     while (prev > 0) {
-      const m = state.messages[prev - 1]
+      const m = msgs[prev - 1]
       if (isOutOfBandRow(m) || (m.role === 'user' && !isTurnBoundaryUser(m))) { prev--; continue }
       break
     }
-    const open = prev > 0 ? state.messages[prev - 1] : undefined
+    const open = prev > 0 ? msgs[prev - 1] : undefined
     if (open?.role === 'thinking') { open.content += content; return }
-    state.messages.splice(at, 0, { role: 'thinking', content, cls: '', meta: { clientTs: mintMsgId() } })
+    msgs.splice(at, 0, { role: 'thinking', content, cls: '', meta: { clientTs: mintMsgId() } })
   },
 }

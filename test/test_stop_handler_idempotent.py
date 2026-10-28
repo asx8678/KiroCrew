@@ -35,10 +35,7 @@ class _FakeSlot:
         #: nobody owns is cancellable by the dashboard caller.
         self._app = None
         self._active_turn_session_key = ""
-        #: Remote-execution binding — "local" so these tests exercise the LOCAL
-        #: stop path. ``stop_slot_turn`` reads it to decide whether the stop must
-        #: travel to a peer crew, and the property below mirrors ``_ChatSlot`` in
-        #: requiring the WHOLE binding rather than just the marker.
+        #: Relay-archive marker, "local" as on every ordinary slot.
         self.executor = "local"
         self.instance_id = ""
         self.remote_slot = ""
@@ -46,10 +43,6 @@ class _FakeSlot:
         self.messages: list[dict] = []
         self._dirty = False
         self.source_links_invalidated = 0
-
-    @property
-    def is_remote(self) -> bool:
-        return bool(self.executor == "remote" and self.instance_id and self.remote_slot)
 
     def append(self, role, content, cls_meta):
         self.messages.append({"role": role, "content": content, "cls": cls_meta})
@@ -149,7 +142,6 @@ class TestStopHandlerIdempotent:
         request.match_info = {"slot": "test-slot"}
         request.query = {}
 
-        # Mock SEL logging and _reject_pending_approvals
         with patch("kiro_crew.dashboard.chat_handlers.sel") as mock_sel:
             mock_sel.return_value.log_tool_invocation = MagicMock()
             mock_sel.return_value.log = MagicMock()
@@ -573,7 +565,7 @@ class TestStopCardTeardownRace:
     """A turn tearing down must not strand the stop card at "stopping".
 
     `_finish_queue_cycle` (chat_runner.py) drives `_stopping = False` when the
-    queue drains, which the setter in state.py maps to `_stop_state = "idle"`.
+    queue drains, which the setter in state_parts/chat_slot.py maps to `_stop_state = "idle"`.
     That write races the soft-stop budget: when it landed before the escalation
     callback ran, the callback's old `_stop_state` gate bailed and the card was
     never settled. Observed against a live gateway as a stop card pulsing for

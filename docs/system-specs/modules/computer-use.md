@@ -117,6 +117,28 @@ Both in-process checks stay, and they cover what the gate structurally cannot: t
 keystone flipping **off** mid-session, after the spec was written and the backend
 spawned. The gate covers what they cannot: the process existing.
 
+**The usage text follows the same gate.** How to call the `computer_*` tools is
+`kirocrew-computer`'s own MCP `instructions` (`kiro_crew.mcp_instructions.COMPUTER`),
+so it reaches a session exactly when the server is mounted, in the harness's own
+system prompt ([mcp.md](../../architecture/mcp.md), "Server instructions travel
+with the server"). The default agent prompt (`config/prompt.md`) holds a
+`{{COMPUTER_USE_BLOCK}}` slot for the other case only:
+`ContextBuilder._resolve_prompt_templates` leaves it empty
+(`context_assembly.sections.computer_use_block(True)`) when
+`_computer_use_spec_gate()` is open and fills it with a short pointer to Settings →
+Computer Use when it is closed. The reading is taken whenever the session's backend
+spawns -- at session start and again on a resume -- and reused by the
+post-compaction re-render, so the restored block matches the tools that backend
+mounted. A session open across an enable resumes its own transcript after the reset
+(the session map keeps its id), and a resume re-sends no contract, so the pointer
+also tells the model to read the `computer-use` skill if the tools turn up. The
+mirror case, a session open across a disable, holds no stale usage text: the
+instructions left with the server, and the next compaction restores the pointer.
+A user prompt override under the data home (`prompt.md` there) is the user's own
+text: one copied before the slot existed still carries the section inline and
+keeps it whatever the gate says. Pinned by `test_context_computer_use_block.py`,
+`test_prompt_compact_contract.py` and `test_mcp_instructions.py`.
+
 `tools` is **not** touched. The `@kirocrew-computer` ref the shipped
 `defaults.json` grants stays where it is: a ref resolves against the agent's own
 `mcpServers` plus the global `mcp.json`, so once the entry is withheld the ref names
@@ -248,7 +270,7 @@ which the gate already treats as "nothing session-scoped is claimed, nothing to
 verify". Nothing in `_verify_unix_peer` changes; a real key declared by the wrong
 process is still denied. The body placeholder still scopes the `SnapshotIndex`
 namespace and the audit line. Pinned by
-`test_mcp_computer.py::TestUnresolvedKeysAreNeverDeclared`.
+`test_mcp_computer_sessions.py::TestUnresolvedKeysAreNeverDeclared`.
 
 The prefix is deliberate: this is a namespace separator, not attribution, and an audit
 reader must not mistake a pid — or a nonce — for a resolved identity. And it is a
@@ -357,16 +379,7 @@ check is kept as the last line of defence rather than deleted as redundant.
 `SKILL.md`'s tool table states the same thing, since an optional-looking argument
 there would have the model discover the refusal by hitting it.
 
-The chokepoint is pinned structurally, repo-wide
-(`test_computer_use_dispatch_pin.py`): no module outside `computer_use/` may
-import the service, a platform driver or the FFI, `get_shared_service()` may
-be called only by `tools.py` and the CLI, and the dashboard handler's one
-action entry must call `dispatch_tool`. A new action route therefore cannot
-ship without passing the chokepoint. `backend` is importable outside only for
-its read-only probe names (`get_shared_backend`, `platform_id_for_current_os`)
-and the fake's subclass.
-
-Every tool has a `MCP_COMPUTER_SCHEMAS` entry in `validation.py`. That is
+Every tool has a `MCP_COMPUTER_SCHEMAS` entry in `validation_parts/computer_use_schemas.py`. That is
 mandatory, not tidiness: an unregistered tool's arguments pass RAW through
 `_validate_args`, and a `ValidationError` raised inside a handler escapes the
 stdio loop and kills the server.
@@ -448,8 +461,9 @@ Window: "Documents", App: Finder.
 [tree truncated at 1200 nodes]
 
 Screenshot: /var/folders/…/kirocrew-computer-shots/shot-1769472013411.jpeg
-  (1280x604 jpeg, 24.2 KB) — read it with the fs_read tool only if the tree is
-  insufficient.
+  (1280x604 jpeg, 24.2 KB) — DOWNSCALED from the window size printed above, so
+  image pixels are not window coordinates. Take coordinates from an element's own
+  frame. Read the file with the fs_read tool only if the tree is insufficient.
 ```
 
 Every mutating tool re-walks the window at the cached snapshot's walk budget and
@@ -539,6 +553,12 @@ Mechanics:
 - `is_enabled()` is strict identity against `True`: a hand-edited
   `"enabled": "false"` (a truthy string) or `"enabled": 1` does not enable
   desktop control.
+- An enterprise build ignores the opt-in: `is_enabled()` answers `False`, the
+  config GET carries `locked_by_policy: true`, and a PUT with `enabled: true`
+  answers 409 `locked_by_policy`
+  ([rfc-crew-enterprise-edition](../../request-for-change/rfc-crew-enterprise-edition.md)
+  D3, `kiro_crew.edition_locks`). This is an edition lock, not a governance scope;
+  computer use stays ungoverned, and an `oss` build is unchanged.
 - The only writer is the dashboard PUT handler, which does not route through the
   agent tool gate.
 - `allowed_apps` is an optional narrowing (empty = everything not denied);
@@ -560,7 +580,7 @@ models is the point.
 | Route | Auth | Caller |
 |---|---|---|
 | `GET /api/computer-use/config` | cookie (browser) | Settings panel |
-| `PUT /api/computer-use/config` | cookie (browser) | Settings panel |
+| `PUT /api/computer-use/config` | cookie (browser), owner only | Settings panel |
 | `POST /api/computer-use/invoke` | loopback + `X-Internal-Secret` | the stdio shim ONLY |
 | `POST /api/computer-use/frame` | loopback + `X-Internal-Secret` | this gateway's own capture thread ONLY |
 
@@ -618,8 +638,10 @@ extra_denied_apps}` (→ keystone) and the seven display/budget fields (the five
 returns the refreshed GET payload. Everything is validated before anything is
 written.
 
-**It is dashboard-browser-only, asserted in the handler** — `request["app"]` must be
-empty, else `403` before the body is read. That gate is the write boundary the
+**It is dashboard-browser-only and owner-only, asserted in the handler** —
+`request["app"]` must be empty, else `403` before the body is read, and then
+`require_owner_dashboard_request(request, "computer_use.config_save")` refuses a
+dashboard user who is not the owner with 403 `owner_only`. That gate is the write boundary the
 keystone design rests on: `request["user"]` is truthy for an App-Kit token too, so
 the cookie check cannot separate them, and an app whose manifest declares
 `permissions.api: ["/api/computer-use"]` satisfies `app_token_path_allowed` (a bare
@@ -627,7 +649,7 @@ prefix matches on the path boundary). Since `enable_state.save_state` deliberate
 bypasses `is_sensitive_path` — that is what lets the operator's own panel write a
 file the agent cannot — an agent able to author an app manifest could otherwise read
 its own `.app_secret`, mint a token, and flip `enabled: true` on its own desktop
-automation. Same guard as `handlers/kiro_prerequisite.py` and `messaging.py`'s
+automation. Same guard as `handlers/kiro_prerequisite.py` and `messaging_api/agent_push.py`'s
 notification push; the two machine routes are covered instead by their
 `request["internal_auth"]` assertion, which an app token can never satisfy.
 
@@ -828,12 +850,12 @@ it would let a planted `~/Applications/Anything.app` be launched by name.
 Then **every directory on the path to the code that will run is probed for writability**
 (`_writable_component`): the bundle's parent, the bundle itself, `Contents`, and
 `Contents/MacOS`. The parent alone was not enough, and the gap it left is the common case
-rather than a corner. `/Applications` is root-owned and unwritable, but a bundle installed
-there by any user-space installer — every drag-install, every Homebrew cask — is owned by
-the installing user, so `Foo.app/Contents/MacOS/Foo` can be replaced without
-`/Applications` ever being writable. A parent-only probe passed that bundle and launched
-agent-authored native code. The parent probe still runs, which also catches an
-`/Applications` that is group-writable on a machine whose admin group has been widened.
+rather than a corner. On a stock macOS install `/Applications` is `drwxrwxr-x root admin`, so the parent probe
+fires for every admin user and every bundle dropped there is indistinguishable from one the
+operator installed. The parent probe and the bundle probes are independent: an unwritable
+parent is not evidence of an unwritable bundle. A bundle installed by any user-space
+installer — every drag-install, every Homebrew cask — is owned by the installing user, so
+`Foo.app/Contents/MacOS/Foo` can be replaced without the parent ever being writable.
 
 **Every level, not just the endpoints.** Write access to any single directory on that path
 is enough to control what executes, and `Contents` is the one an endpoints-only check
@@ -913,9 +935,9 @@ judged. `Contents/MacOS` is the location the OS itself requires, and any deeper 
 sits under a directory already being probed.
 
 The cost is real and is the right trade: an application installed only for the current
-user cannot be launched by name. The refusal says so and names the remedy (move the
-bundle under `/Applications`, or open it by hand), which is recoverable — where a launch
-verb that runs whatever the agent wrote is not.
+user cannot be launched by name. The refusal names the reason and tells the user to open
+the application themselves, which is recoverable — where a launch verb that runs whatever
+the agent wrote is not.
 
 A **command interpreter is refused by name** on both platforms (`cmd`, `powershell`,
 `wt`, `Terminal.app`, …). That list is explicitly *not* a security boundary and does
@@ -1183,8 +1205,8 @@ a Zoom annotation overlay: every public method refused or silently did nothing.
   open-source reverse-engineering work, attributed in `NOTICE` rather than in code
   comments (no third-party code is copied — the implementation is independent);
 - the private ABI lives in ONE module, `macos_skylight.py`, so a macOS point release
-  that changes a byte offset has one review boundary. `macos_ffi.py` keeps its
-  "public frameworks only" property, which is what makes it reviewable against
+  that changes a byte offset has one review boundary. `macos_ffi.py` and its owners keep their
+  "public frameworks only" property, which is what makes them reviewable against
   Apple's documentation. `test_computer_use_skylight.py` asserts that quarantine
   structurally — the private symbols must not appear in any other module;
 - it **fails closed with a readable refusal.** `available()` reports which symbols
@@ -1412,7 +1434,7 @@ the Settings copy says to raise it for dense apps), which is what made the loop
 worth a stamped field rather than a comment. `want_image` is still forced off for
 both — the verification compares structure, and spooling a screenshot nobody asked
 for would double the cost of every action. Pinned by
-`test_mcp_computer.py::TestTheDriftWalkHonoursTheSnapshotBudget`, which asserts the
+`test_mcp_computer_actions.py::TestTheDriftWalkHonoursTheSnapshotBudget`, which asserts the
 budget off the driver's own call journal (a behavioural assertion passed while the
 refresh walk was still using the default).
 
@@ -1436,7 +1458,7 @@ list position — position and index are not interchangeable.
 
 ## The ctypes layer: four findings from running real code
 
-All in-gateway macOS native work is confined to `macos_ffi.py`; the separate
+All in-gateway macOS native work is confined to `macos_ffi.py` and its owners; the separate
 cursor-overlay child owns its explicitly documented ctypes exception. `import ctypes`
 is a top-level import statement (AUTOSDE `top-level-imports`), but **no `CDLL`/`find_library`
 runs at module scope** — the four frameworks (CoreFoundation,
@@ -1505,10 +1527,28 @@ actually doing) appears nowhere.
 
 Two smaller findings encoded the same way: **the advertised action list lies** —
 an `AXScrollArea` advertising `AXScrollDownByPage` returned
-`-25205 (kAXErrorActionUnsupported)`, so `scroll` attempts the AX action, checks
-the error code, and falls back to `CGEventCreateScrollWheelEvent` posted with
-`CGEventPostToPid`; and **the tree walk is ITERATIVE** (an explicit stack), so a
-pathological deep tree cannot `RecursionError` inside ctypes.
+`-25205 (kAXErrorActionUnsupported)`, so `scroll` attempts the AX action and
+checks the error code; and **the tree walk is ITERATIVE** (an explicit stack), so
+a pathological deep tree cannot `RecursionError` inside ctypes.
+
+**When the AX scroll action is refused, `scroll` goes through the scroll bar.**
+The fallback chain, in order:
+
+| Step | Taken when | Result text |
+|---|---|---|
+| `AXScrollDownByPage` and siblings on the element | always first | `scrolled element N ...` |
+| Press the bar's page area (`AXButton` with subrole `AXIncrementPage` / `AXDecrementPage`) once per page | the element, or one of up to three ancestors, names an `AXVerticalScrollBar` / `AXHorizontalScrollBar` that has the page area | `scrolled element N down K of P page(s) with its scroll bar` plus the bar's `AXValue` before and after |
+| No press | the bar is disabled (`AXEnabled` false: the content fits) | refused: nothing to scroll |
+| No press | the bar's `AXValue` is already at the requested end | `already at the bottom` |
+| `CGEventCreateScrollWheelEvent` posted with `CGEventPostToPid`, located at the element's centre | no bar or page area, a press refused, or a press that moved nothing | `sent a ... wheel scroll ... not confirmed`; refused outright when the element has no frame |
+
+A page-area press animates the scroll, so the bar's `AXValue` still reads the old
+position right after the press: on TextEdit it read `1.0` at once, `0.85` after
+50 ms and `0.0` after 250 ms. Each press is therefore followed by polling until
+the position has moved and two reads agree, for at most 20 x 50 ms. The wheel
+event is last because nothing confirms it: a pid-targeted wheel event is routed
+by the app to the view under the event's location, and TextEdit dropped one aimed
+at its own scroll area while the window was not under the pointer.
 
 **Secure fields are a subrole, not a role.** A real macOS password box reports:
 
@@ -1784,7 +1824,7 @@ asyncio loop, so the overlay cannot live in the gateway at all. `overlay_proc.py
 is therefore its own process (`python -m kiro_crew.computer_use.overlay_proc`,
 fixed argv, nothing agent-supplied in it) driven by newline-delimited JSON on
 stdin. It has its **own ctypes surface**, which is the one documented exception to
-"`macos_ffi.py` is the only module that touches ctypes": that invariant exists so a
+"`macos_ffi.py` and its owners are the only modules that touch ctypes": that invariant exists so a
 native fault cannot take down the gateway, and a fault in a separate short-lived
 child costs one animation. The child's docstring says so.
 
@@ -1879,7 +1919,7 @@ missing so a user learns something and a maintainer finds the next step. When
 
 Reading and input both work through real UI Automation, and the whole layer above
 the driver (the keystone, schema validation, the snapshot index, fingerprint
-drift, redaction, the SEL audit) runs unchanged. Files: `windows_ffi.py` (the only module touching Windows-native code),
+drift, redaction, the SEL audit) runs unchanged. Files: `windows_ffi.py` and its owners (the Windows-native surface),
 `apps_windows.py`, `snapshot_windows.py`, `capture_windows.py`, `windows_driver.py`.
 
 Five things differ from macOS in ways that are load-bearing rather than
@@ -1900,7 +1940,11 @@ incidental. Each was measured on Windows 11:
   Delete and the action presses it — the model's "click Save" deletes the user's
   work. The name is already computed for the elision test, so this costs nothing.
 - **A pid is not an app identity, so confinement keys on the HWND.**
-  `apps_macos.pid_owns_point` is sound because macOS delivers input per-process;
+  `apps_macos.pid_owns_point` is sound because macOS delivers input per-process
+  (it stays closed over the Dock's full-screen layer-20 backing window, which a
+  rectangle hit test reports as covering the display: a real-pointer action there
+  is refused, the app-scoped paths still deliver, and `ERR_POINT_NOT_OWNED` names
+  the winning window through `topmost_window_label`);
   Windows delivers none per-process, and one broker fronts many apps —
   `ApplicationFrameHost.exe` was observed hosting *Settings* and *HP Audio
   Control* simultaneously under a single pid. `apps_windows.hwnd_owns_point`
@@ -2347,10 +2391,11 @@ The non-web allowlist (`EXTERNAL_URLS`) matches **whole URLs, exactly** — the 
 `SETTINGS_URL_*` panes — not the `x-apple.systempreferences:` scheme. A
 scheme-granular rule would admit unbounded attacker-chosen payloads into
 LaunchServices, and that is reachable rather than theoretical: LLM-authored widget
-and artifact content renders in iframes carrying
-`sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"`, no CSP
-directive constrains a `window.open` target's scheme, and remote-instance frames
-share this same handler — so model-generated JS could otherwise pop *any* pane
+and artifact content renders in `sandbox="allow-scripts"` iframes whose links the
+dashboard opens through its link bridge with `window.open` (`useFrameLinkBridge`,
+http(s) only), other frames such as the browser preview still grant
+`allow-popups`, no CSP directive constrains a `window.open` target's scheme, and
+remote-instance frames share this same handler — so model-generated JS could otherwise pop *any* pane
 (Sharing → Remote Login, Configuration Profiles) beside agent-authored text
 telling the user to enable it. Exact matching also removes a parser-differential
 class: the verdict is computed from `new URL(...)` (WHATWG lowercases the scheme,
@@ -2459,6 +2504,48 @@ tools would let a model launder one per-call gate decision into many.
 
 ---
 
+## Enabling restarts the chat sessions (on purpose)
+
+A kiro-cli session caches its MCP `tools/list` for its whole life, which is why `PUT /api/computer-use/config` calls
+`_reset_all_sessions` whenever the enable **flips**. ACP has no
+`tools/list_changed` notification, so a session that started while the feature was
+off keeps an empty computer-use tool set for its whole life: the operator enables
+it, asks the agent to look at a window, and is told there are no tools. Restarting
+is the same remedy `POST /api/mcp/sync` already applies when MCP routing changes,
+and for the same reason.
+
+**The spec is rebuilt BEFORE the reset, under the config lock, and both of those are
+load-bearing.** The enable is also a spec-emission gate ([above](#the-shim-is-not-spawned-at-all-unless-it-can-be-used)),
+so while it was off the server was not in `mcpServers` at all. A reset alone would
+restart every session into the *same* spec that omits it, and the tools would not
+appear until the next gateway start; a rebuild *after* the reset would be equally
+broken, restarting sessions into the old spec. Rebuilding first keeps the
+user-visible contract — enable, sessions restart, the tools are there — exactly as
+it was before the gate existed.
+
+The lock matters because the rebuild READS the keystone and WRITES the spec. Outside
+it, two overlapping PUTs interleave: an enable's slower rebuild can land its spec
+*after* a later disable's, leaving a spec that mounts — and therefore spawns — the
+server the keystone now forbids. Holding `_get_config_lock()` makes read-decide-write
+atomic against every keystone writer, so whichever rebuild finishes last is the one
+that read the final state. It is a plain reacquisition: the write block has already
+exited its own, and `rebuild_agent_config` never takes this lock.
+
+
+Deliberately narrow, so a restart is never gratuitous:
+
+- only on the `enabled` key, and only when the value actually CHANGED — a no-op
+  re-save must not tear down the operator's session;
+- never for the budget knobs (`max_tree_nodes`, `screenshot_max_px`, …), which are
+  read per call;
+- neither a rebuild failure nor a restart failure fails the SAVE. The write already
+  landed and was audited; reporting failure would be a lie, and the fallback is simply
+  the old behaviour (the new tool surface appears on the next cold session).
+
+The response carries `sessions_reset` so the panel can EXPLAIN the restart — an
+unexplained session reset reads as a crash. Pinned by
+`test_computer_use_api_keystone.py::TestEnableRestartsSessions`.
+
 ## Known limitations
 
 Stated plainly. Each one is real; none is papered over.
@@ -2502,7 +2589,7 @@ ONLY one, and the consequences should be stated rather than discovered:
   permission requests, so the interactive prompt is not a guarantee either. That is
   a pre-existing gap affecting every capability, hardening deferred to its own PR;
 * **typing into a terminal window reaches a shell without passing the command deny
-  floor.** The 137 `BUILTIN_DENIED_RULES` are matched against a `bash` tool call's
+  floor.** The `BUILTIN_DENIED_RULES` table's rules are matched against a `bash` tool call's
   command string; a `computer_type_text` into Terminal.app is not one, so
   `security.py` sees none of it. The terminal denylist entry that used to cover this
   was removed with the rest of the per-app model (it was incomplete by construction —
@@ -2546,51 +2633,6 @@ computer use.
   Python failures and stalls, not a native process crash. Mitigation is prevention
   (the argtypes tripwire tests); the service supervisor may restart a managed gateway.
 
-### Enabling restarts the chat sessions (on purpose)
-
-That same `tools/list` cache is why `PUT /api/computer-use/config` calls
-`_reset_all_sessions` whenever the enable **flips**. ACP has no
-`tools/list_changed` notification, so a session that started while the feature was
-off keeps an empty computer-use tool set for its whole life: the operator enables
-it, asks the agent to look at a window, and is told there are no tools. Restarting
-is the same remedy `POST /api/mcp/sync` already applies when MCP routing changes,
-and for the same reason.
-
-**The spec is rebuilt BEFORE the reset, under the config lock, and both of those are
-load-bearing.** The enable is also a spec-emission gate ([above](#the-shim-is-not-spawned-at-all-unless-it-can-be-used)),
-so while it was off the server was not in `mcpServers` at all. A reset alone would
-restart every session into the *same* spec that omits it, and the tools would not
-appear until the next gateway start; a rebuild *after* the reset would be equally
-broken, restarting sessions into the old spec. Rebuilding first keeps the
-user-visible contract — enable, sessions restart, the tools are there — exactly as
-it was before the gate existed.
-
-The lock matters because the rebuild READS the keystone and WRITES the spec. Outside
-it, two overlapping PUTs interleave: an enable's slower rebuild can land its spec
-*after* a later disable's, leaving a spec that mounts — and therefore spawns — the
-server the keystone now forbids. Holding `_get_config_lock()` makes read-decide-write
-atomic against every keystone writer, so whichever rebuild finishes last is the one
-that read the final state. It is a plain reacquisition: the write block has already
-exited its own, and `rebuild_agent_config` never takes this lock.
-
-A rebuild failure never fails the SAVE (same rule as the reset: the write already
-landed and was audited), and the fallback is the old behaviour of the surface
-appearing on the next cold gateway. Pinned by
-`test_computer_use_api.py::TestEnableRestartsSessions`.
-
-Deliberately narrow, so a restart is never gratuitous:
-
-- only on the `enabled` key, and only when the value actually CHANGED — a no-op
-  re-save must not tear down the operator's session;
-- never for the budget knobs (`max_tree_nodes`, `screenshot_max_px`, …), which are
-  read per call;
-- a restart failure never fails the SAVE. The write already landed and was audited;
-  reporting failure would be a lie, and the fallback is simply the old behaviour
-  (the new tool surface appears on the next cold session).
-
-The response carries `sessions_reset` so the panel can EXPLAIN the restart — an
-unexplained session reset reads as a crash. Pinned by
-`test_computer_use_api.py::TestEnableRestartsSessions`.
 - **The live mirror is SPARSE, not a video feed.** [The live view (PiP)](#the-live-view-pip)
   is a relay over the screenshots the model already read, so the panel updates once
   per `computer_get_state` with `attach_screenshot` and shows nothing at all during a
@@ -2614,16 +2656,16 @@ unexplained session reset reads as a crash. Pinned by
   action expresses a sweep between two points, so `click_method: "accessibility"` is
   refused for it rather than approximated.
 - **`_CU_ACTION_CLASSES` must stay in sync with the tool list.** A tool added
-  without a table row is classified `("mutate",)` — fail-closed in both
-  directions (it can never satisfy an `@observe` allow-list and IS caught by an
-  `@mutate` deny), but it also means a *read* tool added without a row will
-  needlessly prompt. The coverage tests enumerate the registered tool set; the
+  without a table row falls back to `("mutate",)`, so `hooks._cu_read_only_auto_approve`
+  never auto-approves it: a *read* tool added without a row needlessly prompts, which is
+  the safe direction. Computer use is not governed by scope rules, so no matcher expands
+  an action class; the table is read only for that observe auto-approve. The coverage tests enumerate the registered tool set; the
   next author adds the row.
 - **The shell plane is a separate plane.** `osascript` / `cliclick` / `xdotool` /
   `screencapture` typed into a Bash tool are `commands`-scope items, never
   re-parsed into GUI sub-effects, and the **web terminal PTY**
-  (`dashboard/handlers/terminal.py`) contains no deny-floor or governance call at
-  all — it is an operator-only, ungoverned plane today. `playwright-cli screenshot`
+  (`dashboard/handlers/terminal.py` and its `terminal_*` owners) contains no
+  deny-floor or governance call at all — it is an operator-only, ungoverned plane today. `playwright-cli screenshot`
   is a second pixel channel and lands on this same plane: it is a shell command,
   so an `mcp`-scope deny cannot reach it. None of these are covered by any
   `computer_use.*` scope, and the spec says so rather than implying coverage.
@@ -2645,14 +2687,22 @@ unexplained session reset reads as a crash. Pinned by
 | `computer_use/tools.py` | The single in-gateway dispatch chokepoint: validation, enable, audit, target/freshness/input checks, driver dispatch and response shaping (incl. the post-action diff, `_action_rows`) |
 | `computer_use/service.py` | Blocking snapshot/index/screenshot orchestration over the active backend; no policy decisions |
 | `computer_use/windows_driver.py` | `WindowsBackend`: observation + all seven input verbs — the UIA pattern ladder, pointer confinement, verified focus, and the closed `perform_action` vocabulary |
-| `computer_use/windows_ffi.py` | The ONLY module touching Windows-native code: the UIA COM client, the one vtable-slot table, VARIANT/BSTR marshalling, the fail-closed secure read, the bounded walk, the DPI scope, `window_render_scale`, window enumeration |
+| `computer_use/windows_ffi.py` | The Windows-native surface's import path and patch surface (a `_facade_mirror` facade over the three owners below), and the `SendInput` keyboard and mouse synthesis |
+| `computer_use/windows_ffi_com.py` | ABI constants and structures, the flat-function table and the one vtable-slot table, the library loader and `vcall`, COM reference discipline, the per-thread apartment and UIA client |
+| `computer_use/windows_ffi_uia.py` | VARIANT/BSTR marshalling, the fail-closed secure read, the control-pattern ladder and focus, the bounded cached walk |
+| `computer_use/windows_ffi_window.py` | The DPI scope, window enumeration and geometry, `window_render_scale`, `quantize_point` and the hit test |
 | `computer_use/apps_windows.py` | Window-list app enumeration keyed on the top-level HWND (a pid fronts many apps), the transient-popup filter, `find_window_for` (the launch verb's non-raising lookup) + `hwnd_owns_point`, the confinement predicate |
 | `computer_use/snapshot_windows.py` | Iterative bounded UIA walk, UIA role vocabulary, window-local frames, truncation flags |
 | `computer_use/capture_windows.py` | `PW_RENDERFULLCONTENT` into a 32bpp DIB sized to what the window renders + GDI+ JPEG encode, with pixel validation because a blank capture reports success. No `BitBlt` fallback: it reads the screen |
 | `computer_use/launch_windows.py` | `computer_launch_app`'s Windows resolver: the `App Paths` catalog (read including the writable hive) verified against protected install roots + a basename match, the shell-target refusal, and the no-arguments spawn |
 | `computer_use/launch_macos.py` | The macOS resolver: `.app` bundles under the conventional roots, handed to `/usr/bin/open -a` (pinned absolute) with no document and no arguments |
 | `computer_use/linux_driver.py` | Typed refusal + the implementation plan |
-| `computer_use/macos_ffi.py` | The only in-gateway macOS module touching ctypes: `_FN_SPECS`, structs, binder, CF hygiene, key/scroll/mouse event synthesis |
+| `computer_use/macos_skylight.py` | The quarantined private SkyLight ABI behind `click_method: "sky_click"` (a click on a window behind others, without raising it or moving the pointer); the only module allowed to touch undocumented Apple ABI, never reached from `auto`, and reported unavailable (`available()`) when a symbol is missing |
+| `computer_use/macos_ffi.py` | The in-gateway macOS ctypes surface's import path and patch surface (a `_facade_mirror` facade over the four owners below), and key/scroll/mouse event synthesis |
+| `computer_use/macos_ffi_bind.py` | ABI constants, structs, `_FN_SPECS` and the one bind pass, the cached framework handles, type ids and private event source |
+| `computer_use/macos_ffi_cf.py` | CF hygiene: CFString lifetime, type-checked number/bool/array reads, the CF dictionary |
+| `computer_use/macos_ffi_ax.py` | Accessibility reads, actions and settable writes, with the messaging timeout and the Create Rule |
+| `computer_use/macos_ffi_window.py` | The CoreGraphics window list, `executable_path`, in-process window capture and the JPEG size check |
 | `computer_use/apps_macos.py` | Window-list app enumeration + pid resolution (never `pgrep`). Bundle `Info.plist` reads honour `security.is_sensitive_path`, so a bundle planted under a protected directory resolves to "identity unknown" rather than being opened |
 | `computer_use/snapshot_macos.py` | Iterative AX walk, `AXManualAccessibility` retry, secure detection |
 | `computer_use/capture_macos.py` | In-process capture + ImageIO encode + `0o700` persistence + ring trim |
@@ -2669,7 +2719,7 @@ unexplained session reset reads as a crash. Pinned by
 | `website/src/pages/settings/ComputerUsePanel.tsx` | Settings → Computer Use |
 | `website/src/components/ComputerUseLiveView.tsx` | The floating live view (PiP) panel |
 | `website/src/hooks/useComputerUseFrame.ts` | Frame-stream subscription + session-title lookup |
-| `src/kiro_crew/builtin_skills/computer-use/SKILL.md` | The agent-facing workflow. **Bundled**, not in the top-level `skills/` dir: `config/prompt.md` tells the model to read it by name (its opening and "The loop" before the first call, "Reading the refusals correctly" on a refusal), so per AGENTS.md it is load-bearing and must reach every pip/DMG install |
+| `src/kiro_crew/builtin_skills/computer-use/SKILL.md` | The agent-facing workflow. **Bundled**, not in the top-level `skills/` dir: `kirocrew-computer`'s MCP instructions (`mcp_instructions.COMPUTER`) and the agent prompt's closed-gate pointer (`context_assembly/sections.py::computer_use_block`) tell the model to read it by name, so per AGENTS.md it is load-bearing and must reach every pip/DMG install |
 
 Cross-references: [governance.md](governance.md) for why computer use is
 deliberately NOT governed; [security.md](security.md) for the keystone leaf and the

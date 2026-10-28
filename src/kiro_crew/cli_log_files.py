@@ -8,14 +8,10 @@ every name here, so existing references keep working.
 from __future__ import annotations
 
 import logging
-import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-
-def owner_only_opener(path: str, flags: int) -> int:
-    """``open(..., opener=)`` hook that creates a missing file ``0600``."""
-    return os.open(path, flags, 0o600)
+from kiro_crew.owner_only_files import owner_only_opener
 
 
 def _open_owner_only(handler: logging.FileHandler):  # type: ignore[no-untyped-def]

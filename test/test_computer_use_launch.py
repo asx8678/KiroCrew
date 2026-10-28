@@ -11,9 +11,9 @@ Split by what each group can be honest about:
   whatever happens to be installed on the runner;
 * :class:`TestLaunchDispatch` drives the real chokepoint through the shipped fake, so
   the denylist ordering and the launch-then-snapshot shape are covered on Linux CI;
-* :class:`TestWindowsHostCatalog` is Windows-only and asserts the invariant against
-  the host's REAL catalog — it is the one that would catch a host where the rule does
-  not hold.
+* :class:`TestWindowsHostCatalog` lives in
+  ``test_computer_use_launch_windows_catalog.py``; it is Windows-only and asserts the
+  invariant against the host's REAL catalog.
 """
 
 from __future__ import annotations
@@ -76,24 +76,6 @@ def fake_computer_backend(tmp_path, monkeypatch):
         cu_backend.reset_shared_backend()
         cu_service.reset_shared_service()
         cu_index.reset_shared_index()
-
-
-def _running_elevated() -> bool:
-    """Whether this process has an administrator token. ``False`` off Windows.
-
-    Two host-catalog assertions are only meaningful for an ORDINARY user: an elevated process
-    can write every install root and owns content inside them, so the resolver correctly
-    refuses everything and the assertion would be measuring privilege rather than the rule.
-    CI's ``windows-latest`` runner is elevated.
-    """
-    if not IS_WINDOWS:
-        return False
-    try:
-        import ctypes
-
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
-    except Exception:  # noqa: BLE001 - an unknown privilege level is not a test failure
-        return False
 
 
 def _launch(app: str) -> str:
@@ -1100,11 +1082,57 @@ class TestMacOSCatalogAndResolution:
         with pytest.raises(ComputerUseError, match="this user can write"):
             launch_macos.resolve_target("Paintbrush")
 
-    def test_the_write_probe_is_removed_and_reports_writable(self, tmp_path):
-        # A leftover probe in a system directory would be litter with our name on it.
+    def test_a_bundle_under_an_admin_writable_root_gets_no_move_hint(self, monkeypatch, tmp_path):
+        """A bundle under /Applications must not be told to "Move it under /Applications".
+
+        The refusal still fires (writable component found), but the message names the real
+        reason ("this user can write…") and omits the unsatisfiable move hint — the bundle
+        is already in the catalog root.
+        """
         from kiro_crew.computer_use import launch_macos
 
+        root = tmp_path / "Applications"
+        root.mkdir()
+        self._bundle(root, "WeChat")
+        monkeypatch.setattr(launch_macos, "_APP_ROOTS", (str(root),))
+        monkeypatch.setattr(launch_macos, "_writable_component", lambda _app: True)
+        with pytest.raises(ComputerUseError) as exc_info:
+            launch_macos.resolve_target("WeChat")
+        msg = str(exc_info.value)
+        # Still refused — the refusal is unchanged.
+        assert "WeChat" in msg
+        # No impossible move hint.
+        assert "move" not in msg.lower()
+        assert "this user can write" in msg
+
+    def test_the_write_probe_is_removed_and_reports_writable(self, monkeypatch, tmp_path):
+        # A leftover probe in a system directory would be litter with our name on it.
+        # ``os.access`` is forced negative so the create-probe FALLBACK runs and its
+        # self-removal is what gets asserted (a writable dir would otherwise short-circuit
+        # on ``os.access`` before any file is created — see the no-mtime test below).
+        from kiro_crew.computer_use import launch_macos
+
+        monkeypatch.setattr(launch_macos.os, "access", lambda *_a, **_k: False)
         assert launch_macos._directory_is_writable(str(tmp_path)) is True
+        assert list(tmp_path.iterdir()) == []
+
+    def test_an_os_access_writable_dir_is_NOT_probed_and_mtime_is_untouched(self, tmp_path):
+        """The common refused case must not mutate the directory.
+
+        A stock ``/Applications`` is ``drwxrwxr-x root:admin`` and every admin user is in
+        ``admin``, so ``os.access`` reports it writable. The non-mutating check answers
+        directly: ``True`` (so the caller still refuses) with no create, no unlink, and no
+        mtime change on the operator's directory.
+        """
+        from kiro_crew.computer_use import launch_macos
+
+        assert os.access(str(tmp_path), os.W_OK)  # the stock /Applications shape
+        # Pin the mtime to a fixed point in the past so a create-and-unlink would move it
+        # to "now" — a deterministic marker, not a timing assumption.
+        pinned_ns = 1_000_000_000_000_000_000
+        os.utime(str(tmp_path), ns=(pinned_ns, pinned_ns))
+        assert launch_macos._directory_is_writable(str(tmp_path)) is True
+        assert tmp_path.stat().st_mtime_ns == pinned_ns
         assert list(tmp_path.iterdir()) == []
 
     @pytest.mark.skipif(IS_WINDOWS, reason="Windows refuses to unlink a file that is open")
@@ -1118,6 +1146,7 @@ class TestMacOSCatalogAndResolution:
         """
         from kiro_crew.computer_use import launch_macos
 
+        monkeypatch.setattr(launch_macos.os, "access", lambda *_a, **_k: False)
         probe = tmp_path / launch_macos._WRITE_PROBE_NAME
         seen: dict = {}
         real_open = open
@@ -1154,8 +1183,11 @@ class TestMacOSCatalogAndResolution:
         self, monkeypatch, tmp_path, error, expected
     ):
         # "Assume writable" is the safe answer, because the caller then REFUSES. A name
-        # collision cannot prove unwritability either, so it fails closed too.
+        # collision cannot prove unwritability either, so it fails closed too. ``os.access``
+        # is forced negative so the create-probe runs and classifies each error itself.
         from kiro_crew.computer_use import launch_macos
+
+        monkeypatch.setattr(launch_macos.os, "access", lambda *_a, **_k: False)
 
         def boom(*_args, **_kwargs):
             raise error
@@ -1826,74 +1858,6 @@ class TestLaunchDispatch:
         entry = next(d for d in _tool_definitions() if d["name"] == TOOL_LAUNCH_APP)
         assert entry["inputSchema"]["required"] == ["app"]
         assert set(entry["inputSchema"]["properties"]) == {"app"}
-
-
-@pytest.mark.skipif(not IS_WINDOWS, reason="asserts the real Windows host catalog")
-class TestWindowsHostCatalog:
-    """The invariant against the host's REAL catalog.
-
-    The fabricated-catalog tests above prove the rules are implemented; this proves
-    they are SATISFIABLE here — that a real installed application actually resolves.
-    A resolver that refused everything would pass every test above.
-    """
-
-    def test_at_least_one_real_installed_app_resolves(self):
-        """Satisfiable on an ORDINARY user's host, which is who this verb is for.
-
-        Skipped when the suite runs elevated, and that is the honest reading rather than a
-        convenience: an administrator genuinely can rewrite ``System32`` and genuinely does
-        own content under ``Program Files``, so refusing every target is the CORRECT answer
-        for that process — the trust question is "could this user have planted it", and for
-        an admin the answer is yes everywhere. CI's ``windows-latest`` runner is elevated, so
-        without this guard the assertion measures the runner's privilege rather than the
-        resolver. The rules themselves are covered on every platform by
-        :class:`TestLaunchResolutionTrust`; what this adds is that they are satisfiable on a
-        real unelevated desktop.
-        """
-        from kiro_crew.computer_use import launch_windows
-
-        catalog = launch_windows.installed_apps()
-        assert catalog, "the host reported no installed applications at all"
-        resolved = []
-        for app in catalog:
-            try:
-                resolved.append(launch_windows.resolve_target(app.name))
-            except ComputerUseError:
-                continue
-        if not resolved and _running_elevated():
-            pytest.skip("elevated process: every install root is writable, so refusing is correct")
-        assert resolved, "no entry in the host's own catalog survived resolution"
-
-    def test_every_resolvable_entry_lives_under_a_protected_root(self):
-        # The rule restated over real data: whatever resolves must be somewhere this
-        # user cannot write. A failure here means the protected-root list is missing
-        # a root that real applications use, which would be a genuine finding rather
-        # than a test to relax.
-        from kiro_crew.computer_use import launch_windows
-
-        for app in launch_windows.installed_apps():
-            try:
-                executable, _name = launch_windows.resolve_target(app.name)
-            except ComputerUseError:
-                continue
-            assert launch_windows._under_protected(executable), executable
-
-    def test_the_local_windowsapps_alias_dir_is_never_a_launch_source(self):
-        # Measured: %LOCALAPPDATA%\Microsoft\WindowsApps is ON PATH and writable, and
-        # it is what shutil.which("mspaint") returns. Nothing that resolves may come
-        # from there — that is the specific hole the protected-root rule closes.
-        from kiro_crew.computer_use import launch_windows
-
-        alias_dir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps")
-        if not alias_dir or not os.path.isdir(alias_dir):
-            pytest.skip("no execution-alias directory on this host")
-        folded = os.path.realpath(alias_dir).casefold()
-        for app in launch_windows.installed_apps():
-            try:
-                executable, _name = launch_windows.resolve_target(app.name)
-            except ComputerUseError:
-                continue
-            assert not os.path.realpath(executable).casefold().startswith(folded)
 
 
 def test_the_already_running_refusal_names_get_state():

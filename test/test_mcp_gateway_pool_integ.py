@@ -49,6 +49,7 @@ from kiro_crew import code_fingerprint as cf
 from kiro_crew import platform_compat as pc
 from kiro_crew.mcp_gateway import gatewayd as gw
 from kiro_crew.mcp_gateway import transport
+from kiro_crew.testing.wait import async_wait_until, finished
 
 _FAKE_SERVER = Path(__file__).with_name("fake_pool_mcp_server.py")
 
@@ -93,16 +94,21 @@ def _endpoint_dir() -> str | None:
 
 
 def _init_frame(req_id: int) -> str:
-    return json.dumps({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "pool-integ", "version": "0.0.0"},
-        },
-    }) + "\n"
+    return (
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pool-integ", "version": "0.0.0"},
+                },
+            }
+        )
+        + "\n"
+    )
 
 
 async def _spawn_stub(
@@ -139,14 +145,22 @@ async def _spawn_stub(
         sys.executable,
         "-m",
         "kiro_crew.mcp_gateway.stub",
-        "--server", server,
-        "--agent", agent,
-        "--target-command", sys.executable,
-        "--target-args", str(_FAKE_SERVER),
-        "--work-dir", str(work_dir),
-        "--socket", str(socket_path),
-        "--sandbox-mode", "off",
-        "--approval-mode", "auto",
+        "--server",
+        server,
+        "--agent",
+        agent,
+        "--target-command",
+        sys.executable,
+        "--target-args",
+        str(_FAKE_SERVER),
+        "--work-dir",
+        str(work_dir),
+        "--socket",
+        str(socket_path),
+        "--sandbox-mode",
+        "off",
+        "--approval-mode",
+        "auto",
         *(["--env-json", env_json] if env_json else []),
         *(["--poolable"] if poolable else []),
         stdin=asyncio.subprocess.PIPE,
@@ -211,12 +225,17 @@ async def _drive_tool_call(proc: asyncio.subprocess.Process, req_id: int) -> dic
     requests, and the handshake is cached across stubs), so proving injection
     needs a per-turn frame.
     """
-    frame = json.dumps({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "method": "tools/call",
-        "params": {"name": "noop", "arguments": {}},
-    }) + "\n"
+    frame = (
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {"name": "noop", "arguments": {}},
+            }
+        )
+        + "\n"
+    )
     return await _drive_frame(proc, frame, req_id)
 
 
@@ -237,8 +256,8 @@ async def _reap(procs: list[asyncio.subprocess.Process]) -> None:
                 pass
     for p in procs:
         try:
-            await asyncio.wait_for(p.wait(), timeout=15)
-        except (asyncio.TimeoutError, ProcessLookupError):
+            await finished(p.wait(), "process wait")
+        except (asyncio.TimeoutError, ProcessLookupError, AssertionError):
             pass
 
 
@@ -258,7 +277,7 @@ async def test_two_stubs_on_one_backend_are_told_apart(tmp_path: Path, short_soc
 
     The unit tests around ``kirocrew-cron`` prove the server CONSUMES the caller
     block. They cannot prove gatewayd SENDS one, which is the half that was
-    broken: ``backend.py`` strips any stub-supplied block from every forwarded
+    broken: ``backend_stubs.py`` strips any stub-supplied block from every forwarded
     request and re-injects its own only when the backend advertised
     ``kirocrew.caller-identity`` -- and that capability is parsed off a REAL
     ``initialize`` response, a step the in-process stub seam every other gateway
@@ -299,17 +318,21 @@ async def test_two_stubs_on_one_backend_are_told_apart(tmp_path: Path, short_soc
     )
     procs: list[asyncio.subprocess.Process] = []
     try:
-        for _ in range(100):
-            if transport.endpoint_exists(sock):
-                break
-            await asyncio.sleep(0.05)
-        assert transport.endpoint_exists(sock), "gatewayd never bound its endpoint"
+        await async_wait_until(
+            lambda: transport.endpoint_exists(sock),
+            off_loop=True,
+            describe=lambda: "gatewayd never bound its endpoint",
+        )
 
         keys = ["dashboard:alice", "dashboard:bob"]
         for i, key in enumerate(keys):
             proc = await _spawn_stub(
-                socket_path=sock, server="fake", agent="probe",
-                work_dir=work_dir, home=home, session_key=key,
+                socket_path=sock,
+                server="fake",
+                agent="probe",
+                work_dir=work_dir,
+                home=home,
+                session_key=key,
             )
             procs.append(proc)
             reply = await _drive_initialize(proc, req_id=i + 1)
@@ -392,16 +415,20 @@ async def test_two_UNNAMED_stubs_on_one_backend_get_distinct_namespaces(
     )
     procs: list[asyncio.subprocess.Process] = []
     try:
-        for _ in range(100):
-            if transport.endpoint_exists(sock):
-                break
-            await asyncio.sleep(0.05)
-        assert transport.endpoint_exists(sock), "gatewayd never bound its endpoint"
+        await async_wait_until(
+            lambda: transport.endpoint_exists(sock),
+            off_loop=True,
+            describe=lambda: "gatewayd never bound its endpoint",
+        )
 
         for i in range(2):
             proc = await _spawn_stub(
-                socket_path=sock, server="fake", agent="probe",
-                work_dir=work_dir, home=home, session_key="",
+                socket_path=sock,
+                server="fake",
+                agent="probe",
+                work_dir=work_dir,
+                home=home,
+                session_key="",
             )
             procs.append(proc)
             reply = await _drive_initialize(proc, req_id=i + 1)
@@ -468,17 +495,20 @@ async def test_real_stubs_sharing_a_key_share_one_backend(tmp_path: Path, short_
     )
     procs: list[asyncio.subprocess.Process] = []
     try:
-        for _ in range(100):  # wait for the endpoint to accept
-            if transport.endpoint_exists(sock):
-                break
-            await asyncio.sleep(0.05)
-        assert transport.endpoint_exists(sock), "gatewayd never bound its endpoint"
+        await async_wait_until(
+            lambda: transport.endpoint_exists(sock),
+            off_loop=True,
+            describe=lambda: "gatewayd never bound its endpoint",
+        )
 
         # --- three stubs, one identical key -------------------------------
         for i in range(3):
             proc = await _spawn_stub(
-                socket_path=sock, server="fake", agent="probe",
-                work_dir=work_dir, home=home,
+                socket_path=sock,
+                server="fake",
+                agent="probe",
+                work_dir=work_dir,
+                home=home,
             )
             procs.append(proc)
             reply = await _drive_initialize(proc, req_id=i + 1)
@@ -495,9 +525,7 @@ async def test_real_stubs_sharing_a_key_share_one_backend(tmp_path: Path, short_
         # No stub may have taken the degrade path; a fallback would still have
         # answered initialize, so the reply assertions above cannot see it.
         fallback = home / "logs" / "stub_fallback.jsonl"
-        assert not fallback.exists(), (
-            f"a stub degraded to per-session exec: {fallback.read_text()}"
-        )
+        assert not fallback.exists(), f"a stub degraded to per-session exec: {fallback.read_text()}"
 
         # --- a different agent SHARES it ----------------------------------
         # Measured on real processes: the agent name never reaches the backend,
@@ -508,8 +536,11 @@ async def test_real_stubs_sharing_a_key_share_one_backend(tmp_path: Path, short_
         # dir, binary -- is its own PoolKey dimension and still partitions,
         # which the declared-env control at the end of this test measures.
         other = await _spawn_stub(
-            socket_path=sock, server="fake", agent="other-agent",
-            work_dir=work_dir, home=home,
+            socket_path=sock,
+            server="fake",
+            agent="other-agent",
+            work_dir=work_dir,
+            home=home,
         )
         procs.append(other)
         reply = await _drive_initialize(other, req_id=99)
@@ -522,8 +553,7 @@ async def test_real_stubs_sharing_a_key_share_one_backend(tmp_path: Path, short_
             "server config each burn their own MCP server process."
         )
         assert not fallback.exists(), (
-            f"the second agent's stub degraded to per-session exec: "
-            f"{fallback.read_text()}"
+            f"the second agent's stub degraded to per-session exec: " f"{fallback.read_text()}"
         )
 
         # --- negative control: a real difference still partitions ----------
@@ -532,8 +562,11 @@ async def test_real_stubs_sharing_a_key_share_one_backend(tmp_path: Path, short_
         # dimension to vary here: the resolver hands every key the same target,
         # so ``effective_env_hash`` is the only thing that can differ.
         partitioned = await _spawn_stub(
-            socket_path=sock, server="fake", agent="probe",
-            work_dir=work_dir, home=home,
+            socket_path=sock,
+            server="fake",
+            agent="probe",
+            work_dir=work_dir,
+            home=home,
             env_json=json.dumps({"DECLARED": "different"}),
         )
         procs.append(partitioned)
@@ -546,6 +579,98 @@ async def test_real_stubs_sharing_a_key_share_one_backend(tmp_path: Path, short_
             "has stopped partitioning on execution shape, which would make the "
             "sharing assertion above meaningless."
         )
+    finally:
+        await _reap(procs)
+        stop.set()
+        try:
+            await asyncio.wait_for(daemon, timeout=30)
+        except asyncio.TimeoutError:  # pragma: no cover - daemon shutdown hang
+            daemon.cancel()
+
+
+@pytest.mark.asyncio
+async def test_pooled_stubs_get_the_backends_instructions_after_a_respawn_too(
+    tmp_path: Path, short_sock_dir
+) -> None:
+    """MCP ``instructions`` reach every stub of a pooled backend, unchanged.
+
+    Kiro Crew's servers carry their usage text in the ``initialize`` result
+    (``kiro_crew.mcp_instructions``), and gatewayd answers every stub after the
+    first from its cached copy of that result. So the text must survive the
+    replay, and after the shared backend dies, a stub that connects later must get
+    the REPLACEMENT's result rather than a stale one. The fake stamps its pid into
+    the text, which names the backend each reply came from.
+    """
+    sock = short_sock_dir / "gw.sock"
+    work_dir = tmp_path / "ws"
+    work_dir.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    launch_log = tmp_path / "launches.txt"
+    # The fake answers ``tools/call`` only while it records callers.
+    caller_log = tmp_path / "callers.txt"
+
+    def _resolver(_key: object) -> tuple[str, list[str], dict[str, str], str]:
+        return (
+            sys.executable,
+            [str(_FAKE_SERVER), str(launch_log), str(caller_log)],
+            {"FAKE_POOL_INSTRUCTIONS": "Use the fake well."},
+            str(work_dir),
+        )
+
+    stop = asyncio.Event()
+    daemon = asyncio.create_task(
+        gw.run_gatewayd(
+            socket_path=sock,
+            max_backends=8,
+            idle_timeout_secs=300,
+            stop_event=stop,
+            target_resolver=_resolver,
+            prewarm_count=0,
+        )
+    )
+    procs: list[asyncio.subprocess.Process] = []
+    try:
+        await async_wait_until(
+            lambda: transport.endpoint_exists(sock),
+            off_loop=True,
+            describe=lambda: "gatewayd never bound its endpoint",
+        )
+
+        async def _instructions_of_a_new_stub(req_id: int) -> str:
+            proc = await _spawn_stub(
+                socket_path=sock, server="fake", agent="probe", work_dir=work_dir, home=home
+            )
+            procs.append(proc)
+            reply = await _drive_initialize(proc, req_id=req_id)
+            assert "result" in reply, reply
+            return reply["result"].get("instructions", "")
+
+        first = await _instructions_of_a_new_stub(1)
+        second = await _instructions_of_a_new_stub(2)
+        backends = recorded(launch_log)
+        assert len(backends) == 1, backends
+        assert first == f"Use the fake well. pid={backends[0]}"
+        assert second == first, "the cached initialize did not replay the instructions"
+
+        await pc.kill_process_tree_async(int(backends[0]), pc.SIGKILL)
+        # The next forwarded call finds the backend gone and respawns it; the call
+        # that hits the dead one fails retryably, so drive calls (bounded) until one
+        # is answered by the replacement.
+        for attempt in range(10):
+            reply = await _drive_tool_call(procs[0], req_id=100 + attempt)
+            if "result" in reply and len(recorded(launch_log)) == 2:
+                break
+        backends = recorded(launch_log)
+        assert len(backends) == 2, backends
+        dead = first.removeprefix("Use the fake well. pid=")
+        third = await _instructions_of_a_new_stub(3)
+        assert third.startswith("Use the fake well. pid="), third
+        served_by = third.removeprefix("Use the fake well. pid=")
+        assert served_by != dead, "a stub after the respawn was replayed the dead backend's result"
+        assert served_by in backends, (served_by, backends)
+        fallback = home / "logs" / "stub_fallback.jsonl"
+        assert not fallback.exists(), fallback.read_text()
     finally:
         await _reap(procs)
         stop.set()
@@ -598,18 +723,27 @@ async def test_real_stubs_without_poolable_get_their_own_backend(
         )
     )
     procs: list[asyncio.subprocess.Process] = []
-    backend_pids: list[int] = []
+    # pid -> the process's start-time identity token, read WHILE it is alive.
+    # The survivor check below is a PID-reuse guard, not a bare existence probe:
+    # a recycled pid compares unequal (or unreadable -> ``None``), so a new,
+    # unrelated process landing on a reaped backend's pid number cannot read as
+    # one of our backends surviving.
+    backend_ids: dict[int, str | None] = {}
     try:
-        for _ in range(100):
-            if transport.endpoint_exists(sock):
-                break
-            await asyncio.sleep(0.05)
-        assert transport.endpoint_exists(sock), "gatewayd never bound its endpoint"
+        await async_wait_until(
+            lambda: transport.endpoint_exists(sock),
+            off_loop=True,
+            describe=lambda: "gatewayd never bound its endpoint",
+        )
 
         for i in range(3):
             proc = await _spawn_stub(
-                socket_path=sock, server="fake", agent="probe",
-                work_dir=work_dir, home=home, poolable=False,
+                socket_path=sock,
+                server="fake",
+                agent="probe",
+                work_dir=work_dir,
+                home=home,
+                poolable=False,
             )
             procs.append(proc)
             reply = await _drive_initialize(proc, req_id=i + 1)
@@ -629,9 +763,23 @@ async def test_real_stubs_without_poolable_get_their_own_backend(
             f"{fallback.read_text()}"
         )
         # The fake server records under ``<log>.d/<pid>.txt``, so the file names
-        # are the backend pids the daemon is answerable for.
-        backend_pids = [int(p.stem) for p in Path(f"{launch_log}.d").iterdir()]
-        assert len(backend_pids) == 3
+        # are the backend pids the daemon is answerable for. Capture each pid's
+        # start-time identity HERE, while the backend is still alive and before
+        # the reap below, so the post-teardown survivor check can tell a genuine
+        # survivor from a reaped pid recycled onto an unrelated process.
+        backend_ids = {
+            int(p.stem): pc.process_start_time(int(p.stem))
+            for p in Path(f"{launch_log}.d").iterdir()
+        }
+        assert len(backend_ids) == 3
+        # Every token must be readable HERE: the backends are alive at this
+        # point, so a ``None`` means the identity probe itself failed, not that
+        # a pid was reused. Asserting it keeps the survivor check below from
+        # passing vacuously -- an all-``None`` capture would make every pid
+        # "not a survivor" regardless of what the pool actually did.
+        assert all(
+            token is not None for token in backend_ids.values()
+        ), f"could not read a start-time identity for a live backend: {backend_ids}"
     finally:
         await _reap(procs)
         stop.set()
@@ -647,7 +795,21 @@ async def test_real_stubs_without_poolable_get_their_own_backend(
     # map, so the child was outside ``shutdown_all`` and outlived the daemon --
     # a zombie or a live process here, and its pipe transports still finalizing
     # after the test's loop closed.
-    survivors = [pid for pid in backend_pids if pc.pid_exists(pid)]
+    #
+    # The check is identity-pinned, not a bare ``pid_exists``: a reaped pid can
+    # be recycled onto an unrelated process between ``shutdown_all`` and here
+    # (common on a busy CI host, and Windows pids are small and recycle fast),
+    # and a bare existence probe would then read that stranger as a surviving
+    # backend and fail the test spuriously. A pid counts as a survivor only
+    # while it STILL names the same process object it did when captured above --
+    # ``process_start_time`` unchanged. A token that was unreadable at capture
+    # (``None``) cannot be confirmed as a survivor and is not counted; the
+    # pooling assertions above already prove all three backends ran.
+    survivors = [
+        pid
+        for pid, token in backend_ids.items()
+        if token is not None and pc.pid_exists(pid) and pc.process_start_time(pid) == token
+    ]
     assert not survivors, (
         f"private backends {survivors} outlived run_gatewayd: their reap was not "
         "joined by shutdown_all"
@@ -657,19 +819,17 @@ async def test_real_stubs_without_poolable_get_their_own_backend(
 def _windows_collect_ignore() -> list[str]:
     """Read the Windows exclusion list from its DATA FILE, not conftest's runtime state.
 
-    Importing conftest and reading the attribute looks equivalent and is not:
-    the list is assigned inside ``if platform_compat.IS_WINDOWS:``, so on the
-    Linux matrix -- the only place this guard runs -- the attribute does not
-    exist at all and ``getattr(..., [])`` silently yields an empty set. Every
-    membership assertion against it then passes vacuously, which is precisely
-    the class of false pass this guard exists to prevent. Reading the file is
-    platform-independent.
+    Importing conftest and reading its state looks equivalent and is not: the set
+    is filled only when ``platform_compat.IS_WINDOWS``, so on the Linux matrix --
+    the only place this guard runs -- it is empty, and every membership assertion
+    against it passes vacuously, which is precisely the class of false pass this
+    guard exists to prevent. Reading the file is platform-independent.
 
     The names live in ``windows-collect-ignore.txt`` rather than as string
     literals inside conftest, because a
     second reader needs them: naming a file explicitly on the pytest command
-    line bypasses ``collect_ignore``, so the CI reduced-scope selector
-    (``scripts/ci-surface-tests.py``) has to apply the same exclusion itself.
+    line bypasses conftest's ``pytest_ignore_collect`` hook, so the CI reduced-scope
+    selector (``scripts/ci-surface-tests.py``) has to apply the same exclusion itself.
     Reading that file keeps this guard pointed at the real source of truth --
     an AST walk over conftest now finds no literals and would go blind.
     """
@@ -677,8 +837,7 @@ def _windows_collect_ignore() -> list[str]:
     found = [
         name
         for name in (
-            ln.split("#", 1)[0].strip()
-            for ln in listfile.read_text(encoding="utf-8").splitlines()
+            ln.split("#", 1)[0].strip() for ln in listfile.read_text(encoding="utf-8").splitlines()
         )
         if name
     ]
@@ -692,11 +851,11 @@ def _windows_collect_ignore() -> list[str]:
 def test_pool_integ_is_never_silently_skipped_on_windows() -> None:
     """Guard the coverage, not the code.
 
-    Windows has two silent filters -- ``conftest.collect_ignore`` (whole files)
+    Windows has two silent filters -- ``windows-collect-ignore.txt`` (whole files)
     and ``windows-expected-failures.txt`` (node ids marked skip) -- and nothing
     audits either. During the port a set of enforcing tests was written,
     mutation-verified, and still never ran on Windows, because their whole file
-    sat in ``collect_ignore``; CI stayed green throughout.
+    sat in that list; CI stayed green throughout.
 
     A skipped test asserts nothing, so this guard has to live outside the suite
     it protects. It runs on Linux, where it always executes, and fails loudly if
@@ -706,7 +865,7 @@ def test_pool_integ_is_never_silently_skipped_on_windows() -> None:
     this_file = Path(__file__).name
 
     assert this_file not in set(_windows_collect_ignore()), (
-        f"{this_file} was added to conftest.collect_ignore — the only positive "
+        f"{this_file} was added to windows-collect-ignore.txt — the only positive "
         "proof that pooling happens would stop running on Windows"
     )
 
@@ -718,9 +877,7 @@ def test_pool_integ_is_never_silently_skipped_on_windows() -> None:
             if ln.strip() and not ln.startswith("#")
         ]
         offenders = [e for e in entries if e.startswith(f"test/{this_file}::")]
-        assert not offenders, (
-            f"pooling assertions were added to the Windows skip list: {offenders}"
-        )
+        assert not offenders, f"pooling assertions were added to the Windows skip list: {offenders}"
 
 
 def test_every_consumer_of_the_fake_reads_it_through_recorded() -> None:
@@ -813,7 +970,9 @@ def _windows(log: Path) -> list[tuple[float, float]]:
 
 
 def _max_overlap(windows: list[tuple[float, float]]) -> int:
-    events = sorted([(a, 1) for a, _ in windows] + [(b, -1) for _, b in windows], key=lambda e: (e[0], e[1]))
+    events = sorted(
+        [(a, 1) for a, _ in windows] + [(b, -1) for _, b in windows], key=lambda e: (e[0], e[1])
+    )
     live = peak = 0
     for _, delta in events:
         live += delta
@@ -876,17 +1035,21 @@ async def test_a_private_stub_storm_is_admitted_a_few_at_a_time_and_all_reach_re
     )
     procs: list[asyncio.subprocess.Process] = []
     try:
-        for _ in range(100):
-            if transport.endpoint_exists(sock):
-                break
-            await asyncio.sleep(0.05)
-        assert transport.endpoint_exists(sock), "gatewayd never bound its endpoint"
+        await async_wait_until(
+            lambda: transport.endpoint_exists(sock),
+            off_loop=True,
+            describe=lambda: "gatewayd never bound its endpoint",
+        )
 
         for _ in range(_STORM_STUBS):
             procs.append(
                 await _spawn_stub(
-                    socket_path=sock, server="fake", agent="storm",
-                    work_dir=work_dir, home=home, poolable=False,
+                    socket_path=sock,
+                    server="fake",
+                    agent="storm",
+                    work_dir=work_dir,
+                    home=home,
+                    poolable=False,
                 )
             )
         replies = await asyncio.gather(
@@ -894,7 +1057,9 @@ async def test_a_private_stub_storm_is_admitted_a_few_at_a_time_and_all_reach_re
             return_exceptions=True,
         )
         failures = [r for r in replies if isinstance(r, BaseException) or "result" not in r]
-        assert not failures, f"{len(failures)} of {_STORM_STUBS} stubs never got initialize answered: {failures[:3]}"
+        assert (
+            not failures
+        ), f"{len(failures)} of {_STORM_STUBS} stubs never got initialize answered: {failures[:3]}"
 
         assert _launch_count(launch_log) == _STORM_STUBS, "one private backend per stub"
         windows = _windows(window_log)
@@ -905,9 +1070,9 @@ async def test_a_private_stub_storm_is_admitted_a_few_at_a_time_and_all_reach_re
             f"{_STORM_CAPACITY}. Without admission all {_STORM_STUBS} fork together."
         )
         assert peak >= 2, "the storm never overlapped at all, so the bound was not exercised"
-        assert not (home / "logs" / "stub_fallback.jsonl").exists(), (
-            "a stub fell back to a per-session exec: capacity must queue, never degrade"
-        )
+        assert not (
+            home / "logs" / "stub_fallback.jsonl"
+        ).exists(), "a stub fell back to a per-session exec: capacity must queue, never degrade"
     finally:
         await _reap(procs)
         stop.set()

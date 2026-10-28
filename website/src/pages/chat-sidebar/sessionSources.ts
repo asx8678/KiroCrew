@@ -3,11 +3,11 @@
 import { useQuery } from '@tanstack/react-query'
 import { useMemo } from 'react'
 import { useAppSelector } from '../../store'
-import { usePreviewFlag } from '../../hooks/usePreviewFlag'
-import { PREVIEW_INSTANCE_SESSIONS } from '../../utils/previewFlags'
+import { useRemoteCrewChat } from '../../hooks/usePreviewFlag'
 import { api } from '../../api/client'
 import { crewGroupsFor, useInstanceSessions } from '../../hooks/useInstanceSessions'
 import { i18nT } from '../../i18n/t'
+import { isInstancesDisabledError } from '../../utils/instancesDisabled'
 import { useSelectInstance } from '../../hooks/useSelectInstance'
 import { useDebouncedSessionSearch } from './search'
 import type { Slot } from './types'
@@ -31,8 +31,9 @@ export function useSessionSources({ historyFilter, slotTitleDigest, localSlots }
   // Live sessions on remote instances, grouped per crew by the sidebar.
   // The flag is read HERE and passed in, so a user who has not opted in issues no
   // per-instance request at all — this component mounts for every dashboard user,
-  // so gating the render would gate the rows but not the wire.
-  const instanceSessionsEnabled = usePreviewFlag(PREVIEW_INSTANCE_SESSIONS)
+  // so gating the render would gate the rows but not the wire. The SAME switch as
+  // "New chat on crew": a chat started on a crew must have a group to return to.
+  const instanceSessionsEnabled = useRemoteCrewChat()
   const historySearchResults = useDebouncedSessionSearch(
     historyFilter, s => s, slotTitleDigest, hasWarmInstances,
   )
@@ -94,6 +95,8 @@ export function useSessionSources({ historyFilter, slotTitleDigest, localSlots }
   // different feature's decision to make.
   const remoteSessionsError = useMemo((): { title?: string, message: string } | null => {
     if (!instanceSessionsEnabled) return null
+    // The gateway's own "feature off" 403 is routine, not a failed read.
+    if (isInstancesDisabledError(instancesQuery.error)) return null
     const say =(sentence: string, detail?: string) => (detail
       ? { title: sentence, message: detail }
       : { message: sentence })
@@ -157,8 +160,10 @@ export function useSessionSources({ historyFilter, slotTitleDigest, localSlots }
   // One sidebar group per crew, preview only. Read off `allRows` so a local slot
   // whose turns run on a crew gives that crew a group even while it is offline.
   const crewGroups = useMemo(
-    () => (instanceSessionsEnabled ? crewGroupsFor(instancesList, allRows) : []),
-    [instanceSessionsEnabled, instancesList, allRows],
+    () => (instanceSessionsEnabled
+      ? crewGroupsFor(instancesList, allRows, instanceSessions.folders, instanceSessions.folderFailures)
+      : []),
+    [instanceSessionsEnabled, instancesList, allRows, instanceSessions.folders, instanceSessions.folderFailures],
   )
   // `selectInstance` stays for the FEDERATED OLDER-SESSIONS rows the pane renders,
   // which genuinely have nowhere local to go: a history row names a closed

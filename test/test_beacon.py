@@ -35,7 +35,10 @@ _NO_BASH_REASON = "no working bash on PATH (the stamping script only runs on bui
 
 def _run_stamp(dist: str, pkg_dir) -> "subprocess.CompletedProcess[str]":
     return subprocess.run(
-        ["bash", str(_STAMP_SCRIPT), dist, str(pkg_dir)], capture_output=True, text=True
+        ["bash", str(_STAMP_SCRIPT), dist, str(pkg_dir)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
     )
 
 
@@ -1535,9 +1538,8 @@ class TestGovernancePin:
     ):
         """All FOUR enforcement sites audit, each identifiably.
 
-        The CI reviewer caught two unaudited CLI refusals after the send gate was
-        wired; there were in fact three (the dashboard PATCH too). A per-site
-        ``tool_name`` is what makes the trail answer "which control refused",
+        The sites are the send gate, two CLI refusals and the dashboard PATCH.
+        A per-site ``tool_name`` is what makes the trail answer "which control refused",
         rather than just "something did".
         """
         import argparse

@@ -38,6 +38,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from crew_log_drain import assert_drained
 from off_loop_helpers import off_loop
 
 from kiro_crew.crew_log import crew_log_path, emit
@@ -48,6 +49,7 @@ from kiro_crew.hooks import TOOL_ALLOW, ToolHookResult
 from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
 from kiro_crew.subagent import SubagentInfo, SubagentManager
 from kiro_crew.subagent_manager._component import ManagerComponent
+from kiro_crew.testing.wait import await_until
 
 SESSION = "acp-child-tool-approval-1"
 ASKING_TURN = 4
@@ -244,15 +246,11 @@ class _ParkedApproval:
 async def _reach_the_prompt(approval: _ParkedApproval) -> None:
     """Let the run task get as far as its approval await.
 
-    A real sleep rather than ``sleep(0)``: the path from the stream to the
-    approval arm awaits provider calls of its own, and yielding without
-    advancing the clock does not always let them all resolve.
+    Waits on the callback's own ``entered`` event: the path from the stream to
+    the approval arm awaits provider calls of its own, so a fixed number of
+    yields would not reliably let them all resolve.
     """
-    for _ in range(600):
-        if approval.entered.is_set():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("the approval callback was never reached")
+    await await_until(approval.entered, what="the approval callback being reached")
 
 
 # --------------------------------------------------------------------------
@@ -275,7 +273,7 @@ async def test_a_child_waiting_on_a_human_is_pending_in_the_approvals_fold():
     )
     task = asyncio.ensure_future(_drive(manager, info))
     await _reach_the_prompt(approval)
-    assert emit.flush()
+    assert_drained()
 
     folded = _folded()
     assert folded["pending"] == 1, folded
@@ -300,7 +298,7 @@ async def test_an_approved_child_tool_is_decided_without_naming_who_answered():
     )
     approval.gate.set()
     await _drive(manager, info)
-    assert emit.flush()
+    assert_drained()
 
     provider.approve_tool.assert_awaited_once_with(REQUEST_ID)
     (decided,) = _of("approval/decided")
@@ -325,7 +323,7 @@ async def test_a_declined_child_tool_is_recorded_as_rejected():
         _permission_event(), on_tool_approval_factory=lambda _info: _declined
     )
     await _drive(manager, info)
-    assert emit.flush()
+    assert_drained()
 
     provider.reject_tool.assert_awaited_once_with(REQUEST_ID)
     folded = _folded()
@@ -349,12 +347,12 @@ async def test_the_gateway_level_arm_records_its_own_pair():
     manager, info, provider = _manager(_permission_event(), on_tool_approval=approval)
     task = asyncio.ensure_future(_drive(manager, info))
     await _reach_the_prompt(approval)
-    assert emit.flush()
+    assert_drained()
     assert _folded()["pending"] == 1, "the gateway arm's wait is visible too"
 
     approval.gate.set()
     await task
-    assert emit.flush()
+    assert_drained()
 
     provider.approve_tool.assert_awaited_once_with(REQUEST_ID)
     (requested,) = _of("approval/requested")
@@ -381,7 +379,7 @@ async def test_the_low_fidelity_child_arm_records_its_own_pair():
     )
     task = asyncio.ensure_future(_drive(manager, info))
     await _reach_the_prompt(approval)
-    assert emit.flush()
+    assert_drained()
 
     folded = _folded()
     assert folded["pending"] == 1, folded
@@ -391,7 +389,7 @@ async def test_the_low_fidelity_child_arm_records_its_own_pair():
 
     approval.gate.set()
     await task
-    assert emit.flush()
+    assert_drained()
 
     provider.approve_tool.assert_awaited_once_with(REQUEST_ID)
     (decided,) = _of("approval/decided")
@@ -416,7 +414,7 @@ async def test_a_callback_that_raised_answers_its_own_request():
         _low_fidelity_event(), on_tool_approval_factory=lambda _info: _broken
     )
     await _drive(manager, info)
-    assert emit.flush()
+    assert_drained()
 
     provider.reject_tool.assert_awaited_once_with(REQUEST_ID)
     assert [row["approval_id"] for row in _of("approval/requested")] == [LOGGED_ID]
@@ -440,7 +438,7 @@ async def test_a_cancelled_wait_still_answers_its_own_request():
     )
     task = asyncio.ensure_future(_drive(manager, info))
     await _reach_the_prompt(approval)
-    assert emit.flush()
+    assert_drained()
     assert _folded()["pending"] == 1
 
     task.cancel()
@@ -448,7 +446,7 @@ async def test_a_cancelled_wait_still_answers_its_own_request():
         if task.done():
             break
         await asyncio.sleep(0)
-    assert emit.flush()
+    assert_drained()
 
     (decided,) = _of("approval/decided")
     assert decided["approval_id"] == LOGGED_ID
@@ -475,7 +473,7 @@ async def test_an_unpinned_child_writes_neither_half():
     )
     emit.forget_child_origin(AGENT_ID)
     await _drive(manager, info)
-    assert emit.flush()
+    assert_drained()
 
     folded = _folded()
     assert folded["requested"] == 0 and folded["decided"] == 0
@@ -528,7 +526,7 @@ def test_two_children_of_one_parent_sharing_a_wire_id_keep_separate_rows():
     second_origin = recorder._record_crew_log_tool_approval_requested(
         second, approval_id=second_id, tool="fs_write", reason="Write: src/app.py"
     )
-    assert emit.flush()
+    assert_drained()
 
     folded = _folded()
     assert folded["pending"] == 2, folded
@@ -539,7 +537,7 @@ def test_two_children_of_one_parent_sharing_a_wire_id_keep_separate_rows():
     recorder._record_crew_log_approval_decided(
         first_origin, approval_id=first_id, decision="approved"
     )
-    assert emit.flush()
+    assert_drained()
     folded = _folded()
     assert folded["pending"] == 1, folded
     (still_open,) = folded["pending_requests"]
@@ -551,7 +549,7 @@ def test_two_children_of_one_parent_sharing_a_wire_id_keep_separate_rows():
     recorder._record_crew_log_approval_decided(
         second_origin, approval_id=second_id, decision="rejected"
     )
-    assert emit.flush()
+    assert_drained()
     folded = _folded()
     assert folded["pending"] == 0
     assert folded["by_decision"] == {"approved": 1, "rejected": 1}
@@ -603,5 +601,5 @@ def test_the_decision_helper_is_a_no_op_for_a_request_that_was_not_written():
         approval_id="orphan",
         decision="approved",
     )
-    assert emit.flush()
+    assert_drained()
     assert _of("approval/decided") == []

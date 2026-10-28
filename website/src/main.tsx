@@ -1,5 +1,13 @@
+// The look-preview frame's fences (utils/lookPreviewBoot.ts). Must stay the
+// very first import: ES modules evaluate in import order, and this has to run
+// before any module -- the base-path shim and the extension root included --
+// touches storage, fetch or a socket.
+import './utils/lookPreviewBoot'
+// Base-path transport shims (sub-path builds only) run before any module that
+// could capture `fetch`. A no-op in the stock build. See ./lib/basePath.ts.
+import './lib/installBasePath'
 // Extension composition root — the one file a downstream edition owns. Imported
-// FIRST (before store/providers/App) so seam registrations run before render.
+// before store/providers/App so seam registrations run before render.
 // Empty in the stock build. See website/src/extensions.ts.
 import './extensions'
 import { startMemoryWatch } from './lib/memoryWatch'
@@ -19,6 +27,7 @@ import { NavigationLeaveGuardProvider, NavigationBackGuard } from './components/
 import { RouteHistoryTracker } from './components/NavHistoryArrows'
 import { initRum } from './rum'
 import { isEmbeddedPane } from './lib/embedded'
+import { routerBasename } from './lib/basePath'
 // i18n must initialize before the first render — a component rendering ahead of
 // init would emit its bare translation key instead of text. The `/lazy` entry
 // fetches a non-English catalog on demand; plain `./i18n` has no loader, so
@@ -32,6 +41,8 @@ import ErrorBoundary from './components/ErrorBoundary'
 import DashboardBootstrap from './components/DashboardBootstrap'
 import { installPageZoomSuppression } from './utils/pageZoom'
 import { installStaleShellHeal } from './lib/staleShellHeal'
+import { installScrollReveal } from './lib/scrollReveal'
+import { installSwConnectedProbe } from './lib/swConnectedProbe'
 import { captureSafeReload, reloadKeepingSafe } from './lib/safeReload'
 import {
   hasUnreconciledKeys,
@@ -79,6 +90,13 @@ const catalogReady = ensureCatalog(i18next.language).then(async (loaded) => {
 installPageZoomSuppression()
 // Detect and break out of a stale service-worker shell (see the module doc).
 installStaleShellHeal()
+// Scrollbars show only while a box is scrolling: the reveal rules in index.css
+// key on the attribute this sets. Before render, so the first scroll counts.
+installScrollReveal()
+
+// Answer the service worker's push probe from the live connection state, so a
+// push is shown as an OS banner unless this tab is actually receiving notes.
+installSwConnectedProbe(() => store.getState().dashboard.connected)
 // A crash-recovery reload must not reopen the chat that crashed it. Read (and
 // strip) `?safe=1` before the router sees the URL. See lib/safeReload.ts.
 captureSafeReload()
@@ -189,7 +207,7 @@ const appTree = (
               <UIModeProvider>
                 <ThemeExperienceLayer />
                 <NavigationLeaveGuardProvider>
-                  <BrowserRouter>
+                  <BrowserRouter basename={routerBasename()}>
                     {/* Inside the router (it navigates) and outside the routes
                         (it must survive every route change). Renders nothing,
                         and stays out of the history stack entirely until a page

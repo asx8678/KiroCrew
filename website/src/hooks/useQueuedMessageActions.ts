@@ -5,6 +5,7 @@ import { cancelQueuedMessage, editQueuedMessage, queueEntryAttachments } from '.
 import { restoreQueuedContent } from '../utils/fileTokens'
 import { quoteBlock, readMessageQuote, stripQuoteBlock, type MessageQuote } from '../chat-core/composer/messageQuote'
 import type { ChatMessage } from '../types'
+import type { PasteBlock } from '../utils/pasteTokens'
 
 /** Pre-serialization composer state of a send the server QUEUED, written by the
  *  host's send path when the `queued: true` receipt names the entry. */
@@ -47,7 +48,9 @@ export const queuedSendStash = new Map<string, QueuedSendRecord>()
 export interface QueuedMessageActions {
   onCancel: (queueId: string) => void
   onInterrupt: (queueId: string) => void
-  onEdit: (queueId: string, content: string) => void
+  /** `pastes`: the paste blocks the edit kept, when the card carried any
+   *  (`QueueStack`'s `onEdit`); the optimistic row takes exactly that set. */
+  onEdit: (queueId: string, content: string, pastes?: PasteBlock[]) => void
   onReorder: (queueId: string, direction: 'next' | 'later') => void
   /** Feed straight to `QueueStack`'s `pendingIds`. */
   pendingIds: ReadonlySet<string>
@@ -81,6 +84,19 @@ export interface QueuedMessageActionsOptions {
    *  split pane did before #5891 and what no host should do.
    */
   restoreDraft?: (text: string, files: string[], aliases?: Record<string, string[]>, quote?: MessageQuote) => void
+  /** The paths the host composer has staged right now. A cancelled card's
+   *  restore MERGES into that composer, so a mention the parser writes back
+   *  must not use a suffix one of those files also has: two cards naming
+   *  `x/a.txt` and `y/a.txt`, cancelled in turn, would otherwise both come
+   *  back as `@a.txt` and the next send would bind both to one file. Read at
+   *  cancel time; omitted, the parser only checks the card's own files. */
+  stagedFiles?: () => readonly string[]
+  /** The host composer's project root, read at cancel time. A mention the
+   *  parser writes back for a file under it is spelled relative to it, the
+   *  way the picker inserts it, because that is the only spelling the
+   *  composer revives a chip for when the mention is deleted and undone.
+   *  Omitted, the parser uses the shortest unambiguous suffix. */
+  project?: () => string | undefined
 }
 
 const queueIdOf = (m: ChatMessage): string | undefined => m.meta?.queueId as string | undefined
@@ -112,6 +128,8 @@ export function useQueuedMessageActions({
   allQueued,
   visibleQueued,
   restoreDraft,
+  stagedFiles,
+  project,
 }: QueuedMessageActionsOptions): QueuedMessageActions {
   const dispatch = useAppDispatch()
   const [pendingIds, setPendingIds] = useState<ReadonlySet<string>>(() => new Set())
@@ -125,6 +143,10 @@ export function useQueuedMessageActions({
   visibleQueuedRef.current = visibleQueued
   const restoreDraftRef = useRef(restoreDraft)
   restoreDraftRef.current = restoreDraft
+  const stagedFilesRef = useRef(stagedFiles)
+  stagedFilesRef.current = stagedFiles
+  const projectRef = useRef(project)
+  projectRef.current = project
 
   const markPending = useCallback((queueId: string, pending: boolean) => {
     setPendingIds(prev => {
@@ -208,10 +230,10 @@ export function useQueuedMessageActions({
       // another tab's card, an edited entry — falls to the strict parser,
       // handed the entry's own attachment list when the server echoed one
       // on the row (`meta.files`, the same list a user row carries): with
-      // it the parser matches each own-line marker by exact text, so a
-      // spaced path restores whole; without it the parser claims only
-      // byte-exact round-trippable shapes and is never worse than the
-      // verbatim restore this replaced.
+      // it the parser matches each marker by exact text, so a spaced path
+      // restores whole and an inline marker comes back as an `@` mention;
+      // without it the parser claims only byte-exact round-trippable shapes
+      // and is never worse than the verbatim restore this replaced.
       const stashed = queuedSendStash.get(queueId)
       if (stashed) queuedSendStash.delete(queueId)
       const hit = stashed && stashed.sent === msg.content
@@ -226,15 +248,22 @@ export function useQueuedMessageActions({
       // patterns are anchored at offset 0, so a quote on the head would hide
       // an image block behind it and the file would restore as literal text.
       const parsed = hit
-        ? { text: stashed.raw, files: stashed.files }
-        : restoreQueuedContent(rowQuote ? stripQuoteBlock(msg.content, rowQuote) : msg.content, queueEntryAttachments(msg.meta).files)
-      const { files, text } = parsed
-      // The stash also carries the alias map the send-clear dropped; the
-      // parser fallback cannot know it, and a restore without aliases falls
-      // into the documented reload-limitation class rather than corrupting.
+        ? { text: stashed.raw, files: stashed.files, aliases: stashed.aliases }
+        : restoreQueuedContent(
+          rowQuote ? stripQuoteBlock(msg.content, rowQuote) : msg.content,
+          queueEntryAttachments(msg.meta).files,
+          stagedFilesRef.current?.(),
+          projectRef.current?.(),
+        )
+      const { files, text, aliases } = parsed
+      // The stash carries the alias map the send-clear dropped. The parser
+      // carries one only for a mention it wrote back from an inline marker
+      // (the entry's list proved the path), so that chip and mention stay
+      // reconciled too; any other parser restore has none, which falls into
+      // the documented reload-limitation class rather than corrupting.
       const quote = hit ? stashed.quote : rowQuote
-      if (quote) restoreDraftRef.current?.(text, files, hit ? stashed.aliases : undefined, quote)
-      else restoreDraftRef.current?.(text, files, hit ? stashed.aliases : undefined)
+      if (quote) restoreDraftRef.current?.(text, files, aliases, quote)
+      else restoreDraftRef.current?.(text, files, aliases)
     }
     // Optimistically remove the card; the WS echo is a no-op if already gone.
     dispatch(cancelQueuedMessage({ slot, queue_id: queueId }))
@@ -254,12 +283,12 @@ export function useQueuedMessageActions({
     )
   }, [slot, markPending])
 
-  const onEdit = useCallback((queueId: string, content: string) => {
+  const onEdit = useCallback((queueId: string, content: string, pastes?: PasteBlock[]) => {
     if (!slot) return
     const trimmed = content.trim()
     if (!trimmed) return
     // Optimistically update the card; the WS event reconciles other clients.
-    dispatch(editQueuedMessage({ slot, queue_id: queueId, content: trimmed }))
+    dispatch(editQueuedMessage({ slot, queue_id: queueId, content: trimmed, ...(pastes ? { pastes } : {}) }))
     run(queueId, api.editQueuedMessage(slot, queueId, trimmed))
   }, [slot, dispatch, run])
 

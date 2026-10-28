@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useAppSelector, useAppDispatch, store } from '../../store'
+import { useAppSelector, useAppDispatch, useAppStore, store } from '../../store'
 import { changeApprovalMode, updateSlot } from '../../store/dashboardSlice'
-import { createSlot, setAgentSwitchNotice } from '../../store/chatSlice'
+import { setAgentSwitchNotice } from '../../store/chatSlice'
+import { createChatForView, showCreatedChat } from '../../lib/createdChatView'
 import { pendingSlotSwitch, pendingSlotSwitchTarget, performSlotSwitch } from '../../lib/slotSwitch'
 import { performAgentSlotSwitch } from '../../lib/agentSwitch'
-import { queryComposerOrExpand } from '../../pages/chat/composerFocus'
-import { agentSwitchFailureMessage } from '../../utils/agentSwitchFeedback'
+import { focusComposerElement, queryComposerOrExpand } from '../../pages/chat/composerFocus'
+import { agentSwitchFailureMessage, modelSwitchDeferredMessage } from '../../utils/agentSwitchFeedback'
 import { api } from '../../api/client'
-import { toggleTerminalByChord } from '../../lib/terminalChordFocus'
+import { newTerminalByChord, toggleTerminalByChord } from '../../lib/terminalChordFocus'
 import { focusPopout as focusTerminalPopout } from '../../utils/terminalPopout'
 import { useKeyboardShortcuts } from '../../hooks/useKeyboardShortcuts'
 import { useInstanceShortcuts } from '../../hooks/useInstanceShortcuts'
@@ -17,6 +18,8 @@ import { useAutoConnectInstances } from '../../hooks/useAutoConnectInstances'
 import { useCommandPalette } from '../../hooks/useCommandPalette'
 import { useProvider } from '../../providers/context'
 import { useAgents } from '../../hooks/useAgents'
+import { i18nT } from '../../i18n/t'
+import { SESSION_FOLDER_UNAVAILABLE_EVENT } from '../../lib/sessionFolderNotice'
 
 const REASONING_EFFORT_LEVELS = ['', 'low', 'medium', 'high', 'xhigh', 'max']
 // Approval-mode DISCRIMINANTS in escalating order, cycled by keyboard shortcut.
@@ -40,16 +43,21 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
 }) {
   const navigate = useNavigate()
   const dispatch = useAppDispatch()
+  // The Provider's store, so the create is judged against the store it was
+  // dispatched to; the module singleton would bypass a test-injected store.
+  const appStore = useAppStore()
   const queryClient = useQueryClient()
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const toggleShortcutsModal = useCallback(() => setShortcutsOpen(p => !p), [])
   // Search Everywhere command palette — global double-Shift / ⌘K
-  // trigger + open state. Mounted once at the app shell (`App.tsx`).
+  // trigger + open state. Mounted once at the app shell (`shell/appShell.tsx`).
   const commandPalette = useCommandPalette()
   const newChatMutation = useMutation({
-    mutationFn: () => dispatch(createSlot(undefined)).unwrap(),
-    onSuccess: () => {
-      navigate('/chat')
+    mutationFn: () => createChatForView(dispatch, appStore.getState, { defaultFolder: true }),
+    onSuccess: (view) => {
+      // A create the user moved away from (another session, another page)
+      // leaves the user there: no navigate and no composer focus.
+      if (!showCreatedChat(view, navigate)) return
       // Unguarded on purpose: this mutation only fires from the new-chat
       // keyboard shortcut, and a pressed shortcut proves a keyboard exists —
       // focusComposer()'s touch-device skip would wrongly suppress focus on a
@@ -60,7 +68,7 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
       // left collapsed is asked back instead of swallowing the caret: creating a
       // session IS a typing intent, and the alternative is a new chat whose
       // first keystroke goes nowhere.
-      requestAnimationFrame(() => queryComposerOrExpand(ta => ta.focus()))
+      requestAnimationFrame(() => queryComposerOrExpand(focusComposerElement))
     },
   })
   const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
@@ -72,6 +80,14 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
     const timer = window.setTimeout(() => dispatch(setAgentSwitchNotice(null)), 6000)
     return () => window.clearTimeout(timer)
   }, [agentSwitchNotice, dispatch])
+  // A new chat that could not get its own session folder opened on the default
+  // project; the API client announces it for every create path (see
+  // lib/sessionFolderNotice), and it shares this transient notice.
+  useEffect(() => {
+    const onFolderUnavailable = () => dispatch(setAgentSwitchNotice(i18nT('store.chatSlice.session_folder_unavailable')))
+    window.addEventListener(SESSION_FOLDER_UNAVAILABLE_EVENT, onFolderUnavailable)
+    return () => window.removeEventListener(SESSION_FOLDER_UNAVAILABLE_EVENT, onFolderUnavailable)
+  }, [dispatch])
   const switchActiveSlotAgent = useCallback(async (slot: string, agent: string) => {
     dispatch(setAgentSwitchNotice(null))
     try {
@@ -203,6 +219,8 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
         await performSlotSwitch('model', activeSlot, name,
           async () => {
             const r = await api.chatSlotModel(activeSlot, name)
+            // Taken during a response: committed now, applies from the next message.
+            if (r?.deferred) store.dispatch(setAgentSwitchNotice(modelSwitchDeferredMessage(r.model ?? name)))
             return r?.model ?? name
           },
           (value) => store.dispatch(updateSlot({ key: activeSlot, model: value })))
@@ -228,6 +246,8 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
         await performSlotSwitch('model', activeSlot, name,
           async () => {
             const r = await api.chatSlotModel(activeSlot, name)
+            // Taken during a response: committed now, applies from the next message.
+            if (r?.deferred) store.dispatch(setAgentSwitchNotice(modelSwitchDeferredMessage(r.model ?? name)))
             return r?.model ?? name
           },
           (value) => store.dispatch(updateSlot({ key: activeSlot, model: value })))
@@ -251,13 +271,18 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
     // swallowed on behalf of a panel the rest of the UI hides.
     //
     // Also unbound in a popout or embedded pane, which render no docked terminal
-    // of their own. `useBottomTerminal`'s state is localStorage-backed AND
-    // cross-window synced (it listens for `storage` on `mc-bottom-terminal`), so
-    // a chord fired in a popout would not be a local no-op — it would open or
-    // close the terminal in the MAIN window, out of sight of the person pressing
-    // the key.
+    // of their own. `useBottomTerminal`'s tab list is localStorage-backed AND
+    // cross-window synced, while its `open` flag is per window and no surface
+    // in a popout reads it: a chord there would flip a flag nothing renders,
+    // and with an empty tab list would mint a shell into the shared list.
     onToggleTerminal: terminalEnabled && !isPopout && !isEmbed
       ? () => { if (terminalPoppedOut) focusTerminalPopout(); else toggleTerminalByChord(activeSlotProject) }
+      : undefined,
+    // VS Code's Create New Terminal: open the docked panel if needed and add a
+    // tab in the active session's project. Same gating as the toggle above, and
+    // a popped-out panel is focused rather than grown from out of sight.
+    onNewTerminal: terminalEnabled && !isPopout && !isEmbed
+      ? () => { if (terminalPoppedOut) focusTerminalPopout(); else newTerminalByChord(activeSlotProject) }
       : undefined,
   })
   // Cmd+1..9 (⌘ mac / Ctrl win-linux) switches instance panes: 1=Local,

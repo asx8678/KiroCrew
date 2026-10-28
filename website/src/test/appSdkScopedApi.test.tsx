@@ -11,6 +11,7 @@
  */
 import { installSessionExpiryHandler } from '../api/sessionExpirySignal'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { AcceptedBodyUnreadable } from '../api/apiError'
 import { render, act } from '@testing-library/react'
 import React from 'react'
 import { AppApiProvider, useAppApi, type AppApi } from '../app-sdk/index'
@@ -141,6 +142,21 @@ describe('createScopedApi (via AppApiProvider) — SSRF / permission guard', () 
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
+  it('permits a backslash inside a query value (path portion carries no authority)', async () => {
+    const api = getScopedApi(['/api/apps/test'])
+    await api.get('/api/apps/test/items?q=a\\b')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/apps/test/items?q=a\\b')
+  })
+
+  it('rejects percent-encoded `..` traversal that escapes the allowlist', async () => {
+    const api = getScopedApi(['/api/apps/test'])
+    // The WHATWG URL parser resolves %2e as `.` during dot-segment removal,
+    // so this normalizes outside the declared scope.
+    await expect(api.get('/api/apps/test/%2e%2e/secret')).rejects.toThrow(/not permitted to access/)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it('rejects paths outside the declared allowlist', async () => {
     const api = getScopedApi(['/api/apps/test'])
     await expect(api.get('/api/apps/other/secrets')).rejects.toThrow(/not permitted to access/)
@@ -194,12 +210,39 @@ describe('createScopedApi (via AppApiProvider) — SSRF / permission guard', () 
     await expect(api.post('/api/apps/test/action')).resolves.toBeUndefined()
   })
 
+  it('returns undefined for a 205 Reset Content response', async () => {
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 205 }))
+    const api = getScopedApi(['/api/apps/test'])
+    await expect(api.del('/api/apps/test/item/1')).resolves.toBeUndefined()
+  })
+
   it('still parses a normal JSON body', async () => {
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, n: 3 }), {
       status: 200, headers: { 'content-type': 'application/json' },
     }))
     const api = getScopedApi(['/api/apps/test'])
     await expect(api.get('/api/apps/test/data')).resolves.toEqual({ ok: true, n: 3 })
+  })
+
+  it('tags a 2xx whose body read fails as AcceptedBodyUnreadable (accepted, receipt lost)', async () => {
+    const cause = new TypeError('network error')
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, text: async () => { throw cause } } as unknown as Response)
+    const api = getScopedApi(['/api/apps/test'])
+    await expect(api.post('/api/apps/test', {})).rejects.toSatisfy(
+      (e: unknown) => e instanceof AcceptedBodyUnreadable && e.reason === cause,
+    )
+  })
+
+  it('tags a 2xx whose body is not JSON as AcceptedBodyUnreadable', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('data: hello\n\n', { status: 200 }))
+    const api = getScopedApi(['/api/apps/test'])
+    await expect(api.post('/api/apps/test', {})).rejects.toBeInstanceOf(AcceptedBodyUnreadable)
+  })
+
+  it('a request that never left rejects with the raw TypeError (not tagged)', async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    const api = getScopedApi(['/api/apps/test'])
+    await expect(api.post('/api/apps/test', {})).rejects.toBeInstanceOf(TypeError)
   })
 })
 
@@ -323,6 +366,14 @@ describe('scoped request options and HTTP errors', () => {
     await expect(api.request('/api/apps/test/item', { method: 'POST' })).rejects.toMatchObject({
       name: 'AppApiError', status: 409, body, message: `API 409: ${body}`,
     })
+  })
+
+  it('marks the gateway signed-out 403 as authRequired, and no other 403 (#20398)', async () => {
+    const api = getScopedApi(['/api/apps/test'])
+    fetchMock.mockResolvedValueOnce(new Response('{"error":"auth required"}', { status: 403, headers: { 'X-Auth-Required': 'true' } }))
+    await expect(api.post('/api/apps/test/item', {})).rejects.toMatchObject({ status: 403, authRequired: true })
+    fetchMock.mockResolvedValueOnce(new Response('{"error":"forbidden"}', { status: 403 }))
+    await expect(api.post('/api/apps/test/item', {})).rejects.toMatchObject({ status: 403, authRequired: false })
   })
 
   it('uses statusText if the error body cannot be read', async () => {

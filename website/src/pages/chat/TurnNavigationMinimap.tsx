@@ -1,4 +1,5 @@
-import { createPortal } from 'react-dom'
+import { OverlayPortal } from '../../components/overlayRoot'
+import { sliceCodePoints } from '../../components/CommentOverlay'
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent, type PointerEvent, type RefObject } from 'react'
 import type { ChatSection } from '../../hooks/useChatNavigation'
 import type { MinimapSide } from './ChatSettings'
@@ -36,7 +37,7 @@ export function shortenTurnPreview(value: string, maxChars: number): string {
   const candidate = compact.slice(0, budget + 1)
   const lastSpace = candidate.lastIndexOf(' ')
   const cut = lastSpace >= Math.floor(budget * 0.6) ? lastSpace : budget
-  return `${candidate.slice(0, cut).trimEnd()}...`
+  return `${sliceCodePoints(candidate, 0, cut).trimEnd()}...`
 }
 
 export function markerPosition(index: number, count: number): number {
@@ -527,7 +528,7 @@ export default function TurnNavigationMinimap({
         ))}
       </button>
       </div>
-      {active && activeBucket && createPortal(
+      {active && activeBucket && <OverlayPortal>{
         // The card floats beside the rail, toward the content: the scrubbed
         // turn in its
         // conversational neighbourhood (one faint neighbour title above and
@@ -576,9 +577,8 @@ export default function TurnNavigationMinimap({
             <span className="truncate">{activeMeta}</span>
             {activeTime && <span className="shrink-0">{activeTime}</span>}
           </div>
-        </div>,
-        document.body,
-      )}
+        </div>
+      }</OverlayPortal>}
     </nav>
   )
 }

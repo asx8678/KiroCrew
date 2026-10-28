@@ -52,7 +52,6 @@ import json
 import os
 import socket
 import tempfile
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -61,6 +60,7 @@ from typing import Any, Callable, Iterator, NoReturn
 import pytest
 
 from kiro_crew import platform_compat
+from kiro_crew.testing.wait import wait_until
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("KIROCREW_E2E"),
@@ -167,7 +167,7 @@ class _Client:
             ) from exc
 
 
-def _await_memory_recovery(client: _Client, *, secs: float = 60) -> None:
+def _await_memory_recovery(client: _Client, *, secs: float = 60, interval: float = 0.25) -> None:
     """Wait out startup recovery before the caller writes anything.
 
     The gateway binds its socket and prints ``KIROCREW_READY`` before memory
@@ -178,21 +178,41 @@ def _await_memory_recovery(client: _Client, *, secs: float = 60) -> None:
 
     A store that never becomes ready fails HERE, carrying the gateway's own body
     and diagnostics, instead of at whichever line happened to write first.
+    ``interval`` is the gap between reads of a still-recovering store.
     """
-    deadline = time.monotonic() + secs
-    while True:
+    refusals: list[AssertionError] = []
+
+    def admitted() -> bool:
         try:
             client.get("/api/memory/stats?store=default")
-            return
         except AssertionError as exc:
             cause = exc.__cause__
             still_recovering = isinstance(cause, urllib.error.HTTPError) and cause.code in (
                 409,
                 503,
             )
-            if not still_recovering or time.monotonic() >= deadline:
+            if not still_recovering:
+                # Not "not yet": this error is the one to surface, so no earlier
+                # refusal may stand in for it below.
+                refusals.clear()
                 raise
-        time.sleep(0.25)
+            refusals[:] = [exc]
+            return False
+        return True
+
+    try:
+        wait_until(
+            admitted,
+            timeout=secs,
+            interval=interval,
+            describe=lambda: "the memory store is still recovering",
+        )
+    except AssertionError:
+        if not refusals:
+            raise
+        # The gateway's own refusal (body, diagnostics, the HTTPError as its
+        # cause) is the failure worth reading; the wait's own message is its context.
+        raise refusals[0]
 
 
 @contextlib.contextmanager
@@ -290,19 +310,23 @@ def _await_assistant_reply(client: _Client, slot: str, timeout: float = _REPLY_T
     (testing-conventions.md, flake class 2), and raises by name at THIS line so a
     broken turn is a failed test rather than a lost run.
     """
-    deadline = time.monotonic() + timeout
     detail: dict[str, Any] = {}
-    while time.monotonic() < deadline:
+
+    def assistant_reply() -> dict | None:
+        nonlocal detail
         detail = client.get(f"/api/chat/slots/{slot}")
         for msg in detail.get("messages", []):
             if msg.get("role") == "assistant" and str(msg.get("content", "")).strip():
                 return dict(msg)
-        time.sleep(0.5)
-    seen = [(m.get("role"), str(m.get("content", ""))[:120]) for m in detail.get("messages", [])]
-    raise AssertionError(
-        f"no non-empty assistant reply within {timeout:.0f}s; slot messages: {seen!r}\n"
-        f"{client.diagnostics()}"
-    )
+        return None
+
+    def seen() -> str:
+        messages = [
+            (m.get("role"), str(m.get("content", ""))[:120]) for m in detail.get("messages", [])
+        ]
+        return f"no non-empty assistant reply; slot messages: {messages!r}\n{client.diagnostics()}"
+
+    return wait_until(assistant_reply, timeout=timeout, interval=0.5, describe=seen)
 
 
 def _run_one_turn(client: _Client, message: str) -> dict:
@@ -318,16 +342,23 @@ def _run_one_turn(client: _Client, message: str) -> dict:
     return _await_assistant_reply(client, slot)
 
 
-def _port_is_refused(port: int, timeout: float = _PORT_RELEASE_TIMEOUT) -> bool:
-    """True once a TCP connect to ``port`` is refused (no listener left)."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+def _await_port_refused(port: int, timeout: float = _PORT_RELEASE_TIMEOUT) -> None:
+    """Return once a TCP connect to ``port`` is refused (no listener left); fail by name otherwise."""
+
+    def refused() -> bool:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(1.0)
-            if sock.connect_ex(("127.0.0.1", port)) != 0:
-                return True
-        time.sleep(0.2)
-    return False
+            return sock.connect_ex(("127.0.0.1", port)) != 0
+
+    wait_until(
+        refused,
+        timeout=timeout,
+        interval=0.2,
+        describe=lambda: (
+            f"port {port} still has a listener after teardown; the process that bound it "
+            "did not die"
+        ),
+    )
 
 
 # --- The matrix ---------------------------------------------------------------
@@ -447,13 +478,22 @@ def test_seeded_sandbox_mode_boots_and_runs_a_turn(fixture: str) -> None:
         # gateway must survive the refusal.
         slot = client.post("/api/chat/slots", {})["key"]
         client.post("/api/chat?ws=1", {"message": "ping", "slot": slot})
-        deadline = time.monotonic() + _REPLY_TIMEOUT
         transcript = ""
-        while time.monotonic() < deadline:
+
+        def turn_settled() -> bool:
+            # Either outcome ends the wait: the named refusal the test wants, or
+            # the reply that proves the spawn ran anyway. The asserts below name
+            # which one happened.
+            nonlocal transcript
             transcript = json.dumps(client.get(f"/api/chat/slots/{slot}"))
-            if "sandbox" in transcript.lower():
-                break
-            time.sleep(0.5)
+            return "sandbox" in transcript.lower() or _REPLY_MARKER in transcript
+
+        wait_until(
+            turn_settled,
+            timeout=_REPLY_TIMEOUT,
+            interval=0.5,
+            describe=lambda: f"slot transcript under agent.sandbox={seeded!r}: {transcript[:2000]}",
+        )
         assert _REPLY_MARKER not in transcript, (
             "a host with no sandbox backend ran the agent spawn anyway under "
             f"agent.sandbox={seeded!r}"
@@ -483,10 +523,12 @@ def test_shutdown_leaves_no_gateway_child_alive() -> None:
     So the gateway's descendants are SNAPSHOTTED while it is still serving, each
     with its creation identity, and re-probed after teardown. Before the kill,
     because a kill orphans survivors out of the parent map and a post-teardown walk
-    cannot find them; attributed by ``platform_compat.created_after`` so a recycled
-    pid's stray is not blamed on this gateway; and existence-first on the re-probe,
-    because a creation token stays readable while any handle to the exited process
-    is open and would report a corpse as residue.
+    cannot find them; attributed by ``platform_compat.attributed_descendants`` so
+    every parent-child edge is validated against the IMMEDIATE parent's token, not
+    only the root's -- a stale orphan sitting under a recycled intermediate pid
+    passes a root-only check but fails the per-edge check; and existence-first on
+    the re-probe, because a creation token stays readable while any handle to the
+    exited process is open and would report a corpse as residue.
 
     Liveness is probed through ``platform_compat.pid_exists``, never
     ``os.kill(pid, 0)``, which TERMINATES the target on Windows.
@@ -498,11 +540,15 @@ def test_shutdown_leaves_no_gateway_child_alive() -> None:
         assert status == 200, "gateway was not serving before the shutdown check"
         root_token = platform_compat.process_start_time(pid) or ""
         assert root_token, "the gateway's creation identity must be readable to attribute its tree"
+        # ``attributed_descendants`` walks the tree level-by-level and checks each
+        # child against its IMMEDIATE parent's creation time, not only the root's.
+        # This matches the harness's own teardown attribution and excludes stale
+        # orphans that appear in a flat walk but whose edge timestamp predates the
+        # recycled PID they are reached through.
         descendants = {
             child: token
-            for child in platform_compat.process_descendants(pid)
+            for child in platform_compat.attributed_descendants(pid, root_token)
             if (token := platform_compat.process_start_time(child))
-            and platform_compat.created_after(token, root_token)
         }
 
     assert handle.proc.poll() is not None, "the gateway process was not reaped"
@@ -520,7 +566,5 @@ def test_shutdown_leaves_no_gateway_child_alive() -> None:
         f"running: {leaked}. The port check cannot see this, because a descendant never "
         "inherits the listener."
     )
-    assert _port_is_refused(port), (
-        f"port {port} still has a listener after teardown; the process that bound it " "did not die"
-    )
+    _await_port_refused(port)
     assert not handle.home.exists(), "the throwaway KIROCREW_HOME was not removed"

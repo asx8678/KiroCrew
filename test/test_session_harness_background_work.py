@@ -35,6 +35,7 @@ inside the hold, or a session that keeps launching work would never be bounded.
 from __future__ import annotations
 
 import inspect
+import logging
 import time
 import unicodedata
 from typing import Any
@@ -47,6 +48,7 @@ from kiro_crew.acp._dispatch import (
     BACKGROUND_LAUNCH_LABELS_MAX,
     BackgroundLaunchRecord,
     parse_background_launch,
+    unrecognised_background_launch,
 )
 from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, JsonRpcMessage
@@ -270,6 +272,94 @@ class TestTheRecord:
 
 
 # --------------------------------------------------------------------------- #
+# The drift tripwire: a launch-shaped response the parse does not recognise
+# --------------------------------------------------------------------------- #
+
+
+def _claude_update(response: dict[str, Any], tool: str = "Bash") -> dict[str, Any]:
+    return {
+        "sessionUpdate": "tool_call_update",
+        "_meta": {"claudeCode": {"toolResponse": response, "toolName": tool}},
+    }
+
+
+class TestDriftTripwire:
+    @pytest.mark.parametrize(
+        "update",
+        [
+            CAPTURED_BASH_LAUNCH,
+            CAPTURED_WORKFLOW_LAUNCH,
+            CAPTURED_BASH_TERMINAL,
+            FOREGROUND_BASH,
+            ASYNC_AGENT_LAUNCH,
+            _claude_update(
+                {"status": "async_launched", "taskId": "t1", "isAsync": True}, tool="Task"
+            ),
+            {**CAPTURED_BASH_LAUNCH, "sessionUpdate": "tool_call"},
+        ],
+        ids=[
+            "bash",
+            "workflow",
+            "prose-result",
+            "foreground",
+            "held-agent",
+            "held-task",
+            "not-an-update",
+        ],
+    )
+    def test_silent_on_every_frame_the_parse_already_handles(self, update: dict[str, Any]) -> None:
+        assert unrecognised_background_launch(update) is None
+
+    @pytest.mark.parametrize(
+        ("response", "expected"),
+        [
+            ({"stdout": "", "background_task_id": "b1"}, "keys background_task_id; tool Bash"),
+            ({"status": "asyncLaunched", "taskId": "w1"}, 'status "asyncLaunched"; tool Bash'),
+            ({"status": "async_launched", "task_id": "w1"}, 'status "async_launched"; tool Bash'),
+            ({"backgroundTaskId": "  "}, "keys backgroundTaskId; tool Bash"),
+            ({"BackgroundJob": {"id": "j"}}, "keys BackgroundJob; tool Bash"),
+        ],
+        ids=[
+            "renamed-bash-key",
+            "renamed-status",
+            "renamed-task-id",
+            "blank-id",
+            "reshaped-nested",
+        ],
+    )
+    def test_fires_on_a_renamed_or_reshaped_launch(
+        self, response: dict[str, Any], expected: str
+    ) -> None:
+        update = _claude_update(response)
+        assert parse_background_launch(update) is None
+        assert unrecognised_background_launch(update) == expected
+
+    def test_a_rename_without_either_word_is_not_caught(self) -> None:
+        """Residual: a rename that drops both words (``bgTaskId``) slips past.
+
+        The tripwire is a word match by design; a closed list of every future
+        spelling does not exist. Pinned so whoever widens it sees this flip.
+        """
+        assert unrecognised_background_launch(_claude_update({"bgTaskId": "b1"})) is None
+
+    def test_adapter_authored_names_are_folded_and_bounded(self) -> None:
+        key = "background\x1b[31m\nforged" + "x" * 100
+        drift = unrecognised_background_launch(_claude_update({key: "b1"}, tool="Ba\u202esh"))
+        assert drift is not None
+        assert not any(unicodedata.category(c) in ("Cc", "Cf") for c in drift)
+        assert len(drift) < 120
+
+    def test_the_record_hands_out_drift_once(self) -> None:
+        record = BackgroundLaunchRecord()
+        renamed = _claude_update({"background_task_id": "b1"})
+        assert not record.note(renamed, now=1.0)
+        assert record.take_drift() == "keys background_task_id; tool Bash"
+        assert not record.note(_claude_update({"status": "asyncLaunched"}), now=2.0)
+        assert record.take_drift() is None
+        assert record.age(10.0) is None
+
+
+# --------------------------------------------------------------------------- #
 # The transport that serves the stamping harness records it
 # --------------------------------------------------------------------------- #
 
@@ -301,6 +391,27 @@ class TestTheDedicatedClientRecordsIt:
     def test_a_turn_frame_that_is_not_a_launch_records_nothing(self) -> None:
         client = _bare_client()
         client._note_background_launch(_update_msg(CAPTURED_BASH_TERMINAL))
+        assert client.background_launch() is None
+
+    def test_a_drifted_shape_is_logged_once_per_session(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = _bare_client()
+        renamed = _claude_update({"background_task_id": "b1"})
+        with caplog.at_level("INFO", logger="kiro_crew.acp.client"):
+            client._note_background_launch(_update_msg(renamed))
+            client._note_background_launch(_update_msg(renamed))
+            client._note_background_launch(_update_msg(FOREGROUND_BASH))
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if "recognised claude-agent-acp shape" in r.getMessage()
+        ]
+        assert lines == [
+            "ACP: a tool response looks like a background launch but matches no recognised "
+            "claude-agent-acp shape (keys background_task_id; tool Bash); the watchdog will "
+            "not hold this session for it. Logged once per session."
+        ]
         assert client.background_launch() is None
 
     @pytest.mark.parametrize(
@@ -381,6 +492,15 @@ def _proc_route(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(session.platform_compat, "IS_WINDOWS", False)
 
 
+def _notice_recorder(notices: list[tuple[str, str]]):
+    """A recycle callback that keeps each ``(key, reason)`` notice it is handed."""
+
+    async def _record(key: str, *, reason: str) -> None:
+        notices.append((key, reason))
+
+    return _record
+
+
 async def _rss_tick(manager: Any, rss: int = 2514) -> None:
     with (
         patch("kiro_crew.session._build_child_map", return_value={}),
@@ -392,7 +512,7 @@ async def _rss_tick(manager: Any, rss: int = 2514) -> None:
 @pytest.mark.usefixtures("_proc_route")
 class TestRssRecycleHonoursHarnessWork:
     @pytest.mark.asyncio
-    async def test_a_launch_inside_the_hold_keeps_the_session(self) -> None:
+    async def test_a_launch_inside_the_hold_keeps_the_session(self, caplog) -> None:
         # rss=1500 is above the 1000 MB ceiling but inside the 2x hard ceiling,
         # so the hold applies.
         manager = _make_manager(rss_max_mb=1000)
@@ -400,9 +520,15 @@ class TestRssRecycleHonoursHarnessWork:
         manager.reset = AsyncMock(return_value=True)
         manager.get_pid = MagicMock(return_value=4242)
 
-        await _rss_tick(manager, rss=1500)
+        with caplog.at_level(logging.INFO, logger="kiro_crew.session"):
+            await _rss_tick(manager, rss=1500)
 
         manager.reset.assert_not_awaited()
+        assert manager._cleanup_boundary().state.rss_recycled == {}
+        assert any(
+            "harness launched background work 30s ago" in m and "skipping" in m
+            for m in caplog.messages
+        )
 
     @pytest.mark.asyncio
     async def test_the_hard_ceiling_recycles_even_inside_the_hold(self) -> None:
@@ -431,13 +557,13 @@ class TestRssRecycleHonoursHarnessWork:
         manager._sessions["dashboard:x"] = _session_with_launch(None)
         manager.reset = AsyncMock(return_value=True)
         manager.get_pid = MagicMock(return_value=4242)
-        cb = AsyncMock()
-        manager.set_recycle_callback(cb)
+        notices: list[tuple[str, str]] = []
+        manager.set_recycle_callback(_notice_recorder(notices))
 
         await _rss_tick(manager)
 
         manager.reset.assert_awaited_once()
-        assert cb.await_args.kwargs["reason"] == "memory limit (2514MB)"
+        assert notices == [("dashboard:x", "memory limit (2514MB)")]
 
     @pytest.mark.asyncio
     async def test_a_launch_past_the_hold_recycles_with_the_plain_notice(self) -> None:
@@ -449,13 +575,13 @@ class TestRssRecycleHonoursHarnessWork:
         manager._sessions["dashboard:x"] = _session_with_launch(_PAST)
         manager.reset = AsyncMock(return_value=True)
         manager.get_pid = MagicMock(return_value=4242)
-        cb = AsyncMock()
-        manager.set_recycle_callback(cb)
+        notices: list[tuple[str, str]] = []
+        manager.set_recycle_callback(_notice_recorder(notices))
 
         await _rss_tick(manager)
 
         manager.reset.assert_awaited_once()
-        assert cb.await_args.kwargs["reason"] == "memory limit (2514MB)"
+        assert notices == [("dashboard:x", "memory limit (2514MB)")]
 
     @pytest.mark.asyncio
     async def test_a_raising_provider_does_not_break_the_tick(self) -> None:
@@ -473,23 +599,29 @@ class TestRssRecycleHonoursHarnessWork:
         await _rss_tick(manager)
 
         manager.reset.assert_awaited_once()
+        assert set(manager._cleanup_boundary().state.rss_recycled) == {"dashboard:x"}
 
 
 class TestIdleSweepHonoursHarnessWork:
     @pytest.mark.asyncio
-    async def test_an_idle_session_inside_the_hold_is_kept(self) -> None:
+    async def test_an_idle_session_inside_the_hold_is_kept(self, caplog) -> None:
         manager = _make_manager(rss_max_mb=0)
         sess = _session_with_launch(_INSIDE)
         sess.last_used = time.monotonic() - 10_000
         manager._sessions["dashboard:x"] = sess
         manager.reset = AsyncMock(return_value=True)
 
-        await manager._expire_idle(timeout_secs=1)
+        with caplog.at_level(logging.INFO, logger="kiro_crew.session"):
+            await manager._expire_idle(timeout_secs=1)
 
         manager.reset.assert_not_awaited()
+        assert any(
+            m.startswith("Idle sweep: dashboard:x looks idle but its harness launched")
+            for m in caplog.messages
+        )
 
     @pytest.mark.asyncio
-    async def test_an_orphaned_session_inside_the_hold_is_kept(self) -> None:
+    async def test_an_orphaned_session_inside_the_hold_is_kept(self, caplog) -> None:
         manager = _make_manager(rss_max_mb=0)
         sess = _session_with_launch(_INSIDE)
         sess.last_used = time.monotonic()
@@ -498,9 +630,14 @@ class TestIdleSweepHonoursHarnessWork:
         manager.set_active_dashboard_slots({"dashboard:x"})
         manager.set_active_dashboard_slots({"dashboard:other"})  # x's tab closed
 
-        await manager._expire_idle(timeout_secs=9999)
+        with caplog.at_level(logging.INFO, logger="kiro_crew.session"):
+            await manager._expire_idle(timeout_secs=9999)
 
         manager.reset.assert_not_awaited()
+        assert any(
+            m.startswith("Idle sweep: dashboard:x looks orphaned but its harness launched")
+            for m in caplog.messages
+        )
 
     @pytest.mark.asyncio
     async def test_an_orphaned_session_without_a_launch_is_reaped(self) -> None:
@@ -516,6 +653,7 @@ class TestIdleSweepHonoursHarnessWork:
         await manager._expire_idle(timeout_secs=9999)
 
         manager.reset.assert_awaited_once()
+        assert manager.reset.await_args.args[0] == "dashboard:x"
 
     @pytest.mark.asyncio
     async def test_an_idle_session_past_the_hold_expires(self) -> None:
@@ -528,3 +666,4 @@ class TestIdleSweepHonoursHarnessWork:
         await manager._expire_idle(timeout_secs=1)
 
         manager.reset.assert_awaited_once()
+        assert manager.reset.await_args.args[0] == "dashboard:x"

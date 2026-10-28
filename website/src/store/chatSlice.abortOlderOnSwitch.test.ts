@@ -55,7 +55,6 @@ vi.mock('../api/client', () => ({
 
 import chatReducer, {
   setActiveSlot,
-  resumeFromHistory,
   loadOlderMessages,
   switchSlot,
   refreshSlot,
@@ -63,6 +62,7 @@ import chatReducer, {
   isSupersededPagingRejection,
 } from './chatSlice'
 import { api } from '../api/client'
+import { landResume } from '../test/resumeLanded'
 
 function makeStore() {
   return configureStore({
@@ -74,13 +74,7 @@ function makeStore() {
 /** Arms the cursor the way resume does: last PAGE of TOTAL, has_more true. */
 function resumed(store: ReturnType<typeof makeStore>, key = 'A') {
   store.dispatch(setActiveSlot(key))
-  store.dispatch(
-    resumeFromHistory.fulfilled(
-      { ok: true, key, nextBefore: TOTAL - PAGE, messages: HISTORY.slice(TOTAL - PAGE), hasMore: true, total: TOTAL },
-      'req-resume',
-      { key, title: key },
-    ),
-  )
+  landResume(store, { ok: true, key, nextBefore: TOTAL - PAGE, messages: HISTORY.slice(TOTAL - PAGE), hasMore: true, total: TOTAL }, 'req-resume', { key, title: key })
 }
 
 /** Lets queued microtasks (thunk settle + reducer) run. */
@@ -190,6 +184,22 @@ describe('older-history fetch is cancelled when the user switches chat', () => {
   })
 })
 
+// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings),
+// so the pins read the page and those owners.
+async function readChatPageSource(): Promise<string> {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const pages = path.resolve(__dirname, '..', 'pages')
+  const ownerDir = path.join(pages, 'chat', 'page')
+  return [
+    fs.readFileSync(path.join(pages, 'ChatPage.tsx'), 'utf8'),
+    ...fs.readdirSync(ownerDir).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+      .map(f => fs.readFileSync(path.join(ownerDir, f), 'utf8')),
+    ...fs.readdirSync(pages).filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f)).sort()
+      .map(f => fs.readFileSync(path.join(pages, f), 'utf8')),
+  ].join('\n')
+}
+
 // The pin-jump effect turns any rejection into a "message unavailable" notice,
 // so a chat switch would now show it for a pin that is perfectly reachable.
 describe('an abort is distinguishable from a real failure', () => {
@@ -231,9 +241,7 @@ describe('an abort is distinguishable from a real failure', () => {
   })
 
   it('is guarded at the pin-jump call site before the unavailable notice', async () => {
-    const fs = await import('node:fs')
-    const path = await import('node:path')
-    const src = fs.readFileSync(path.resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
+    const src = await readChatPageSource()
 
     // The catch must return on an abort BEFORE reaching the notice. A failed
     // page load is an ERROR (it renders through ErrorNotice via
@@ -245,9 +253,7 @@ describe('an abort is distinguishable from a real failure', () => {
   })
 
   it('picks the notice from the entry point, so the earlier-messages row avoids pin copy', async () => {
-    const fs = await import('node:fs')
-    const path = await import('node:path')
-    const src = fs.readFileSync(path.resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
+    const src = await readChatPageSource()
 
     // Both entry points must tag themselves; `origin` is a required field, so a
     // future caller that forgets cannot silently inherit pin wording.
@@ -270,9 +276,7 @@ describe('an abort is distinguishable from a real failure', () => {
   })
 
   it('keeps the pin entry point on its own copy, so the transient string cannot regress it', async () => {
-    const fs = await import('node:fs')
-    const path = await import('node:path')
-    const src = fs.readFileSync(path.resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
+    const src = await readChatPageSource()
 
     // The transient string is scoped to the earlier-messages origin; the pin
     // origin has no paging-error string, so it falls back to its own wording.
@@ -437,13 +441,7 @@ describe('a background refresh must not re-validate a cursor a pending switch in
     // outliving one. The shape here is the real case the retry exists for: a tab
     // holding history from before the conversation moved on.
     store.dispatch(setActiveSlot('A'))
-    store.dispatch(
-      resumeFromHistory.fulfilled(
-        { ok: true, key: 'A', nextBefore: 0, messages: HISTORY.slice(0, PAGE), hasMore: false, total: TOTAL },
-        'req-resume',
-        { key: 'A', title: 'A' },
-      ),
-    )
+    landResume(store, { ok: true, key: 'A', nextBefore: 0, messages: HISTORY.slice(0, PAGE), hasMore: false, total: TOTAL }, 'req-resume', { key: 'A', title: 'A' })
 
     store.dispatch(switchSlot('A'))
     await flush()
@@ -532,9 +530,10 @@ describe('a slot activated during a switch keeps its own cursor', () => {
     store.dispatch({ type: switchSlot.pending.type, meta: { requestId: 'r1', arg: 'A' } })
     expect(store.getState().chat.slotCursorKey).toBeNull()
 
+    // The create started on A with no move since, so it carries A's move count.
     store.dispatch({
       type: 'chat/createSlot/fulfilled',
-      meta: { requestId: 'c1', activate: true, originActiveSlot: 'A' },
+      meta: { requestId: 'c1', activate: true, originActiveSlot: 'A', originActiveSlotMoves: store.getState().chat.activeSlotMoves },
       payload: { key: 'NEW' },
     })
     expect(store.getState().chat.activeSlot).toBe('NEW')

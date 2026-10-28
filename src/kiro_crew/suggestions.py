@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from aiohttp import web
 
 from kiro_crew.context import ContextBuilder
+from kiro_crew.dashboard.chat_title import _ui_language
 from kiro_crew.history import TranscriptWithheld, is_incognito_transcript
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.loop_lock import LoopBoundLock
@@ -25,15 +25,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Regenerate suggestions every 30 minutes — an upper bound, not a schedule
-# (LOOP-10): a refresh whose rebuilt context hashes the same as the one the
-# current suggestions were built from skips the model call and only bumps the
-# stamp, so an unchanged Welcome view stops re-billing the background role.
+# Regenerate suggestions every 30 minutes
 _REFRESH_INTERVAL_SECS = 30 * 60
-# How long one /api/suggestions request waits for a generation it started or
-# joined. Shorter than the model call's own 60 s timeout on purpose: the request
-# returns the current set and the shielded refresh finishes into the cache.
-_REQUEST_WAIT_SECS = 45
 
 # The fixed vocabulary the dashboard maps to an icon. Anything else the model
 # returns collapses to "general", so a new kind is a change here AND in the
@@ -43,27 +36,14 @@ _DEFAULT_KIND = "general"
 
 Suggestion = dict[str, str]
 
-# Fallback suggestions when LLM is unavailable or context is empty
-_FALLBACK_SUGGESTIONS: list[Suggestion] = [
-    {"text": "Summarize my recent activity", "kind": "general"},
-    {"text": "Search my code for usage examples", "kind": "research"},
-    {"text": "Summarize this week's chat activity", "kind": "general"},
-    {"text": "Help me write a design doc", "kind": "write"},
-    {"text": "Review my latest changes", "kind": "review"},
-    {"text": "What should I work on next?", "kind": "tasks"},
-]
-
-
-def _fallback() -> list[Suggestion]:
-    return [dict(s) for s in _FALLBACK_SUGGESTIONS]
-
-
 _PROMPT_TEMPLATE = """\
 You are generating contextual prompt suggestions for a developer assistant dashboard.
 
 Based on the user's current context below, generate 4-6 short, actionable prompt suggestions \
 that the user might want to ask right now. Each suggestion should be a single sentence \
 (under 60 characters) that the user can click to start a conversation.
+
+{language}
 
 Consider:
 - What they were working on recently (projects, sessions)
@@ -89,18 +69,52 @@ Example: [{"text": "Continue refactoring auth module", "kind": "code"}, \
 {"text": "Draft the release notes", "kind": "write"}]
 """
 
+# Filled into the ``{language}`` slot when the workspace has an explicit UI
+# language. The cards sit under a heading and a refresh link rendered in the UI
+# language, so the cards are UI chrome too: they follow the configured tag, not
+# the conversation, exactly as chat titles do (``chat_title._TITLE_LANGUAGE_TEMPLATE``).
+# The raw BCP-47 tag is injected for the reason ``context._build_ui_language_section``
+# gives: the frontend's SUPPORTED_LANGUAGES registry is the one list of languages.
+_LANGUAGE_TEMPLATE = (
+    'LANGUAGE: Write every suggestion\'s "text" in the language of BCP-47 tag {lang}. '
+    "That is the language the dashboard around the suggestions is rendered in, so the "
+    "text must be in it even when the context below is in another language. Keep code, "
+    'identifiers, paths, and product names verbatim. The "kind" value always stays one '
+    "of the fixed English tags listed below."
+)
+
+# Filled in when no UI language is configured (``ui_language_tag`` returns ""):
+# the dashboard then follows the browser, which the backend cannot see, so the
+# best available signal is the user's own preferences and messages.
+_LANGUAGE_INFERRED = (
+    'LANGUAGE: Write every suggestion\'s "text" in the language the user writes and '
+    "prefers: a preferred/response language stated in the context below, else the "
+    'language of the user\'s recent messages. The "kind" value always stays one of the '
+    "fixed English tags listed below."
+)
+
+
+def _build_prompt(context: str, ui_language: str) -> str:
+    """Render the suggestions prompt for ``context`` in ``ui_language``.
+
+    ``ui_language`` is a validated tag from ``chat_title._ui_language``; ``""`` keeps
+    the inference wording. The language line is filled first, so a context that
+    quotes the ``{language}`` slot cannot steer it.
+    """
+    language = _LANGUAGE_TEMPLATE.format(lang=ui_language) if ui_language else _LANGUAGE_INFERRED
+    return _PROMPT_TEMPLATE.replace("{language}", language).replace("{context}", context)
+
 
 @dataclass
 class SuggestionsCache:
     """Holds pre-computed suggestions with a timestamp."""
 
-    suggestions: list[Suggestion] = field(default_factory=_fallback)
+    suggestions: list[Suggestion] = field(default_factory=list)
     generated_at: float = 0.0
-    #: LOOP-10: sha256 of the context the current suggestions were built from.
-    #: A refresh whose rebuilt context hashes the same skips the model call and
-    #: only bumps generated_at, so an unchanged Welcome view stops re-billing
-    #: the background role every interval.
-    context_digest: str = ""
+    # The UI language tag the cached set was generated for. A request whose
+    # current tag differs regenerates instead of serving the old language's
+    # cards for the rest of the refresh interval.
+    language: str = ""
     # LoopBoundLock, not asyncio.Lock: the cache is stored on the
     # long-lived DashboardState, which outlives any single event loop.
     _lock: LoopBoundLock = field(default_factory=LoopBoundLock, repr=False)
@@ -239,29 +253,34 @@ def _redact_suggestions(suggestions: list[Suggestion]) -> list[Suggestion]:
     return result
 
 
-async def _generate_from_context(context: str, sessions: Any = None) -> list[Suggestion]:
-    """One model call over an already-built context (LOOP-10 split).
+async def generate_suggestions(state: DashboardState, *, ui_language: str) -> list[Suggestion]:
+    """Generate suggestions in ``ui_language`` using the background kiro-cli session.
 
-    The context build and the model call separated so a refresh can hash the
-    rebuilt context BEFORE deciding to spend the call.
+    Returns ``[]`` when nothing is generated (too little context, a failed call,
+    an unusable reply). The welcome screen answers an empty list with its own
+    catalog-localized cards, so no fixed English set reaches another language.
     """
+    # _build_context() calls list_sessions() + recent() — O(all sessions) disk IO.
+    # Offload to keep the event loop responsive (same pattern as the offload
+    # sites in sessions.py).
+    context = await asyncio.to_thread(_build_context, state)
     if not context or len(context) < 50:
-        logger.debug("Insufficient context for suggestions — using fallback")
-        return _fallback()
+        logger.debug("Insufficient context for suggestions; sending none")
+        return []
 
-    prompt = _PROMPT_TEMPLATE.replace("{context}", context)
+    prompt = _build_prompt(context, ui_language)
 
     # run_bg_oneliner owns the shared background-session skeleton (acquire _bg,
     # reject + SEL-audit any tool call, drive the event loop, destroy in finally)
     # and its reactive rejected-model fallback — so a partition that does not
     # serve "auto" (e.g. GovCloud) retries once with an advertised model instead
-    # of failing permanently. Best-effort: on any error fall back to the static
-    # suggestions rather than surfacing it.
+    # of failing permanently. Best-effort: on any error send no suggestions
+    # rather than surfacing it.
     try:
-        text = await run_bg_oneliner(sessions, prompt, sel_source="suggestions", timeout=60)
+        text = await run_bg_oneliner(state.sessions, prompt, sel_source="suggestions", timeout=60)
     except Exception:
         logger.warning("Suggestions generation failed", exc_info=True)
-        return _fallback()
+        return []
 
     suggestions = _parse_suggestions(text)
     if suggestions:
@@ -269,69 +288,43 @@ async def _generate_from_context(context: str, sessions: Any = None) -> list[Sug
         logger.info("Generated %d suggestions", len(suggestions))
         return suggestions
 
-    return _fallback()
+    return []
 
 
-async def refresh_suggestions(
-    state: DashboardState, cache: SuggestionsCache, *, force: bool = False
-) -> None:
-    """Background task: regenerate suggestions when the context changed.
-
-    LOOP-10: the rebuilt context is hashed against the digest the current
-    suggestions were built from — an unchanged context skips the model call and
-    only bumps ``generated_at`` (the interval stays the upper bound), while
-    *force* always regenerates.
-    """
+async def refresh_suggestions(state: DashboardState, cache: SuggestionsCache) -> None:
+    """Background task: regenerate suggestions."""
     async with cache._lock:
         try:
-            context = await asyncio.to_thread(_build_context, state)
-            digest = hashlib.sha256(context.encode("utf-8")).hexdigest()
-            if not force and digest == cache.context_digest:
-                cache.generated_at = time.time()
-                return
-            # The session manager is required: without it the model call fails at
-            # once and every refresh silently fell back to the static set.
-            suggestions = await _generate_from_context(context, getattr(state, "sessions", None))
+            language = await asyncio.to_thread(_ui_language)
+            suggestions = await generate_suggestions(state, ui_language=language)
             cache.suggestions = suggestions
             cache.generated_at = time.time()
-            cache.context_digest = digest
+            cache.language = language
         except Exception:
             logger.warning("Suggestions generation failed", exc_info=True)
 
 
-def _start_refresh(
-    state: DashboardState, cache: SuggestionsCache, *, force: bool = False
-) -> "asyncio.Task[None]":
-    """Run a refresh as a tracked background task.
+async def maybe_refresh(
+    state: DashboardState, cache: SuggestionsCache, *, language_changed: bool = False
+) -> None:
+    """Trigger a background refresh if suggestions are stale or in another language.
 
-    A task, not an inline await, so a request that stops waiting does not cancel
-    the generation: the result still lands in the cache for the next request.
+    A language switch takes this background path too, never the blocking one:
+    the request keeps the cached set, and a slow generation finishes on its own
+    instead of being cut off and retried by every page view.
     """
-    task = asyncio.create_task(refresh_suggestions(state, cache, force=force))
-    cache._task = task
-    state._background_tasks.add(task)
-    task.add_done_callback(state._background_tasks.discard)
-    return task
-
-
-async def _wait_for_refresh(task: "asyncio.Task[None]") -> None:
-    """Wait up to the request budget for *task*; on timeout it keeps running."""
-    try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=_REQUEST_WAIT_SECS)
-    except (asyncio.TimeoutError, Exception):
-        pass
-
-
-async def maybe_refresh(state: DashboardState, cache: SuggestionsCache) -> None:
-    """Trigger a background refresh if suggestions are stale."""
     now = time.time()
-    if now - cache.generated_at < _REFRESH_INTERVAL_SECS:
+    if not language_changed and now - cache.generated_at < _REFRESH_INTERVAL_SECS:
         return
-    if cache._lock.locked():
+    # A started task that has not reached the lock yet counts as running too.
+    if cache._lock.locked() or (cache._task is not None and not cache._task.done()):
         return
 
     # Fire and forget
-    _start_refresh(state, cache)
+    task = asyncio.create_task(refresh_suggestions(state, cache))
+    cache._task = task
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
 
 
 def get_suggestions_cache(state: DashboardState) -> SuggestionsCache:
@@ -353,27 +346,37 @@ async def api_suggestions(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     cache = get_suggestions_cache(state)
     force = request.query.get("force") == "1"
+    # A set generated for another UI language is stale whatever its age.
+    language_changed = bool(cache.generated_at) and (
+        cache.language != await asyncio.to_thread(_ui_language)
+    )
 
-    # The generation may take up to its 60 s model timeout, longer than this
-    # request waits; the refresh runs as a shielded task so a slow model still
-    # fills the cache instead of being cancelled and retried on every refetch.
     if force:
-        await _wait_for_refresh(_start_refresh(state, cache, force=True))
+        try:
+            await asyncio.wait_for(refresh_suggestions(state, cache), timeout=45)
+        except (asyncio.TimeoutError, Exception):
+            pass
     elif cache.generated_at == 0:
         # Never generated yet — wait for result
         if cache._lock.locked() and cache._task is not None:
-            await _wait_for_refresh(cache._task)
+            try:
+                await asyncio.wait_for(asyncio.shield(cache._task), timeout=45)
+            except (asyncio.TimeoutError, Exception):
+                pass
         if cache.generated_at == 0 and not cache._lock.locked():
-            await _wait_for_refresh(_start_refresh(state, cache))
+            try:
+                await asyncio.wait_for(refresh_suggestions(state, cache), timeout=45)
+            except (asyncio.TimeoutError, Exception):
+                pass
     else:
-        await maybe_refresh(state, cache)
+        await maybe_refresh(state, cache, language_changed=language_changed)
 
     return web.json_response(
         {
             "suggestions": cache.suggestions,
             "generated_at": cache.generated_at,
             "stale": (
-                (time.time() - cache.generated_at) > _REFRESH_INTERVAL_SECS
+                language_changed or (time.time() - cache.generated_at) > _REFRESH_INTERVAL_SECS
                 if cache.generated_at
                 else True
             ),

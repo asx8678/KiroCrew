@@ -30,11 +30,13 @@ from kiro_crew.shell_audit_log import (
     rotate_shell_audit_log,
     shell_audit_log_path,
 )
+from kiro_crew.testing.wait import finished
 
-# One record in the shape the bundled hook writes: a UTC stamp line, the
-# hook-event payload kiro-cli hands the hook on stdin, a blank separator. The
-# payload bytes stand in for that JSON; only the size matters to the sweep.
-_RECORD = b"1970-01-01T00:00:00Z BASH:\nls -la\n\n"
+# One record in the shape the bundled hook writes: a single line -- a UTC stamp,
+# then " BASH: ", then the hook-event payload kiro-cli hands the hook on stdin
+# with every CR and LF stripped. The payload bytes stand in for that JSON; only
+# the size matters to the sweep.
+_RECORD = b"1970-01-01T00:00:00Z BASH: ls -la\n"
 
 
 def _fill(path: Path, size: int) -> bytes:
@@ -259,6 +261,7 @@ def _service(shutdown: _Shutdown, rotate: Any, pool: ThreadPoolExecutor) -> Any:
         cleanup_stale_sandbox_profiles=lambda: 0,
         prune_session_pid_mappings=lambda: 0,
         prune_member_pid_bindings=lambda: 0,
+        sweep_session_staging_temps=lambda: 0,
         rotate_shell_audit_log=rotate,
         prune_pycache=lambda: (0, 0),
         collect_active_pids=lambda sessions: (set(), True),
@@ -321,7 +324,7 @@ async def test_every_cleanup_tick_rotates_the_audit_log_off_the_loop() -> None:
             patch.object(SessionCleanup, "_adopt_idle_policy", adopt),
             patch.multiple(SessionCleanup, **{name: AsyncMock() for name in _OTHER_TICK_STEPS}),
         ):
-            await asyncio.wait_for(service._run_cleanup_ticks(0.01), timeout=10)
+            await finished(service._run_cleanup_ticks(0.01), "the tick loop stopping on shutdown")
     finally:
         pool.shutdown(wait=True)
 
@@ -354,7 +357,7 @@ async def test_a_rotation_that_raises_does_not_end_the_tick() -> None:
             patch.object(SessionCleanup, "_adopt_idle_policy", adopt),
             patch.multiple(SessionCleanup, **{name: AsyncMock() for name in _OTHER_TICK_STEPS}),
         ):
-            await asyncio.wait_for(service._run_cleanup_ticks(0.01), timeout=10)
+            await finished(service._run_cleanup_ticks(0.01), "the tick loop stopping on shutdown")
     finally:
         pool.shutdown(wait=True)
 

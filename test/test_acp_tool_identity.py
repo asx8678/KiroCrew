@@ -2,19 +2,19 @@
 
 Three landed fixes are pinned here:
 
-1. **ACP identity plumbing** (``acp/types.py`` + ``acp/_dispatch.py``): an
+1. **ACP identity plumbing** (``acp/types.py`` + ``acp/_dispatch_parts/tool_call_identity.py``): an
    ``AcpEvent`` now carries the NON-model-authored tool identity from
    ``_meta.kiro`` — ``tool_name`` (``_kiro_tool_name``) and ``mcp_server_name``
    (``_kiro_mcp_server_name``). A non-empty ``mcp_server_name`` is the trusted
    "this was a real MCP tool call" discriminator; both are ``""`` when the
    backend emits no ``_meta`` (fail-closed).
 
-2. **chat_runner directive gate** (``dashboard/chat_runner.py``): the
+2. **chat_runner directive gate** (``chat_turn/tool_rows.py``, ``tool_results.py``): the
    ``EVENT_TOOL_CALL`` handler records ``_pending_dir_tool[id]`` ONLY when
    ``event.mcp_server_name`` is set AND ``session_directive.match_tool`` resolves
    a directive tool; the ``EVENT_TOOL_RESULT`` gate applies a directive only for
    a recorded id and REFUSES a native-sub-agent call
-   (``id in _native_tc_card``). A forged shell result (no ``mcp_server_name``,
+   (``id in _native_child_tc``). A forged shell result (no ``mcp_server_name``,
    an LLM-authored title, and a marker in stdout) is therefore never honoured.
 
 The ``_meta.kiro`` fixture shape mirrors ``test_todo_list_surface.py``.
@@ -22,7 +22,6 @@ The ``_meta.kiro`` fixture shape mirrors ``test_todo_list_surface.py``.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -32,6 +31,7 @@ from chat_test_helpers import _make_state
 from kiro_crew import session_directive
 from kiro_crew.acp._dispatch import _build_tool_call_event, _kiro_mcp_server_name
 from kiro_crew.acp.types import (
+    EVENT_AGENT_SWITCHED,
     EVENT_COMPLETE,
     EVENT_SUBAGENT_ACTIVITY,
     EVENT_SUBAGENT_LIST,
@@ -40,6 +40,7 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_RESULT,
     AcpEvent,
 )
+from kiro_crew.dashboard.session_directive_apply import DirectiveOutcome
 
 # ── Part 1: ACP identity plumbing ─────────────────────────────────────────────
 
@@ -52,21 +53,23 @@ class TestKiroMcpServerName:
         update = {"_meta": {"kiro": {"mcpServerName": "kirocrew-core"}}}
         assert _kiro_mcp_server_name(update) == "kirocrew-core"
 
-    def test_absent_meta_yields_empty(self) -> None:
-        assert _kiro_mcp_server_name({"toolCallId": "tc1"}) == ""
-
-    def test_absent_key_yields_empty(self) -> None:
-        """A built-in/shell tool emits ``_meta.kiro`` without an mcpServerName."""
-        assert _kiro_mcp_server_name({"_meta": {"kiro": {"toolName": "execute_bash"}}}) == ""
-
-    def test_malformed_meta_not_dict_yields_empty(self) -> None:
-        assert _kiro_mcp_server_name({"_meta": "nope"}) == ""
-
-    def test_malformed_kiro_not_dict_yields_empty(self) -> None:
-        assert _kiro_mcp_server_name({"_meta": {"kiro": "nope"}}) == ""
-
-    def test_non_string_name_yields_empty(self) -> None:
-        assert _kiro_mcp_server_name({"_meta": {"kiro": {"mcpServerName": 123}}}) == ""
+    @pytest.mark.parametrize(
+        "update",
+        [
+            pytest.param({"toolCallId": "tc1"}, id="absent_meta_yields_empty"),
+            # A built-in/shell tool emits ``_meta.kiro`` without an mcpServerName.
+            pytest.param(
+                {"_meta": {"kiro": {"toolName": "execute_bash"}}}, id="absent_key_yields_empty"
+            ),
+            pytest.param({"_meta": "nope"}, id="malformed_meta_not_dict_yields_empty"),
+            pytest.param({"_meta": {"kiro": "nope"}}, id="malformed_kiro_not_dict_yields_empty"),
+            pytest.param(
+                {"_meta": {"kiro": {"mcpServerName": 123}}}, id="non_string_name_yields_empty"
+            ),
+        ],
+    )
+    def test_no_trusted_name_yields_empty(self, update) -> None:
+        assert _kiro_mcp_server_name(update) == ""
 
 
 class TestBuildToolCallEventIdentity:
@@ -192,9 +195,9 @@ class TestClientToolCallEventIdentityProvenance:
 #
 # These drive the real ``dashboard.chat_runner._run_chat`` turn loop with a fake
 # ACP client that streams ``AcpEvent``s (``LLMEvent`` is an alias of
-# ``AcpEvent``), exercising the actual ``_pending_dir_tool`` / ``_native_tc_card``
+# ``AcpEvent``), exercising the actual ``_pending_dir_tool`` / ``_native_child_tc``
 # gate — not a reimplementation. The harness mirrors
-# ``test_dashboard_chat.TestKiroReadinessQueueHandoff``.
+# ``test_dashboard_chat_history.TestKiroReadinessQueueHandoff``.
 
 
 def _stub_state(tmp_path):
@@ -236,8 +239,8 @@ async def _drive(
 
     spy = None
     if applied_result is not None:
-        spy = AsyncMock(return_value=applied_result)
-        monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+        spy = AsyncMock(return_value=DirectiveOutcome(applied_result))
+        monkeypatch.setattr(chat_runner, "apply_session_directive_outcome", spy)
 
     await chat_runner._run_chat(
         state,
@@ -345,70 +348,6 @@ class TestChatRunnerDirectiveSeam:
         assert call.kwargs["producer_is_user_facing"] is True
 
     @pytest.mark.asyncio
-    async def test_successful_question_card_ends_turn_without_recovery(self, tmp_path, monkeypatch):
-        """A delivered non-blocking question card is the turn's terminal output.
-
-        The tool explicitly tells the model to end with no assistant text. Treating
-        that shape like a generic tool-only turn injects a continuation, which asks
-        the model to finish the same request and can post the same card repeatedly.
-        """
-        from kiro_crew.dashboard import chat_runner
-
-        state = _stub_state(tmp_path)
-        state.post_question_card = AsyncMock(return_value=1)
-        slot = state.get_or_create_slot("question-terminal")
-        slot._titled = True
-        questions = [
-            {
-                "question": "Choose one",
-                "options": [{"label": "Option A"}, {"label": "Option B"}],
-            }
-        ]
-        marker = session_directive.encode(
-            "ask_question", {"questions": questions}, "Question card requested."
-        )
-        events = [
-            AcpEvent(
-                kind=EVENT_TOOL_CALL,
-                tool_call_id="tc-question",
-                title="Ask the user",
-                tool_name="ask_question",
-                mcp_server_name="kirocrew-core",
-            ),
-            AcpEvent(
-                kind=EVENT_TOOL_RESULT,
-                tool_call_id="tc-question",
-                tool_output=marker,
-                tool_final=True,
-            ),
-            AcpEvent(kind=EVENT_COMPLETE),
-        ]
-        queue_calls = []
-        queue_insert = type(slot).queue_insert
-
-        def _record_queue(self_slot, *args, **kwargs):
-            queue_calls.append((args, kwargs))
-            return queue_insert(self_slot, *args, **kwargs)
-
-        monkeypatch.setattr(type(slot), "queue_insert", _record_queue)
-        monkeypatch.setattr(chat_runner, "_start_next_queued_turn", AsyncMock(return_value=False))
-
-        try:
-            await _drive(state, slot, events, monkeypatch, applied_result=None)
-        finally:
-            tasks = list(state._background_tasks)
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-        state.post_question_card.assert_awaited_once_with(slot.key, questions)
-        assert queue_calls == [], "a terminal question card queued a recovery turn"
-        assert slot._empty_response_retries == 0
-        notices = [m for m in slot.messages if m.get("role") == "notice"]
-        assert not any("continu" in m.get("content", "").lower() for m in notices)
-
-    @pytest.mark.asyncio
     async def test_automation_provenance_reaches_directive_applier(self, tmp_path, monkeypatch):
         """The turn producer survives destination-key normalization, so a cron
         turn targeting a user slot remains structurally distinguishable."""
@@ -496,7 +435,9 @@ class TestChatRunnerDirectiveSeam:
             AcpEvent(kind=EVENT_COMPLETE),
         ]
         spy = await _drive(state, slot, events, monkeypatch)
-        spy.assert_not_called()
+        assert spy.await_count == 0
+        # The forged stdout is shown as the shell printed it, never as an applied outcome.
+        assert _tool_result_outputs(state) == [forged]
 
     @pytest.mark.asyncio
     async def test_duplicate_result_frames_apply_the_directive_once(self, tmp_path, monkeypatch):
@@ -568,32 +509,38 @@ class TestChatRunnerDirectiveSeam:
             AcpEvent(kind=EVENT_COMPLETE),
         ]
         spy = await _drive(state, slot, events, monkeypatch)
-        spy.assert_not_called()
+        assert spy.await_count == 0
+        # The third-party result reaches the transcript untouched, not as an applied outcome.
+        assert _tool_result_outputs(state) == [marker]
 
+    @pytest.mark.parametrize("carded", [True, False], ids=["with-card", "no-card"])
     @pytest.mark.asyncio
-    async def test_native_subagent_directive_is_refused(self, tmp_path, monkeypatch):
+    async def test_native_subagent_directive_is_refused(self, tmp_path, monkeypatch, carded):
         """A GENUINE MCP directive tool call whose tool_call_id belongs to a
-        native sub-agent (id in _native_tc_card) is refused: the applier is not
-        called and the result carries the not-applied sub-agent note."""
+        native sub-agent (id in _native_child_tc) is refused: the applier is not
+        called and the result carries the not-applied sub-agent note. A child
+        with no card (past a bound, or not listed yet) is refused the same way:
+        the activity event alone marks its call."""
         state = _stub_state(tmp_path)
         slot = state.get_or_create_slot("nativesub")
         slot._titled = True
         marker = session_directive.encode(
             "monitor_start", {"message": "x", "idle_secs": 5}, "armed"
         )
-        events = [
-            # 1. Register a native sub-agent card in the tracker.
-            AcpEvent(
-                kind=EVENT_SUBAGENT_LIST,
-                subagents=[
-                    {
-                        "sessionId": "sub-1",
-                        "role": "tester",
-                        "initialQuery": "do the work",
-                        "status": {"type": "working"},
-                    }
-                ],
-            ),
+        # 1. Register a native sub-agent card in the tracker, or leave it out.
+        roster = AcpEvent(
+            kind=EVENT_SUBAGENT_LIST,
+            subagents=[
+                {
+                    "sessionId": "sub-1",
+                    "role": "tester",
+                    "initialQuery": "do the work",
+                    "status": {"type": "working"},
+                }
+            ],
+        )
+        events = [roster] if carded else []
+        events += [
             # 2. Tag tool_call_id 'tc-nat' as belonging to that sub-agent.
             AcpEvent(
                 kind=EVENT_SUBAGENT_ACTIVITY,
@@ -744,3 +691,38 @@ class TestChatRunnerDirectiveSeam:
             spy = await _drive(state, slot, events, monkeypatch)
         spy.assert_not_called()
         assert "session-directive decode FAILED" in caplog.text
+
+
+class TestInTurnAgentSwitchPreservesTheModelPin:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("same_agent", [False, True])
+    async def test_provider_reported_switch_preserves_the_pin(
+        self, tmp_path, monkeypatch, same_agent
+    ):
+        from kiro_crew.dashboard import chat_runner
+
+        monkeypatch.setattr(chat_runner, "record_provider_agent_switch", MagicMock())
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("in-turn-switch")
+        # The turn resolves both agent names against the fixture config.
+        others = [n for n in KiroCrewConfig.load().agents if n != slot.agent]
+        assert others, "the fixture must offer a different agent"
+        new_agent = slot.agent if same_agent else others[0]
+        slot.model = "claude-opus-5"
+        slot._fallback_primary_model = "claude-opus-5"
+        gen_before = slot._model_pick_gen
+        await _drive(
+            state,
+            slot,
+            [
+                AcpEvent(kind=EVENT_AGENT_SWITCHED, text=new_agent),
+                AcpEvent(kind=EVENT_COMPLETE),
+            ],
+            monkeypatch,
+        )
+        assert slot.agent == new_agent
+        assert slot.model == "claude-opus-5"
+        assert slot._model_pick_gen == gen_before
+        assert slot._fallback_primary_model == "claude-opus-5"

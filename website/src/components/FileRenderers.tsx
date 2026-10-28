@@ -1,4 +1,4 @@
-import { memo, useState, useMemo, useCallback, useEffect, useRef } from 'react'
+import { memo, useState, useMemo, useCallback, useEffect, useId, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronLeft, ChevronRight, Download, ExternalLink, FileText, Film, Music, Sparkles } from 'lucide-react'
 import DOMPurify from 'dompurify'
@@ -6,11 +6,23 @@ import DOMPurify from 'dompurify'
 import { i18nT } from '../i18n/t'
 import { ExcalidrawBlock } from './ExcalidrawBlock'
 import ErrorNotice from './ErrorNotice'
+import FileDownloadLink from './FileDownloadLink'
 import { useCanOpenFile, useCopyAck } from './FilePathMenu'
-import { fileDownloadUrl, fileStreamUrl, fileOfficePreviewUrl, fileOfficeSlidesUrl, fileOfficeSlideUrl } from '../utils/fileReadUrl'
+import { fileStreamUrl, fileOfficePreviewUrl, fileOfficeSlidesUrl, fileOfficeSlideUrl } from '../utils/fileReadUrl'
 import { sendErrorToChat } from '../utils/errorReport'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import { pathBasename } from '../utils/pathBasename'
+import { guideUntrusted, stripGuideMarkers } from '../guide/untrustedContent'
+import {
+  MD_EM_CLS,
+  MD_HEADING_CLS,
+  MD_LIST_ITEM_CLS,
+  MD_OL_CLS,
+  MD_STRONG_CLS,
+  MD_TABLE_CELL_CLS,
+  MD_TABLE_HEAD_CELL_CLS,
+  MD_UL_CLS,
+} from './markdown/typography'
 /* ── extension helpers ── */
 const IMG_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.avif', '.svg', '.ico'])
 const CSV_EXTS = new Set(['.csv', '.tsv'])
@@ -94,12 +106,13 @@ export const ImageViewer = memo(function ImageViewer({ filePath }: { filePath: s
 export const SvgViewer = memo(function SvgViewer({ content }: { content: string }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const safe = useMemo(
-    () => DOMPurify.sanitize(content, { USE_PROFILES: { svg: true, svgFilters: true } }),
+    () => stripGuideMarkers(DOMPurify.sanitize(content, { USE_PROFILES: { svg: true, svgFilters: true } })),
     [content],
   )
   return (
     <div
       className="flex items-center justify-center h-full overflow-auto p-4 bg-bg-elevated rounded-md border border-border"
+      {...guideUntrusted}
       dangerouslySetInnerHTML={{ __html: safe }}
     />
   )
@@ -200,21 +213,43 @@ export const JsonViewer = memo(function JsonViewer({ content }: { content: strin
   )
 })
 
+// Longer string leaves start as a preview of this many characters.
+const JSON_STRING_PREVIEW_CHARS = 200
+
+// JSON.stringify restores the escapes JSON.parse consumed (\" \\ \n …), so a
+// string holding embedded JSON (an SNS Message, an SQS body) renders as valid
+// JSON source instead of masquerading as unescaped nested JSON — which reads
+// as a corrupt file. The preview slices the RAW value before stringifying so
+// the cut can never split an escape sequence, and keeps the ellipsis OUTSIDE
+// the quotes so a preview never reads as the faithful full value. The toggle
+// is the same disclosure ToolInputPreview uses for a long command.
+function JsonString({ value }: { value: string }) {
+  const [expanded, setExpanded] = useState(false)
+  const valueId = useId()
+  if (value.length <= JSON_STRING_PREVIEW_CHARS) return <span className="text-warn">{JSON.stringify(value)}</span>
+  return (
+    <>
+      <span id={valueId} className="text-warn">{JSON.stringify(expanded ? value : value.slice(0, JSON_STRING_PREVIEW_CHARS))}{!expanded && '…'}</span>
+      <button
+        className="ml-2 text-accent text-[13px] cursor-pointer bg-transparent border-none font-body hover:underline"
+        aria-expanded={expanded}
+        aria-controls={valueId}
+        onClick={() => setExpanded(e => !e)}
+      >
+        {expanded
+          ? i18nT('components.fileRenderers.json_string_show_less')
+          : i18nT('components.fileRenderers.json_string_show_all', { count: value.length })}
+      </button>
+    </>
+  )
+}
+
 function JsonNode({ value, depth }: { value: unknown; depth: number }) {
   const [open, setOpen] = useState(depth < 2)
   if (value === null) return <span className="text-muted">{i18nT('components.fileRenderers.null')}</span>
   if (typeof value === 'boolean') return <span className="text-ok">{String(value)}</span>
   if (typeof value === 'number') return <span className="text-accent">{value}</span>
-  // JSON.stringify restores the escapes JSON.parse consumed (\" \\ \n …), so a
-  // string holding embedded JSON (an SNS Message, an SQS body) renders as valid
-  // JSON source instead of masquerading as unescaped nested JSON — which reads
-  // as a corrupt file. Truncate the RAW value before stringifying so the slice
-  // can never cut an escape sequence in half, and keep the ellipsis OUTSIDE the
-  // quotes so a truncated leaf never reads as the faithful full value.
-  if (typeof value === 'string') {
-    const truncated = value.length > 200
-    return <span className="text-warn">{JSON.stringify(truncated ? value.slice(0, 200) : value)}{truncated && '…'}</span>
-  }
+  if (typeof value === 'string') return <JsonString value={value} />
 
   const isArr = Array.isArray(value)
   const entries = isArr ? (value as unknown[]).map((v, i) => [i, v] as const) : Object.entries(value as Record<string, unknown>)
@@ -371,7 +406,6 @@ function OfficeCard({ filePath, showBigDownload, hideHint, compact }: {
   // `BIN` fallback: the binary card is reached by a byte sniff, not by an
   // extension list, so `coredump` and `a.out` land here with nothing to show.
   const ext = extOf(filePath).replace('.', '').toUpperCase() || 'BIN'
-  const url = fileDownloadUrl(filePath)
   const sizeCls = showBigDownload ? 'px-3 py-1.5 text-sm' : 'px-2 py-1 text-xs'
   const iconSize = showBigDownload ? 16 : 14
   // The ONE gate for an Open-with-default-app surface, shared with the file
@@ -385,6 +419,19 @@ function OfficeCard({ filePath, showBigDownload, hideHint, compact }: {
   // so the primary button acknowledges that degrade with the same inline swap
   // instead of reading as a dead click.
   const { copyStatus, revealOrOpenWithAck, revealError, clearRevealError } = useCopyAck(filePath)
+  // A failed Download is reported here and shown beside the Open error, in a
+  // row of its own, so the Open / Download row keeps exactly two controls.
+  const [downloadError, setDownloadError] = useState<string | null>(null)
+  const downloadNotice = (
+    <ErrorNotice
+      variant="inline"
+      className="text-left whitespace-normal"
+      message={downloadError}
+      askAgent
+      onDismiss={() => setDownloadError(null)}
+      testId="office-card-download-error"
+    />
+  )
   const openLabel = copyStatus === 'copied'
     ? i18nT('components.filePathMenu.path_copied')
     : copyStatus === 'failed'
@@ -402,19 +449,20 @@ function OfficeCard({ filePath, showBigDownload, hideHint, compact }: {
           {openLabel}
         </button>
       )}
-      <a
-        href={url}
+      <FileDownloadLink
+        filePath={filePath}
         download={filename}
         className={`inline-flex items-center gap-2 rounded no-underline ${sizeCls} ${canOpen
           ? 'border border-border bg-bg-hover text-text hover:bg-bg-elevated'
           : 'bg-accent text-white hover:opacity-90'}`}
-        aria-label={i18nT('components.fileRenderers.download_file', { filename })}
+        ariaLabel={i18nT('components.fileRenderers.download_file', { filename })}
+        onError={setDownloadError}
       >
         <Download size={iconSize} aria-hidden="true" />
         {showBigDownload
           ? i18nT('components.fileRenderers.download')
           : i18nT('components.fileRenderers.office_download_original')}
-      </a>
+      </FileDownloadLink>
     </>
   )
   if (compact) {
@@ -431,6 +479,7 @@ function OfficeCard({ filePath, showBigDownload, hideHint, compact }: {
           onDismiss={clearRevealError}
           testId="office-card-open-error"
         />
+        {downloadNotice}
         <div className="flex items-center gap-2 flex-wrap justify-end">{actions}</div>
       </div>
     )
@@ -455,6 +504,7 @@ function OfficeCard({ filePath, showBigDownload, hideHint, compact }: {
         onDismiss={clearRevealError}
         testId="office-card-open-error"
       />
+      {downloadNotice}
       {showBigDownload && !hideHint && (
         <div className="text-xs text-muted">
           {/* The hint is the card's only instruction, so it must name the action
@@ -519,7 +569,8 @@ export const BinaryFileCard = memo(function BinaryFileCard({ filePath }: { fileP
  *
  * Typography is deliberately the same as MarkdownRenderer's: a heading in a
  * .docx and a heading in a .md are the same thing to a reader, and rendering
- * them differently in the same panel would be the surprise. Page layout, theme
+ * them differently in the same panel would be the surprise. The class strings
+ * come from `markdown/typography.ts`, the owner both surfaces read. Page layout, theme
  * colours and embedded pictures are explicitly NOT attempted — this is a
  * readable document, not a Word emulator. */
 type OfficeRun = { text: string; bold?: boolean; italic?: boolean }
@@ -540,22 +591,12 @@ type OfficePreviewBody = {
  *  slide number (from `slideN.xml`), so a gap means a slide with no text. */
 type OfficePreviewSlide = { index: number; text: string }
 
-/** Heading classes per level, mirroring MarkdownRenderer's h1–h6. */
-const OFFICE_HEADING_CLS = [
-  'text-xl font-bold mt-4 mb-2 text-text-strong',
-  'text-lg font-bold mt-3 mb-2 text-text-strong',
-  'text-base font-semibold mt-3 mb-1.5 text-text-strong',
-  'text-sm font-semibold mt-2 mb-1 text-text-strong',
-  'text-sm font-medium mt-2 mb-1 text-text-strong',
-  'text-[13px] font-medium mt-2 mb-1 text-muted',
-]
-
 function OfficeHeading({ level, text }: { level: number; text: string }) {
   // A .docx can nominally carry Heading7-9; HTML stops at h6, so deeper levels
   // render as h6 rather than as an invalid tag.
   const lvl = Math.min(Math.max(level, 1), 6)
   const Tag = `h${lvl}` as 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6'
-  return <Tag className={OFFICE_HEADING_CLS[lvl - 1]}>{text}</Tag>
+  return <Tag className={MD_HEADING_CLS[lvl - 1]}>{text}</Tag>
 }
 
 /** A document table as a real grid.
@@ -575,7 +616,7 @@ function OfficeTable({ rows, truncatedCols }: { rows: string[][]; truncatedCols?
               {head.map((cell, i) => (
                 <th
                   key={i}
-                  className="text-left text-muted text-[13px] font-medium px-3 py-2 border-b border-border bg-bg-elevated whitespace-pre-line align-top"
+                  className={`${MD_TABLE_HEAD_CELL_CLS} whitespace-pre-line align-top`}
                 >
                   {cell}
                 </th>
@@ -589,7 +630,7 @@ function OfficeTable({ rows, truncatedCols }: { rows: string[][]; truncatedCols?
               {row.map((cell, c) => (
                 <td
                   key={c}
-                  className="px-3 py-2 border-b border-border text-sm whitespace-pre-line align-top"
+                  className={`${MD_TABLE_CELL_CLS} whitespace-pre-line align-top`}
                 >
                   {cell}
                 </td>
@@ -626,22 +667,20 @@ function OfficeBlockList({ blocks }: { blocks: OfficeBlock[] }) {
                 {block.runs.map((run, r) => {
                   // Both flags apply independently: a run can be bold AND italic,
                   // and an either/or chain dropped the second one.
-                  const inner = run.italic ? <em className="italic">{run.text}</em> : run.text
+                  const inner = run.italic ? <em className={MD_EM_CLS}>{run.text}</em> : run.text
                   return run.bold
-                    ? <strong key={r} className="font-semibold text-text-strong">{inner}</strong>
+                    ? <strong key={r} className={MD_STRONG_CLS}>{inner}</strong>
                     : <span key={r}>{inner}</span>
                 })}
               </p>
             )
           case 'list': {
             const Tag = block.ordered ? 'ol' : 'ul'
-            const cls = block.ordered
-              ? 'list-decimal pl-8 my-2 space-y-1 marker:text-muted'
-              : 'list-disc pl-8 my-2 space-y-1 marker:text-muted'
+            const cls = block.ordered ? MD_OL_CLS : MD_UL_CLS
             return (
               <Tag key={i} className={cls}>
                 {block.items.map((item, li) => (
-                  <li key={li} className="text-sm leading-relaxed break-words">{item}</li>
+                  <li key={li} className={`${MD_LIST_ITEM_CLS} break-words`}>{item}</li>
                 ))}
               </Tag>
             )
@@ -1113,15 +1152,15 @@ export const MediaPlayer = memo(function MediaPlayer({ filePath, kind }: { fileP
           <div className="text-xs text-muted">
             {i18nT('components.fileRenderers.media_preview_failed')}
           </div>
-          <a
-            href={fileDownloadUrl(filePath)}
+          <FileDownloadLink
+            filePath={filePath}
             download={filename}
             className="inline-flex items-center gap-2 px-3 py-1.5 rounded text-sm bg-accent text-white hover:opacity-90 no-underline"
-            aria-label={i18nT('components.fileRenderers.download_file', { filename })}
+            ariaLabel={i18nT('components.fileRenderers.download_file', { filename })}
           >
             <Download size={16} aria-hidden="true" />
             {i18nT('components.fileRenderers.download')}
-          </a>
+          </FileDownloadLink>
         </div>
       </div>
     )
@@ -1250,9 +1289,9 @@ export const SheetViewer = memo(function SheetViewer({ filePath }: { filePath: s
         <div className="text-center text-muted text-[12px] py-1.5 border-b border-border bg-chrome shrink-0">
           {i18nT('components.fileRenderers.sheet_formulas_note')}
           {' · '}
-          <a href={fileDownloadUrl(filePath)} download className="text-accent no-underline hover:underline">
+          <FileDownloadLink filePath={filePath} className="text-accent no-underline hover:underline">
             {i18nT('components.fileRenderers.download')}
-          </a>
+          </FileDownloadLink>
         </div>
       )}
       <div className="flex-1 overflow-auto">
@@ -1301,9 +1340,9 @@ export const SheetViewer = memo(function SheetViewer({ filePath }: { filePath: s
           {(sheet.truncated_rows || sheet.truncated_cols || payload.truncated_sheets) && (
             <>
               {' · '}
-              <a href={fileDownloadUrl(filePath)} download className="text-accent no-underline hover:underline">
+              <FileDownloadLink filePath={filePath} className="text-accent no-underline hover:underline">
                 {i18nT('components.fileRenderers.download')}
-              </a>
+              </FileDownloadLink>
             </>
           )}
         </div>

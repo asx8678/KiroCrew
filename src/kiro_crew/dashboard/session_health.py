@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Tuple
 
 from kiro_crew.config.paths import config_dir
+from kiro_crew.dashboard.slot_projection import summary_rows
 from kiro_crew.metrics.events import (
     TASKQ_DEPTH,
     TASKQ_EFFECTIVE_CAP,
@@ -354,6 +355,13 @@ def _getattr_soft(obj: Any, name: str, default: Any = None) -> Any:
         return default
 
 
+def _summary_rows_soft(slot: Any) -> Any:
+    try:
+        return summary_rows(slot) or []
+    except Exception:
+        return []
+
+
 def snapshot_slot(
     slot: Any, *, children_running: int = 0, mono_now: float | None = None
 ) -> SlotSnapshot:
@@ -377,7 +385,10 @@ def snapshot_slot(
         val = _getattr_soft(slot, attr, 0)
         if isinstance(val, int) and not isinstance(val, bool) and val > 0:
             snap.recovery_kinds.append(f"{label}x{val}")
-    messages = _getattr_soft(slot, "messages", None) or []
+    # The summary rows: a restored sidebar row answers from its bounded tail,
+    # stable across polls while it stays unopened, instead of loading its whole
+    # transcript on the loop for one count and one timestamp.
+    messages = _summary_rows_soft(slot)
     try:
         n_messages = len(messages)
         snap.last_message_ts = str(messages[-1].get("ts") or "") if n_messages else ""
@@ -464,6 +475,8 @@ def snapshot_state(
     snap = HealthSnapshot(wall_now=wall, mono_now=mono)
     if state is None:
         return snap
+    from kiro_crew.dashboard.chat_utils_slots import session_key_for
+
     subagents = _getattr_soft(state, "subagents", None)
     children = _children_by_parent(subagents) if subagents is not None else {}
     slots = _getattr_soft(state, "_slots", None)
@@ -472,11 +485,10 @@ def snapshot_state(
             skey = str(key)
             if _is_internal(skey):
                 continue
-            kids = children.get(skey, 0)
-            if not kids:
-                # Children are keyed by the EFFECTIVE session key; try it too.
-                eff = _getattr_soft(slot, "linked_session_key", "") or ""
-                kids = children.get(str(eff), 0) if eff else 0
+            # A child records its parent's EFFECTIVE session key: the channel
+            # key for a channel-born slot, else ``dashboard:<slot>``.
+            linked = str(_getattr_soft(slot, "linked_session_key", "") or "")
+            kids = children.get(session_key_for(skey, linked), 0) or children.get(skey, 0)
             try:
                 snap.slots.append(snapshot_slot(slot, children_running=kids, mono_now=mono))
             except Exception:
@@ -912,16 +924,22 @@ def compute_session_health(
 def health_verdict_fingerprint(health: Mapping[str, Any] | None) -> str:
     """A stable digest of the health VERDICT -- what a refresh must react to.
 
-    Deliberately excludes every age, timestamp and monotonic reading. Those move
-    on every sample, so folding them in would make each computation look like a
-    change and turn a periodic refresh into a periodic broadcast. Everything else
-    the payload says is folded in BY IDENTITY, never only by count: which
-    classification each slot holds and its harness-native child count, which
-    slots are stalled, which slot and task rows are waiting or recovering and in
-    which state, the queue's per-state tallies, the effective caps per lane, the
-    uncharged-residency tally per kind, and the degrade reason. A count alone
-    is not enough -- one row leaving a state as another enters it keeps every
-    count still while the rows a subscriber holds are wrong.
+    Two rules decide what is hashed. Every STABLE field -- one that moves only
+    when the state it reports moves -- is folded in BY IDENTITY, never only by
+    count: a count alone lets one row leave a state as another enters it with
+    every count still while the rows a subscriber holds are wrong. Every
+    TIME-DERIVED reading (ages, timestamps, monotonic readings, the ``evidence``
+    strings that embed them) and every DETECTOR-PROVENANCE field (``sources``, a
+    slot's ``source``, a stall's ``reason`` label) is left out: the former move on
+    every sample and would turn a periodic refresh into a periodic broadcast; the
+    latter say which detector produced a verdict the folded fields already
+    identify.
+
+    ``test_session_health_signal.py::TestFingerprintCoverage`` records which side
+    of that line every top-level key and every slot-entry field falls on, pins
+    those keys to a payload the real ``compute`` produced, and checks each by
+    mutation, so a field added to the payload fails a test until it is placed
+    rather than silently falling outside the digest.
 
     The digest is process-internal. Only the bare signal is broadcast, so the slot
     keys and task ids hashed here are compared and never published.

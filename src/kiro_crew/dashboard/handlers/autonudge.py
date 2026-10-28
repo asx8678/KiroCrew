@@ -10,21 +10,33 @@ from typing import Any
 
 from aiohttp import web
 
-from kiro_crew.autonudge import binding_key_for
+from kiro_crew.autonudge import (
+    NudgeAdmissionReason,
+    NudgeAdmissionRefused,
+    binding_key_for,
+)
 from kiro_crew.autonudge import get_instance as _autonudge_get
-from kiro_crew.autonudge import is_structured_monitor_loop
+from kiro_crew.autonudge import (
+    is_channel_key,
+    is_structured_monitor_loop,
+)
 
 # The security chokepoint lives in the transport-agnostic module (see its
 # docstring); re-exported here so existing importers keep working. This file
 # is intentionally a THIN HTTP mapping over it.
 from kiro_crew.autonudge_authz import (  # noqa: F401 - re-exported
+    STALE_GOAL_BASELINE_ERROR,
+    admission_refusal_status,
     authorize_and_add_nudge,
     authorize_and_clear_monitor,
     authorize_and_stop_monitor,
     authorize_and_update_monitor,
     authorize_and_update_nudge,
+    loop_hosting_refusal,
     resolve_stop_sentinel,
 )
+from kiro_crew.autonudge_service.model import SERVICE_SHUTTING_DOWN_MESSAGE
+from kiro_crew.dashboard.body_numbers import body_int
 from kiro_crew.dashboard.handlers import source_providers
 from kiro_crew.dashboard.handlers.source_providers import (
     is_owner_dashboard_request,
@@ -346,6 +358,12 @@ def _autonudge_loop_reading(loop: Any) -> dict[str, Any]:
         "created_ts": loop.created_ts,
         "next_due_ts": loop.next_due_ts,
         "stopped_reason": loop.stopped_reason,
+        # Active but holding: a cycle's approval went unanswered and it fires
+        # nothing until a person answers one, sends a message or fires it.
+        "paused_for_approval": bool(loop.approval_stalled) and not is_structured_monitor_loop(loop),
+        # Active but holding: every open work-ledger item waits on a person, and it
+        # fires nothing until the ledger moves.
+        "waiting_on_person": bool(getattr(loop, "waiting_on_person", False)),
         "has_banner": bool(loop.banner),
     }
 
@@ -607,6 +625,23 @@ async def api_session_monitor_get(request: web.Request) -> web.Response:
     svc = _autonudge_get()
     if svc is None:
         return web.json_response({"enabled": False, "monitor": None})
+    # Why the authorizer will refuse ANY arm on this session, judged by its own
+    # predicate on the live slot, so the arming tools can say so in band instead
+    # of acknowledging a request the turn boundary is certain to deny. Only a
+    # dashboard slot carries a memory mode; the key is added only when it
+    # refuses, so every other reading keeps its exact shape.
+    hosting_refusal = ""
+    if not is_channel_key(binding):
+        slots = getattr(request.app.get("state"), "_slots", None)
+        slot = slots.get(binding) if isinstance(slots, dict) else None
+        if slot is not None:
+            hosting_refusal = loop_hosting_refusal(slot)
+
+    def _reading(payload: dict[str, Any]) -> web.Response:
+        if hosting_refusal:
+            payload["hosting_refusal"] = hosting_refusal
+        return web.json_response(payload)
+
     loop = svc.get_by_slot(binding)
     if loop is None:
         # Nothing is armed on this session. This is the ONLY case that reads as
@@ -614,7 +649,7 @@ async def api_session_monitor_get(request: web.Request) -> web.Response:
         # Collapsing the two into an identical ``monitor: None`` would leave a
         # caller unable to tell an accepted-and-armed loop from an
         # accepted-and-dropped request.
-        return web.json_response({"enabled": True, "monitor": None, "autonudge_loop": None})
+        return _reading({"enabled": True, "monitor": None, "autonudge_loop": None})
     if not is_structured_monitor_loop(loop):
         # A plain auto-nudge loop IS armed. ``monitor`` stays None because a
         # structured monitor genuinely does not exist, but ``autonudge_loop``
@@ -622,12 +657,12 @@ async def api_session_monitor_get(request: web.Request) -> web.Response:
         # can verify arming instead of being told "do not assume" with no
         # instrument. The loop's free-text ``message`` is deliberately omitted:
         # this reading answers "is it armed and firing", not "what does it say".
-        return web.json_response(
+        return _reading(
             {"enabled": True, "monitor": None, "autonudge_loop": _autonudge_loop_reading(loop)}
         )
     monitor = loop.monitor
     assert monitor is not None
-    return web.json_response(
+    return _reading(
         {
             "enabled": True,
             "active": bool(loop.active),
@@ -955,9 +990,9 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
     # idle_secs/max_cycles/max_runtime_secs come straight from the request
-    # body: int() raises ValueError on "abc", TypeError on null/list, and
-    # OverflowError on float("inf") (1e309 is legal JSON in aiohttp's parser),
-    # any of which would surface as a 500 instead of a 400. Non-integral
+    # body: body_int raises ValueError on "abc" and on float("inf") (1e309 is
+    # legal JSON in aiohttp's parser) and TypeError on null/list, any of which
+    # would surface as a 500 instead of a 400 if uncaught. Non-integral
     # floats are rejected rather than silently truncated (int(1.5) -> 1 would
     # store a value the caller never asked for). Coerce up front and reject
     # bad input, matching the sibling handlers_instances.api_instances_add
@@ -970,9 +1005,9 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
                     {"error": f"{_name} must be a whole number", "code": "not_a_whole_number"},
                     status=400,
                 )
-        idle_secs = int(body.get("idle_secs", 60))
-        max_cycles = int(body.get("max_cycles", 0))
-    except (TypeError, ValueError, OverflowError):
+        idle_secs = body_int(body.get("idle_secs", 60))
+        max_cycles = body_int(body.get("max_cycles", 0))
+    except (TypeError, ValueError):
         return web.json_response(
             {"error": "idle_secs, max_cycles and max_runtime_secs must be integers"}, status=400
         )
@@ -1079,6 +1114,17 @@ async def api_autonudge_update(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    # The goal baseline the popover read when it opened (``goal_token``). Absent skips
+    # the store's stale check; a present one is compared under the store's
+    # lock, so a goal another writer saved meanwhile is refused instead of overwritten.
+    # A non-string is refused rather than coerced: ``str(123)`` would always mismatch
+    # and read as a concurrent edit that never happened.
+    expect_fingerprint = body.get("expect_fingerprint")
+    if expect_fingerprint is not None and not isinstance(expect_fingerprint, str):
+        return web.json_response(
+            {"error": "expect_fingerprint must be a string", "code": "not_a_string"},
+            status=400,
+        )
     loop, error, status = await authorize_and_update_nudge(
         svc=svc,
         loop_id=loop_id,
@@ -1096,10 +1142,15 @@ async def api_autonudge_update(request: web.Request) -> web.Response:
         fresh_run=True,
         max_runtime_secs=body.get("max_runtime_secs"),
         banner=body.get("banner"),
+        expect_fingerprint=expect_fingerprint,
         source="dashboard",
         caller=request.remote or "",
     )
     if error is not None:
+        if status == 409 and error == STALE_GOAL_BASELINE_ERROR:
+            # Coded so the popover can tell this refusal from every other 409, re-read
+            # the baseline and word it in the reader's language.
+            return web.json_response({"error": error, "code": "goal_stale_baseline"}, status=status)
         return web.json_response({"error": error}, status=status)
     return web.json_response({"ok": True, "loop": _serialize(loop)})
 
@@ -1188,7 +1239,29 @@ async def api_autonudge_delete(request: web.Request) -> web.Response:
     denied = await _require_monitor_owner(request, "autonudge_delete")
     if denied is not None:
         return denied
-    await svc.remove(loop_id, stop_reason="dashboard_delete")
+
+    def _audit_denial(error: str) -> None:
+        try:
+            sel().log_tool_invocation(
+                session_key=existing.slot_key if existing else "",
+                source="dashboard",
+                tool_name="autonudge_delete",
+                outcome="denied",
+                error=error,
+                metadata={"loop_id": loop_id, "caller": request.remote or ""},
+            )
+        except Exception:  # noqa: BLE001 - a denial audit must not mask the refusal
+            logger.warning("autonudge delete denial audit failed", exc_info=True)
+
+    try:
+        await svc.remove(loop_id, stop_reason="dashboard_delete")
+    except NudgeAdmissionRefused as exc:
+        error = str(exc)
+        _audit_denial(error)
+        return web.json_response(
+            {"error": error, "code": "autonudge_delete_denied"},
+            status=admission_refusal_status(exc),
+        )
     sel().log_tool_invocation(
         session_key=existing.slot_key if existing else "",
         source="dashboard",
@@ -1252,7 +1325,7 @@ async def api_autonudge_fire(request: web.Request) -> web.Response:
       ``asyncio.to_thread`` because a synchronous flush on the loop would freeze
       every session's turn (``no-blocking-call-on-event-loop``). This is the same
       shape this subsystem's own ``autonudge_authz`` uses for ``monitor_update``
-      and ``monitor_stop``, and the 503 mirrors ``handlers/cron.py``'s
+      and ``monitor_stop``, and the 503 mirrors ``handlers/cron_shared.py``'s
       ``audit_unavailable`` refusal for a grant it could not record.
     * The **refusals** stay best-effort, but they are audited BEFORE
       ``fire_now`` returns: a guard below that denied a request and left no SEL
@@ -1385,6 +1458,36 @@ async def api_autonudge_fire(request: web.Request) -> web.Response:
             },
             status=503,
         )
+    # A person pressed fire: that ends an approval hold first, or the armed tick
+    # would find the loop still paused and the press would do nothing. Unarmed,
+    # because fire_now arms the tick itself.
+    try:
+        await svc.release_approval_hold(existing.slot_key, why="fired by hand", arm=False)
+    except Exception as exc:
+        if (
+            isinstance(exc, NudgeAdmissionRefused)
+            and exc.reason is NudgeAdmissionReason.SERVICE_SHUTTING_DOWN
+        ):
+            await _audit("denied", existing.slot_key, SERVICE_SHUTTING_DOWN_MESSAGE)
+            return web.json_response(
+                {
+                    "error": SERVICE_SHUTTING_DOWN_MESSAGE,
+                    "code": "shutting_down",
+                },
+                status=503,
+            )
+        # The hold stays as the store has it, so a fire now would only hold
+        # again: refuse it out loud rather than report a press that did nothing.
+        logger.warning("autonudge: releasing the approval hold failed", exc_info=True)
+        await _audit("denied", existing.slot_key, "approval_hold_release_failed")
+        return web.json_response(
+            {
+                "error": "nudge not sent: the loop is paused for approval and could "
+                "not be resumed, so press again",
+                "code": "approval_hold_release_failed",
+            },
+            status=503,
+        )
     loop, error, status = await svc.fire_now(loop_id)
     await _audit("success" if error == "" else "denied", existing.slot_key, error)
     if error:
@@ -1393,10 +1496,14 @@ async def api_autonudge_fire(request: web.Request) -> web.Response:
         # statuses for a stated reason — computing one is how the coded-response
         # ratchet gets defeated while looking like ordinary refactoring — so the
         # pairing is written out where a reader and a static check can both see
-        # it. Both arms are kept even though this route answers ``not found``
+        # it. All arms are kept even though this route answers ``not found``
         # itself above: relying on the 404 being unreachable would make a later
-        # edit to that guard silently change this response's status.
+        # edit to that guard silently change this response's status. The 503
+        # uses the dashboard's existing shutdown code so clients do not need a
+        # second identity for the same gateway state.
         if status == 404:
             return web.json_response({"error": error, "code": "autonudge_not_found"}, status=404)
+        if status == 503:
+            return web.json_response({"error": error, "code": "shutting_down"}, status=503)
         return web.json_response({"error": error, "code": "autonudge_not_fired"}, status=409)
     return web.json_response({"ok": True, "loop": _serialize(loop)})

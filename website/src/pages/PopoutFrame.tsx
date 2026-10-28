@@ -5,6 +5,7 @@ import { useAppSelector } from '../store'
 import ChatPage from './ChatPage'
 
 import { i18nT } from '../i18n/t'
+import { slotRowByKey } from '../store/slotIndex'
 
 /**
  * The window shell for a popped-out chat session (`/popout/chat/:slug?sid=…`).
@@ -14,13 +15,13 @@ import { i18nT } from '../i18n/t'
  * independently. On top it (1) registers as a live popout so the main
  * dashboard can track / focus / bring it back, and (2) mirrors the session
  * title into the OS window/taskbar. The "Return to main" control lives in the
- * chat title bar (rendered by ChatPage for `popout`), alongside where the main
+ * chat title bar (rendered by ChatTitleOverlay for `popout`), alongside where the main
  * window shows its pop-out control.
  */
 export default function PopoutFrame() {
   const [params] = useSearchParams()
   const sid = params.get('sid') || params.get('slot') || ''
-  const title = useAppSelector(s => s.dashboard.slots.find(x => x.key === sid)?.title)
+  const title = useAppSelector(s => slotRowByKey(s.dashboard.slots, sid)?.title)
 
   // Announce presence for `sid` and wire the heartbeat/control responder.
   useEffect(() => {

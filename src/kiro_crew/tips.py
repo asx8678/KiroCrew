@@ -7,7 +7,6 @@ Selection uses weighted-random newer-biased pick (recency_decay ** rank).
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import math
@@ -23,7 +22,7 @@ from aiohttp import web
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.paths import config_dir
-from kiro_crew.context import ContextBuilder
+from kiro_crew.context import ContextBuilder, ui_language_tag
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE
@@ -102,7 +101,7 @@ rather than inventing one)
 - doc: the doc filename from the catalog
 - cta_prompt: a ready-to-send chat message demonstrating the feature
 
-Feature catalog:
+{language}Feature catalog:
 ---
 {catalog}
 ---
@@ -117,6 +116,22 @@ Dismissed tip IDs (never suggest): {dismissed_ids}
 
 Respond with ONLY a JSON array. No explanation, no markdown fences.
 """
+
+# Filled into the ``{language}`` slot of ``_PROMPT_TEMPLATE`` when the workspace has
+# an explicit UI language. A tip renders beside chrome in that language, so it
+# follows the configured tag and not the language of the user context
+# (``chat_title._TITLE_LANGUAGE_TEMPLATE``). ``id``, ``feature`` and ``doc`` stay as
+# given: ``doc`` is matched against the catalog and doubles as the dismissal
+# identity. The tag is shape- and catalog-validated by ``context.ui_language_tag``
+# before it reaches the prompt.
+_LANGUAGE_TEMPLATE = (
+    'LANGUAGE: Write each tip\'s "title", "body" and "why" in the language of BCP-47 '
+    "tag {lang}. That is the language the dashboard around the tip is rendered in, so "
+    "the text must be in it even when the user context below is in another language. "
+    "Keep code, commands, key names, Settings paths and product names verbatim. The "
+    '"id" stays a kebab-case ASCII identifier, and "feature" and "doc" stay exactly as '
+    "the catalog gives them.\n\n"
+)
 
 
 # ── Catalog ──
@@ -400,11 +415,6 @@ class TipsCache:
     # long-lived DashboardState, which outlives any single event loop.
     _lock: LoopBoundLock = field(default_factory=LoopBoundLock, repr=False)
     _task: asyncio.Task | None = field(default=None, repr=False)  # type: ignore[type-arg]
-    # UI-4: digest of the last generation's full input (the prompt, which holds
-    # the context, catalog and shown/dismissed sets, plus the model). A stale
-    # refresh with an unchanged digest reuses the tips instead of a model call.
-    # In memory only: a restart regenerates once.
-    _input_digest: str = field(default="", repr=False)
 
 
 _tips_init_lock = LoopBoundLock()
@@ -1110,29 +1120,24 @@ async def generate_tips(state: DashboardState) -> list[dict]:  # type: ignore[ty
         return []
 
     st = cache.state
+    loop2 = asyncio.get_running_loop()
+    cfg = await loop2.run_in_executor(None, KiroCrewConfig.load)
+    tips_model = cfg.dashboard.tips_model
+    ui_language = ui_language_tag(cfg)
     prompt = _PROMPT_TEMPLATE.format(
         max_tips=_MAX_GENERATED_TIPS,
         catalog=catalog_text,
         context=context or "(no user context available)",
         shown_ids=", ".join(st.shown.keys()) or "none",
         dismissed_ids=", ".join(_active_pool_dismissals(st)) or "none",
+        language=_LANGUAGE_TEMPLATE.format(lang=ui_language) if ui_language else "",
     )
 
-    loop2 = asyncio.get_running_loop()
-    cfg = await loop2.run_in_executor(None, KiroCrewConfig.load)
-    # Empty means the background ROLE: resolve the operator's pin here (an
-    # unpinned install resolves to "auto", unchanged) so an explicit id and a
-    # pin travel the same path. Resolved per call from the live config.
-    tips_model = cfg.dashboard.tips_model or cfg.agent.resolve_model("background")
-    digest = hashlib.sha256(f"{tips_model}\0{prompt}".encode("utf-8")).hexdigest()
-    if st.tips and digest == cache._input_digest:
-        # Nothing the generation reads has changed since the tips on hand were
-        # made, so a model call would reproduce them (UI-4).
-        return list(st.tips)
     # Delegate acquire / pin-model / drive / reject-tools / destroy — and the
     # reactive model-rejection fallback — to run_bg_oneliner.
-    # A rejected model is retried once against the advertised list. Any failure
-    # or timeout degrades to the catalog fallback.
+    # tips_model (default "auto") is resolved at the wire chokepoint; a rejected
+    # model is retried once against the advertised list. Any failure or timeout
+    # degrades to the catalog fallback.
     try:
         text = await run_bg_oneliner(
             state.sessions, prompt, model=tips_model, sel_source="tips", timeout=90
@@ -1145,7 +1150,6 @@ async def generate_tips(state: DashboardState) -> list[dict]:  # type: ignore[ty
     if tips:
         tips = _redact_tips(tips)
         logger.info("Generated %d personalized tips", len(tips))
-        cache._input_digest = digest
         return tips
 
     return _fallback_tips(cache.catalog, st)
@@ -1208,32 +1212,13 @@ async def api_tips_next(request: web.Request) -> web.Response:
     if st.opted_out:
         return web.Response(status=204)
 
-    # UI-4: the refresh trigger moved BELOW the gates — a request whose
-    # answer is already decided (an outstanding offered tip, or a closed
-    # cadence gate) must not pay a background generation. Reading the gate
-    # state needs no lock; the offered-tip check below re-reads it under the
-    # lock before acting.
+    # Trigger background refresh if stale
+    await maybe_refresh(state, cache)
+
     now = time.time()
     cadence_hours = cfg.dashboard.tips_cadence_hours
     snooze_hours = cfg.dashboard.tips_snooze_hours
     recency_decay = cfg.dashboard.tips_recency_decay
-
-    # Offered-tip gate WITHOUT the transaction lock: re-serving an outstanding
-    # tip never needs a refresh. The eligibility check is the same one the
-    # locked branch runs; if it reports eligible here the locked branch serves
-    # it, and if it reports ineligible the locked branch clears it and falls
-    # through to the cadence gate and the refresh below.
-    offered = st.offered
-    if offered and isinstance(offered, dict) and _is_eligible(offered, st, now, snooze_hours):
-        return web.json_response({"tip": _redact_tips([offered])[0], "glow": True})
-
-    # Cadence gate: has enough time passed since last feedback?
-    if (now - st.last_shown_ts) < (cadence_hours * 3600):
-        return web.json_response({"tip": None, "glow": False})
-
-    # Both gates open — now a tip could actually be shown, so this is the
-    # first point where a stale-tips refresh is worth its cost.
-    await maybe_refresh(state, cache)
 
     # Hold the lock across the whole inspect→select→persist transaction so two
     # concurrent tabs cannot both observe "no offered tip + cadence open" and
@@ -1241,11 +1226,7 @@ async def api_tips_next(request: web.Request) -> web.Response:
     # the lock is fast (list filters + one small file write) — the long LLM
     # generation path lives in maybe_refresh's background task, NOT here.
     async with cache._lock:
-        # If there is an outstanding offered tip, re-serve it (unless it became
-        # ineligible). The unlocked gate above returns the same answer without
-        # the lock; this is the transaction's own copy because a concurrent
-        # tab may have SELECTED a new tip between the unlocked read and here,
-        # and clearing that fresh offer would break the single-offer contract.
+        # If there is an outstanding offered tip, re-serve it (unless it became ineligible)
         if st.offered and isinstance(st.offered, dict):
             offered_id = st.offered.get("id", "")
             if offered_id and _is_eligible(st.offered, st, now, snooze_hours):
@@ -1255,8 +1236,7 @@ async def api_tips_next(request: web.Request) -> web.Response:
             st.offered = None
             await loop.run_in_executor(None, _save_state, st)
 
-        # Cadence gate under the lock (re-read: a concurrent feedback write
-        # may have moved last_shown_ts since the unlocked read above).
+        # Cadence gate: has enough time passed since last feedback?
         cadence_open = (now - st.last_shown_ts) >= (cadence_hours * 3600)
 
         if not cadence_open:

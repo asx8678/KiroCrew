@@ -114,8 +114,7 @@ SERVICE_LABELS: dict[str, str] = {
 #: forge it; what it could do is block the owner's REVOKE, leaving consent active
 #: for subsequent billable calls. A consent mechanism whose withdrawal can be
 #: denied by the party the consent constrains is defective in its central
-#: promise, so there is no lock file to hold. Same treatment, and the same
-#: reasoning, as ``file_delivery_consent._STORE_LOCK``.
+#: promise, so there is no lock file to hold.
 #:
 #: One writing PROCESS is what makes this sufficient. Every writer of this store
 #: runs in the gateway process, on its ``asyncio.to_thread`` pool: the
@@ -399,7 +398,15 @@ def revoke_for_profile(profile: str) -> list[str]:
     return revoked
 
 
-def is_granted(service: str, *, profile: str, region: str) -> tuple[bool, str]:
+#: Default for :func:`is_granted`'s ``grant`` argument. A sentinel rather than
+#: ``None`` because ``None`` is a real answer there: "the caller read the store and
+#: found no grant".
+_READ_GRANT: Any = object()
+
+
+def is_granted(
+    service: str, *, profile: str, region: str, grant: Grant | None = _READ_GRANT
+) -> tuple[bool, str]:
     """Whether a grant exists matching this profile+region. LOCAL only.
 
     Returns ``(granted, reason)``. ``reason`` is an operator-facing sentence for
@@ -409,8 +416,13 @@ def is_granted(service: str, *, profile: str, region: str) -> tuple[bool, str]:
     This is the first of two checks. It does NOT verify the live account -- see
     :func:`authorize`, which is what call sites use. Kept separate because the
     local half is what the dashboard reports and what the tests pin.
+
+    ``grant`` is the record to check, for a caller that also checks the grant's
+    account and so has already read it: both checks then judge the same record.
+    Omitted, the grant is read here.
     """
-    grant = read_grant(service)
+    if grant is _READ_GRANT:
+        grant = read_grant(service)
     label = SERVICE_LABELS.get(service, service)
     if grant is None:
         return False, (
@@ -482,13 +494,12 @@ async def authorize(service: str, *, profile: str, region: str) -> tuple[bool, s
     # surfaces, where it only coalesces repeated panel renders.
     identity = await probe_identity(profile, region, use_cache=False)
     if not identity.ok or not identity.account:
-        # Fail CLOSED. An earlier revision allowed this so a transient STS fault
-        # would not stop voice output, but that let a repointed profile bill an
-        # unconfirmed account, and on a host with boto3 but no `aws` CLI it meant
-        # the account was never verified at all. Denying costs little: a grant
-        # can only exist where the probe once succeeded, because the confirmation
-        # refuses to record without a resolved account -- so this withholds a
-        # paid call during an outage rather than breaking a working setup.
+        # Fail CLOSED. Allowing this so a transient STS fault does not stop voice
+        # output would let a repointed profile bill an unconfirmed account, and on
+        # a host with boto3 but no `aws` CLI the account would never be verified.
+        # Denying costs little: a grant can only exist where the probe once succeeded,
+        # because the confirmation refuses to record without a resolved account -- so this
+        # withholds a paid call during an outage rather than breaking a working setup.
         return False, (
             f"{label} was confirmed for AWS account {grant.account}, but that "
             f"account could not be re-checked just now, so nothing was sent to "
@@ -771,10 +782,9 @@ def _redacted(raw: str) -> str:
     # Imported here rather than at module scope: ``security`` is a heavy module
     # and this module is imported by the voice/STT call paths purely for the
     # local gate, which needs none of it.
-    from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+    from kiro_crew.security import redact
 
     lines = raw.strip().splitlines()
     first = lines[0] if lines else ""
-    first, _ = redact_credentials(first)
-    first, _ = redact_exfiltration_urls(first)
+    first = redact(first)
     return first[:300]

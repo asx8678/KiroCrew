@@ -32,16 +32,20 @@ def is_model_id(value: object) -> bool:
 class Choice:
     """Pick one member of the declared option domain.
 
-    ``option_rubric`` is the optional one-sentence meaning of each option, sent
-    as the provider's per-option ``criteria`` (LOOP-28): the option names
-    travel alone otherwise, and the judge cannot know what choosing one is
-    claiming. Keys outside ``options`` are ignored by the wire mapping.
+    ``criteria`` is the optional per-option rubric, sent as the provider's
+    ``criteria`` map so the model is told what separates one option from another
+    rather than inferring it from the option name alone. It maps an option to its
+    rubric text; an option left out, or the whole field left unset, sends that
+    option with no rubric -- today's wire shape -- so a point gains nothing until
+    it authors text and nothing changes for one that does not. Any text supplied
+    travels in the request, so it is scanned by the same scrub as the rest of the
+    payload (see :func:`question_texts`).
     """
 
     id: str
     prompt: str
     options: list[str] = field(default_factory=list)
-    option_rubric: dict[str, str] | None = None
+    criteria: dict[str, str] | None = None
 
 
 #: The fewest and most levels one ``Score`` may declare. The provider refuses
@@ -91,13 +95,8 @@ def question_texts(question: object) -> list[str]:
     texts = [str(getattr(question, "prompt", "") or "")]
     if isinstance(question, Choice):
         texts.extend(str(option) for option in question.options)
-        # LOOP-28: the rubric leaves the machine in the same request, so it
-        # must pass the scrub like every other question text.
-        texts.extend(
-            str(text)
-            for option, text in sorted((question.option_rubric or {}).items())
-            if text and option in question.options
-        )
+        if question.criteria:
+            texts.extend(str(text) for text in question.criteria.values() if text)
     elif isinstance(question, Noul):
         texts.extend(str(t) for t in (question.true_means, question.false_means) if t)
     elif isinstance(question, Score):

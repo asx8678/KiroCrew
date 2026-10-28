@@ -19,10 +19,30 @@ const PROMPTS_SOURCE = fs.readFileSync(path.join(RUNTIME_DIR, "prompts.js"), "ut
   .replace(/\r\n/g, "\n");
 const {
   BROWSER_PARTITION,
+  HEADER_CSS_PX,
   createWindowLifecycle,
 } = require("../window-lifecycle");
 const { registerCaptureSurface } = require("../capture-trust");
 const { setRemoteHostConfig } = require("../host-config");
+const {
+  WIN_CAPTION_RESERVE_CSS_PX,
+  WIN_CAPTION_OVERLAY_CSS_PX,
+  winCaptionReserveForZoom,
+  winDragReserveForZoom,
+} = require("../runtime/window/chrome");
+
+// The gateway supervisor's source: the runtime/gateway/ owners that define code
+// these pins read, then the facade, as one text because the pins hold over all of
+// it.
+const SUPERVISOR_FILES = [
+  "runtime/gateway/home-lock.js",
+  "runtime/gateway/successor-handoff.js",
+  "runtime/gateway/failure-dialog.js",
+  "runtime/gateway/holder-decision.js",
+  "runtime/gateway/shutdown.js",
+  "runtime/gateway/reconnect.js",
+  "gateway-supervisor.js",
+];
 
 function validOptions(overrides = {}) {
   return {
@@ -50,8 +70,9 @@ describe("every token-bearing navigation stays on the configured origin", () => 
   // every existing user's unsent drafts, and the configured string is compared by
   // exact equality in several places. This scans the SOURCE rather than one call
   // path, so a site added later reddens too.
-  const SUPERVISOR = fs
-    .readFileSync(path.join(__dirname, "..", "gateway-supervisor.js"), "utf8")
+  const SUPERVISOR = SUPERVISOR_FILES
+    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+    .join("\n")
     .replace(/\r\n/g, "\n");
 
   /** Lines composing a credential onto a base, with the 4 lines before each. */
@@ -121,10 +142,9 @@ describe("every token-bearing navigation stays on the configured origin", () => 
     // The boot navigation is the one token-bearing site outside this module, and
     // it addresses the URL it was configured with -- so the first document the
     // user sees is already on the origin every later navigation uses.
-    const supervisor = fs.readFileSync(
-      path.join(__dirname, "..", "gateway-supervisor.js"),
-      "utf8",
-    );
+    const supervisor = SUPERVISOR_FILES
+      .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+      .join("\n");
     assert.equal(
       /loopbackOrigin|tokenOrigin/.test(supervisor),
       false,
@@ -998,8 +1018,12 @@ function dashboardWindowHarness({ platform, frameless = false } = {}) {
       webRequest: {
         onBeforeSendHeaders() { log.push("view.session.onBeforeSendHeaders"); },
       },
+      on(event) { log.push(`view.session.on:${event}`); return this; },
     },
-    setWindowOpenHandler() { log.push("view.setWindowOpenHandler"); },
+    setWindowOpenHandler(handler) {
+      log.push("view.setWindowOpenHandler");
+      this.windowOpenHandler = handler;
+    },
     insertCSS(css) { log.push(`view.insertCSS:${firstLine(css)}`); return Promise.resolve(); },
     executeJavaScript(script) {
       log.push(`view.executeJavaScript:${firstLine(script)}`);
@@ -1028,6 +1052,7 @@ function dashboardWindowHarness({ platform, frameless = false } = {}) {
     setTitleBarOverlay() { log.push("win.setTitleBarOverlay"); },
   };
   const panelViews = [];
+  const openedExternally = [];
   class WebContentsView {
     constructor(options) {
       if (options.webPreferences.partition) {
@@ -1058,7 +1083,7 @@ function dashboardWindowHarness({ platform, frameless = false } = {}) {
       WebContentsView,
       BaseWindow: { getAllWindows: () => [win], getFocusedWindow: () => null },
       Menu: { buildFromTemplate: () => ({ popup() {} }) },
-      shell: { openExternal() {} },
+      shell: { openExternal(url) { openedExternally.push(url); return Promise.resolve(); } },
       nativeTheme: { shouldUseDarkColors: false, themeSource: "system" },
       app: { getPath: () => "/virtual/logs", getVersion: () => "0.8.0", name: "Kiro Crew" },
     },
@@ -1066,7 +1091,7 @@ function dashboardWindowHarness({ platform, frameless = false } = {}) {
     platform,
     env: {},
   }));
-  return { lifecycle, win, viewContents, log, panelViews };
+  return { lifecycle, win, viewContents, log, panelViews, openedExternally };
 }
 
 async function wireDashboardWindow(t, options) {
@@ -1094,6 +1119,7 @@ describe("dashboard window wiring order", () => {
       || entry.startsWith("view.set") || entry.startsWith("view.session") || entry.startsWith("win.set"));
     assert.deepEqual(events, [
       "view.on:did-finish-load",
+      "win.on:swipe",
       "win.on:closed",
       "win.on:resize",
       "win.on:closed",
@@ -1117,7 +1143,11 @@ describe("dashboard window wiring order", () => {
       "win.on:focus",
       "win.on:focus",
       "view.setWindowOpenHandler",
+      "view.on:will-navigate",
+      "view.on:will-redirect",
+      "view.on:did-create-window",
       "view.session.onBeforeSendHeaders",
+      "view.session.on:will-download",
     ]);
     assert.deepEqual(onLoad, [
       "view.send:fullscreen-changed",
@@ -1162,6 +1192,73 @@ describe("dashboard window wiring order", () => {
       "view.executeJavaScript:JSON.stringify({pref: document.documentElement.dataset.modePref || \"\",mode: document.documentElement.dataset.mode || \"\"})",
     ]);
     assert.equal(win._mcLinuxMaximizeSyncArmed, true);
+  });
+
+  it("a pop-out child window, and its own child, send external links to the OS browser", async (t) => {
+    const { viewContents, openedExternally } = await wireDashboardWindow(t, { platform: "darwin" });
+    const childContents = () => ({
+      ...recordingEmitter("child", []),
+      setWindowOpenHandler(handler) { this.windowOpenHandler = handler; },
+    });
+    // The session pop-out: a same-origin window.open the dashboard allows in-app.
+    assert.deepEqual(viewContents.windowOpenHandler({ url: "http://localhost:5476/chat/x" }), { action: "allow" });
+    const popout = { webContents: childContents() };
+    viewContents.emit("did-create-window", popout);
+    const nested = { webContents: childContents() };
+    popout.webContents.emit("did-create-window", nested);
+    for (const contents of [popout.webContents, nested.webContents]) {
+      const verdict = contents.windowOpenHandler({ url: "https://example.com/docs" });
+      assert.deepEqual(verdict, { action: "deny" }, "no in-app window for an external link");
+    }
+    assert.deepEqual(openedExternally, ["https://example.com/docs", "https://example.com/docs"]);
+  });
+
+  it("refuses a top-level navigation off the app origin, in the dashboard and its pop-outs", async (t) => {
+    const { viewContents, openedExternally } = await wireDashboardWindow(t, { platform: "darwin" });
+    const popout = { webContents: { ...recordingEmitter("child", []), setWindowOpenHandler() {} } };
+    viewContents.emit("did-create-window", popout);
+    const navigate = (contents, url) => {
+      let prevented = false;
+      contents.emit("will-navigate", { preventDefault: () => { prevented = true; } }, url);
+      return prevented;
+    };
+    for (const contents of [viewContents, popout.webContents]) {
+      // A pane on another loopback port promoting itself to the top frame.
+      assert.equal(navigate(contents, "http://localhost:5477/"), true);
+      assert.equal(navigate(contents, "http://127.0.0.1:5476/"), true);
+      assert.equal(navigate(contents, "https://example.com/"), true);
+      assert.equal(navigate(contents, "file:///etc/passwd"), true);
+      assert.equal(navigate(contents, "blob:http://localhost:5476/x"), true);
+      assert.equal(navigate(contents, "not a url"), true);
+      // The dashboard's own routes, and the token prompt's hand-off, still work.
+      assert.equal(navigate(contents, "http://localhost:5476/chat?x=1"), false);
+      assert.equal(navigate(contents, "http://localhost:5476/?token=t"), false);
+    }
+    assert.deepEqual(openedExternally, [], "a refused navigation opens nothing");
+  });
+
+  it("refuses a main-frame redirect off the app origin, in the dashboard and its pop-outs", async (t) => {
+    const { viewContents } = await wireDashboardWindow(t, { platform: "darwin" });
+    const popout = { webContents: { ...recordingEmitter("child", []), setWindowOpenHandler() {} } };
+    viewContents.emit("did-create-window", popout);
+    const redirect = (contents, url, isMainFrame = true) => {
+      let prevented = false;
+      contents.emit("will-redirect", { url, isMainFrame, preventDefault: () => { prevented = true; } });
+      return prevented;
+    };
+    for (const contents of [viewContents, popout.webContents]) {
+      assert.equal(redirect(contents, "https://sso.example/login"), true);
+      assert.equal(redirect(contents, "http://127.0.0.1:5476/"), true);
+      assert.equal(redirect(contents, "http://localhost:54760/"), true);
+      assert.equal(redirect(contents, "http://localhost:5476.evil.test/"), true);
+      // A pane iframe redirecting inside its own origin is not the dashboard's.
+      assert.equal(redirect(contents, "http://kirocrew.localhost:6000/x", false), false);
+      assert.equal(redirect(contents, "http://localhost:5476/chat?token=t"), false);
+      // No isMainFrame on the event: an unknown frame counts as main, so refused.
+      let unknownFrameRefused = false;
+      contents.emit("will-redirect", { url: "https://sso.example/login", preventDefault: () => { unknownFrameRefused = true; } });
+      assert.equal(unknownFrameRefused, true);
+    }
   });
 
   it("a framed window injects neither the drag band nor caption controls", async (t) => {
@@ -1305,6 +1402,137 @@ describe("window chrome controls", () => {
     assert.equal(lifecycle.chrome.setZoom(sender, 100), zoom, "setZoom returns the clamped factor");
     assert.ok(zoom < 100);
     assert.equal(placed.length, 2, "only windows carrying a dashboard view are reconciled");
+  });
+
+  it("repaints the Windows caption overlay and pushes the zoom-aware reserve var", () => {
+    // Regression for the reported bug. Secondary half: Ctrl+/- and the Settings
+    // "Zoom Level" stepper changed the renderer zoom but never repainted the
+    // Windows title-bar overlay, so its HEIGHT (which scales with zoom) stayed
+    // at the old zoom and the native caption buttons were no longer centred in
+    // the 42px header. Primary half: the header's right RESERVE is in CSS px,
+    // which paints to reserve*zoom DIP, so a static reserve stopped clearing
+    // the fixed-DIP caption buttons below 100% and the bell slid under
+    // Minimize. applyZoom now reconciles the Windows overlay AND pushes
+    // --mc-win-caption-reserve = round(142/zoom)px (so it paints to a constant
+    // 142 DIP) at the window's own new zoom factor, the same path that already
+    // scales the overlay height.
+    let zoom = 1;
+    const painted = [];
+    const injected = [];
+    const dashboard = {
+      _mcView: {
+        webContents: {
+          isDestroyed: () => false,
+          getZoomFactor: () => zoom,
+          executeJavaScript: (code) => { injected.push(code); return Promise.resolve(); },
+        },
+      },
+      isDestroyed: () => false,
+      setTitleBarOverlay: (opts) => painted.push(opts),
+    };
+    const lifecycle = createWindowLifecycle(validOptions({
+      platform: "win32",
+      electron: {
+        nativeTheme: { shouldUseDarkColors: true },
+        BaseWindow: { getAllWindows: () => [dashboard, { isDestroyed: () => false }] },
+      },
+    }));
+    const sender = {
+      getZoomFactor: () => zoom,
+      setZoomFactor: (factor) => { zoom = factor; },
+    };
+
+    const reserveFor = (z) => Math.round(WIN_CAPTION_RESERVE_CSS_PX / z);
+    const dragReserveFor = (z) => Math.round(WIN_CAPTION_OVERLAY_CSS_PX / z);
+
+    const stepped = lifecycle.chrome.stepZoom(sender, 1);
+    assert.ok(stepped > 1, "a step-in raises the zoom factor");
+    assert.equal(painted.length, 1, "only the dashboard window carries an overlay to repaint");
+    // The overlay height tracks the NEW zoom factor (HEADER_CSS_PX * zoom).
+    assert.equal(painted[0].height, Math.round(HEADER_CSS_PX * zoom));
+    // The reserve var is set from the same new zoom factor: 142/zoom CSS px, so
+    // it paints to a constant 142 DIP. Zoomed IN (>1), the CSS-px reserve shrinks.
+    assert.ok(
+      injected.some((c) => c.includes(`'--mc-win-caption-reserve', '${reserveFor(zoom)}px'`)),
+      "the zoom-aware reserve var is pushed at the stepped-in zoom",
+    );
+    // The drag-strip inset rides the same push: 138/zoom CSS px, painting to a
+    // constant 138 DIP so the injected #electron-drag-bar stays off the caption
+    // buttons at the new zoom.
+    assert.ok(
+      injected.some((c) => c.includes(`'--mc-win-drag-reserve', '${dragReserveFor(zoom)}px'`)),
+      "the zoom-aware drag-reserve var is pushed at the stepped-in zoom",
+    );
+
+    painted.length = 0;
+    injected.length = 0;
+    lifecycle.chrome.setZoom(sender, 0.8);
+    assert.equal(zoom, 0.8);
+    assert.equal(painted.length, 1);
+    assert.equal(painted[0].height, Math.round(HEADER_CSS_PX * 0.8));
+    // Zoomed OUT (0.8), the CSS-px reserve GROWS to 178 so it still paints to
+    // 142 DIP — the fix for the reported overlap.
+    assert.equal(reserveFor(0.8), 178);
+    assert.ok(
+      injected.some((c) => c.includes("'--mc-win-caption-reserve', '178px'")),
+      "the reserve grows below 100% zoom so it still clears the fixed-DIP buttons",
+    );
+    // The drag inset grows the same way (138/0.8 = 173) so the drag strip still
+    // clips short of the fixed-DIP caption buttons below 100% zoom.
+    assert.equal(dragReserveFor(0.8), 173);
+    assert.ok(
+      injected.some((c) => c.includes("'--mc-win-drag-reserve', '173px'")),
+      "the drag inset grows below 100% zoom so the drag strip stays off the buttons",
+    );
+  });
+
+  it("re-pushes the Windows caption reserve on every reload, not only when the theme resolves", async (t) => {
+    // A reload replaces the document and wipes the inline --mc-win-caption-reserve
+    // from <html>. The only re-push NOT gated on the theme mode resolving
+    // (syncNativeTheme repaints only when data-mode is dark/light) is the one
+    // trackZoomChrome wires to did-finish-load — so the header's zoom-correct
+    // reserve survives a reload even before the SPA sets its mode. The harness
+    // emits did-finish-load (first load); a second emit simulates a reload.
+    const { harness } = await (async () => {
+      const h = await wireDashboardWindow(t, { platform: "win32" });
+      return { harness: h };
+    })();
+    harness.log.splice(0);
+    harness.viewContents.emit("did-finish-load");
+    t.mock.timers.tick(1); // flush the setTimeout(…,0) the reload re-push uses
+    const reload = harness.log.splice(0);
+    assert.ok(
+      reload.some((e) => e.includes("'--mc-win-caption-reserve', '142px'")),
+      "a reload re-pushes the zoom-correct reserve with no theme gate",
+    );
+    assert.ok(
+      reload.some((e) => e.includes("'--mc-win-drag-reserve', '138px'")),
+      "a reload re-pushes the zoom-correct drag inset too (same relay)",
+    );
+  });
+
+  it("winDragReserveForZoom paints the drag inset to a constant native width at every zoom", () => {
+    // The CSS-px drag inset is 138/zoom, so inset*zoom === 138 DIP regardless of
+    // zoom; a non-finite or non-positive zoom falls back to 1x.
+    for (const z of [0.5, 0.67, 0.8, 1, 1.25, 2]) {
+      assert.equal(winDragReserveForZoom(z), Math.round(WIN_CAPTION_OVERLAY_CSS_PX / z));
+    }
+    assert.equal(winDragReserveForZoom(1), WIN_CAPTION_OVERLAY_CSS_PX);
+    for (const bad of [undefined, null, NaN, Infinity, 0, -1]) {
+      assert.equal(winDragReserveForZoom(bad), WIN_CAPTION_OVERLAY_CSS_PX);
+    }
+  });
+
+  it("winCaptionReserveForZoom paints to a constant native width at every zoom", () => {
+    // The CSS-px reserve is 142/zoom, so reserve*zoom === 142 DIP regardless of
+    // zoom; a non-finite or non-positive zoom falls back to 1x.
+    for (const z of [0.5, 0.67, 0.8, 1, 1.25, 2]) {
+      assert.equal(winCaptionReserveForZoom(z), Math.round(WIN_CAPTION_RESERVE_CSS_PX / z));
+    }
+    assert.equal(winCaptionReserveForZoom(1), WIN_CAPTION_RESERVE_CSS_PX);
+    for (const bad of [undefined, null, NaN, Infinity, 0, -1]) {
+      assert.equal(winCaptionReserveForZoom(bad), WIN_CAPTION_RESERVE_CSS_PX);
+    }
   });
 });
 
@@ -1491,5 +1719,82 @@ describe("gateway port prompt", () => {
       await settle();
       assert.deepEqual(ports, expected, `answer ${JSON.stringify(answer)}`);
     }
+  });
+});
+
+// ── Close button: background vs quit (#12204) ───────────────────────────────
+
+describe("main window close action", () => {
+  function closeHandlerBody() {
+    const start = SOURCE.indexOf('mainWindow.on("close", createCloseHandler({');
+    assert.notEqual(start, -1, "main window close handler must be built by createCloseHandler");
+    return SOURCE.slice(start, SOURCE.indexOf("\n    }));\n", start));
+  }
+
+  it("wires the close listener to the store, the tray hide, requestQuit and persist", () => {
+    // The sequence itself is exercised behaviourally in close-action.test.js;
+    // this pins that the main window feeds it the real effects.
+    const body = closeHandlerBody();
+    assert.match(body, /getAction: \(\) => getCloseAction\(store\)/);
+    assert.match(body, /cancelPendingTrayHide\(mainWindow\)/);
+    assert.match(body, /^\s*requestQuit,$/m);
+    assert.match(body, /hideToTray\(mainWindow, \{/);
+    assert.match(body, /persist\(\);/);
+  });
+
+  function facadeHarness(stored = {}) {
+    const data = { ...stored };
+    const writes = [];
+    const store = {
+      get: (key) => data[key],
+      set: (key, value) => { writes.push([key, value]); data[key] = value; },
+    };
+    const lifecycle = createWindowLifecycle(validOptions({ store }));
+    return { lifecycle, data, writes };
+  }
+
+  it("the facade reads and writes the stored choice, canonicalized", () => {
+    const h = facadeHarness();
+    assert.equal(h.lifecycle.closeAction.get(), "background", "an untouched install keeps running");
+    assert.equal(h.lifecycle.closeAction.set("quit"), "quit");
+    assert.equal(h.data.closeAction, "quit");
+    assert.equal(h.lifecycle.closeAction.get(), "quit");
+    assert.equal(h.lifecycle.closeAction.set("nonsense"), "background");
+    assert.equal(h.data.closeAction, "background");
+  });
+
+  it("the facade skips a write that changes nothing", () => {
+    const h = facadeHarness({ closeAction: "quit" });
+    h.lifecycle.closeAction.set("quit");
+    assert.deepEqual(h.writes, []);
+    h.lifecycle.closeAction.set("background");
+    assert.deepEqual(h.writes, [["closeAction", "background"]]);
+  });
+
+  it("the tray menu is unchanged: the setting lives only in Settings", () => {
+    const menus = [];
+    const lifecycle = createWindowLifecycle(validOptions({
+      electron: {
+        app: { name: "Kiro Crew", getVersion: () => "0.8.0", getPath: () => "/virtual/logs" },
+        Tray: class {
+          setToolTip() {}
+          setContextMenu() {}
+          on() {}
+        },
+        Menu: { buildFromTemplate: (template) => { menus.push(template); return { template }; } },
+        nativeImage: {
+          createFromPath: () => ({ resize: () => ({ fake: "icon" }), setTemplateImage() {} }),
+        },
+        shell: {},
+      },
+      store: { path: "/virtual/config.json", get: () => undefined, set() {} },
+      platform: "linux",
+      env: {},
+    }));
+    lifecycle.createTray();
+    assert.deepEqual(
+      menus[0].map((item) => item.label || item.type),
+      ["Show Kiro Crew", "separator", "New Connection Window…", "separator", "Open Config File", "separator", "Quit"],
+    );
   });
 });

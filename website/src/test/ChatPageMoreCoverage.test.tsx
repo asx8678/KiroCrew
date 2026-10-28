@@ -25,7 +25,7 @@
  * (the technique ChatPageCoverage.test.tsx uses). Nothing else about the page is
  * faked: grouping, the render dispatch and the handlers run for real.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, act, waitFor, fireEvent, within, renderHook } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -62,7 +62,7 @@ vi.mock('../components/CliPanel', async (importOriginal) => {
 })
 import { ThemeProvider } from '../hooks/useTheme'
 import { store as appStore } from '../store'
-import { setVoicePlaying, switchSlot } from '../store/chatSlice'
+import { appendMessage, setVoicePlaying, switchSlot } from '../store/chatSlice'
 import { sseDisconnected } from '../store/dashboardSlice'
 import type { RootState } from '../store'
 import type { ChatMessage } from '../types'
@@ -72,13 +72,16 @@ import type { ChatMessage } from '../types'
 interface AssistantProps {
   content: string
   timestamp?: string
-  onFork?: (visibleIndex: number) => void | Promise<void>
+  onFork?: (visibleIndex: number, messageId?: string, direction?: 'head') => void | Promise<void>
   onQuote?: (text: string, rect: DOMRect) => void
   onAsk?: (text: string) => void
   onSpeak?: (content: string) => void
   onRegenerate?: () => void
   onApplyPlan?: (steps: never[]) => Promise<boolean>
   forkIndex?: number
+  forkDirectionChoice?: boolean
+  forkHasLaterMessages?: (forkIndex: number) => boolean
+  shareEnabled?: boolean
 }
 let assistantProps: AssistantProps | null = null
 
@@ -134,7 +137,10 @@ vi.mock('../components/FlyingQuote', async () => {
 // The split grid is stubbed to a prop recorder: what matters here is the
 // `openSideChat` capability ChatPage hands its panes (and when it withholds
 // it), not the grid's own layout, which SessionGridView's suite covers.
-interface GridProps { openSideChat?: (slot: string) => boolean | void | Promise<boolean | void> }
+interface GridProps {
+  openSideChat?: (slot: string) => boolean | void | Promise<boolean | void>
+  onCollapse?: (slot: string, anchorTs?: string, anchorMid?: string, gesture?: boolean) => void
+}
 let gridProps: GridProps | null = null
 vi.mock('../components/SessionGridView', async () => {
   const React = await import('react')
@@ -227,6 +233,7 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       getFollow: () => true,
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(() => false),
+      retainRange: vi.fn(),
       farmIsMeasured: () => true,
       farmRecord: vi.fn(() => true),
       measureRef: () => () => {},
@@ -261,7 +268,9 @@ vi.mock('../api/client', () => ({
       if (!(prop in apiMocks)) {
         apiMocks[prop] = vi.fn().mockResolvedValue(
           prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 }
-            : prop === 'pendingQuestions' || prop === 'approvals' ? [] : {},
+            : prop === 'pendingQuestions' || prop === 'approvals' ? []
+              // Every chat here runs on this machine: Run in terminal waits for that.
+              : prop === 'chatSlotEnvironment' ? { profile: null, profiles: [] } : {},
         )
       }
       return apiMocks[prop]
@@ -271,17 +280,26 @@ vi.mock('../api/client', () => ({
   SEARCH_MIN_CHARS: 2,
 }))
 
-Object.defineProperty(window, 'matchMedia', {
-  writable: true,
-  value: vi.fn().mockImplementation((q: string) => ({
+// A direct assignment outlives this file: a sibling in the same shard would inherit a
+// matchMedia that never matches and a fetch that resolves empty. stubGlobal reverses.
+vi.stubGlobal(
+  'matchMedia',
+  vi.fn().mockImplementation((q: string) => ({
     matches: false, media: q, onchange: null,
     addListener: vi.fn(), removeListener: vi.fn(),
     addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
   })),
+)
+vi.stubGlobal(
+  'fetch',
+  vi.fn().mockResolvedValue({
+    ok: true, status: 200, text: () => Promise.resolve(''), json: () => Promise.resolve({}),
+  }),
+)
+
+afterAll(() => {
+  vi.unstubAllGlobals()
 })
-globalThis.fetch = vi.fn().mockResolvedValue({
-  ok: true, status: 200, text: () => Promise.resolve(''), json: () => Promise.resolve({}),
-}) as never
 
 import ChatPage from '../pages/ChatPage'
 import { readSideChatDraft } from '../chat-core/composer/sideChatDrafts'
@@ -399,8 +417,8 @@ afterEach(() => {
   alertSpy.mockRestore()
 })
 
-describe('Welcome recreation preserves remote execution', () => {
-  it('carries instanceId through a memory mode change', async () => {
+describe('Welcome recreation of a crew archive', () => {
+  it('recreates a plain local session that names no crew', async () => {
     apiSpy('dashboardConfig').mockResolvedValue({ default_memory_mode: 'persistent' })
     apiSpy('createChatSlot').mockResolvedValue({
       ...REMOTE_SLOT,
@@ -416,7 +434,7 @@ describe('Welcome recreation preserves remote execution', () => {
     })
 
     await waitFor(() => expect(apiMocks.createChatSlot).toHaveBeenCalled())
-    expect(apiMocks.createChatSlot.mock.calls.at(-1)?.[8]).toBe('crew-remote-1')
+    expect(apiMocks.createChatSlot.mock.calls.at(-1)).not.toContain('crew-remote-1')
     expect(apiMocks.deleteChatSlot).toHaveBeenCalledWith('chat-1')
   })
 })
@@ -445,34 +463,121 @@ describe('ChatPage row callbacks — fork', () => {
     expect(apiMocks.forkChatSlot).toHaveBeenCalledWith('chat-1', 3, undefined, undefined, 'tail')
   })
 
-  it('reports a refused fork through the in-page ErrorNotice instead of switching sessions', async () => {
+  it('reports a refused fork through the error notice instead of switching sessions', async () => {
     apiSpy('forkChatSlot').mockResolvedValue({ ok: false, error: 'slot is busy' })
     await renderTurn()
     await act(async () => { await assistantProps!.onFork!(1) })
-    // The surface is the shared ErrorNotice (role="alert" + agent hand-off),
-    // never a native alert(): the rule `errors-use-error-notice` forbids the
-    // browser dialog, which also carried no structured context to the agent.
-    const notice = await screen.findByTestId('action-error')
+    const notice = await waitFor(() => screen.getByTestId('action-error'))
+    // The id rides `ErrorNotice`'s own `testId`, so the element found by it is the
+    // one carrying `role="alert"`. A wrapper div would split those apart.
     expect(notice).toHaveAttribute('role', 'alert')
     expect(notice.textContent).toContain('slot is busy')
+    // A fork failure rides the surface that already existed rather than a second
+    // one of its own, so there is no `fork-error` slot to find.
+    expect(screen.queryByTestId('fork-error')).toBeNull()
     expect(alertSpy).not.toHaveBeenCalled()
   })
 
-  it('still reports when the fork request throws, naming the real reason', async () => {
+  it('still surfaces a thrown fork request, naming the real reason', async () => {
     apiSpy('forkChatSlot').mockRejectedValue(new Error('network down'))
     await renderTurn()
     await act(async () => { await assistantProps!.onFork!(1) })
-    const said = (await screen.findByTestId('action-error')).textContent ?? ''
+    const notice = await waitFor(() => screen.getByTestId('action-error'))
+    const said = notice.textContent ?? ''
     expect(said).toContain('Fork failed')
-    // Flipped, as this assertion's previous form asked to be: it pinned the
-    // reason being LOST — `unwrap()` rejects with a redux-toolkit
-    // SerializedError (a PLAIN OBJECT), so the handler's `e instanceof Error`
-    // test was false and the `String(e)` fallback rendered '[object Object]'.
-    // The handler now reads the message through `utils/thunkError.errMessage`,
-    // which knows that shape, so the notice carries the real text.
+    // `unwrap()` rejects with a SerializedError (a PLAIN OBJECT), so an `e instanceof
+    // Error` test reads false and a `String(e)` fallback renders '[object Object]'.
     expect(said).toContain('network down')
     expect(said).not.toContain('[object Object]')
     expect(alertSpy).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['head', 'Fork with earlier messages', 'an earlier message'],
+    [undefined, 'Fork with later messages only', 'a later message'],
+  ] as const)('names the %s entry the menu shows when a too-large fork is refused with Tail-only Fork on', async (direction, label, where) => {
+    apiSpy('dashboardConfig').mockResolvedValue({ tail_fork_enabled: true })
+    apiSpy('forkChatSlot').mockRejectedValue(new ApiError(400, 'Bad Request', JSON.stringify({ error: 'too large', code: 'fork_corpus_too_large' })))
+    await renderTurn()
+    await waitFor(() => expect(assistantProps!.forkDirectionChoice).toBe(true))
+    await act(async () => { await (direction ? assistantProps!.onFork!(1, 'row-1', direction) : assistantProps!.onFork!(1, 'row-1')) })
+    const said = (await screen.findByTestId('action-error')).textContent ?? ''
+    expect(said).toContain(`choose “${label}”`)
+    expect(said).toContain(where)
+  })
+
+  it('keeps naming the lone fork entry when a too-large fork is refused with Tail-only Fork off', async () => {
+    apiSpy('dashboardConfig').mockResolvedValue({ tail_fork_enabled: false, social_share_enabled: true })
+    apiSpy('forkChatSlot').mockRejectedValue(new ApiError(400, 'Bad Request', JSON.stringify({ error: 'too large', code: 'fork_corpus_too_large' })))
+    await renderTurn()
+    await waitFor(() => expect(assistantProps!.shareEnabled).toBe(true))
+    await act(async () => { await assistantProps!.onFork!(1, 'row-1') })
+    const said = (await screen.findByTestId('action-error')).textContent ?? ''
+    expect(said).toContain('choose “Fork conversation from here”')
+  })
+
+  it.each([false, true] as const)('forks with history when the menu entry names head whatever Tail-only Fork says (setting %s)', async (setting) => {
+    apiSpy('dashboardConfig').mockResolvedValue({ tail_fork_enabled: setting })
+    apiSpy('forkChatSlot').mockResolvedValue({ ok: true, key: 'chat-2', title: 'fork' })
+    await renderTurn()
+    await act(async () => { await assistantProps!.onFork!(1, 'row-1', 'head') })
+    expect(apiMocks.forkChatSlot).toHaveBeenCalledWith('chat-1', 1, undefined, undefined, 'head', 'row-1')
+  })
+
+  it.each([[false, 'head'], [true, 'tail']] as const)('still lets the setting pick the direction for the plain entry (setting %s)', async (setting, direction) => {
+    apiSpy('dashboardConfig').mockResolvedValue({ tail_fork_enabled: setting })
+    apiSpy('forkChatSlot').mockResolvedValue({ ok: true, key: 'chat-2', title: 'fork' })
+    await renderTurn()
+    await act(async () => { await assistantProps!.onFork!(2, 'row-9') })
+    expect(apiMocks.forkChatSlot).toHaveBeenCalledWith('chat-1', 2, undefined, undefined, direction, 'row-9')
+  })
+
+  it('offers the fork-direction choice while Tail-only Fork is on', async () => {
+    apiSpy('dashboardConfig').mockResolvedValue({ tail_fork_enabled: true })
+    await renderTurn()
+    await waitFor(() => expect(assistantProps!.forkDirectionChoice).toBe(true))
+  })
+
+  it('withholds the fork-direction choice while Tail-only Fork is off, because the server would answer a tail request with a history fork', async () => {
+    // `shareEnabled` and `forkDirectionChoice` are both read from the one ['dashboardConfig']
+    // query, so `shareEnabled` going true proves the payload landed with the setting off.
+    apiSpy('dashboardConfig').mockResolvedValue({ tail_fork_enabled: false, social_share_enabled: true })
+    await renderTurn()
+    await waitFor(() => expect(assistantProps!.shareEnabled).toBe(true))
+    expect(assistantProps!.forkDirectionChoice).toBe(false)
+  })
+
+  it('withholds the fork-direction choice while the config does not name the setting', async () => {
+    apiSpy('dashboardConfig').mockResolvedValue({ social_share_enabled: true })
+    await renderTurn()
+    await waitFor(() => expect(assistantProps!.shareEnabled).toBe(true))
+    expect(assistantProps!.forkDirectionChoice).toBe(false)
+  })
+
+  it('tells the newest reply that no message follows it', async () => {
+    await renderTurn()
+    expect(assistantProps!.forkIndex).toBe(1)
+    expect(assistantProps!.forkHasLaterMessages!(1)).toBe(false)
+  })
+
+  it('keeps one check for an older reply that sees a message appended after it', async () => {
+    const { store } = await renderTurn()
+    const check = assistantProps!.forkHasLaterMessages!
+    expect(check(1)).toBe(false)
+    act(() => { store.dispatch(appendMessage(msg('user', 'which ones?', { ts: '2026-08-12T07:00:09Z' }))) })
+    expect(check(1)).toBe(true)
+    expect(assistantProps!.forkHasLaterMessages).toBe(check)
+  })
+
+  it('tells a reply with a later message that one follows it', async () => {
+    renderChatPage([
+      msg('user', 'what changed?', { ts: '2026-08-12T07:00:00Z' }),
+      msg('assistant', 'two files changed', { ts: '2026-08-12T07:00:05Z' }),
+      msg('user', 'which ones?', { ts: '2026-08-12T07:00:09Z' }),
+    ])
+    await waitFor(() => expect(assistantProps).not.toBeNull())
+    expect(assistantProps!.forkIndex).toBe(1)
+    expect(assistantProps!.forkHasLaterMessages!(1)).toBe(true)
   })
 })
 
@@ -598,6 +703,22 @@ describe('ChatPage row callbacks — quote and ask', () => {
     expect(store.getState().chat.activityTab).not.toBe('side')
   })
 
+  // #23564: a recorded open marks that chat's cron notes read, so only the
+  // pane's own open-full click may record one. The grid collapsing itself after
+  // the other pane closes leaves the survivor on screen but is not an open.
+  it('a split collapsing on its own records no chat open', async () => {
+    const { store } = await renderSplit()
+    await act(async () => { gridProps!.onCollapse!('chat-2') })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2'))
+    expect(store.getState().chat.userOpen?.key).not.toBe('chat-2')
+  })
+
+  it('a pane\'s open-full click records the chat open', async () => {
+    const { store } = await renderSplit()
+    await act(async () => { gridProps!.onCollapse!('chat-2', undefined, undefined, true) })
+    await waitFor(() => expect(store.getState().chat.userOpen?.key).toBe('chat-2'))
+  })
+
   it('withholds Ask from the panes while disconnected instead of switching slots offline', async () => {
     const { store } = await renderSplit()
     const askWhileConnected = gridProps!.openSideChat!
@@ -646,7 +767,7 @@ describe('ChatPage row callbacks — regenerate and speak', () => {
     apiSpy('voiceSynthesize').mockResolvedValue({})
     await renderTurn()
     act(() => { assistantProps!.onSpeak!('two files changed') })
-    await waitFor(() => expect(apiMocks.voiceSynthesize).toHaveBeenCalledWith('chat-1', 'two files changed'))
+    await waitFor(() => expect(apiMocks.voiceSynthesize).toHaveBeenCalledWith('chat-1', 'two files changed', { clientFallback: true }))
   })
 
   it('stops playback instead of synthesizing again while a clip is playing', async () => {

@@ -53,11 +53,7 @@ from datetime import datetime
 from pathlib import Path
 
 from kiro_crew.artifacts import ArtifactNotFoundError, ArtifactStore
-from kiro_crew.security import (
-    is_sensitive_path,
-    redact_credentials,
-    redact_exfiltration_urls,
-)
+from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
 
 from .ingestion import DUPLICATE_JOB_STATUS, IngestionPipeline, run_to_completion
@@ -101,8 +97,8 @@ def _redact_for_ingest(text: str) -> str:
     (never persist secrets), run the same redaction the chat
     path applies before the text lands in the Knowledge store.
     """
-    cleaned, _ = redact_credentials(text)
-    cleaned, _ = redact_exfiltration_urls(cleaned)
+    from kiro_crew.security import redact
+    cleaned = redact(text)
     return cleaned
 
 
@@ -374,9 +370,10 @@ async def ingest_artifact(
         # File-backed artifact: art_store.get() read live content from
         # source_path on disk. Refuse to ingest a file that resolves to a
         # sensitive credential path into the searchable Knowledge store
-        # (defense-in-depth; resolves symlinks before checking).
+        # (defense-in-depth; resolves symlinks before checking). Resolving stats
+        # the disk, so it runs in a worker thread, not on the event loop.
         try:
-            resolved = str(Path(art.source_path).expanduser().resolve())
+            resolved = str(await asyncio.to_thread(Path(art.source_path).expanduser().resolve))
         except (OSError, ValueError, RuntimeError):
             return None
         if is_sensitive_path(resolved):
@@ -1051,21 +1048,36 @@ class ArtifactKnowledgeSync:
         self._reconcile_task = asyncio.create_task(self._run_reconcile(source_id))
 
     async def _run_reconcile(self, source_id: str) -> None:
+        try:
+            await self.reconcile_now(source_id)
+        except Exception:
+            logger.exception("artifact KB reconcile failed")
+
+    async def reconcile_now(self, source_id: str) -> None:
+        """Run the reconcile pass now and log what it changed.
+
+        The start-time pass and the dashboard's manual Sync on the aggregate
+        source both come through here. The pass holds the same lock as the
+        live change-listener, so it never interleaves with an ingest or remove
+        already in flight. A failure of the pass itself propagates to the
+        caller; a single artifact that fails to ingest is logged inside
+        :func:`reconcile_artifacts` and does not fail the pass.
+        """
         async with self._lock:
-            try:
-                ingested, removed, deferred = await reconcile_artifacts(
-                    self.pipeline, self.art_store, source_id, self.kinds
-                )
-            except Exception:
-                logger.exception("artifact KB reconcile failed")
-                return
+            ingested, removed, deferred = await reconcile_artifacts(
+                self.pipeline, self.art_store, source_id, self.kinds
+            )
+        self._log_reconcile(ingested, removed, deferred)
+
+    @staticmethod
+    def _log_reconcile(ingested: int, removed: int, deferred: int) -> None:
         if not (ingested or removed or deferred):
             # The steady state. Logged at debug so an already-converged store
             # does not write a line on every boot.
             logger.debug("artifact KB reconcile: already in sync")
             return
         logger.info(
-            "artifact KB reconcile: %d ingested, %d removed, %d deferred to a later start",
+            "artifact KB reconcile: %d ingested, %d removed, %d deferred to a later pass",
             ingested,
             removed,
             deferred,
@@ -1073,7 +1085,7 @@ class ArtifactKnowledgeSync:
         if deferred:
             logger.info(
                 "artifact KB reconcile: %d artifact(s) exceed the per-run budget of "
-                "%d and will be picked up on the next start, newest first",
+                "%d and will be picked up by the next start or Sync, newest first",
                 deferred,
                 RECONCILE_INGEST_BUDGET,
             )

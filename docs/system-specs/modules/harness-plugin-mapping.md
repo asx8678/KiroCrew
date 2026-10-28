@@ -13,9 +13,8 @@ exception here.
 
 The harnesses are Codex (Rust), openclaw (TypeScript), hermes (Python) and grok-build
 (Rust). pi-mono (TypeScript) is included where it decides a boundary. Codex and
-openclaw were read from local clones; hermes, grok-build and pi-mono are from the
-architecture cards written this week and are marked `[card]` where a claim rests only
-on the card.
+openclaw were read from local clones; hermes, grok-build and pi-mono are from
+architecture cards and are marked `[card]` where a claim rests only on the card.
 
 ## 1. The four buckets
 
@@ -48,14 +47,14 @@ field exists but a foreign process has to be alive to fill it.
 ## 2. What Kiro Crew already has
 
 The mapping targets, from this tree (`src/kiro_crew/apps/manifest.py`, consumed at
-`src/kiro_crew/apps/bridges.py`):
+the `kiro_crew.apps.bridges` owners):
 
 | Target | `app.json` field | Consumer |
 |---|---|---|
 | Skills | `skills` (list of paths) | `bridges.register_app`, symlinked into `config_dir()/skills` |
 | MCP servers | `mcpServers` (object) | `bridges._register_mcp_servers` |
 | Agents | `agents` (list of paths) | `bridges`, materialized into the kiro agents dir |
-| Cron jobs | `crons` (list of objects) | `bridges.register_app_crons` |
+| Cron jobs | `crons` (list of objects) | `bridges.register_app_crons_with_service` |
 | Command rows | `contributes.commands` | Command Bar, see [command-bar.md](command-bar.md) |
 | Panel tabs / pages | `contributes.panelTabs`, `ui.pages` | dashboard, declarative |
 | HTTP surface | `backend.entryPoint`, `backend.routes`, `permissions.api` | app backend + gateway proxy |
@@ -96,9 +95,9 @@ under the package root. In-process extensions are Rust contributor traits collec
 | `interface.displayName`, `.shortDescription`, `.developerName` | (c) | `displayName`, `description`, `author`. Pure converter. |
 | `interface` icons, `logo`, `screenshots`, `defaultPrompt`, `brandColor` | (c) partial | No installed-app manifest field. Carried in `extra` as provenance; nothing renders them. |
 | `keywords` | (c) | `tags`. Pure converter. |
-| `hooks` -- `command` handlers | (d) today | 5 of their 11 event names exist on the agent hook surface, but that surface is operator config and takes an absolute path to a metacharacter-free file, so a shell-line command needs materializing as a script the operator installs. No app can declare it. Closing it needs a new app-declarable hook surface. |
+| `hooks` -- `command` handlers | (d) today | 4 of their 11 event names (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`) exist on the agent hook surface, but that surface is operator config and takes an absolute path to a metacharacter-free file, so a shell-line command needs materializing as a script the operator installs. No app can declare it. Closing it needs a new app-declarable hook surface. |
 | `hooks` -- `mcp_tool`, `prompt`, `agent` handlers | (d) | Handler kinds with no Kiro Crew counterpart; `prompt` and `agent` are loop-internal. |
-| `hooks` -- `PermissionRequest`, `Pre/PostCompact`, `Session*`, `Subagent*` | (d) | No app-facing event for these. Kiro Crew's own PreToolUse gate (`agent_sdk/tool_gate.py`) is core and not app-extensible. |
+| `hooks` -- `PermissionRequest`, `Pre/PostCompact`, `Session*`, `Subagent*` | (d) | No app-facing event for these. `SessionStart` is not reported as `agentSpawn`, though the kiro-cli trigger map pairs them; whether plugin import should is open (#13243). Kiro Crew's own PreToolUse gate (`agent_sdk/tool_gate.py`) is core and not app-extensible. |
 | `apps` (connectors, a single path) | (d) | A foreign connector concept with no Kiro Crew equivalent. |
 | Contributor traits: thread/turn/tool lifecycle, prompt/context, config, MCP-server, skill-invocation | (d) | Agent-loop internals. They run inside their own agent process; hosting them would not put them in our loop. |
 | Contributor traits: token-usage, turn-item | (b) | Observation only. An adapter that hosts them can append their output as namespaced events and publish a projection. Runtime adapter. |
@@ -247,13 +246,12 @@ Two platform findings came out of that run, neither a converter question:
   port would otherwise be a dead address that breaks every session. A SELF-MANAGED app
   (empty `backend.entryPoint` -- which is also every converted package, since a
   converted app emits no `backend`) has an AUTHORITATIVE fixed endpoint that never gets
-  a live registration, so the registrar now PRESERVES its url rather than dropping it.
+  a live registration, so the registrar PRESERVES its url rather than dropping it.
   This mirrors `_collect_app_mcp_servers` in `agent_materialization/mcp_sources.py`, the
-  other writer of this config, which already kept a self-managed url: the two writers
+  other writer of this config, which also keeps a self-managed url: the two writers
   must agree, or registration scrubs an entry the next rebuild writes straight back.
-  (Resolved: #15826 initially moved the fix to the converter, which `@buluoray`'s review
-  blocked because the rebuild path deliberately carries these servers; the fix belongs
-  in the registrar, scrubbing only when a backend port is expected.)
+  The scrub lives in the registrar, not the converter, and runs only when a backend port
+  is expected, because the rebuild path deliberately carries these servers.
 - The dashboard app card reads `mcpServers` from the MANIFEST, so it shows a server
   the agent config does not carry. The two surfaces disagree by construction.
 

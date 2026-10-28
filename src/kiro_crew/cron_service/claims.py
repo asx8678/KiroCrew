@@ -50,7 +50,7 @@ class _RunClaim:
     A claim's life: ``trigger``, ``claimed_at`` and ``marker_run`` are fixed at
     claim time. ``task`` is the handle the dispatcher tracks (the manual route's
     wrapper, then the run task that replaces it). ``generation``,
-    ``started_monotonic`` and ``jitter`` are stamped by ``_run_job_isolated`` as
+    ``started_monotonic``, ``job`` and ``jitter`` are stamped by ``_run_job_isolated`` as
     the run body reaches them. ``taken`` is set by ``cancel()`` / ``_force_reap``
     when they take over the run's terminal write: from then on the run's own
     fences fail, the reaper skips it and ``running_since`` is silent, while the
@@ -77,6 +77,13 @@ class _RunClaim:
     started_monotonic: float | None = None
     #: Jitter seconds the run slept before executing; the reaper's allowance.
     jitter: float | None = None
+    #: The job object this run executes and mutates, stamped with ``started_monotonic``.
+    #: Every store reload replaces the registry's job objects, and the runtime-only
+    #: markers the run set (``run_never_started``, ``fire_time_denied``) stay on this
+    #: one, so the reaper reads whether the payload ever started here and not off the
+    #: registry's replacement. None until the run body starts. Left out of the claim's
+    #: repr, so a logged or asserted claim does not print the whole job.
+    job: CronJob | None = field(default=None, repr=False)
     #: The task the dispatcher tracks for this run, for cancel / reap / stop.
     task: asyncio.Task[Any] | None = None
     #: Set by ``cancel()`` / ``_force_reap`` once they own the run's terminal
@@ -96,6 +103,10 @@ class _RunClaim:
     #: the reaper killed this run and writes its terminal row, so the run's
     #: finalizer writes none. Same lifetime as ``cancelled``.
     reaped: bool = False
+    #: Set by ``_execute`` when it resets this run's outcome fields. Until then
+    #: the job still holds the previous run's ``last_status`` / ``last_error``,
+    #: so a run stopped before this point has no outcome of its own.
+    outcome_reset: bool = False
 
 
 class RunClaims:
@@ -110,7 +121,10 @@ class RunClaims:
     run generation this process has allocated per job (see
     :meth:`next_generation`): service state, not job state, because every store
     reload replaces the job objects and a counter kept on one of them would be
-    lost with it before the run's merge persisted it.
+    lost with it before the run's merge persisted it. Its entry is dropped with
+    the claim on :meth:`release` -- by then the run's generation lives on the
+    persisted ``job.run_generation`` the reseed reads, so the in-process entry
+    has done its job and a one-shot's would otherwise leak forever.
     """
 
     def __init__(self) -> None:
@@ -148,10 +162,29 @@ class RunClaims:
         return stored is not None and stored is claim and not stored.taken
 
     def release(self, job_id: str, claim: _RunClaim | None) -> bool:
-        """Release ``claim`` -- every field at once -- if it still owns the job."""
+        """Release ``claim`` -- every field at once -- if it still owns the job.
+
+        Drops the job's run-generation entry too. Keeping it was a leak: a
+        one-shot job (``at``/delay) is minted with a fresh ``uuid4`` id, fires
+        once and is removed from the store, so its ``generations`` entry became
+        dead weight that lived for the gateway's life, one int per reminder ever
+        fired. Dropping it is safe because the next number for the job is
+        reseeded from the max of the PERSISTED ``job.run_generation`` and this
+        in-process counter (:meth:`next_generation`): by the time a release runs,
+        the run's terminal record -- carrying the generation this run drew -- has
+        been held onto the listed job object and is re-applied across every store
+        reload (``_hold_run_record``), so ``job.run_generation`` already stands at
+        that value and a restarted run of the same id still draws a strictly
+        higher one. A late result from an old run is fenced on ``run_generation``
+        too (``_merge_job_result``), never on this map, so its rejection is
+        unaffected. Dropped only on a true release (``holds``): a claim a teardown
+        has taken keeps its entry, because ``cancel()``/``_force_reap`` draw the
+        terminal row's generation after finishing the claim.
+        """
         if not self.holds(job_id, claim):
             return False
         del self.claims[job_id]
+        self.generations.pop(job_id, None)
         return True
 
     def take(self, job_id: str, expected: _RunClaim | None = None) -> _RunClaim | None:

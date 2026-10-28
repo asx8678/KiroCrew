@@ -415,11 +415,12 @@ class PrObservation:
         carry up to ``_MAX_CHECK_PAGES * _CHECK_PAGE_SIZE`` rows, so an unbounded list
         here puts hundreds of kilobytes of provider-chosen text into that record.
 
-        The caps and the overflow marker are the canonical writer's own names rather
-        than new literals, because this is one population with one bound: two numbers
-        for it would drift, and the reader holding the smaller one would disagree about
-        what a complete board is. Truncation is said out loud in the retained dict, so
-        a reader cannot mistake a clipped board for a whole one.
+        The per-bucket cap is the canonical writer's own name rather than a new literal,
+        because this is one population with one bound: two numbers for it would drift,
+        and the reader holding the smaller one would disagree about what a complete
+        board is. The board-wide overflow marker is the same ``"checks:incomplete"``
+        string the canonical writer spells. Truncation is said out loud in the retained
+        dict, so a reader cannot mistake a clipped board for a whole one.
 
         The displaced bucket is bounded on its own terms, the way the canonical writer
         bounds it. A displaced row carries no verdict, so however many of them a head
@@ -475,9 +476,9 @@ class PrObservation:
         the remark metadata are read by the collector that builds the judge's evidence,
         and every one of them is also read by the core's reading-digest, which is what
         makes an unchanged subject quiet. A field no consumer reads is a claim the
-        reading cannot back, so there is none. What describes the FETCH rather than the
-        subject is not here at all: what the window had left stays on the transport,
-        which is the one place it is read -- to yield a call on a nearly-spent window.
+        reading cannot back, so there is none. The transport's rate-limit state is not
+        here at all: what the window had left stays on the transport, which is the one
+        place it is read -- to yield a call on a nearly-spent window.
         """
         facts: dict[str, object] = {
             "kind": "gh-pr",
@@ -884,8 +885,9 @@ def _workflow_of(item: dict, resolved: dict[str, str] | None = None) -> str:
 
 #: Which bucket survives when duplicate rows for one identity cannot be ordered by
 #: time. A row saying "something may be wrong or unfinished" outranks an "all good"
-#: row. The reading itself says so too: an unresolved identity is one of the notes
-#: that make the whole observation ``partial``, which is what a consumer reads.
+#: row. The reading itself says so too: an unresolved identity and an undated
+#: duplicate that disagrees are each a note that makes the whole observation
+#: ``partial``, which is what a consumer reads.
 _UNDATED_RANK = {"failing": 4, "unknown": 3, "pending": 2, "passing": 1, "noise": 0}
 
 
@@ -910,10 +912,12 @@ def _family_of(item: dict) -> str:
 
 def _collapse(
     rows: list, resolved: dict[str, str] | None = None
-) -> tuple[tuple[CheckRow, ...], int]:
+) -> tuple[tuple[CheckRow, ...], int, tuple[str, ...]]:
     """Fold raw rows into one :class:`CheckRow` per identity, newest per name.
 
-    Returns the rows and how many raw rows were folded. Deduping is DATA, not a
+    Returns the rows, how many raw rows were folded, and the names of the rows
+    whose bucket is a choice because an undated duplicate disagreed with them --
+    the caller turns those into a note on the reading. Deduping is DATA, not a
     judgment: a re-run leaves both the old row and the new one on the board, so a
     tally over raw rows counts a superseded attempt as a current one. Recency is
     the arbiter in both directions -- a re-run green supersedes a stale red and a
@@ -921,13 +925,14 @@ def _collapse(
     so a string compare picks the newer row.
 
     Recency may arbitrate only where one identity means one lane. Two rows of one
-    workflow are that; two rows whose workflow could not be resolved are not, and
-    neither are a check run and a commit status sharing a name, so those take the
-    conservative path below rather than letting the later row stand for the earlier
-    one.
+    workflow are that; two rows from different runs whose workflow could not be
+    resolved are not, so those take the conservative path below rather than letting
+    the later row stand for the earlier one. A check run and a commit status sharing
+    a name never share a key: :func:`_family_of` is part of it, so they stay two rows.
     """
     per_key: dict[tuple[str, str, str], CheckRow] = {}
     unordered: set[tuple[str, str, str]] = set()
+    undated: set[tuple[str, str, str]] = set()
     runs: dict[tuple[str, str, str], str] = {}
     seen = 0
     for item in rows:
@@ -958,16 +963,17 @@ def _collapse(
             if started >= previous.started_at:
                 per_key[key] = CheckRow(qualified, bare, bucket, started)
             continue
-        # Recency cannot arbitrate -- neither row is dated, or the identity is not
-        # known to be one lane. Keep the more conservative bucket and say the row is
-        # a choice rather than a reading.
+        # Recency cannot arbitrate -- either row is undated, or the identity is not
+        # known to be one lane. Keep the more conservative bucket. Where the rows
+        # disagree on an identity that IS one lane, the kept bucket is a choice
+        # rather than a reading, so it is recorded for the reading's note; the
+        # unresolved-identity case already has its own note from the caller.
+        if bucket != previous.bucket:
+            undated.add(key)
         if _UNDATED_RANK.get(bucket, 0) > _UNDATED_RANK.get(previous.bucket, 0):
             per_key[key] = CheckRow(qualified, bare, bucket, started or previous.started_at)
-        else:
-            per_key[key] = CheckRow(
-                previous.name, previous.bare, previous.bucket, previous.started_at
-            )
-    return tuple(per_key.values()), seen
+    chosen = tuple(sorted(per_key[key].name for key in undated - unordered))
+    return tuple(per_key.values()), seen, chosen
 
 
 def _remarks(data: dict, clock: float) -> tuple[tuple[Remark, ...], int]:
@@ -1250,7 +1256,14 @@ def fetch(message: object, *, budget_secs: float = _TICK_BUDGET_SECS) -> PrObser
     status_rows, status_declared, statuses_ok, status_note = _fetch_statuses(transport, repo, head)
     if status_note:
         incomplete.append(status_note)
-    checks, folded = _collapse([*check_rows, *status_rows], workflows)
+    checks, folded, chosen = _collapse([*check_rows, *status_rows], workflows)
+    if chosen:
+        # Every row was read, so the board is complete; what is short is the
+        # ordering. The bucket kept is the conservative one, and the note says it
+        # was chosen rather than read.
+        incomplete.append(
+            "undated duplicate checks, kept the more conservative bucket: " + ", ".join(chosen)
+        )
     return observation(
         STATUS_PARTIAL if incomplete else STATUS_OK,
         tuple(incomplete),

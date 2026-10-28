@@ -7,6 +7,7 @@ import ErrorNotice from './ErrorNotice'
 import { InAppUpdateFlow } from '../pages/settings/AboutPanel'
 import { updateInfoQuery } from '../api/updateInfoQuery'
 import { failedWithNoData } from '../api/queryState'
+import { useIsPolicyGoverned } from '../utils/updateSwitches'
 import { Download, X, Copy, Check } from 'lucide-react'
 
 import { api, ApiError } from '../api/client'
@@ -85,7 +86,7 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
   const { data: desktop } = useQuery<UpdateState | null>({
     queryKey: ['update-state'],
     queryFn: () => null,
-    enabled: false, // populated by useUpdateSubscription (App.tsx)
+    enabled: false, // populated by useUpdateSubscription (shell/appShell.tsx)
     staleTime: Infinity,
   })
 
@@ -99,6 +100,9 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
   const gwCommand = useAppSelector(s => s.dashboard.status?.update_command) || ''
   const gwRequired = useAppSelector(s => s.dashboard.status?.update_required === true)
   const gwMinVersion = useAppSelector(s => s.dashboard.status?.update_min_version) || ''
+  // True when the policy provider governs this bundled install.
+  // Read from the main-process-confirmed update-state (useIsPolicyGoverned).
+  const gwPolicyManaged = useIsPolicyGoverned()
 
   // When the user enabled background auto-download, the Electron main process
   // starts the download itself right after `found` — a consent popup whose
@@ -139,14 +143,15 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
     || (infoQ.data !== undefined && infoQ.errorUpdatedAt > infoQ.dataUpdatedAt)
 
   // Desktop first: when the dashboard runs inside the desktop app the gateway
-  // defers its own check (`managed_by_app`), so the two cannot both report —
-  // this ordering is belt-and-braces for the transition frame, not a policy.
+  // defers its own check (`managed_by_app`), so the two cannot both report.
+  // When a security policy provider governs the install, the Electron feed lane
+  // stands down (feed-lane.js), so the desktop candidate is skipped here too.
   // Candidacy waits for a read finished since this build was found (or for it
   // to fail), otherwise the popup opens for a frame on a stale preference and
   // then vanishes when the current one lands.
   const preferenceSettled = foundKey !== null && readForKey === foundKey && (bridgeInfo !== undefined || preferenceUnread)
   let candidate: Candidate | null = null
-  if (desktop && buildFound && !desktop.replayed && desktop.version && desktopCanDownload() && preferenceSettled && (preferenceUnread || bridgeInfo?.autoDownload !== true)) {
+  if (!gwPolicyManaged && desktop && buildFound && !desktop.replayed && desktop.version && desktopCanDownload() && preferenceSettled && (preferenceUnread || bridgeInfo?.autoDownload !== true)) {
     // Desktop-reported version never crosses the gateway, so the fold is
     // computed locally, keyed on the followed channel like the backend's.
     candidate = {
@@ -434,7 +439,7 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
     // dismiss needs no role; Escape covers keyboard dismissal.
     //
     // z-[65]: this modal renders inside the App shell's `relative z-[1]` root
-    // (NOT portaled to document.body like Modal), so it must sit above every
+    // (NOT portaled to the body-level overlay root like Modal), so it must sit above every
     // chat-page layer it would otherwise paint under -- the sessions flyout
     // (z-[59]), its drawer morph (z-[60]), the focus-peek rail toggle (z-[61])
     // and the focus-mode rail (inline z 62/63) -- and below the shell's z-[70]
@@ -514,11 +519,7 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
             <ErrorNotice variant="inline" className="mt-2" message={i18nT('pages.settings.aboutPanel.auto_download_unreadable')}
               askAgent={!required} onHandoff={required ? undefined : () => setHandedOffVersion(candidate.version)}
               testId="update-found-preference-error" />
-          ) : (
-            <p className="mt-2 text-[12px] text-muted">
-              {i18nT('components.updateFoundModal.nothing_downloads_until_you_choose_to')}
-            </p>
-          ))}
+          ) : null)}
           {candidate.source === 'gateway' && candidate.affordance === 'arm' && (
             <div className="mt-2">
               <InAppUpdateFlow

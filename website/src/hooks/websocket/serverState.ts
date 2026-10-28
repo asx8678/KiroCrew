@@ -14,12 +14,16 @@ import { api } from '../../api/client'
 // do not export ApiError, and an `instanceof` against a missing mock export
 // throws inside the reconnect heal's own catch.
 import { ApiError } from '../../api/apiError'
+import { refreshDashboardReads } from '../../api/dashboardRefresh'
 import { forgetUnobservedMemberThreads, MEMBERS_ROSTER_QUERY_KEY, MEMBER_PROJECTIONS_QUERY_PREFIX } from '../../api/membersQuery'
 import { memberProjectionStore } from '../../state/memberProjectionStore'
 import { threadLiveStore, type ThreadReplyFrame } from '../../state/threadLiveStore'
 import { threadQueryKey, threadsQueryKey } from '../../api/threads'
 import { applyStatusDelta, parseStatusDelta } from '../../utils/pullRequestStatusDelta'
+import { GUIDE_PENDING_QUERY_KEY } from '../../api/guide'
+import { CHANGE_CARDS_QUERY_PREFIX } from '../../api/cards'
 import { slotChangeUrls } from '../../utils/pullRequestLinks'
+import { dashboardSessionKey, SESSION_CONTROL_STATUS_KEY } from '../useSessionControls'
 import type { ChatSlot, PullRequestStatusBatch } from '../../types'
 import { emitArtifactDeleted } from './browserEvents'
 import type { FrameData } from './frames'
@@ -62,51 +66,168 @@ export async function healRedactionSwitchAfterReconnect(qc: QueryClient): Promis
   if (moved || unknownAndNowOn) purgeDocumentBodiesForRedactionChange(qc)
 }
 
-/**
- * Invalidate React Query caches for keys that previously relied on the
- * `refreshTrigger` counter being part of their queryKey.  Calling
- * `invalidateQueries` refetches **in-place** (keeping the cached data visible
- * to the UI) instead of minting a brand-new cache entry with `undefined` data
- * — which is what caused the flash-to-empty bug (#4132, #4179).
- */
-export function invalidateRefreshQueries(qc: QueryClient): void {
-  qc.invalidateQueries({ queryKey: ['cron-jobs'] })
-  // Prefix match on purpose: `['crons', 'crew-wake', <crew>]` caches the one global cron
-  // payload once per crewmate whose schedules pane has been opened (the crew editor's and
-  // the Crewmates panel's). Invalidating only `['cron-jobs']` refreshed the Schedule page
-  // and left every one of those entries stale, so a schedule changed anywhere else kept
-  // its old status under each crewmate until that entry happened to refetch.
-  qc.invalidateQueries({ queryKey: ['crons'] })
-  qc.invalidateQueries({ queryKey: ['cron-history-all'] })
-  qc.invalidateQueries({ queryKey: ['spawn-list'] })
-  qc.invalidateQueries({ queryKey: ['sessions-context'] })
-  qc.invalidateQueries({ queryKey: ['sessions-usage'] })
-  qc.invalidateQueries({ queryKey: ['agents-installed'] })
-  qc.invalidateQueries({ queryKey: ['mcp-tools'] })
-  // Prefix match on purpose: the Crew Members roster lives under this key
-  // (api/membersQuery.ts) and refreshes with the registry.
-  qc.invalidateQueries({ queryKey: ['kirocrew-agents'] })
-  qc.invalidateQueries({ queryKey: ['default-agent'] })
-  qc.invalidateQueries({ queryKey: ['workspaces'] })
-  qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+interface RefreshTarget {
+  queryKey: readonly unknown[]
+  exact?: boolean
+}
+
+// Prefix match on purpose: `['crons', 'crew-wake', <crew>]` caches the one global cron
+// payload once per crewmate whose schedules pane has been opened (the crew editor's and
+// the Crewmates panel's). Invalidating only `['cron-jobs']` refreshed the Schedule page
+// and left every one of those entries stale, so a schedule changed anywhere else kept
+// its old status under each crewmate until that entry happened to refetch.
+const CRON_TARGETS: readonly RefreshTarget[] = [
+  { queryKey: ['cron-jobs'] },
+  { queryKey: ['crons'] },
+  { queryKey: ['cron-history-all'] },
+]
+
+// A default-template write is pushed as an "agents" refresh, so the roster
+// re-reads its "Default custom agent" row marker. Each row's `used_by` also
+// lists the schedules that reference the template, and a cron edit or delete
+// is pushed as `crons`. Exact on the roster: a template's detail carries
+// neither and need not refetch on every frame.
+const TEMPLATES_TARGET: RefreshTarget = { queryKey: ['agent-templates'], exact: true }
+
+
+// Prefix match on purpose: the Crew Members roster, its member projections and
+// briefings live under this key (api/membersQuery.ts) and refresh with the
+// registry.
+const CREW_TARGET: RefreshTarget = { queryKey: ['kirocrew-agents'] }
+
+// Prefix match on purpose: covers the filtered library list
+// (['artifacts', {tag, kind}]) and the tag-options read
+// (['artifacts', 'all-tags']) in one shot. The `artifact_update` frame
+// heals these on live mutations. The folder list fails alongside it under the
+// same trigger (an auth-expired window 403s every endpoint) and renders `?? []`
+// the same way, so both are healed together (#10867).
+const ARTIFACT_TARGETS: readonly RefreshTarget[] = [
+  { queryKey: ['artifacts'] },
+  { queryKey: ['artifact-folders'] },
+]
+
+/** Every cache a `refresh` frame can make stale. */
+const ALL_TARGETS: readonly RefreshTarget[] = [
+  ...CRON_TARGETS,
+  { queryKey: ['agents-installed'] },
+  CREW_TARGET,
+  { queryKey: ['default-agent'] },
+  TEMPLATES_TARGET,
+  { queryKey: ['workspaces'] },
+  { queryKey: ['kirocrewConfig'] },
   // These answers derive from the config AND, for an `auto` default, the
   // installed agent spec rebuilt by the server's config applier. A refresh
   // frame is emitted only after that applier completes, so invalidate the
   // infinite-stale caches here rather than relying solely on a changed config
   // value to mint a new key. This also covers external/CLI config writes.
-  qc.invalidateQueries({ queryKey: ['resolved-model'] })
-  qc.invalidateQueries({ queryKey: ['agent-resolved-model'] })
-  // Prefix match on purpose: covers the filtered library list
-  // (['artifacts', {tag, kind}]) and the tag-options read
-  // (['artifacts', 'all-tags']) in one shot. The `artifact_update` frame
-  // already heals these on live mutations; this covers the server's generic
-  // refresh broadcast so an errored or stale list recovers without a reload
-  // (#10867).
-  qc.invalidateQueries({ queryKey: ['artifacts'] })
-  // The folder list fails alongside it under the same trigger (an
-  // auth-expired window 403s every endpoint) and renders `?? []` the same
-  // way — heal both or the library recovers half-empty (#10867).
-  qc.invalidateQueries({ queryKey: ['artifact-folders'] })
+  { queryKey: ['resolved-model'] },
+  { queryKey: ['agent-resolved-model'] },
+  ...ARTIFACT_TARGETS,
+]
+
+/** The cron kinds, each with the only caches its writers change. `crons` and
+ *  `cron_history` are pushed on every cron edit and at the start and end of
+ *  every run, and re-reading all of `ALL_TARGETS` for them refetched every
+ *  observed config and registry read several times a minute on a cron-heavy
+ *  install. Every cron writer runs in the gateway and announces itself.
+ *
+ *  Every other kind invalidates everything, and so do a kind this client does
+ *  not know and a frame with no kinds. That includes `history`, pushed at the
+ *  end of a turn: a turn can write config, workspaces and crewmate pins
+ *  through an agent tool or a shell, and nothing else announces those writes,
+ *  so the turn-end frame is what refreshes them. */
+const NARROW_KINDS: Readonly<Record<string, readonly RefreshTarget[]>> = {
+  crons: [...CRON_TARGETS, TEMPLATES_TARGET],
+  cron_history: CRON_TARGETS,
+}
+
+const sameTarget = (a: RefreshTarget, b: RefreshTarget) =>
+  a.exact === b.exact && a.queryKey.length === b.queryKey.length && a.queryKey.every((k, i) => k === b.queryKey[i])
+
+/** How long the cron caches wait after a turn-end frame before they re-read.
+ *  A `history` frame ends every turn on every session, and on a busy install
+ *  that is many a minute; each one re-read the whole job list (twice, with the
+ *  Schedule page open), which is a large read when jobs carry long results.
+ *  A turn writes a job through the gateway's own cron tools, which announce
+ *  `crons` and refetch at once; only a write from an agent's shell (the CLI)
+ *  goes unannounced, and the turn-end frame is still what picks that up -- at
+ *  most once per this window, however many turns end in it. */
+export const TURN_END_CRON_REFRESH_MS = 15_000
+
+let turnEndCronTimer: ReturnType<typeof setTimeout> | null = null
+let turnEndCronClient: QueryClient | null = null
+let turnEndCronNotify: (() => void) | undefined
+
+/** Test seam: drop a pending turn-end cron refresh. */
+export function __resetTurnEndCronRefreshForTests(): void {
+  if (turnEndCronTimer !== null) clearTimeout(turnEndCronTimer)
+  turnEndCronTimer = null
+  turnEndCronClient = null
+  turnEndCronNotify = undefined
+}
+
+/** Re-read the cron caches once the window ends. Later frames inside the
+ *  window join the pending refresh rather than restart it, so a steady stream
+ *  of turns cannot hold the refresh off. */
+function scheduleTurnEndCronRefresh(qc: QueryClient, onCronsStale?: () => void): void {
+  turnEndCronClient = qc
+  turnEndCronNotify = onCronsStale
+  if (turnEndCronTimer !== null) return
+  turnEndCronTimer = setTimeout(() => {
+    const client = turnEndCronClient
+    const notify = turnEndCronNotify
+    turnEndCronTimer = null
+    turnEndCronClient = null
+    turnEndCronNotify = undefined
+    if (client) for (const target of CRON_TARGETS) client.invalidateQueries(target)
+    notify?.()
+  }, TURN_END_CRON_REFRESH_MS)
+}
+
+const isTurnEndOnly = (kinds?: readonly string[]) => !!kinds?.length && kinds.every(kind => kind === 'history')
+
+/**
+ * Invalidate the React Query caches a `refresh` frame names in `kinds`
+ * (every cache, see `NARROW_KINDS`, when it names none or one outside that
+ * table). These keys previously relied on the `refreshTrigger` counter being
+ * part of their queryKey. Calling `invalidateQueries` refetches **in-place**
+ * (keeping the cached data visible to the UI) instead of minting a brand-new
+ * cache entry with `undefined` data — which is what caused the
+ * flash-to-empty bug (#4132, #4179).
+ *
+ * A narrow frame still refetches any listed cache whose last read FAILED:
+ * every refresh frame is a sign the gateway answers again, and an errored list
+ * (the artifact library after an auth-expired window, #10867) would otherwise
+ * stay empty until its own kind is pushed.
+ *
+ * A frame that names only `history` refreshes everything but the cron caches
+ * at once, and those once per `TURN_END_CRON_REFRESH_MS` (an errored one at
+ * once, as above). `onCronsStale` is called whenever the cron caches are
+ * re-read, now or when that window ends, for a reader that holds the job list
+ * outside React Query (the Schedule page).
+ */
+export function invalidateRefreshQueries(qc: QueryClient, kinds?: readonly string[], onCronsStale?: () => void): void {
+  const narrow = !!kinds?.length && kinds.every(kind => Object.prototype.hasOwnProperty.call(NARROW_KINDS, kind))
+  if (!narrow) {
+    const turnEnd = isTurnEndOnly(kinds)
+    for (const target of ALL_TARGETS) {
+      if (turnEnd && CRON_TARGETS.includes(target)) {
+        qc.invalidateQueries({ ...target, predicate: query => query.state.status === 'error' })
+      } else {
+        qc.invalidateQueries(target)
+      }
+    }
+    if (turnEnd) scheduleTurnEndCronRefresh(qc, onCronsStale)
+    else onCronsStale?.()
+    return
+  }
+  // Every narrow kind names the cron caches.
+  const named = kinds.flatMap(kind => NARROW_KINDS[kind])
+  for (const target of ALL_TARGETS) {
+    if (named.some(t => sameTarget(t, target))) qc.invalidateQueries(target)
+    else qc.invalidateQueries({ ...target, predicate: query => query.state.status === 'error' })
+  }
+  onCronsStale?.()
 }
 
 /** Reconnect: re-read the caches whose one-shot frames may have been missed
@@ -157,6 +278,10 @@ export function refreshServerStateAfterReconnect(queryClient: QueryClient): void
   threadLiveStore.reset()
   queryClient.invalidateQueries({ queryKey: ['chat-thread'] })
   queryClient.invalidateQueries({ queryKey: ['chat-threads'] })
+  // A guide frame missed while the socket was down is recovered by re-reading.
+  queryClient.invalidateQueries({ queryKey: GUIDE_PENDING_QUERY_KEY })
+  // Same for a change-card frame: every slot's cards are re-read.
+  queryClient.invalidateQueries({ queryKey: CHANGE_CARDS_QUERY_PREFIX })
   // A dropped socket is the one client-visible sign the gateway may have
   // restarted — and a restart drops an unmessaged member slot while its
   // binding survives. The Crew Members page mounts a cached thread key
@@ -239,6 +364,45 @@ export function handleMemberProjection(data: FrameData): void {
   const pf = (data ?? {}) as { slug?: unknown; key?: unknown; seq?: unknown; value?: unknown }
   if (typeof pf.slug === 'string' && pf.slug && typeof pf.key === 'string' && pf.key && typeof pf.seq === 'number') {
     memberProjectionStore.apply(pf.slug, pf.key, pf.value, pf.seq)
+  }
+}
+
+/** The query key prefix every open Dashboard tab reads under. Slug-only, so a
+ *  frame carrying no crew name still reaches `['member-dashboard', slug, member]`
+ *  -- the refetch re-asks the server, which re-checks ownership. */
+export const MEMBER_DASHBOARD_QUERY_PREFIX = 'member-dashboard'
+
+/** The query key prefix a root session's Dashboard Overview reads under. */
+export const SESSION_DASHBOARD_QUERY_PREFIX = 'session-dashboard'
+
+/** A crewmate's dashboard moved, so an open tab must re-read it.
+ *
+ *  Two frames reach here and both mean the same thing to this tab. A
+ *  `dashboard_value_written` is the crewmate filling one of its own agentic
+ *  fields. A `member_projection` is a FOLD advancing, which is where every other
+ *  number on the page comes from. The tab's read sets no finite staleTime (the
+ *  client's default is freshness-by-push), so without this a dashboard opened at
+ *  the start of a long turn still shows the numbers it had then -- which is the
+ *  one thing a live project report must not do.
+ *
+ *  Invalidate rather than write a value in: the page is composed server-side with
+ *  its data island, its agentic marks and its missing cells already decided, so there
+ *  is no client-side shape to patch. */
+export function handleDashboardMoved(queryClient: QueryClient, data: FrameData): void {
+  const frame = (data ?? {}) as { slug?: unknown; slot?: unknown }
+  const slug = String(frame.slug || '')
+  // A busy crewmate sends these faster than one read takes, so the re-read goes
+  // through `refreshDashboardReads`, which keeps one read per open dashboard out at
+  // a time. A read per frame would pile up on the gateway, each one computed in full
+  // whether or not anyone still waits for it.
+  if (slug) {
+    refreshDashboardReads(queryClient, [MEMBER_DASHBOARD_QUERY_PREFIX, slug])
+  }
+  // A ROOT session's own page is named by its slot: its store key is a digest no
+  // client can match, so the gateway's frame carries the slot instead.
+  const slot = String(frame.slot || '')
+  if (slot) {
+    refreshDashboardReads(queryClient, [SESSION_DASHBOARD_QUERY_PREFIX, slot])
   }
 }
 
@@ -327,7 +491,7 @@ export function handleSourceStatus(dispatch: AppDispatch, queryClient: QueryClie
   // that only touched the query caches would leave the sidebar glyph
   // stale until an unrelated slots broadcast — the same chip↔panel
   // divergence this feature removes, recreated on the sidebar.
-  dispatch(patchSlotSourceLinks({ url: delta.url, state: delta.state, ci: delta.ci }))
+  dispatch(patchSlotSourceLinks({ url: delta.url, state: delta.state, ci: delta.ci, ciPending: delta.ciPending }))
   // Invalidate the detail payload for EVERY changed delta, regardless
   // of origin. A 'detail'-origin delta is produced by one window's full
   // fetch; only that window received the fresh HTTP payload, so other
@@ -339,6 +503,22 @@ export function handleSourceStatus(dispatch: AppDispatch, queryClient: QueryClie
   // delta), so there is no feedback loop.
   queryClient.invalidateQueries({ queryKey: ['pull-request-source', delta.url] })
   queryClient.invalidateQueries({ queryKey: ['pull-request-checks', delta.url] })
+}
+
+/** A finished turn re-asks the session's app-contributed control statuses.
+ *  The agent most often changes what a chip reports during a turn, and the
+ *  probes otherwise re-ask only when a control's popover closes (#10909).
+ *  Only probes of THIS session match. The composer shows the active chat
+ *  only, so the ACTIVE slot refetches its mounted probes now; a background
+ *  slot's are just marked stale, to be re-asked when the user switches to it
+ *  (the same split `refreshPullRequestsAfterTurn` below makes). */
+export function refreshSessionControlStatusesAfterTurn(queryClient: QueryClient, slot: string, isActive: boolean): void {
+  const sessionKey = dashboardSessionKey(slot)
+  if (!sessionKey) return
+  void queryClient.invalidateQueries({
+    queryKey: [SESSION_CONTROL_STATUS_KEY, sessionKey],
+    refetchType: isActive ? 'active' : 'none',
+  })
 }
 
 /** Turn boundary: the finished turn is the likeliest moment for this

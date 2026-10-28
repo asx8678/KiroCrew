@@ -105,13 +105,14 @@ members do not create unbounded native work.
 Private V2 execution requires `agent.sandbox=auto` and working Linux/WSL namespaces
 or macOS outer Seatbelt. Native Windows, unconfined execution, unsupported MCP
 backends and Kiro internal delegation refuse private member turns with a reason.
-The owner can still manage memory in the dashboard. Existing members, including
-the default assistant selection, keep their declared V1 memory after upgrading.
-To opt in, open Crew Manager, select the member, open **Workspace · Memory**, and
-choose **Create private memory**. The new V2 store starts empty; previous V1
-stores remain available for an explicit copy of selected starting knowledge.
-Check the execution requirements above before choosing V2. New members receive
-V2 automatically, and an existing V2 member never falls back to V1 on failure.
+The owner can still manage memory in the dashboard. A member's memory store is
+chosen when the member is created and cannot be rebound afterwards. Existing
+members, including the default assistant selection, keep their declared V1
+memory after upgrading. To give a crewmate private V2 memory, create a new crew
+member: new members receive V2 automatically, starting empty, and V1 stores
+remain available for an explicit copy of selected starting knowledge. Check the
+execution requirements above first. A V2 member never falls back to V1 on
+failure.
 
 ## Install paths
 
@@ -320,7 +321,10 @@ Both targets bootstrap their toolchain first (`ensure-node.sh`,
 `ensure-python.sh`) and fall back to whatever is on `PATH` if that fails. The
 backend target refuses to build a venv from an interpreter older than 3.12,
 matching `pyproject.toml`'s `requires-python`, rather than letting dependency
-resolution backtrack or the package fail at import.
+resolution backtrack or the package fail at import. `ensure-python.sh` also
+skips any interpreter whose throwaway `--without-pip` venv cannot run python,
+such as a shared-libpython build behind a launcher wrapper (Toolbox's kirocrew
+Python), and moves on to the next candidate or mise.
 
 `make.ps1` resolves the same toolchain but installs none of it: the bootstrap
 scripts' install paths are `curl … | sh`, so on Windows it searches (`py`
@@ -423,7 +427,7 @@ command installed on `PATH`.
 Optional extras. Kiro Crew is not on PyPI, so `pip install "kirocrew[voice]"`
 cannot resolve — install an extra's own distributions into the environment that
 runs the gateway instead (e.g. `pip install 'boto3>=1.34,<2'
-'amazon-transcribe>=0.6,<1' 'pywhispercpp>=1.5,<2'` for `voice`). The dashboard
+'amazon-transcribe>=0.6.3,<1' 'pywhispercpp>=1.5,<2'` for `voice`). The dashboard
 prints the exact command, already pointed at the right interpreter.
 
 | Extra | Adds | For |
@@ -469,8 +473,9 @@ and the three Linux formats come from one backend tree packaged three times.
 The published, signed apps ([prebuilt downloads](../../README.md#app-downloads))
 update themselves, and the gateway bundled inside them, through the
 app's own updater. By default a new release downloads in the background and
-installs the next time you quit the app (closing the window only hides it to
-the tray; quit from the tray or the menu bar). To be asked first, turn off
+installs the next time you quit the app (by default closing the window only hides
+it to the tray; quit from the tray or the menu bar, or turn off **Keep running in the background
+after closing the window** in Settings → Display → View → Desktop app so the close button quits). To be asked first, turn off
 **Install app updates automatically** on the About page (an **Update the gateway
 automatically** switch beside it sets only an attached gateway's `auto_update`); the app then offers each release and
 downloads it when you click Download, in the update popup or on the About page.
@@ -551,7 +556,11 @@ Linux, `.\make.ps1 <target>` on Windows.
 | `make clean` | Remove build artifacts, dists, and caches |
 
 Override the Python interpreter with `make PY=python3.12 build`, or
-`.\make.ps1 build -Py C:\path\to\python.exe`.
+`.\make.ps1 build -Py C:\path\to\python.exe`. Either one takes precedence over
+the `<data-home>/python-bin` marker `ensure-python.sh` records; a `PY` exported
+in the environment does not, so the marker still wins over it.
+
+`make wheel`, `make backend-bin` and `make desktop` take `EDITION=oss` or `EDITION=enterprise`, stamped into the built package's `kiro_crew/edition.py`. Only `EDITION=` on the `make` command line counts; an exported shell `EDITION` is ignored, even under `make -e`. Without it, the value comes from the `KIROCREW_BUILD_EDITION` environment variable, and then defaults to `oss`. Both set to different values, or any other value (wildcards such as `%` included), fails the build before it starts. On Windows, set `KIROCREW_BUILD_EDITION` before `.\make.ps1`. See [platform-context](../system-specs/modules/platform-context.md#build-time-edition-constant).
 
 Both desktop targets run `packaging/build-desktop.sh` on every platform,
 including Windows, where `make.ps1` invokes it through the Git for Windows bash:
@@ -563,17 +572,32 @@ app" interstitial.
 
 ## First run
 
-After a source, one-line, wheel or Docker install, install Kiro CLI from
+After any install, the desktop app included, install Kiro CLI from
 <https://kiro.dev/cli/> and sign in for the default agent:
 
 ```bash
 kiro-cli login
 ```
 
-The desktop app bundles its own kiro-cli by default (`BUNDLE_KIRO_CLI=1` at
-build time). That copy is not on your shell `PATH`, so the **Set up Kiro** page
-serves the login command with the bundled binary's absolute path; run that
-command instead of a bare `kiro-cli login`.
+The desktop app does not carry its own kiro-cli: it detects the one you
+installed, and the **Set up Kiro** page shows the install and sign-in commands
+until it finds one. (A build made with `BUNDLE_KIRO_CLI=1` stages a copy inside
+the app; that copy is not on your shell `PATH`, so the page then serves the
+login command with the bundled binary's absolute path.) If you updated from a
+version that included kiro-cli and never installed your own, install it from
+<https://kiro.dev/cli/>; your sign-in carries over, since both copies read the
+same account store.
+
+The built-in KAS engine is an alternative that needs no Kiro CLI. It is in
+shadow testing: the switch is off by default on every platform and nothing turns
+it on for you. From a source install, `bash install.sh --kas` downloads the
+engine version this release pins; after any other install, `kirocrew kas
+install` does the same. The desktop app ships that engine inside the app
+(`BUNDLE_KAS=1` at build time), so there is nothing to download. To try the
+route, turn on **Run KAS on Kiro Crew's own engine** under Settings → Developer →
+Feature Previews (or `kirocrew config set agent.kas_bundle true`) and restart; you
+then sign in from the **Kiro sign-in** card on Settings → Agent Harness → KAS, and
+`kiro-cli login` is not used.
 
 Then start Kiro Crew:
 
@@ -774,7 +798,9 @@ On Linux this writes `/etc/systemd/system/kirocrew.service` (sudo is prompted
 for the unit file and the `systemctl` calls; the gateway itself runs as your own
 user, never under sudo). When you are already root — a minimal container or
 `root` login — no `sudo` binary is required. On macOS it writes a launchd plist
-and needs no sudo.
+and needs no sudo. That plist is a per-user LaunchAgent, so on a Mac the gateway
+starts when you log in, not at boot; see
+[The gateway does not start after a reboot until someone logs in](macos-troubleshooting.md#the-gateway-does-not-start-after-a-reboot-until-someone-logs-in).
 
 The gateway runs untrusted agent tools, so it must run as a **non-root** user:
 the installer sets `User=` to the account behind `sudo` (`$SUDO_USER`, else
@@ -846,6 +872,32 @@ preferring user units at install time. Installing kirocrew onto a system-labelle
 path such as `/usr/local/bin` also avoids the problem.
 
 [#10813]: https://github.com/kirodotdev/KiroCrew/issues/10813
+
+### SELinux labels on files the service writes
+
+On an SELinux host (enforcing or permissive) the system unit can carry a
+`SELinuxContext=` line set to the context of the shell that ran
+`kirocrew service install`, for example
+`unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023`. A new file takes its
+SELinux user from the process that creates it, so without that line the gateway
+runs as `system_u` and every cache it writes under your home (`~/.npm/_cacache`,
+`~/.gradle`, `~/.cache/pip`) is labelled `system_u`. Your own shell is then
+refused hardlinks inside it, which npm reports as `EPERM` / `syscall link` and
+"root-owned files" even though ownership is correct.
+
+The line is written only when the loaded policy says the unit still starts with
+it: PID 1 may switch into that context, and the context may start the kirocrew
+binary (and the interpreter its shebang names). Otherwise it is left out and the
+unit runs exactly as before (the reason is logged at INFO). On
+AL2023's targeted policy, for example, a kirocrew under
+`/usr/local/bin` (`bin_t`) gets the line, while one under `~/.local/bin`
+(`home_bin_t`) does not and keeps the `system_u` caches; the per-user unit above
+avoids them there. The line is also left out when SELinux is off, when the
+context cannot be read, and when the installing shell is itself `system_u`.
+
+A unit installed by an earlier build has no such line: re-run
+`kirocrew service install`, then fix an already-poisoned cache with
+`restorecon -RF ~/.npm` (or delete it).
 
 ### Setting the service port
 

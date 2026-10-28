@@ -1,8 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, act } from '@testing-library/react'
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
 import FollowUpBar, { FOLLOWUP_CHIP_DEBOUNCE_MS } from '../components/FollowUpBar'
+import { readIndexCss } from './indexCssSource'
 
 // jsdom polyfill: scroll-layout uses ResizeObserver to track when the chip
 // strip can scroll left/right.
@@ -263,6 +262,68 @@ describe('FollowUpBar', () => {
     })
   })
 
+  // ─── Single-select [OPTION:] rows: tooltip must not promise multi-select ──
+  // A single-select pick REPLACES the previous one, so "Shift+Click to select
+  // multiple" / "Click to add to selection" would describe a gesture whose
+  // result is silently dropped.
+  describe('quickSend tooltip wording by selection mode', () => {
+    const tipFor = (label: string) => {
+      fireEvent.focus(screen.getByRole('button', { name: label }))
+      return screen.getByRole('tooltip').textContent ?? ''
+    }
+
+    it('single-select with no picks says Shift+Click adds without sending', () => {
+      render(<FollowUpBar options={['Deploy']} picked={new Set()} onSelect={() => {}} onSend={() => {}} quickSend multi={false} />)
+      const tip = tipFor('Deploy')
+      expect(tip).toContain('Click to send instantly, Shift+Click to add to the message without sending')
+      expect(tip).not.toMatch(/select multiple/i)
+    })
+
+    it('single-select with a pick says the click replaces the selection', () => {
+      render(<FollowUpBar options={['Roll back']} picked={new Set(['Deploy'])} onSelect={() => {}} onSend={() => {}} quickSend multi={false} />)
+      const tip = tipFor('Roll back')
+      expect(tip).toContain('Click to replace selection')
+      expect(tip).not.toMatch(/add to selection/i)
+    })
+
+    it('multi omitted keeps the multi-select wording (control)', () => {
+      const { unmount } = render(<FollowUpBar options={['Deploy']} picked={new Set()} onSelect={() => {}} onSend={() => {}} quickSend />)
+      expect(tipFor('Deploy')).toContain('Shift+Click to select multiple')
+      unmount()
+      render(<FollowUpBar options={['Roll back']} picked={new Set(['Deploy'])} onSelect={() => {}} onSend={() => {}} quickSend />)
+      expect(tipFor('Roll back')).toContain('Click to add to selection')
+    })
+  })
+
+  // ─── Quick Send off: a single-select pick still REPLACES ─────────────────
+  // selectSingleFollowUpOption swaps the pick whether or not Quick Send is on,
+  // so "Click to add to input" would promise an add that never happens.
+  describe('non-quickSend tooltip wording by selection mode', () => {
+    const tipFor = (label: string) => {
+      fireEvent.focus(screen.getByRole('button', { name: label }))
+      return screen.getByRole('tooltip').textContent ?? ''
+    }
+
+    it('single-select with a pick and onSend says the click replaces (double-click sends)', () => {
+      render(<FollowUpBar options={['Roll back']} picked={new Set(['Deploy'])} onSelect={() => {}} onSend={() => {}} multi={false} />)
+      const tip = tipFor('Roll back')
+      expect(tip).toContain('Click to replace selection (double-click to send)')
+      expect(tip).not.toMatch(/add to input/i)
+    })
+
+    it('single-select with a pick and no onSend says the click replaces', () => {
+      render(<FollowUpBar options={['Roll back']} picked={new Set(['Deploy'])} onSelect={() => {}} multi={false} />)
+      const tip = tipFor('Roll back')
+      expect(tip).toContain('Click to replace selection')
+      expect(tip).not.toMatch(/add to input/i)
+    })
+
+    it('multi omitted with a pick keeps the add-to-input wording (control)', () => {
+      render(<FollowUpBar options={['Roll back']} picked={new Set(['Deploy'])} onSelect={() => {}} onSend={() => {}} />)
+      expect(tipFor('Roll back')).toContain('Click to add to input (double-click to select and send)')
+    })
+  })
+
   // ─── Quick-send instant-send state preserves no-lag UX ───────────────────
   describe('with onSend + quickSend (instant-send state)', () => {
     beforeEach(() => { vi.useFakeTimers() })
@@ -354,7 +415,7 @@ describe('FollowUpBar', () => {
     it('backs the cap class with a real max-width rule', () => {
       // jsdom does not load index.css, so the class assertions above would pass
       // with the rule deleted. Read the stylesheet directly.
-      const css = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf-8')
+      const css = readIndexCss()
       expect(css).toMatch(
         /\.followup-chip\s*\{[^}]*max-width:\s*min\(100%,\s*clamp\(18rem,\s*calc\(50% - 0\.1875rem\),\s*26rem\)\)/,
       )
@@ -372,7 +433,7 @@ describe('FollowUpBar', () => {
     // reshaped rule fails both tests below with this message instead of a
     // TypeError on a null match.
     const chipCapPreferred = (): { pct: number, halfGapRem: number } => {
-      const css = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf-8')
+      const css = readIndexCss()
       const m = css.match(/\.followup-chip\s*\{[^}]*calc\((\d+)% - ([\d.]+)rem\)/)
       expect(m, '.followup-chip must cap width relative to the row (calc(<pct>% - <half-gap>rem))').not.toBeNull()
       return { pct: Number(m![1]), halfGapRem: Number(m![2]) }

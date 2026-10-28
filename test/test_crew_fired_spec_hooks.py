@@ -20,12 +20,21 @@ import kiro_crew.config.paths as paths_mod
 import kiro_crew.hooks as hooks_mod
 from kiro_crew.acp.kas_permissions import kas_tool_match_names
 from kiro_crew.agent_sdk import spec_hooks
-from kiro_crew.agent_sdk.backends import ACP_BACKEND_KAS, ACP_BACKEND_KIRO
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_GOOSE,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
+)
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.hooks import (
     HOOK_EVENT_PRE_TOOL_USE,
     HOOK_EVENT_STOP,
+    HOOK_EVENT_USER_PROMPT_SUBMIT,
     ScriptHook,
     ScriptHookResult,
     ScriptHookStore,
@@ -68,7 +77,9 @@ def _prepare(client, agent, *, is_new=False):
 def notices(monkeypatch) -> list:
     seen: list = []
     monkeypatch.setattr(
-        chat_runner, "append_and_surface", lambda state, slot, role, text, cls: seen.append(text)
+        chat_runner,
+        "append_and_surface",
+        lambda state, slot, role, text, cls, **kw: seen.append(text),
     )
     return seen
 
@@ -107,12 +118,78 @@ def test_an_unreadable_spec_fails_closed(agents_dir, notices):
 
 
 def test_tools_settings_notice_fires_once_per_session(agents_dir, notices):
-    _write_spec(agents_dir, "a1", hooks=_OBJECT_HOOKS, toolsSettings={"shell": {}})
+    _write_spec(
+        agents_dir,
+        "a1",
+        hooks=_OBJECT_HOOKS,
+        toolsSettings={"shell": {"autoAllowReadonly": True}},
+    )
     _prepare(_client(ACP_BACKEND_KAS), "a1", is_new=True)
     _prepare(_client(ACP_BACKEND_KAS), "a1", is_new=False)
     assert len(notices) == 1
-    assert "toolsSettings" in notices[0]
+    assert "toolsSettings.shell.autoAllowReadonly" in notices[0]
     assert "hooks" not in notices[0]
+
+
+def test_translated_tools_settings_raise_no_notice(agents_dir, notices):
+    _write_spec(agents_dir, "a1", toolsSettings={"read": {"deniedPaths": ["~/.ssh"]}})
+    _prepare(_client(ACP_BACKEND_KAS), "a1", is_new=True)
+    assert notices == []
+
+
+def test_a_goose_session_still_hears_that_tools_settings_is_lost(agents_dir, notices):
+    """Only KAS receives the translation; goose fires spec hooks but gets no rules."""
+    _write_spec(agents_dir, "a1", toolsSettings={"read": {"deniedPaths": ["~/.ssh"]}})
+    _prepare(_client(ACP_BACKEND_GOOSE), "a1", is_new=True)
+    assert len(notices) == 1
+    assert "toolsSettings" in notices[0]
+
+
+_PROMPT_AND_STOP_HOOKS = {
+    "stop": [{"command": "done.sh"}],
+    "userPromptSubmit": [{"command": "stamp.sh"}],
+}
+_RUN_NOWHERE = "does not run an agent's hooks"
+
+
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX])
+def test_a_new_session_where_nothing_runs_spec_hooks_names_their_events(
+    backend, agents_dir, notices
+):
+    _write_spec(agents_dir, "a1", hooks=_PROMPT_AND_STOP_HOOKS)
+    assert _prepare(_client(backend), "a1", is_new=True) == ([], False, None)
+    assert len(notices) == 1
+    assert _RUN_NOWHERE in notices[0]
+    assert "a1 has hooks on userPromptSubmit, stop." in notices[0]
+
+
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX])
+def test_the_run_nowhere_notice_needs_a_new_session_and_a_spec_with_hooks(
+    backend, agents_dir, notices
+):
+    _write_spec(agents_dir, "a1", hooks=_PROMPT_AND_STOP_HOOKS)
+    _write_spec(agents_dir, "plain")
+    _prepare(_client(backend), "a1", is_new=False)
+    _prepare(_client(backend), "plain", is_new=True)
+    assert notices == []
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_GOOSE, ACP_BACKEND_OPENCODE, ACP_BACKEND_PI],
+)
+def test_no_run_nowhere_notice_where_spec_hooks_run_or_nothing_is_ruled(
+    backend, agents_dir, notices
+):
+    _write_spec(agents_dir, "a1", hooks=_PROMPT_AND_STOP_HOOKS)
+    _prepare(_client(backend), "a1", is_new=True)
+    assert not any(_RUN_NOWHERE in text for text in notices)
+
+
+def test_an_unreadable_spec_renders_no_run_nowhere_notice(agents_dir, notices):
+    (agents_dir / "a1.json").write_text("{not json", encoding="utf-8")
+    assert _prepare(_client(ACP_BACKEND_CLAUDE), "a1", is_new=True) == ([], False, None)
+    assert notices == []
 
 
 def test_disabled_and_confirm_documents_do_not_run():
@@ -243,6 +320,93 @@ def test_a_spec_pre_tool_use_hook_exit_2_blocks(tmp_path, agents_dir, monkeypatc
     assert Path(results[0].stderr).resolve() == workspace.resolve()
 
 
+def _session_id_probe(tmp_path: Path, out_name: str) -> str:
+    """A hook command that writes its ``KIRO_SESSION_ID`` env and stdin ``acp_session_id``."""
+    script = tmp_path / "probe.py"
+    script.write_text(
+        "import json, os, sys\n"
+        "event = json.load(sys.stdin)\n"
+        "out = sys.argv[1]\n"
+        "with open(out, 'w', encoding='utf-8') as f:\n"
+        "    json.dump({'env': os.environ.get('KIRO_SESSION_ID'),"
+        " 'stdin': event.get('acp_session_id', '<absent>')}, f)\n",
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{script}" "{tmp_path / out_name}"'
+
+
+def test_a_spec_hook_gets_the_acp_session_id_and_a_stored_hook_does_not(tmp_path, monkeypatch):
+    """On KAS a spec hook sees the session id kiro-cli gives it as KIRO_SESSION_ID."""
+    _passthrough_sandbox(monkeypatch)
+    monkeypatch.setattr(hooks_mod, "_script_hooks_capability_denied", lambda sk="": None)
+    monkeypatch.delenv("KIRO_SESSION_ID", raising=False)
+    store = ScriptHookStore(tmp_path)
+    store._hooks["stored"] = ScriptHook(
+        id="stored", event=HOOK_EVENT_USER_PROMPT_SUBMIT, command=_session_id_probe(tmp_path, "s")
+    )
+    spec = ScriptHook(
+        id="spec:a1:x",
+        event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+        command=_session_id_probe(tmp_path, "x"),
+    )
+    asyncio.run(
+        store.fire(
+            HOOK_EVENT_USER_PROMPT_SUBMIT,
+            "hi",
+            session_key="dashboard:1",
+            extra_hooks=[spec],
+            acp_session_id="sess_abc",
+        )
+    )
+    spec_seen = json.loads((tmp_path / "x").read_text(encoding="utf-8"))
+    stored_seen = json.loads((tmp_path / "s").read_text(encoding="utf-8"))
+    assert spec_seen == {"env": "sess_abc", "stdin": "sess_abc"}
+    assert stored_seen == {"env": None, "stdin": "<absent>"}
+
+
+def test_an_unknown_acp_session_id_leaves_kiro_session_id_unset(tmp_path, monkeypatch):
+    _passthrough_sandbox(monkeypatch)
+    monkeypatch.setattr(hooks_mod, "_script_hooks_capability_denied", lambda sk="": None)
+    monkeypatch.delenv("KIRO_SESSION_ID", raising=False)
+    spec = ScriptHook(
+        id="spec:a1:x",
+        event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+        command=_session_id_probe(tmp_path, "x"),
+    )
+    asyncio.run(
+        ScriptHookStore(tmp_path).fire(
+            HOOK_EVENT_USER_PROMPT_SUBMIT, "hi", extra_hooks=[spec], acp_session_id=None
+        )
+    )
+    seen = json.loads((tmp_path / "x").read_text(encoding="utf-8"))
+    assert seen == {"env": None, "stdin": "<absent>"}
+
+
+@pytest.mark.parametrize(("sid", "expected"), [("sess_abc", "sess_abc"), ("", None)])
+def test_the_chat_turn_hands_the_spec_hooks_its_session_id(sid, expected):
+    from kiro_crew.dashboard.chat_turn import turn_spec_hooks
+
+    seen: dict = {}
+
+    class _Store:
+        async def fire(self, *a, **kw):
+            seen.update(kw)
+            return []
+
+    spec = ScriptHook(id="spec:a1:x", event=HOOK_EVENT_USER_PROMPT_SUBMIT, command="c")
+    turn = SimpleNamespace(
+        session_key="dashboard:1",
+        slot=SimpleNamespace(key="1"),
+        state=SimpleNamespace(_hook_store=_Store()),
+        client=SimpleNamespace(session_id=sid),
+        _spec_hooks=[spec],
+        _spec_hooks_unreadable=False,
+        _spec_hooks_cwd=None,
+    )
+    asyncio.run(turn_spec_hooks._fire(turn, HOOK_EVENT_USER_PROMPT_SUBMIT, "hi"))
+    assert seen["acp_session_id"] == expected
+
+
 def test_a_governance_denied_spec_hook_does_not_spawn(tmp_path, monkeypatch):
     monkeypatch.setattr(hooks_mod, "_script_hooks_capability_denied", lambda sk="": "off")
 
@@ -268,6 +432,9 @@ def test_a_governance_denied_spec_hook_does_not_spawn(tmp_path, monkeypatch):
 async def test_an_in_turn_agent_switch_reloads_the_new_agents_spec_hooks(tmp_path, monkeypatch):
     """After a provider-side switch, the turn's remaining tool calls meet the NEW
     agent's spec hooks: the runner re-prepares them for the agent it switched to."""
+    from chat_test_helpers import pin_kiro_cli_harness
+
+    pin_kiro_cli_harness()
     from unittest.mock import AsyncMock, MagicMock
 
     from chat_test_helpers import _make_state
@@ -322,7 +489,9 @@ async def test_an_in_turn_agent_switch_reloads_the_new_agents_spec_hooks(tmp_pat
 
 async def _run_switch_turn(state, slot) -> None:
     try:
-        await chat_runner._run_chat(state, slot, "/agent other")
+        # A kiro-cli subcommand, so it reaches the harness: Crew answers a bare
+        # ``/agent <name>`` itself and the provider's switch event never fires.
+        await chat_runner._run_chat(state, slot, "/agent swap other")
     finally:
         tasks = list(state._background_tasks)
         for task in tasks:
@@ -338,6 +507,9 @@ async def test_an_in_turn_switch_that_leaves_the_session_stale_stops_the_turn(
     """A switch to an agent whose hooks cover what the session auto-approves ends
     the turn before anything after it is handled: those calls would never reach the
     permission request, so the hooks could not see them."""
+    from chat_test_helpers import pin_kiro_cli_harness
+
+    pin_kiro_cli_harness()
     from unittest.mock import AsyncMock, MagicMock
 
     from chat_test_helpers import _make_state

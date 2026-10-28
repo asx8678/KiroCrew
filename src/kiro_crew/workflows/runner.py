@@ -30,9 +30,10 @@ Spec: ``docs/system-specs/modules/workflows.md``.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
+import inspect
 import json
-import logging
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -40,10 +41,10 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from kiro_crew.metrics.events import WORKFLOW_RUNS, emit_counter
-from kiro_crew.turn_tokens import TURN_TOKEN_SINK
 
 from . import BudgetExceeded, WorkflowEvent
 from .context import DEFAULT_MAX_AGENTS_PER_RUN, AgentCounter, Budget, build_safe_globals
+from .dsl import _call_stage, _maybe_await
 from .dsl import parallel as _parallel
 from .dsl import pipeline as _pipeline
 from .events import EventStream
@@ -55,8 +56,6 @@ from .registry import (
 )
 from .schema import run_with_schema
 from .validate import CORE_CTX_SURFACE, check_ctx_surface, validate
-
-logger = logging.getLogger(__name__)
 
 # Optional dependency (gate F1): the SEL security event log lives in the app
 # layer, and the workflows engine must stay importable as a standalone unit
@@ -81,13 +80,6 @@ except ImportError:  # pragma: no cover - security is app-layer optional
 
 # Wall-clock ceiling per run (matches ``_RUN_TIMEOUT_SECS`` in the spec).
 DEFAULT_RUN_TIMEOUT_SECS = 3600
-
-# WF-2: run-wide default for the bound on a step's output handed back to the
-# script. A step's text (or schema JSON) can be arbitrarily large, and a script
-# that passes it verbatim into later prompts pays for it again on every step;
-# only the error string (500) and the event summary (120) were bounded before.
-# None disables the bound entirely.
-DEFAULT_MAX_OUTPUT_CHARS = 20_000
 
 # Bounds on a caller-supplied per-run ceiling. The ceiling is the runaway
 # backstop, so a caller may LENGTHEN it for a genuinely long investigation but can
@@ -176,6 +168,58 @@ def describe_agent_error(exc: BaseException) -> str:
     return text
 
 
+def _call_fingerprint(prompt: str, opts: dict, position: tuple) -> str:
+    """Identity of one agent call for replay: its *position* in the run (see
+    :class:`_CallScope`), the prompt, and every option that reaches the model,
+    without the display-only ``label`` and ``phase``.
+
+    The position keeps apart two branches that make the same call with the same
+    options: each replays the answer its own call got, not the other branch's.
+    Returns "" when the options cannot be serialized; a call without a
+    fingerprint is never replayed and always runs live.
+    """
+    keyed = {k: v for k, v in opts.items() if k not in ("label", "phase")}
+    try:
+        blob = json.dumps(
+            {"position": list(position), "prompt": prompt, "opts": keyed},
+            sort_keys=True,
+            default=str,
+        )
+    except (TypeError, ValueError):
+        return ""
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+class _CallScope:
+    """Where a call sits in its run: the branch path and the next ordinal in it.
+
+    The root scope's path is ``()``. Each ``ctx.parallel`` / ``ctx.pipeline``
+    fan-out takes one ordinal in the scope that starts it, and branch (or item)
+    ``i`` runs in the scope ``path + (ordinal, i)``. A call's position is its
+    scope's path plus the ordinal it takes there. The calls inside one branch run
+    one after another, so a call's position is set by the script and its
+    arguments, whatever order the scheduler starts the branches' calls in.
+    """
+
+    __slots__ = ("owner", "path", "_next")
+
+    def __init__(self, owner: object, path: tuple) -> None:
+        self.owner = owner
+        self.path = path
+        self._next = 0
+
+    def take(self) -> int:
+        ordinal = self._next
+        self._next += 1
+        return ordinal
+
+
+#: The scope of the branch the running task belongs to; see ``_RunContext._scope``.
+_CALL_SCOPE: "contextvars.ContextVar[Optional[_CallScope]]" = contextvars.ContextVar(
+    "workflow_call_scope", default=None
+)
+
+
 @asynccontextmanager
 async def _optional_slot(sem: Optional["asyncio.Semaphore"]) -> AsyncIterator[None]:
     """Hold ``sem`` for the duration of the block; a no-op when there is no cap."""
@@ -188,8 +232,6 @@ async def _optional_slot(sem: Optional["asyncio.Semaphore"]) -> AsyncIterator[No
 
 # Signature of the injected agent executor: (prompt, options) -> result string/dict.
 AgentFn = Callable[[str, dict], Awaitable[Any]]
-# WF-1: async (prompt) -> text, the tool-free schema reformat producer.
-ReformatFn = Callable[[str], Awaitable[str]]
 
 # Signature of the injected SEL audit sink (GATE B10). Defaults to the real
 # ``kiro_crew.sel`` security event log; tests inject a capturing stub. Kept as a
@@ -281,10 +323,14 @@ AuthorFn = Callable[..., Awaitable[dict]]
 
 # Signature of the per-call checkpoint hook, mirroring how ``on_source`` publishes
 # the authored script mid-run:
-#   on_agent_result(call_index: int, *, result: Any, ok: bool, error: str) -> None
+#   on_agent_result(call_index: int, *, result: Any, ok: bool, error: str,
+#                   fingerprint: str) -> None
 # Called as soon as EACH agent call settles, so the host can persist that payload
 # before the run reaches a terminal state. Without it, results would live only in
 # process memory until the run finished, and any interruption would throw them away.
+# ``fingerprint`` is the call's identity for replay (see ``_call_fingerprint``, ""
+# when it has none); it lands with the result, so a record that holds a result
+# also holds what a rerun needs to replay it.
 AgentResultFn = Callable[..., None]
 
 
@@ -336,8 +382,7 @@ class _RunContext:
         replay_results: Optional[dict] = None,
         replay_before: int = 0,
         on_agent_result: Optional[AgentResultFn] = None,
-        max_output_chars: Optional[int] = None,
-        reformat_fn: Optional[ReformatFn] = None,
+        replay_fingerprints: Optional[dict] = None,
     ) -> None:
         self.args = args
         self.now = now
@@ -348,11 +393,6 @@ class _RunContext:
         # (e.g. ``ctx.nudge`` → AutoNudge) know which session to act on. Empty
         # when the run was not launched from a nudge-able session.
         self._session_key = session_key
-        # WF-2: run-wide bound on what a step's output may hand the SCRIPT. The
-        # record (agent_results, for resume replay) keeps the WHOLE value; only
-        # the value the script receives is bounded, so a step cannot paste a
-        # 200k-char result verbatim into every later prompt.
-        self._max_output_chars = max_output_chars
 
         # Ports native to Kiro Crew — injected per run; None when the host did
         # not grant/wire them (the frozen contract allows None, like AppContext).
@@ -373,9 +413,6 @@ class _RunContext:
         self._stream = stream
         self._counter = counter
         self._agent_fn = agent_fn
-        # WF-1: the tool-free producer a schema failure's one reformat call goes
-        # through. None (a stub host) gives up on the first schema failure.
-        self._reformat_fn = reformat_fn
         self._concurrency = concurrency
         self._current_phase = ""
         self._events: list[WorkflowEvent] = []
@@ -385,7 +422,25 @@ class _RunContext:
         # ``agent_results`` collects THIS run's results for the next resume.
         self._replay_results: dict[int, Any] = replay_results or {}
         self._replay_before = replay_before
+        # A replayed call is matched to the prior run's call by fingerprint, not
+        # by call_index. Inside ``parallel``/``pipeline`` a replayed call returns
+        # without suspending, so the calls of a rerun start in a different order
+        # than the prior run's did, and the same index names a different call.
+        # The fingerprint includes the call's position in its branch
+        # (``_CallScope``), so two branches that make the same call each get
+        # their own result back. Every call in a run has its own position, so
+        # no two calls of one run share a fingerprint.
+        # fingerprint → the prior call index with that fingerprint. Only prior
+        # calls before ``replay_before`` that carry a fingerprint are eligible;
+        # any other call runs live.
+        prior_fingerprints = replay_fingerprints or {}
+        self._replay_indices: dict[str, int] = {}
+        for prior_index in sorted(k for k in self._replay_results if isinstance(k, int)):
+            prior_fp = prior_fingerprints.get(prior_index)
+            if prior_index < replay_before and isinstance(prior_fp, str) and prior_fp:
+                self._replay_indices.setdefault(prior_fp, prior_index)
         self.agent_results: dict[int, Any] = {}
+        self._root_scope = _CallScope(self, ())
         # call_index → why that call failed (bounded/redacted). Kept alongside
         # agent_results so "no result" is always accompanied by a reason.
         self.agent_errors: dict[int, str] = {}
@@ -419,70 +474,6 @@ class _RunContext:
                 pass
 
     # --- agent execution ---
-    async def _invoke(self, prompt: str, opts: dict) -> Any:
-        """One ``agent_fn`` call, charged to the budget (USE-2)."""
-        return await self._metered(lambda: self._agent_fn(prompt, opts))
-
-    async def _metered(self, start: Callable[[], Awaitable[Any]]) -> Any:
-        """Await one model call, charged to the budget (USE-2).
-
-        Every model turn the call drives is counted into a fresh sink, so a
-        retry or a schema reformat is its own charge. The ceiling is checked
-        before the call starts, so a reformat cannot begin once the budget is
-        spent.
-        """
-        if self.budget.would_exceed():
-            raise BudgetExceeded("budget exhausted before agent call")
-        sink: list[int] = []
-        token = TURN_TOKEN_SINK.set(sink)
-        try:
-            return await start()
-        finally:
-            TURN_TOKEN_SINK.reset(token)
-            self._charge(sum(sink))
-
-    async def _reformat(self, prompt: str) -> str:
-        """The schema loop's one tool-free reformat call, charged to the budget (WF-1).
-
-        A budget ceiling or a cancellation propagates; any other failure of the
-        reformat call is logged and reads as "still invalid", so the step gives
-        up the same way a second invalid reply does.
-        """
-        reformat_fn = self._reformat_fn
-        if reformat_fn is None:
-            return ""
-        try:
-            out = await self._metered(lambda: reformat_fn(prompt))
-        except BudgetExceeded:
-            raise
-        except Exception:  # noqa: BLE001 - a failed reformat is a give-up, not a crash
-            logger.warning("workflow schema reformat call failed", exc_info=True)
-            return ""
-        return out if isinstance(out, str) else ""
-
-    def _charge(self, cost: int) -> None:
-        """Charge one completed call's spend, and report the budget (USE-2).
-
-        The call already completed, so reaching the ceiling is not an error here:
-        ``Budget.charge`` clamps at the ceiling and raises, which is caught. The
-        next call is refused by ``_invoke``'s check.
-        """
-        if cost <= 0:
-            return
-        try:
-            self.budget.charge(cost)
-        except BudgetExceeded:
-            pass
-        if self.budget.total is not None:
-            remaining = self.budget.remaining()
-            self._record(
-                self._stream.budget_update(
-                    self.now,
-                    spent=self.budget.spent(),
-                    remaining=int(remaining),
-                )
-            )
-
     async def agent(
         self,
         prompt: str,
@@ -496,10 +487,12 @@ class _RunContext:
         cwd: Optional[str] = None,
         session: Optional[str] = None,
         nudge: Optional[dict] = None,
-        memory: Optional[bool] = None,
     ) -> Any:
         # B6 cap + A4 ceiling are checked BEFORE the call so a script cannot run
         # past either limit. would_exceed lets us stop at the boundary cleanly.
+        # Taken before the first await, so calls that start together in one
+        # branch keep their start order.
+        position = self._call_position()
         guard = getattr(self, "_execution_guard", None)
         if guard is not None:
             await guard()
@@ -529,29 +522,29 @@ class _RunContext:
             "cwd": cwd,
             "session": session,
             "nudge": nudge,
-            "memory": memory,
         }
+        fingerprint = _call_fingerprint(prompt, opts, position)
+        replay_index = self._replay_indices.pop(fingerprint, None) if fingerprint else None
         error = ""
         try:
-            if call_index < self._replay_before and call_index in self._replay_results:
-                # Resume: replay the cached result from the prior run instead
-                # of re-calling the model. Determinism (no time/random + stable
-                # call_index) makes this sound — same script+args ⇒ same call order.
-                result = self._replay_results[call_index]
+            if replay_index is not None:
+                # Resume: replay the prior run's result for this same call (same
+                # position in the same branch, same prompt and options: the
+                # fingerprint) instead of re-calling the model.
+                result = self._replay_results[replay_index]
                 ok = result is not None
                 if not ok:
                     error = "replayed a call that had already failed in the prior run"
             elif schema is not None:
-                # Structured output (C1–C3): the step runs ONCE through the
-                # injected agent_fn; an invalid reply gets at most one tool-free
-                # reformat call on its text, never a re-run of the step (WF-1).
+                # Structured output (C1–C3): re-ask until the model yields
+                # schema-valid JSON, or None after bounded retries. The producer
+                # is the same injected agent_fn (so prod/stub both flow through).
                 async def _produce(p: str) -> str:
-                    out = await self._invoke(p, opts)
+                    out = await self._agent_fn(p, opts)
                     return out if isinstance(out, str) else json.dumps(out)
 
-                reformat = self._reformat if self._reformat_fn is not None else None
                 async with _optional_slot(self._agent_slots):
-                    result = await run_with_schema(_produce, prompt, schema, reformat=reformat)
+                    result = await run_with_schema(_produce, prompt, schema)
                 ok = result is not None
                 if not ok:
                     # Distinguishing this from an exception matters: it means the
@@ -560,7 +553,7 @@ class _RunContext:
                     error = "no schema-valid result after bounded re-asks"
             else:
                 async with _optional_slot(self._agent_slots):
-                    result = await self._invoke(prompt, opts)
+                    result = await self._agent_fn(prompt, opts)
                 ok = result is not None
                 if not ok:
                     error = "agent returned no result"
@@ -580,7 +573,9 @@ class _RunContext:
         # Best-effort — a failing sink never breaks a run.
         if self._on_agent_result is not None:
             try:
-                self._on_agent_result(call_index, result=result, ok=ok, error=error)
+                self._on_agent_result(
+                    call_index, result=result, ok=ok, error=error, fingerprint=fingerprint
+                )
             except Exception:  # noqa: BLE001 - checkpointing must not break a run
                 pass
         self._record(
@@ -606,20 +601,6 @@ class _RunContext:
                 "error": error,
             },
         )
-        # WF-2: bound the value the SCRIPT receives. The record above
-        # (agent_results, for resume replay) keeps the whole value, so a resume
-        # replays the full result and bounds it again here. Head+tail with a
-        # marker naming the cut, so the script (and the model behind the next
-        # prompt) knows the text was truncated. Schema values are left whole —
-        # the script indexes their fields, and a cut dict is worse than a big
-        # one. None disables the bound.
-        if ok and self._max_output_chars and isinstance(result, str):
-            cap = int(self._max_output_chars)
-            if len(result) > cap:
-                marker = f"\n[… {len(result) - cap} chars truncated …]\n"
-                keep = max(0, cap - len(marker))
-                half = keep // 2
-                result = result[:half] + marker + result[len(result) - (keep - half) :]
         return result
 
     # --- scheduling (delegate to the dsl combinators with the run's cap) ---
@@ -628,10 +609,49 @@ class _RunContext:
     # combinator limit preserves per-fan-out shape, the global slot is what stops
     # overlapping combinators from exceeding the cap in aggregate.
     async def parallel(self, thunks: list) -> list:
-        return await _parallel(thunks, limit=self._concurrency)
+        group = self._call_position()
+
+        def in_branch(index: int, thunk: Any) -> Callable[[], Awaitable[Any]]:
+            async def run() -> Any:
+                token = _CALL_SCOPE.set(_CallScope(self, group + (index,)))
+                try:
+                    return await _maybe_await(thunk if inspect.isawaitable(thunk) else thunk())
+                finally:
+                    _CALL_SCOPE.reset(token)
+
+            return run
+
+        branches = [in_branch(i, t) for i, t in enumerate(thunks)]
+        return await _parallel(branches, limit=self._concurrency)
 
     async def pipeline(self, items: list, *stages: Callable) -> list:
-        return await _pipeline(items, *stages, limit=self._concurrency)
+        group = self._call_position()
+        # One scope per item, shared by its stages: an item's stages run one
+        # after another, so its calls keep one ordinal sequence.
+        chains: dict[int, _CallScope] = {}
+
+        def in_chain(stage: Callable) -> Callable[[Any, Any, int], Awaitable[Any]]:
+            async def run(prev: Any, item: Any, index: int) -> Any:
+                chain = chains.setdefault(index, _CallScope(self, group + (index,)))
+                token = _CALL_SCOPE.set(chain)
+                try:
+                    return await _call_stage(stage, prev, item, index)
+                finally:
+                    _CALL_SCOPE.reset(token)
+
+            return run
+
+        return await _pipeline(items, *[in_chain(s) for s in stages], limit=self._concurrency)
+
+    def _scope(self) -> _CallScope:
+        """The scope of the branch this task runs in, or the run's root scope."""
+        scope = _CALL_SCOPE.get()
+        return scope if scope is not None and scope.owner is self else self._root_scope
+
+    def _call_position(self) -> tuple:
+        """Take the next position in the current scope (see :class:`_CallScope`)."""
+        scope = self._scope()
+        return scope.path + (scope.take(),)
 
     async def workflow(self, name: str, args: Optional[dict] = None) -> Any:
         # Contract-only. ``workflow`` is not in CORE_CTX_SURFACE and no shipped host
@@ -729,17 +749,11 @@ class WorkflowRunner:
         on_complete: Optional[Callable[[], Awaitable[None]]] = None,
         pre_terminal: Optional[Callable[[], Awaitable[None]]] = None,
         execution_guard: Optional[Callable[[], Awaitable[None]]] = None,
-        max_output_chars: Optional[int] = DEFAULT_MAX_OUTPUT_CHARS,
-        reformat_fn: Optional[ReformatFn] = None,
     ) -> None:
         self._agent_fn = agent_fn
-        # WF-1: tool-free producer for a schema failure's one reformat call
-        # (production: ``agent_exec.build_reformat_fn``). None gives up instead.
-        self._reformat_fn = reformat_fn
         self._timeout_secs = timeout_secs
         self._max_agents = max_agents_per_run
         self._concurrency = concurrency
-        self._max_output_chars = max_output_chars
         # B10 audit sink (default = real SEL) + native ports (default = none wired).
         self._audit = _guarded_audit(audit or _default_audit)
         self._ports = ports or {}
@@ -773,6 +787,7 @@ class WorkflowRunner:
         author_fn: Optional[AuthorFn] = None,
         on_source: Optional[Callable[[str], None]] = None,
         on_agent_result: Optional[AgentResultFn] = None,
+        replay_fingerprints: Optional[dict] = None,
     ) -> RunResult:
         """Execute a workflow script end-to-end, returning result + event stream.
 
@@ -790,6 +805,9 @@ class WorkflowRunner:
         return a run_id instantly instead of blocking on a slow synchronous author.
         """
         args = args or {}
+        # B5: the run's ONE wall-clock deadline, taken before authoring so the
+        # in-run author step and the script share the ceiling.
+        deadline = time.monotonic() + self._timeout_secs
         stream = EventStream(run_id, clock=host_now_iso)
         events: list[WorkflowEvent] = []
 
@@ -843,8 +861,33 @@ class WorkflowRunner:
             def _auth_progress(msg: str) -> None:
                 emit(stream.log(now, message=msg))
 
+            # Authoring runs under the run's deadline with the same guard and the
+            # same cancellation handling the script gets in _exec_validated: a
+            # hung author ends at the ceiling, and a caller cancel is answered
+            # with a result instead of escaping run().
+            author_task: Optional["asyncio.Future[Any]"] = None
             try:
-                authored = await author_fn(intent, on_progress=_auth_progress)
+                author_task = asyncio.ensure_future(author_fn(intent, on_progress=_auth_progress))
+                done, _pending = await asyncio.wait(
+                    {author_task}, timeout=max(0.0, deadline - time.monotonic())
+                )
+                if author_task not in done:
+                    author_task.cancel()
+                    await _drain_cleanup(author_task)
+                    emit(
+                        stream.run_failed(
+                            now, error=f"run exceeded {self._timeout_secs}s", where="ceiling"
+                        )
+                    )
+                    return RunResult(run_id, ok=False, result=None, events=events, error="timeout")
+                authored = author_task.result()
+            except asyncio.CancelledError:
+                if author_task is not None:
+                    if not author_task.done():
+                        author_task.cancel()
+                    await _drain_cleanup(author_task)
+                emit(stream.run_cancelled(now, reason="cancelled"))
+                return RunResult(run_id, ok=False, result=None, events=events, error="cancelled")
             except Exception as exc:  # noqa: BLE001 - authoring failure → failed run
                 emit(stream.run_failed(now, error=f"authoring error: {exc!r}", where="author"))
                 return RunResult(
@@ -880,6 +923,7 @@ class WorkflowRunner:
                 )
             return await self._exec_validated(
                 source,
+                deadline=deadline,
                 run_id=run_id,
                 now=now,
                 args=args,
@@ -894,6 +938,7 @@ class WorkflowRunner:
                 events=events,
                 emit=emit,
                 on_agent_result=on_agent_result,
+                replay_fingerprints=replay_fingerprints,
             )
 
         # 1. Validate (B-group static). A bad script fails before any exec.
@@ -917,6 +962,7 @@ class WorkflowRunner:
         )
         return await self._exec_validated(
             source,
+            deadline=deadline,
             run_id=run_id,
             now=now,
             args=args,
@@ -931,12 +977,14 @@ class WorkflowRunner:
             events=events,
             emit=emit,
             on_agent_result=on_agent_result,
+            replay_fingerprints=replay_fingerprints,
         )
 
     async def _exec_validated(
         self,
         source: str,
         *,
+        deadline: float,
         run_id: str,
         now: str,
         args: dict,
@@ -951,10 +999,13 @@ class WorkflowRunner:
         events: list[WorkflowEvent],
         emit: Callable[[WorkflowEvent], WorkflowEvent],
         on_agent_result: Optional[AgentResultFn] = None,
+        replay_fingerprints: Optional[dict] = None,
     ) -> RunResult:
         """Build the run context, exec the (already validated) script under the
         wall-clock guard, and emit the terminal event. Shared by the source-given
         and the author-in-run paths; assumes ``run_started`` was already emitted.
+        *deadline* is the run's ``time.monotonic()`` deadline, taken when
+        :meth:`run` starts, so the script gets only what authoring left of it.
         """
         # Defense-in-depth: re-validate before exec so a future refactor that
         # bypasses the caller's validate() step cannot reach exec unchecked.
@@ -1010,8 +1061,7 @@ class WorkflowRunner:
             replay_results=replay_results,
             replay_before=replay_before,
             on_agent_result=on_agent_result,
-            max_output_chars=self._max_output_chars,
-            reformat_fn=self._reformat_fn,
+            replay_fingerprints=replay_fingerprints,
         )
         ctx._execution_guard = self._execution_guard
         ctx._events = events  # share the sink so phase/log/agent events land in order
@@ -1051,7 +1101,11 @@ class WorkflowRunner:
             # ``run_failed`` (where="ceiling") instead of propagating cancellation.
             run_task: "asyncio.Task[Any]" = asyncio.ensure_future(entry(ctx))
             task = run_task  # keep an outer ref for the cancel handler below
-            done, _pending = await asyncio.wait({run_task}, timeout=self._timeout_secs)
+            # What is left of the run's deadline: authoring, when it ran, already
+            # spent its share, so the script never gets a second full ceiling.
+            done, _pending = await asyncio.wait(
+                {run_task}, timeout=max(0.0, deadline - time.monotonic())
+            )
             if run_task not in done:
                 # Runaway: cancel it and drain its cancellation quietly so no
                 # CancelledError escapes and no "task was destroyed" warning fires.
@@ -1176,6 +1230,7 @@ class WorkflowRunner:
         author: str = "",
         replay_results: Optional[dict] = None,
         replay_before: int = 0,
+        replay_fingerprints: Optional[dict] = None,
         source_is_original: bool = True,
         execution_binding_version: int = 0,
         execution_context: Any = None,
@@ -1219,7 +1274,12 @@ class WorkflowRunner:
                         pass
 
         def _checkpoint_agent_result(
-            call_index: int, *, result: Any, ok: bool = True, error: str = ""
+            call_index: int,
+            *,
+            result: Any,
+            ok: bool = True,
+            error: str = "",
+            fingerprint: str = "",
         ) -> None:
             """Record ONE settled agent call on the run handle the moment it lands.
 
@@ -1230,12 +1290,22 @@ class WorkflowRunner:
             it lands lets the terminal paths read them back and the terminal
             transition flush them to disk. A hard kill of the gateway mid-run can
             still lose whatever no write has covered yet.
+
+            The call's ``fingerprint`` is recorded with its result, so a run the
+            gateway's restart interrupted can still be restarted with replay.
             """
             record = getattr(registry, "record_agent_result", None)
             if record is None:  # pragma: no cover - registry always provides it
                 return
             try:
-                record(run_id, call_index, result=result, ok=ok, error=error)
+                record(
+                    run_id,
+                    call_index,
+                    result=result,
+                    ok=ok,
+                    error=error,
+                    fingerprint=fingerprint,
+                )
             except Exception:  # noqa: BLE001 - checkpointing must never break a run
                 pass
 
@@ -1260,6 +1330,7 @@ class WorkflowRunner:
                     author_fn=author_fn,
                     on_source=_publish_source,
                     on_agent_result=_checkpoint_agent_result,
+                    replay_fingerprints=replay_fingerprints,
                 )
             finally:
                 # Fire per-run teardown (e.g. warm-pool shutdown) on EVERY exit —

@@ -230,6 +230,11 @@ def is_repo_public(url: str) -> bool | None:
 async def _fetch_repo_visibility(ref: SourceRef) -> bool | None:
     """Read a repo's public/private flag via the provider CLI. None on failure."""
     try:
+        if ref.provider == "github" and ref.host != "github.com":
+            # A "public" repository on GitHub Enterprise Server is visible to the
+            # instance's users, which is not anonymous-public, so it stays
+            # owner-only without a read.
+            return False
         if ref.provider == "github":
             # isPrivate is False for BOTH public AND internal (GitHub Enterprise)
             # repos, but an internal repo is visible only to enterprise members —
@@ -245,6 +250,7 @@ async def _fetch_repo_visibility(ref: SourceRef) -> bool | None:
                 f"{ref.owner}/{ref.repo}",
                 "--json",
                 "isPrivate,visibility",
+                host=ref.host,
             )
             if not isinstance(data, dict):
                 return None
@@ -555,29 +561,21 @@ def _emit_status_delta(url: str, status: dict[str, str], origin: str) -> None:
             sink(delta)
 
 
-def _record_merge_state(result: dict[str, str], mergeable: str, merge_state: str) -> None:
-    """Add the merge fields to a chip-status entry, each only once it is real.
-
-    An unanswered field is left out entirely rather than written as ``unknown``:
-    the chip cache is a short-TTL hint the client compares against its loaded
-    pull-request payload, and "still computing" must not read as a disagreement
-    with a real answer the payload already has. The two fields are recorded
-    independently because GitLab settles `need_rebase` and its branch-protection
-    gates in the detail field while ``mergeable`` stays ``unknown`` — dropping the
-    detail because its sibling is unknown would leave exactly those banners
-    invisible to the poll.
-    """
-    if projection._merge_state_real(mergeable):
-        result["mergeable"] = mergeable
-    if projection._merge_state_real(merge_state):
-        result["mergeStateStatus"] = merge_state
-
-
 _MERGE_STATE_FIELDS = ("mergeable", "mergeStateStatus")
 # Lifecycle states for which a merge answer is still meaningful. Once a source is
 # merged or closed the providers stop answering the merge pair at all, so a
 # carried-forward value could never be cleared again.
 _MERGE_STATE_LIVE_STATES = frozenset({"open", "draft"})
+
+
+def carry_known_ci(status: dict[str, str], previous: dict[str, str]) -> dict[str, str]:
+    """Carry the previous entry's CI fields onto a read whose CI was unavailable.
+
+    ``ci`` and ``ciPending`` describe one rollup, so they travel together: a
+    kept ``failed`` without its ``ciPending`` would claim the run had finished.
+    """
+    carried = {key: previous[key] for key in projection.CI_STATUS_FIELDS if key in previous}
+    return {**status, **carried}
 
 
 def _keep_known_merge_state(
@@ -647,12 +645,12 @@ def status_from_full_payload(payload: dict[str, Any]) -> dict[str, str] | None:
     if isinstance(ci_status, str) and ci_status:
         result["ci"] = ci_status
     else:
-        buckets = [
-            str(check.get("bucket") or "") for check in projection._as_list(payload.get("checks"))
-        ]
-        ci = projection._rollup_ci(buckets)
-        if ci is not None:
-            result["ci"] = ci
+        projection._record_ci(result, projection._as_list(payload.get("checks")))
+        # Only a provider whose chip read computes ``ciPending`` keeps it here;
+        # for any other the chip read never carries it, so keeping it would
+        # read as a change on every chip refresh.
+        if payload.get("provider") not in projection.CI_PENDING_PROVIDERS:
+            result.pop(projection.CI_PENDING_KEY, None)
     state = projection._project_state(
         str(payload.get("state") or ""), draft=bool(payload.get("draft"))
     )
@@ -664,7 +662,7 @@ def status_from_full_payload(payload: dict[str, Any]) -> dict[str, str] | None:
     # would see a "change" and drop the full payload, which would write-through
     # and strip them again — the exact repeating chip↔full transition the flap
     # damper below exists to contain, spun by nothing but a projection gap.
-    _record_merge_state(
+    projection._record_merge_state(
         result,
         str(payload.get("mergeable") or ""),
         str(payload.get("mergeStateStatus") or ""),
@@ -698,7 +696,7 @@ def record_full_payload_status(url: str, payload: dict[str, Any]) -> None:
         and "ci" in previous[1]
         and "checks" in (payload.get("partialSections") or [])
     ):
-        status = {**status, "ci": previous[1]["ci"]}
+        status = carry_known_ci(status, previous[1])
     # Never let a lazily-unsettled merge read erase a settled one. A first full
     # fetch commonly returns `unknown` (that is the bug the provider merge-state
     # re-reads address), so without this the write-through would strip a conflict

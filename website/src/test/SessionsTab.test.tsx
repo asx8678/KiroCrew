@@ -20,6 +20,18 @@ vi.mock('../api/client', () => ({
   },
 }))
 
+// The footer's retention chip resolves its key against the config schema; a real
+// fetch has no server here, so hand it the one entry it asks for.
+vi.mock('../components/settingRef/useConfigSchema', () => ({
+  useConfigSchema: () =>
+    new Map([
+      [
+        'session.archive_retention_days',
+        { path: 'session.archive_retention_days', type: 'integer', label: 'Archive Retention (days)' },
+      ],
+    ]),
+}))
+
 function defaultPayload() {
   return {
     sessions: [
@@ -219,8 +231,11 @@ describe('Created-by citation', () => {
     await waitFor(() => {
       expect(screen.getByText('Worker whose conductor closed')).toBeInTheDocument()
     })
-    // The orphan names the slot its crew log cited; nothing else knows the creator.
-    expect(screen.getByText('Created by chat-99-gone (not running, so shown top-level)')).toBeInTheDocument()
+    // The creator (chat-99-gone) is CLOSED and has no row in this payload, so no name
+    // resolves. The line names it with a graceful label, never the raw slot id -- an
+    // id nobody recognises explains the nesting no better than silence (#18153).
+    expect(screen.getByText('Created by a closed session')).toBeInTheDocument()
+    expect(screen.queryByText(/chat-99-gone/)).toBeNull()
     // Rows start expanded, so the nested row is on screen under its creator,
     // whose expander says what it hides: that place IS the citation, so the
     // nested row does not repeat its creator's name beside its own.
@@ -230,6 +245,33 @@ describe('Created-by citation', () => {
     expect(screen.getAllByText(/^Created by /)).toHaveLength(1)
     // Nothing cites the tooltip: no name cell carries a "Created by" title.
     expect(document.querySelector('[title*="Created by"]')).toBeNull()
+  })
+
+  it('keeps the citation on a row re-parented onto an open ancestor, and names the closed creator', async () => {
+    // The one nested row that still needs the line. Its place in the tree is NOT its
+    // creator -- it hangs from the nearest open ancestor -- so the expander above it
+    // names a session that did not open it, and without this line nothing says the
+    // creator closed. The name must be the creator's, never the ancestor's.
+    const payload = defaultPayload()
+    payload.sessions.push({
+      ...payload.sessions[0],
+      key: 'dashboard:chat-4',
+      title: 'Worker whose conductor closed under a live lead',
+      slot_key: 'chat-4',
+      pid: 1006,
+      parent: { slot: 'chat-99-gone', key: 'dashboard:chat-1', ancestor: true },
+    })
+    mockSessionsMemory.mockResolvedValue(payload)
+    renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
+    await waitFor(() => {
+      expect(screen.getByText('Worker whose conductor closed under a live lead')).toBeInTheDocument()
+    })
+    // The closed creator has no row in this payload, so the line uses the graceful
+    // closed label rather than the raw slot id (#18153).
+    expect(screen.getByText('Created by a closed session')).toBeInTheDocument()
+    expect(screen.queryByText(/chat-99-gone/)).toBeNull()
+    // The ancestor it nests under is named by its own expander, not by this row.
+    expect(screen.queryByText(/Created by Debugging session/)).toBeNull()
   })
 
   it('keeps the orphan citation under a fold, where the parent row is a group row', async () => {
@@ -243,7 +285,7 @@ describe('Created-by citation', () => {
     await waitFor(() => {
       expect(screen.getByText('Worker whose conductor closed')).toBeInTheDocument()
     })
-    expect(screen.getByText('Created by chat-99-gone (not running, so shown top-level)')).toBeInTheDocument()
+    expect(screen.getByText('Created by a closed session')).toBeInTheDocument()
     expect(screen.getAllByText(/^Created by /)).toHaveLength(1)
   })
 
@@ -337,9 +379,64 @@ describe('Created-by citation', () => {
     // opens away from the value and a "this many" would point at nothing.
     expect(document.querySelector('[title*="more than 4,096 exist"]')).not.toBeNull()
     expect(document.querySelector('[title*="this many"]')).toBeNull()
-    // The remedy says where it is typed: a reader who does not know that
-    // cannot use it.
-    expect(document.querySelector('[title*="in a terminal run: kirocrew config set"]')).not.toBeNull()
+    // The remedy is prose here: it names the retention period and what a number of
+    // days does. The command itself is not in the tooltip (see the next test).
+    const tip = document.querySelector('[title*="more than 4,096 exist"]')
+    expect(tip?.getAttribute('title')).toMatch(
+      /To expire them sooner, change the retention period; if retention was turned off, setting a number of days turns it back on\./,
+    )
+  })
+
+  it('keeps the retention command out of the tooltip and next to the stat, with sample 7', async () => {
+    // A tooltip cannot hold a control a reader has to reach and copy from. The command
+    // moved to the normal file-setting chip beside the stat, on the same page.
+    const payload = defaultPayload()
+    mockSessionsMemory.mockResolvedValue({
+      ...payload,
+      totals: { ...payload.totals, lineage_over_cap: true },
+    })
+    renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
+    const chip = await screen.findByRole('button', {
+      name: 'File-only setting session.archive_retention_days',
+    })
+
+    const tip = document.querySelector('[title*="more than 4,096 exist"]')
+    expect(tip?.getAttribute('title')).not.toMatch(/kirocrew config set|in a terminal/)
+    expect(tip?.contains(chip)).toBe(false)
+    expect(chip.parentElement).toHaveTextContent('Stored session logs')
+
+    fireEvent.click(chip)
+    expect(
+      await screen.findByText('kirocrew config set session.archive_retention_days 7'),
+    ).toBeInTheDocument()
+  })
+
+  it('offers the retention value as an editor starting at 7 when the gateway sent launcher hints', async () => {
+    const payload = defaultPayload()
+    mockSessionsMemory.mockResolvedValue({
+      ...payload,
+      totals: { ...payload.totals, lineage_over_cap: true },
+    })
+    const { queryClient } = renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
+    queryClient.setQueryData(['kiro-prerequisite'], {
+      platform: 'Linux',
+      config_set_hints: {
+        version: 1,
+        encoding: 'utf-8-base64',
+        shells: [{ id: 'posix', prefix: '/usr/local/bin/kirocrew' }],
+      },
+    })
+    const chip = await screen.findByRole('button', {
+      name: 'File-only setting session.archive_retention_days',
+    })
+
+    fireEvent.click(chip)
+
+    expect(((await screen.findByLabelText('Value for the command')) as HTMLInputElement).value).toBe('7')
+    // `7` encodes to `Nw==`.
+    expect(
+      screen.getByText('/usr/local/bin/kirocrew config set session.archive_retention_days --value-base64=Nw=='),
+    ).toBeInTheDocument()
   })
 
   it('says on the Memory header that a parent figure does not include its nested rows', async () => {

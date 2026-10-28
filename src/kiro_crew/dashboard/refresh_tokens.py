@@ -31,7 +31,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Mapping
+from typing import Iterable, Mapping
 
 from kiro_crew.atomic_write import atomic_write, fsync_dir, replace_with_retry
 from kiro_crew.config.loader import config_dir
@@ -41,9 +41,6 @@ from kiro_crew.dashboard.revocation_gen import (
     current_revocation_gen_or_none,
 )
 from kiro_crew.dashboard.token_secret import _get_secret, auth_store_staging_dir
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -99,15 +96,14 @@ REFRESH_GRACE_SECS = 60
 
 # Grace acceptance is CHAIN-HEAD-ONLY. We retain exactly ONE recently-consumed
 # jti per chain — the single most-recently-rotated one (the chain head) — as
-# the authenticator for a same-IP, in-window replay. An earlier design widened
-# this to a bounded history of the last N consumed jtis so several lagging tabs
-# could each authenticate a benign race; that was a deliberate weakening of the
-# RFC 6819 §5.2.2.3 reuse signal (any of the last N consumed jtis, replayed
-# same-IP within the window, resolved to the live head instead of tripping
-# chain revocation) and was flagged by the Design + Long-Term Impact reviewers.
+# the authenticator for a same-IP, in-window replay. A bounded history of the
+# last N consumed jtis would let several lagging tabs each authenticate a benign
+# race, but it deliberately weakens the RFC 6819 §5.2.2.3 reuse signal (any of
+# the last N consumed jtis, replayed same-IP within the window, resolves to the
+# live head instead of tripping chain revocation).
 # The maintainer chose the STRONGER posture: only the chain head is accepted, so
 # any OLDER rotated jti replayed within the window is treated as token reuse and
-# revokes the chain. This restores an undiluted theft signal at the cost of some
+# revokes the chain. This keeps an undiluted theft signal at the cost of some
 # multi-tab UX (a second stale tab racing a refresh may be logged out). The
 # single-tab / single-refresh false-revocation race (a duplicate request
 # presenting the just-consumed head) is still absorbed. Keep this behaviour and

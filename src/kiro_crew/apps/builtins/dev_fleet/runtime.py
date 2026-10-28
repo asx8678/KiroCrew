@@ -21,6 +21,7 @@ from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.dev_fleet import npm_preflight, sync_runner
 from kiro_crew.env import find_node_tool, node_bin_dirs
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.git_config_hooks import ConfigHookScanError, config_hook_disable_args
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_BUILD,
@@ -28,15 +29,15 @@ from kiro_crew.sandbox import (
     sandboxed_spawn_argv,
     shielded_prepare_off_loop,
 )
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger("kiro_crew.apps.builtins.dev_fleet.server")
 
 
 def _redact(text: str) -> str:
     """Apply both credential and exfiltration-URL redaction to output text."""
-    text, _ = redact_credentials(text)
-    text, _ = redact_exfiltration_urls(text)
+    from kiro_crew.security import redact
+
+    text = redact(text)
     return text
 
 
@@ -227,9 +228,8 @@ _GIT_ENV_NEUTRALIZERS: dict[str, str] = {
     # for the reason GIT_OPTIONAL_LOCKS above is: the argv this handler builds keeps
     # naming just its subcommand, and a ``log`` read added later inherits the pin
     # instead of having to remember a flag. The flag form also has a measured cost --
-    # an earlier round of this change put a global flag in the argv and broke 28
-    # shard tests whose stubs match the argv they expect, in a file this change does
-    # not own.
+    # a global flag in the argv breaks the shard tests whose stubs match the argv
+    # they expect.
     "GIT_CONFIG_KEY_8": "log.showSignature",
     "GIT_CONFIG_VALUE_8": "false",
 }
@@ -505,6 +505,24 @@ def _toolchain_bin(name: str) -> str | None:
     return find_node_tool(name, _TRUSTED_PATH) or _trusted_bin(name)
 
 
+def _with_config_hooks_off(cmd: list[str], cwd: str | None, env: dict | None = None) -> list[str]:
+    """``cmd`` with every config-defined git hook disabled, when ``cmd`` runs git.
+
+    A hook defined in config (``hook.<name>.command``, git 2.54+) is not reached by the
+    ``core.hooksPath`` pin in :data:`_GIT_ENV_NEUTRALIZERS`, and its name is the
+    repository's choice, so each one git can see is disabled by name. See
+    :mod:`kiro_crew.git_config_hooks`. Any other command is returned unchanged. Raises
+    :class:`~kiro_crew.git_config_hooks.ConfigHookScanError` when the names cannot be
+    listed safely.
+    """
+    if not cmd or os.path.splitext(os.path.basename(cmd[0]))[0].lower() != "git":
+        return cmd
+    base = cwd if cwd is not None else os.getcwd()
+    target = cmd[2] if len(cmd) > 2 and cmd[1] == "-C" else base
+    target = os.path.join(base, target)
+    return [cmd[0], *config_hook_disable_args(target, git=cmd[0], env=env), *cmd[1:]]
+
+
 async def _run_cmd(
     cmd: list[str],
     *,
@@ -547,6 +565,12 @@ async def _run_cmd(
         cmd = [trusted, *cmd[1:]]
     base_env["PATH"] = _TRUSTED_PATH
     base_env.update(_GIT_ENV_NEUTRALIZERS)
+    try:
+        cmd = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), _with_config_hooks_off, cmd, cwd, dict(base_env)
+        )
+    except ConfigHookScanError as exc:
+        return -1, "", f"git hook config refused: {exc}"
     # Credential helpers only for gateway-controlled commands at "standard"
     # (background fetch, PR queries). "strict" invocations run in the
     # repo-controlled tier (rebase applying worktree commits) and get none.

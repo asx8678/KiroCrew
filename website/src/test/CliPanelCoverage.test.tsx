@@ -28,6 +28,7 @@ import {
 const xt = vi.hoisted(() => {
   interface FakeOptions {
     cursorBlink?: boolean
+    cursorStyle?: string
     fontSize?: number
     fontFamily?: string
     theme?: Record<string, string>
@@ -112,16 +113,19 @@ const registry = vi.hoisted(() => ({
   manualRetry: { value: false },
   displaced: { value: false },
   invalidCwd: { value: false },
+  wrongMachine: { value: false },
   useTerminalConnStatus: vi.fn<() => 'connected' | 'reconnecting' | 'disconnected' | undefined>(),
   useTerminalManualRetry: vi.fn<() => boolean>(),
   useTerminalDisplaced: vi.fn<() => boolean>(),
   useTerminalInvalidCwd: vi.fn<() => boolean>(),
+  useTerminalWrongMachine: vi.fn<() => boolean>(),
   retryTerminalConnection: vi.fn<(id: string, manual?: boolean, cwd?: string) => void>(),
 }))
 registry.useTerminalConnStatus.mockImplementation(() => registry.connStatus.value)
 registry.useTerminalManualRetry.mockImplementation(() => registry.manualRetry.value)
 registry.useTerminalDisplaced.mockImplementation(() => registry.displaced.value)
 registry.useTerminalInvalidCwd.mockImplementation(() => registry.invalidCwd.value)
+registry.useTerminalWrongMachine.mockImplementation(() => registry.wrongMachine.value)
 vi.mock('../utils/terminalRegistry', () => registry)
 
 // Both children own their own xterm hooks and are covered by their own suites;
@@ -138,7 +142,7 @@ import CliPanel, {
   isThemeSignal,
   useDeleteTerminalSession,
 } from '../components/CliPanel'
-import { setTerminalFontSize, __resetTerminalFontStore } from '../hooks/useTerminalFont'
+import { setTerminalFontSize, setTerminalCursorStyle, __resetTerminalFontStore } from '../hooks/useTerminalFont'
 import { setTerminalCloseFailed, useTerminalCloseFailed } from '../hooks/useBottomTerminal'
 import { ansiPaletteFromVars } from '../utils/terminalPalette'
 
@@ -283,6 +287,7 @@ beforeEach(() => {
   registry.manualRetry.value = false
   registry.displaced.value = false
   registry.invalidCwd.value = false
+  registry.wrongMachine.value = false
   xt.FakeTerminal.instances = []
   xt.FakeFitAddon.instances = []
   touch.value = false
@@ -313,7 +318,9 @@ describe('CliPanel mount', () => {
     expect(term.openCalls).toBe(1)
     expect(container.querySelector('.xterm')).not.toBeNull()
     expect(fit.fit).toHaveBeenCalled()
-    expect(registry.ensureTerminalConnection).toHaveBeenCalledWith(sessionId, term, fit, '/srv/app')
+    // The fifth and sixth arguments are the remote-workspace slot and the chat
+    // a local shell belongs to; this bare panel has neither.
+    expect(registry.ensureTerminalConnection).toHaveBeenCalledWith(sessionId, term, fit, '/srv/app', undefined, undefined)
     // A visible pane takes focus and is re-measured (monospace toggle + restore).
     expect(term.focusCalls).toBe(1)
     expect(term.fontFamilyWrites.slice(-2)).toEqual(['monospace', term.options.fontFamily])
@@ -462,6 +469,18 @@ describe('CliPanel disconnected banner', () => {
     const { sessionId } = mount()
     fireEvent.click(screen.getByRole('button', { name: RECONNECT_LABEL }))
     expect(registry.retryTerminalConnection).toHaveBeenCalledWith(sessionId)
+  })
+
+  it('says why a refused shell was not opened instead of a bare disconnect', () => {
+    registry.connStatus.value = 'disconnected'
+    registry.wrongMachine.value = true
+    mount({ cwd: '/w' })
+    const banner = screen.getByTestId('cli-panel-disconnected')
+    expect(banner).toHaveTextContent(i18nT('components.cliPanel.wrong_machine_message'))
+    expect(screen.queryByText(DISCONNECTED_LABEL)).toBeNull()
+    // Every redial meets the same refusal, so no Reconnect; the hand-off stays.
+    expect(screen.queryByRole('button', { name: RECONNECT_LABEL })).toBeNull()
+    expect(within(banner).getByRole('button', { name: /Ask the agent/ })).toBeInTheDocument()
   })
 
   it('shows the localized invalid-cwd error immediately and allows explicit recovery', () => {
@@ -1031,6 +1050,19 @@ describe('CliPanel theme and font sync', () => {
     // Only the plain family assignment — no monospace/restore re-measure toggle.
     expect(term.fontFamilyWrites).toHaveLength(writesBefore + 1)
     expect(fit.fit).not.toHaveBeenCalled()
+  })
+
+  it('constructs a terminal with the default block cursor', () => {
+    const { term } = mount()
+    expect(term.options.cursorStyle).toBe('block')
+  })
+
+  it('pushes a cursor-style preference change onto every live terminal', () => {
+    const { term } = mount()
+    act(() => { setTerminalCursorStyle('bar') })
+    expect(term.options.cursorStyle).toBe('bar')
+    act(() => { setTerminalCursorStyle('underline') })
+    expect(term.options.cursorStyle).toBe('underline')
   })
 })
 

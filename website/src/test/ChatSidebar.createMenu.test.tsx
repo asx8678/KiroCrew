@@ -15,12 +15,13 @@ import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
-import { MemoryRouter, useLocation } from 'react-router-dom'
+import { MemoryRouter } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import { ThemeProvider } from '../hooks/useTheme'
 import { SETTINGS_CREW_MEMBERS_PREVIEW_ID } from '../hooks/useSettingHighlight'
 import { SETTINGS_REGISTRY } from '../components/commandPalette/settingsRegistry.gen'
 import type { RootState } from '../store'
+import type { ChatFolder } from '../types'
 
 // Render framer-motion elements as plain DOM because jsdom cannot run projection.
 vi.mock('framer-motion', async () => {
@@ -59,7 +60,7 @@ vi.mock('../pages/chat/ChatSettings', () => ({
 }))
 
 const mocks = vi.hoisted(() => ({
-  createChatSlot: vi.fn(), listInstances: vi.fn(),
+  createChatSlot: vi.fn(), listInstances: vi.fn(), chatFolders: vi.fn(),
   instancesCapabilities: vi.fn(), crewPeerPost: vi.fn(), dashboardConfig: vi.fn(),
 }))
 vi.mock('../api/client', () => ({
@@ -89,21 +90,16 @@ import {
 } from '../utils/errorReport'
 // Not mocked: the gate reads real localStorage, so the fixture that turns crew
 // on is the same write the Settings > Developer > Feature Previews toggle performs.
-import { PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT } from '../utils/previewFlags'
+import { PREVIEW_REMOTE_CREW_CHAT } from '../utils/previewFlags'
 import enManual from '../i18n/locales/en.manual.json'
 import { openCrewWindow, closeCrewWindow } from '../pages/chat/crew-window/crewWindowStore'
 
-/** Where the router is: the "Crew Members" entry navigates rather than creates,
- *  so its tests read the destination back instead of a create call. */
-function LocationProbe() {
-  const loc = useLocation()
-  return <div data-testid="location">{loc.pathname}{loc.search}</div>
-}
-
-function renderSidebar(opts: { warm?: Record<string, unknown>; defaultAgent?: string; onOpenPeerSession?: (id: string, key: string) => void } = {}) {
+function renderSidebar(opts: { warm?: Record<string, unknown>; defaultAgent?: string; onOpenPeerSession?: (id: string, key: string) => void; connected?: boolean; folders?: ChatFolder[] } = {}) {
   const store = createTestStore({
     dashboard: {
-      status: {}, connected: false, slots: [], approvalMode: 'normal',
+      // The creators are gateway-gated, so a case asserting a create reaches the
+      // server needs a live gateway; the offline cases pass `connected: false`.
+      status: {}, connected: opts.connected ?? true, slots: [], approvalMode: 'normal',
       channelTrusted: false, refreshTrigger: 0, unreadSlots: [], updateProgress: null,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
@@ -115,7 +111,10 @@ function renderSidebar(opts: { warm?: Record<string, unknown>; defaultAgent?: st
     ...(opts.warm ? { instances: { warm: opts.warm } as unknown as RootState['instances'] } : {}),
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  qc.setQueryData(['chat-folders'], [])
+  // Seeded AND mocked: the ['chat-folders'] query refetches on mount, so a seed
+  // alone is replaced by the Proxy's default [] mid-test.
+  mocks.chatFolders.mockResolvedValue(opts.folders ?? [])
+  qc.setQueryData(['chat-folders'], opts.folders ?? [])
   const view = render(
     <QueryClientProvider client={qc}>
       <Provider store={store}>
@@ -126,7 +125,6 @@ function renderSidebar(opts: { warm?: Record<string, unknown>; defaultAgent?: st
               history={[]} historyHasMore={false} defaultAgent={opts.defaultAgent ?? ''} installedAgents={[]}
               onOpenPeerSession={opts.onOpenPeerSession}
               />
-            <LocationProbe />
           </MemoryRouter>
         </ThemeProvider>
       </Provider>
@@ -189,18 +187,9 @@ describe('create-button caret menu', () => {
     expect(await findCreateMenuItem(/import a session from a file/i)).toBeTruthy()
   })
 
-  it('explains the Crew Members entry at the point of choice', async () => {
-    // The Members page is on, so the crew gloss describes the page itself.
-    localStorage.setItem(PREVIEW_CREW, '1')
-    renderSidebar()
-    openCreateMenu()
-    await findCreateMenuItem('New chat')
-    expect(screen.getByText(/Opens the Crewmates page/)).toBeTruthy()
-  })
-
   it('leaves the plain entries single-line', async () => {
-    // "New chat" / "New folder" need no gloss; only the Crew Members entry,
-    // which does not create a chat, carries one.
+    // "New chat" / "New folder" need no gloss; only the private modes, which
+    // say what they do with memory, carry one.
     renderSidebar()
     openCreateMenu()
     await findCreateMenuItem('New chat')
@@ -213,6 +202,26 @@ describe('create-button caret menu', () => {
     }
   })
 
+  it('orders the rows: the two everyday creates, a rule, then the other kinds of session', async () => {
+    // New chat and New folder first (the two things people make all day), one
+    // separator, then the private modes and import. No folders are seeded and no
+    // peer is warm, so these six are the whole menu.
+    renderSidebar()
+    openCreateMenu()
+    await findCreateMenuItem('New chat')
+    const menu = screen.getByRole('menu')
+    const rows = Array.from(menu.querySelectorAll('[role="menuitem"], [role="separator"]'))
+      .map(el => el.getAttribute('role') === 'separator' ? '---' : el.getAttribute('data-testid') ?? el.textContent?.trim())
+    expect(rows).toEqual([
+      'new-plain-chat',
+      'new-folder',
+      '---',
+      'new-incognito-chat',
+      'new-temporary-chat',
+      expect.stringMatching(/import a session from a file/i),
+    ])
+  })
+
   it('"New chat" creates a plain session', async () => {
     renderSidebar()
     openCreateMenu()
@@ -222,56 +231,32 @@ describe('create-button caret menu', () => {
     expect(mocks.createChatSlot.mock.calls.at(-1)?.[3]).toBe('')
   })
 
-  // "Crew Members" — Crew Mode retired, and the entry that used to create a
-  // `mode: 'crew'` session is now the door to the Members page. It is NOT
-  // preview-gated: the flag only decides where the click lands.
-  it('lists Crew Members whatever the preview flag says, and never creates a session', async () => {
-    // Asserted on a plain `localStorage.clear()` (the beforeEach), which is the
-    // state a fresh install is in — the state the old entry was hidden in.
+  // The Mates door is gone from this menu: every row here creates something and
+  // is named "New …"; a row that navigated instead read as an unnamed create
+  // action on every open. Mates is reached from the rail. The retired Crew Mode
+  // ingress stays gone too, whatever the preview flag says.
+  it('offers no Mates door and no Crew Mode ingress among the create entries', async () => {
+    // Asserted on a plain `localStorage.clear()` (the beforeEach): a fresh install.
     renderSidebar()
     openCreateMenu()
     // Anchor on a sibling entry first: an empty query below would also pass if
     // the menu simply failed to open.
     await findCreateMenuItem('New chat')
-    const item = screen.getByTestId('open-crew-members')
-    expect(item.textContent).toContain('Crewmates')
-    // The retired ingress and its experimental tag are gone, not merely hidden.
+    expect(screen.queryByTestId('open-crew-members')).toBeNull()
+    expect(screen.queryByRole('menuitem', { name: /^Mates\b/ })).toBeNull()
+    expect(screen.queryByText(/Opens the Mates page/)).toBeNull()
+    expect(screen.queryByText(/Opens Settings first/)).toBeNull()
     expect(screen.queryByTestId('new-crew-chat')).toBeNull()
     expect(screen.queryByText('New Crew Mode chat')).toBeNull()
-    expect(item.querySelector('[data-testid="crew-experimental-tag"]')).toBeNull()
-    fireEvent.click(item)
-    await waitFor(() => expect(screen.getByTestId('location').textContent).not.toBe('/'))
+    expect(screen.queryByTestId('crew-experimental-tag')).toBeNull()
     expect(mocks.createChatSlot).not.toHaveBeenCalled()
   })
 
-  it('opens the Members page when the preview flag is on', async () => {
-    localStorage.setItem(PREVIEW_CREW, '1')
-    renderSidebar()
-    openCreateMenu()
-    fireEvent.click(await screen.findByTestId('open-crew-members'))
-    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/members'))
-  })
-
-  it('opens the Feature Previews card that turns the page on when the flag is off', async () => {
-    // Not a toast telling the user to go and find the switch: the click lands
-    // ON the switch, ringed, via the same `?highlight=` deep link Settings
-    // search uses.
-    renderSidebar()
-    openCreateMenu()
-    const item = await screen.findByTestId('open-crew-members')
-    // The gloss discloses the detour BEFORE the click, instead of promising the
-    // page and then landing somewhere else (UX review on #9519).
-    expect(item.textContent).toMatch(/Opens Settings first/)
-    expect(item.textContent).not.toMatch(/Opens the Crewmates page/)
-    fireEvent.click(item)
-    await waitFor(() => expect(screen.getByTestId('location').textContent)
-      .toBe(`/settings/developer?highlight=${SETTINGS_CREW_MEMBERS_PREVIEW_ID}`))
-  })
-
-  it('deep-links to an id the settings registry still knows', () => {
+  it('the Mates preview deep-link id still names a live settings entry', () => {
     // Registry ids derive from the card's LABEL, so a relabel silently breaks
-    // an inlined string — this pins the constant to a live entry on the
-    // developer tab, the same guard `SETTINGS_DEFAULT_MODEL_ID` carries.
+    // every `?highlight=` link that inlines the string — this pins the constant
+    // to a live entry on the developer tab, the same guard
+    // `SETTINGS_DEFAULT_MODEL_ID` carries.
     const entry = SETTINGS_REGISTRY.find(e => e.id === SETTINGS_CREW_MEMBERS_PREVIEW_ID)
     expect(entry, `no registry entry for ${SETTINGS_CREW_MEMBERS_PREVIEW_ID}`).toBeDefined()
     expect(entry?.tab).toBe('developer')
@@ -424,14 +409,15 @@ describe('create-button caret menu', () => {
     expect(JSON.stringify(mocks.crewPeerPost.mock.calls.at(-1))).not.toContain('planner')
   })
 
-  it('still stamps the default agent on an ordinary local create', async () => {
-    // The contrast that makes the subtraction above a deliberate one rather than
-    // a dropped argument: the local entry DOES carry this machine's default.
+  it('sends no agent on an ordinary local create either', async () => {
+    // `defaultAgent` is the roster's default CREWMATE alias. A session created
+    // without picking a crewmate runs the default custom agent (a template),
+    // which the server stamps, so the local entry carries no agent at all.
     renderSidebar({ defaultAgent: 'planner' })
     openCreateMenu()
     fireEvent.click(await findCreateMenuItem('New chat'))
     await waitFor(() => expect(mocks.createChatSlot).toHaveBeenCalled())
-    expect(mocks.createChatSlot.mock.calls.at(-1)?.[1]).toBe('planner')
+    expect(mocks.createChatSlot.mock.calls.at(-1)?.[1]).toBeUndefined()
   })
 
   // A crew create takes seconds (a version read, then the peer's own create),
@@ -468,5 +454,63 @@ describe('create-button caret menu', () => {
     await waitFor(() => expect(screen.queryByTestId('new-chat-on-crew-spinner-i-nobita')).toBeNull())
     expect(screen.queryByText(pendingText)).toBeNull()
     if (!ok) expect(await screen.findByTestId('new-chat-on-crew-error')).toBeTruthy()
+  })
+})
+
+describe('create-menu offline gating', () => {
+  // Listed INLINE at phone width, which is also the only width where jsdom can
+  // reach the folder rows: a Radix flyout needs PointerEvent support jsdom lacks.
+  const folders: ChatFolder[] = [{ id: 'f-alpha', name: 'Alpha', order: 0 } as ChatFolder]
+
+  it('offline a folder row dims, announces itself, and refuses the pick', async () => {
+    mobileViewport.value = true
+    renderSidebar({ connected: false, folders })
+    openCreateMenu()
+    // The offline accessible name REPLACES the folder name: finding it under
+    // 'Alpha' would mean the announcement never applied.
+    const row = await screen.findByRole('menuitem', { name: 'Alpha disabled \u2014 gateway offline' })
+    expect(row.className).toContain('opacity-40')
+    expect(row.className).toContain('text-muted')
+    expect(row.getAttribute('aria-disabled')).toBe('true')
+    fireEvent.click(row)
+    // Radix closes a menu on onSelect, so a surviving menu is the refusal firing.
+    expect(screen.getByTestId('new-menu-offline-reason')).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: 'Alpha disabled \u2014 gateway offline' })).toBeInTheDocument()
+    expect(mocks.createChatSlot).not.toHaveBeenCalled()
+  })
+
+  it('connected the same folder row keeps its name and carries no dim', async () => {
+    mobileViewport.value = true
+    renderSidebar({ connected: true, folders })
+    openCreateMenu()
+    const row = await screen.findByRole('menuitem', { name: 'Alpha' })
+    expect(row.className).not.toContain('opacity-40')
+    expect(screen.queryByTestId('new-menu-offline-reason')).toBeNull()
+  })
+
+  it('offline every create row is dimmed and the menu says why', async () => {
+    renderSidebar({ connected: false })
+    openCreateMenu()
+    const rows = [
+      await screen.findByTestId('new-plain-chat'),
+      screen.getByTestId('new-incognito-chat'),
+      screen.getByTestId('new-temporary-chat'),
+      screen.getByTestId('new-folder'),
+    ]
+    for (const row of rows) {
+      expect(row.getAttribute('aria-disabled')).toBe('true')
+      expect(row.getAttribute('title')).toMatch(/offline/i)
+      expect(row.className).toContain('opacity-40')
+    }
+    expect(screen.getByTestId('new-menu-offline-reason')).toBeInTheDocument()
+    fireEvent.click(rows[0])
+    expect(mocks.createChatSlot).not.toHaveBeenCalled()
+  })
+
+  it('offline the split button\'s primary segment refuses with a notice, not a failure', async () => {
+    renderSidebar({ connected: false })
+    fireEvent.click(screen.getByRole('button', { name: /new chat session disabled/i }))
+    expect(await screen.findByTestId('folder-action-offline')).toHaveTextContent(/reconnect to create sessions/i)
+    expect(mocks.createChatSlot).not.toHaveBeenCalled()
   })
 })

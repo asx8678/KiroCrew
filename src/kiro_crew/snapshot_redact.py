@@ -37,7 +37,6 @@ from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.config.loader import config_dir
 from kiro_crew.memory import INDEX_DB_FILE
 from kiro_crew.memory_stores import MEMORY_DB_FILE, named_store_product_file
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 # Suffixes read as text. Everything else is either a database (handled through SQL) or
 # opaque bytes, and guessing at an unknown binary format is how a bundle gets corrupted.
@@ -301,8 +300,8 @@ def outbound_redaction_enabled() -> bool:
         # An ABSENT key is not an attempt to set the switch, so the default applies and the
         # default is off -- redaction is opt-IN, and off is the fail-safe direction here
         # (no rewriting means no chance of corrupting the off-host copy; the destination is
-        # owner-only either way). Review asked for this to raise, on the grounds that the
-        # refusal contract covers "anything not exactly true or false". It does not: the
+        # owner-only either way). It does not raise, although the refusal contract may read
+        # as covering "anything not exactly true or false". It does not: the
         # refusal below is for a value that IS set and cannot be interpreted -- `"true"`,
         # `1` -- where the operator plainly tried to set the switch and resolving it either
         # way would override their intent. Nothing was attempted here.
@@ -320,8 +319,9 @@ def _scrub(text: str) -> tuple[str, int]:
     The shared pair runs first so its warnings stay the primary signal; the egress-only
     pass then closes the shapes it does not recognise.
     """
-    cleaned, cred_warnings = redact_credentials(text)
-    cleaned, url_warnings = redact_exfiltration_urls(cleaned)
+    from kiro_crew.security import redact_with_findings
+
+    cleaned, cred_warnings, url_warnings = redact_with_findings(text)
     cleaned, extra = _scrub_unrecognised(cleaned)
     return cleaned, len(cred_warnings) + len(url_warnings) + extra
 

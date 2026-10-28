@@ -5,7 +5,7 @@ agents handler through this module. The handler families live in the
 ``agent_admin`` owners -- ``app_mcp_ownership``, ``agent_config``,
 ``default_agent``, ``capabilities``, ``template_lineage``, ``fork_publish``,
 ``agent_detail``, ``roster``, ``installed_agents``, ``crew_records``,
-``crew_update``, ``crew_removal`` and ``avatars`` -- and ``agent_admin.compose``
+``crew_update``, ``crew_removal`` and ``avatars`` -- and ``_facade_compose.compose``
 runs them on this module's globals, so a patch of ``agents.<name>`` reaches them.
 
 This module keeps the imports, constants and seams the owners read (``_err500``,
@@ -36,24 +36,29 @@ import time
 import uuid
 from collections.abc import Sequence  # noqa: F401
 from pathlib import Path  # noqa: F401
-from typing import Any
+from typing import Any, cast  # noqa: F401  (cast: crew_records reads it)
 
 from aiohttp import BodyPartReader, web  # noqa: F401
 
 from kiro_crew import agent_state  # noqa: F401
 from kiro_crew import crew_teams as teams_mod  # noqa: F401
 from kiro_crew import model_registry, model_scope
+from kiro_crew._facade_compose import compose as _facade_compose
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
-from kiro_crew.acp_backends import (
+from kiro_crew.acp_backends import (  # noqa: F401 - selectable_backend_values is a facade name
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KIRO,
+    ACP_BACKENDS_LOCAL_HARNESS_COMMANDS,
     model_registry_namespace,
     selectable_backend_values,
+    selectable_stored_backend_values,
 )
 from kiro_crew.agent import (  # noqa: F401
     AGENT_FILENAME,
     OWNED_KIRO_AGENT_FILES,
+    SharedAgentHomeRefused,
     _atomic_json_write,
+    _declined_foreign_spec_write,
     _is_confirmed_managed_dashboard_author,
     _refresh_forked_templates,
     _spec_path_is_safe,
@@ -79,10 +84,12 @@ from kiro_crew.agent_files import (  # noqa: F401
     DASHBOARD_AUTHOR_AGENT_FILENAME,
     KAS_RESERVED_AGENT_IDS,
 )
+from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.capabilities import capabilities_for, capabilities_of
 from kiro_crew.agent_sdk.drivers.acp import (
     EntitlementRevalidating,
     catalog_row_would_drop,
+    is_auth_failure_output,
     resolve_kiro_bin_for_spawn,
     resolve_pin_spelling,
     resolve_ssh_auth_sock,
@@ -106,11 +113,13 @@ from kiro_crew.config.loader import (  # noqa: F401
     ConfigReadError,
     KiroCrewAgentConfig,
     KiroCrewConfig,
+    _overlay_kiro_agent,
     _safe_color,
     coerce_dict_section,
     coerce_effort,
     config_local_path,
     config_path,
+    default_template,
     dispatch_kiro_agent,
     inject_kiro_cli_api_key,
     normalize_agent_model,
@@ -132,7 +141,6 @@ from kiro_crew.config.sections import _AVATAR_IMAGE_EXTS as _LOADER_AVATAR_IMAGE
 from kiro_crew.config.sections import (  # noqa: F401
     _safe_avatar,
 )
-from kiro_crew.dashboard import agent_admin as _agent_admin
 from kiro_crew.dashboard.agent_admin import agent_config as _owner_agent_config
 from kiro_crew.dashboard.agent_admin import agent_detail as _owner_agent_detail
 from kiro_crew.dashboard.agent_admin import app_mcp_ownership as _owner_app_mcp_ownership
@@ -174,7 +182,6 @@ from kiro_crew.dashboard.agent_admin.avatars import (  # noqa: F401
     _avatar_variant_paths,
     _avatars_dir,
     _carry_motions_through_motionless_save,
-    _carry_pack_through_faceless_save,
     _commit_promoted_avatar,
     _discard_pending_avatar,
     _image_body_complete,
@@ -207,8 +214,11 @@ from kiro_crew.dashboard.agent_admin.capabilities import (  # noqa: F401
     api_capability_skills_uninstall,
 )
 from kiro_crew.dashboard.agent_admin.crew_records import (  # noqa: F401
+    _api_kirocrew_agents_create,
     _crew_effort_rejected,
     _crew_memory_store_rejected,
+    _eager_copy_mate_config,
+    _mark_first_greeting_owed,
     _refresh_session_defaults,
     api_kirocrew_agent_resolved_model,
     api_kirocrew_agents_create,
@@ -217,20 +227,25 @@ from kiro_crew.dashboard.agent_admin.crew_removal import (  # noqa: F401
     _member_slug_is_claimed,
     _prune_private_copy_of_deleted_crew,
     _reclaim_deleted_member_crew_log,
+    _reclaim_deleted_member_dashboard_lock,
+    _remove_goal_check_ins,
     api_kirocrew_agent_delete,
 )
 from kiro_crew.dashboard.agent_admin.crew_update import (  # noqa: F401
+    _apply_member_approval_to_live_thread,
     _effort_inputs,
     api_kirocrew_agent_update,
 )
 from kiro_crew.dashboard.agent_admin.default_agent import (  # noqa: F401
-    _alias_binding_template,
-    _AmbiguousDefaultTarget,
     _AppRegisteredTemplate,
-    _binds_template,
+    _BackgroundOnlyTemplate,
+    _default_template_ineligible_reason,
     _installed_template_alias,
     _is_app_registered,
+    _set_default_template,
+    _spec_lock_or_unlocked_read,
     api_default_agent,
+    default_template_eligible,
 )
 from kiro_crew.dashboard.agent_admin.fork_publish import (  # noqa: F401
     api_agent_fork,
@@ -256,10 +271,12 @@ from kiro_crew.dashboard.agent_admin.template_lineage import (  # noqa: F401
     _ForeignPrivateCopy,
     _ForkBookkeepingFailed,
     _is_reserved_basename,
+    _lineage_unverifiable_error,
     _load_template_specs,
     _PublishNameBound,
     _rebind_crew_locked,
     _reserved_binding_names,
+    _sidecar_unverifiable,
     _spec_stem_on_disk,
     _StaleBinding,
     _unlink_copy_unless_referenced,
@@ -269,6 +286,7 @@ from kiro_crew.dashboard.agent_admin.template_lineage import (  # noqa: F401
 from kiro_crew.dashboard.chat_persistence import get_reasoning_effort_ordered
 from kiro_crew.dashboard.chat_utils import (  # noqa: F401
     _BLOCKED_SLASH_COMMANDS,
+    _DASHBOARD_SERVED_SLASH_COMMANDS,
     _SLASH_COMMANDS,
     SLASH_COMMAND_DESCRIPTIONS,
     _history_key_for,
@@ -288,20 +306,37 @@ from kiro_crew.dashboard.handlers._shared import (  # noqa: F401
     apply_skill_mapping,
     enumerate_skill_catalog,
     read_bounded_json,
+    rebuild_agent_spec,
 )
 from kiro_crew.dashboard.handlers.agent_templates import (  # noqa: F401
     TEMPLATE_DEFINITION_KEYS,
+    ControlPlaneNotDeclarable,
     apply_definition_patch,
+    control_plane_declarations,
     read_only_reason_for_path,
     validate_definition_patch,
 )
-from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
+from kiro_crew.dashboard.handlers.agents_cc_model_rows import merge_advertised_rows
+from kiro_crew.dashboard.handlers.models_kas_bundle import api_models_kas_bundle
+from kiro_crew.dashboard.handlers.source_providers import (  # noqa: F401
+    owner_view_for_request,
+)
+from kiro_crew.dashboard.kiro_readiness import (
+    KIRO_PREREQUISITE_REQUIRED_CODE,
+    reject_if_kiro_unverified,
+)
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES  # noqa: F401
 from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
 from kiro_crew.external_text import redact_external_text as _redact_external  # noqa: F401
 from kiro_crew.kiro_prerequisite import spawn_supervised_oneshot
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.member_workspace import (  # noqa: F401
+    AUTO_WORKSPACE,
+    MemberWorkspaceUnavailable,
+    provision_member_workspace,
+    retire_unpublished_workspace,
+)
 from kiro_crew.members import MemberNameError, key_new_crew, validate_member_name  # noqa: F401
 from kiro_crew.memory_stores import (  # noqa: F401
     DEFAULT_MEMORY_STORE,
@@ -344,6 +379,14 @@ _LIST_MODELS_BACKGROUND_TIMEOUT_SECS: float = 90.0
 # revalidate). The catalog changes rarely, so a few minutes stale costs nothing
 # the per-request entitlement narrowing does not already correct.
 _LIST_MODELS_CATALOG_TTL_SECS: float = 300.0
+# A fetch that spawned kiro-cli and failed (signed out, non-zero exit, timeout,
+# bad output) is remembered this long, and every poll inside the window gets the
+# same 503 without a new spawn or a new WARNING. The dashboard re-polls about
+# every 8s while the list is degraded, so a signed-out CLI cost one spawn and one
+# WARNING per poll (81 of each in 16 minutes on one gateway). 30s holds a failing
+# CLI to two spawns a minute, while a user who has just signed in waits at most
+# 30s for the picker to fill. A success clears the entry at once.
+_LIST_MODELS_FAILURE_BACKOFF_SECS: float = 30.0
 # The cache is the one place ``--list-models`` output is held past the request,
 # so retention is bounded before it is stored. Row count and identifying-field
 # length reuse the repo's ONE shared admission bound
@@ -409,16 +452,19 @@ def _supply_live_enum(entry: dict) -> None:
     backend from the dashboard while the PATCH allowlist accepted it.
 
     Resolved from the same owner as the PATCH allowlist and the config load path,
-    so the three cannot disagree. One binding today, so it is spelled once rather
+    so the three cannot disagree, and in the config-file vocabulary the PATCH
+    stores (Kiro CLI is ``"kiro"``). One binding today, so it is spelled once rather
     than made a registry; turn it into a path -> callable map when a second
     dynamic enum appears.
     """
     if entry.get("path") == _CONFIG_SCHEMA_ACP_BACKEND:
-        entry["enumValues"] = selectable_backend_values()
+        entry["enumValues"] = selectable_stored_backend_values()
 
 
 async def api_config_schema(request: web.Request) -> web.Response:
     """GET /api/config/schema — return config schema entries."""
+    from kiro_crew.edition_locks import LOCKED_BY_POLICY, config_path_locked
+
     entries = SCHEMA_REGISTRY
 
     # Filter by tags (comma-separated, intersection)
@@ -440,6 +486,9 @@ async def api_config_schema(request: web.Request) -> web.Response:
         if entry.sensitive or dataclasses.is_dataclass(d.get("defaultValue")):
             d["defaultValue"] = None
         _supply_live_enum(d)
+        # An enterprise build ignores this local value (RFC D3, kiro_crew.edition_locks).
+        if config_path_locked(entry.path):
+            d["lockedByPolicy"] = LOCKED_BY_POLICY
         result.append(d)
 
     return web.json_response({"entries": result})
@@ -505,9 +554,17 @@ def _advertised_cc_models(request: web.Request, namespace: str) -> list[dict]:
     """Map a live provider's advertised models to the API shape, per namespace.
 
     ``model_name`` is the advertised id verbatim: it is the wire value sent back
-    on selection, and the adapter only accepts ids it advertised. Returns ``[]``
-    when no session of that namespace has initialized or the backend advertised
-    nothing.
+    on selection, and the adapter only accepts ids it advertised.
+
+    A live session wins. With none live (a cold dashboard, a gateway restart, a
+    cold-start timeout) the list is the namespace's cross-session snapshot,
+    ``model_registry.advertised_models``, which every advertising session writes:
+    "no session is up" is not "nothing is advertised", and an id the catalog does
+    not list reaches a picker ONLY through this list. Returns ``[]`` only when the
+    snapshot is empty too (a genuine first run) or the backend advertised nothing.
+    Both sources pass the same bounded admission
+    (:func:`model_registry.live_advertised_model_rows`), so a live payload cannot
+    reach the picker with an id or label the cache would refuse or clip.
 
     Two filters, and both are load-bearing. The CAPABILITY gate
     (``SessionCapabilities.resolves_model_from_advertised_list``) is the property
@@ -526,7 +583,7 @@ def _advertised_cc_models(request: web.Request, namespace: str) -> list[dict]:
         state: DashboardState = request.app["state"]
         providers = state.sessions.active_providers()
     except (KeyError, AttributeError):
-        return []
+        providers = []
     for provider in reversed(providers):
         # Read each field straight off ``capabilities_of(provider)``: binding it to a
         # local would be a second spelling of the question, which the one-spelling
@@ -542,17 +599,17 @@ def _advertised_cc_models(request: web.Request, namespace: str) -> list[dict]:
             advertised = getter()
         except Exception:
             continue
-        if advertised:
-            return [
-                {
-                    "model_name": m.get("modelId", ""),
-                    "display_name": m.get("name", "") or m.get("modelId", ""),
-                    "description": m.get("description", ""),
-                }
-                for m in advertised
-                if m.get("modelId")
-            ]
-    return []
+        rows = model_registry.live_advertised_model_rows(advertised) if advertised else []
+        if rows:
+            return rows
+    return [
+        {
+            "model_name": r["model_name"],
+            "display_name": r.get("display_name", "") or r["model_name"],
+            "description": r.get("description", ""),
+        }
+        for r in model_registry.advertised_model_rows(namespace)
+    ]
 
 
 def _mark_unverified(models: list[dict]) -> list[dict]:
@@ -719,15 +776,17 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
     shown it unfiltered is offered the full flagship list and discovers the truth
     only when a prompt fails.
 
-    So when anything is advertised, registry rows are FILTERED DOWN to it (keeping
-    the registry's cleaner display names for the survivors), and advertised models
-    the registry does not list are appended for forward-compat.
+    So when anything is advertised, registry rows are FILTERED DOWN to it (each survivor
+    labelled with the backend's own name when it sent one, else the registry's),
+    and advertised models the registry does not list are appended for forward-compat.
 
-    When NOTHING is advertised the registry is shown unfiltered. That is not a
-    preference for the unfiltered list -- an empty advertised set means
-    "no session has initialized yet", which is indistinguishable from "this account
-    gets nothing", and showing an empty picker on a cold dashboard would be worse
-    than showing a superset.
+    With no session live the advertised set is the last snapshot any session
+    wrote (:func:`_advertised_cc_models`), so a cold dashboard filters the same
+    way. Only when NOTHING was ever advertised is the registry shown unfiltered.
+    That is not a preference for the unfiltered list -- an empty set then means
+    "no session has ever initialized", which is indistinguishable from "this
+    account gets nothing", and showing an empty picker on a first run would be
+    worse than showing a superset.
 
     ``auto`` is always present and always FIRST. It is the configured default
     (``config.agent.model``) and a sentinel rather than a real model, so it is
@@ -753,20 +812,7 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
             or _normalize_model_key(e.get("model_name", "")) == "auto"
         ]
 
-    merged: list[dict] = []
-    seen: dict[str, int] = {}
-    for entry in (*registry_rows, *advertised):
-        name = entry.get("model_name", "")
-        key = _normalize_model_key(name)
-        if not key:
-            continue
-        if key in seen:
-            # Collision: registry keeps display, advertised id keeps the wire value.
-            if key != "auto":
-                merged[seen[key]] = {**merged[seen[key]], "model_name": name}
-            continue
-        seen[key] = len(merged)
-        merged.append(entry)
+    merged = merge_advertised_rows(registry_rows, advertised, _normalize_model_key)
     # "auto" leads. It may be absent entirely if a future registry drops the row,
     # so synthesize it rather than assuming the filter above preserved one.
     merged = [e for e in merged if _normalize_model_key(e.get("model_name", "")) == "auto"] + [
@@ -774,7 +820,7 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
     ]
     if not any(_normalize_model_key(e.get("model_name", "")) == "auto" for e in merged):
         merged.insert(0, {"model_name": "auto", "display_name": "Auto", "description": ""})
-        seen = {_normalize_model_key(e.get("model_name", "")): i for i, e in enumerate(merged)}
+    seen = {_normalize_model_key(e.get("model_name", "")) for e in merged}
     # Guarantee the configured default is present (e.g. a custom cc_model the
     # backend doesn't advertise) so the selected model never vanishes. Resolve it
     # to its canonical key first (it may be stored as a provider id or alias) so a
@@ -837,9 +883,6 @@ def _advertised_backend_models(
     """
     namespace = model_registry_namespace(backend)
     advertised = _advertised_cc_models(request, namespace)
-    if not advertised:
-        cached = model_registry.advertised_models(namespace)
-        advertised = [{"model_name": m, "display_name": m, "description": ""} for m in cached]
 
     rows: list[dict] = [
         {"model_name": "auto", "display_name": "Auto", "description": "Backend default"}
@@ -915,6 +958,14 @@ def _scoped_default(cfg: Any, backend: str) -> str:
     )
 
 
+#: The ``code`` on an ordinary degraded ``/api/models`` 503 (binary unresolved,
+#: timeout, non-zero exit, empty / invalid output). A machine tag the dashboard
+#: renders as its generic config-load notice; the expired-login path overrides it
+#: with :data:`KIRO_PREREQUISITE_REQUIRED_CODE`. Every ``/api/models`` 503 carries
+#: a code, matching the endpoint's other degraded answers.
+_CATALOG_UNAVAILABLE_CODE = "model_list_unavailable"
+
+
 class _CatalogUnavailable(Exception):
     """A degraded catalog fetch outcome that maps to one 503 body.
 
@@ -924,11 +975,28 @@ class _CatalogUnavailable(Exception):
     the request path renders a dict-literal 503 body from it — one 503 per
     outcome. The message is carried, not a response dict, so the single render
     site stays a dict literal the error-code ratchet can scan.
+
+    ``backoff`` says whether the outcome is held in the cache's negative entry
+    (see :data:`_LIST_MODELS_FAILURE_BACKOFF_SECS`). It is true for every outcome
+    of a spawn that ran. An unresolved binary spawns nothing and resolves on its
+    own shortly after start, so it is retried on the next poll.
+
+    ``code`` is the machine tag the 503 body carries beside ``error`` so a client
+    tells one degraded cause from another, the same contract the sibling 503s on
+    this endpoint already carry (``model_list_revalidating``,
+    ``model_list_sandbox_unavailable``). It defaults to
+    :data:`_CATALOG_UNAVAILABLE_CODE` for the ordinary degraded outcomes (binary
+    unresolved, timeout, non-zero exit, empty / invalid output), which the
+    dashboard renders as its generic config-load notice; the expired / signed-out
+    login path passes :data:`KIRO_PREREQUISITE_REQUIRED_CODE` instead, which the
+    dashboard renders as the one actionable "run ``kiro-cli login``" message.
     """
 
-    def __init__(self, error: str):
+    def __init__(self, error: str, *, backoff: bool = True, code: str = _CATALOG_UNAVAILABLE_CODE):
         super().__init__(error)
         self.error = error
+        self.backoff = backoff
+        self.code = code
 
 
 def _bounded_catalog(models: list[dict]) -> list[dict]:
@@ -1012,11 +1080,37 @@ class _CatalogCache:
 
     ``task`` single-flights the fetch: concurrent polls (and the 8s self-heal
     loop) share one spawn rather than each starting its own cold start.
+
+    ``failure`` is the negative entry: the 503 message of the last failed fetch,
+    and ``failed_at`` when it ended. Inside :data:`_LIST_MODELS_FAILURE_BACKOFF_SECS`
+    the request path answers that 503 instead of spawning again. Only the message
+    is held, not the exception, so no traceback frame outlives the fetch. A
+    successful fetch clears it. ``failure_code`` rides alongside it so a held
+    auth-expiry 503 keeps its :data:`KIRO_PREREQUISITE_REQUIRED_CODE` tag through
+    the backoff window rather than decaying to a generic body on the next poll.
     """
 
     models: list[dict] | None = None
     fetched_at: float = 0.0
     task: "asyncio.Task[list[dict]] | None" = None
+    failure: str | None = None
+    failure_code: str = _CATALOG_UNAVAILABLE_CODE
+    failed_at: float = 0.0
+
+    def recent_failure(self) -> tuple[str, str] | None:
+        """A fetch that failed inside the backoff window: its 503 message and code.
+
+        Returns ``None`` once the window has elapsed (the next poll re-spawns), so
+        a non-``None`` answer is always within backoff. The code is the second
+        element -- the generic ``model_list_unavailable`` for an ordinary degraded
+        outcome, or ``kiro_prerequisite_required`` for an expired login -- so the
+        request path renders the same body the failing fetch would have.
+        """
+        if self.failure is None:
+            return None
+        if time.monotonic() - self.failed_at >= _LIST_MODELS_FAILURE_BACKOFF_SECS:
+            return None
+        return self.failure, self.failure_code
 
 
 _catalog_cache = _CatalogCache()
@@ -1050,7 +1144,7 @@ async def _fetch_kiro_catalog() -> list[dict]:
         # Degraded (binary not resolved yet), NOT a genuine "zero models" result.
         # 503 so the client retries instead of caching an empty list — a cached
         # [] renders an empty picker that only a manual page refresh recovers from.
-        raise _CatalogUnavailable("kiro binary not resolved")
+        raise _CatalogUnavailable("kiro binary not resolved", backoff=False)
     argv = [kiro_bin, "chat", "--list-models", "--format", "json", "--no-interactive"]
     # Mirror AcpClient._spawn() sandbox: wrap_argv + env + process isolation.
     # Note: AcpClient._spawn() is for interactive ACP sessions (stdin/stdout
@@ -1139,6 +1233,22 @@ async def _fetch_kiro_catalog() -> list[dict]:
             proc.returncode,
             stderr_tail or "<no stderr>",
         )
+        # Classify the ONE non-zero exit that is not a degraded backend blip: an
+        # expired / signed-out kiro-cli login. ``--list-models`` fails that way
+        # mid-session once the token lapses, and the generic 503 below rendered as
+        # the dashboard's "Failed to load config." — pointing the user at retry /
+        # switch-model, neither of which can fix auth. The readiness gate above
+        # cannot catch an EXPIRED login: its latch was verified true at startup
+        # and is stale here. ``is_auth_failure_output`` is the SAME classifier the
+        # ACP error-frame and spawn-stderr paths already use (401 / 403, expiry
+        # wording, rejected bearer, the named service exceptions), so this adds no
+        # new auth vocabulary. The stderr is already redacted above, so no token
+        # reaches this branch or the error carried out of it.
+        if is_auth_failure_output(stderr_tail):
+            raise _CatalogUnavailable(
+                host_auth.signed_out_message(ACP_BACKEND_KIRO),
+                code=KIRO_PREREQUISITE_REQUIRED_CODE,
+            )
         raise _CatalogUnavailable("model list command failed")
 
     if not stdout.strip():
@@ -1240,6 +1350,15 @@ def _shared_catalog_fetch() -> "asyncio.Task[list[dict]]":
     async def _run() -> list[dict]:
         try:
             models = await _fetch_kiro_catalog()
+        except _CatalogUnavailable as exc:
+            # Remember a failed spawn so the polls inside the backoff window
+            # answer its 503 without spawning again (see recent_failure). The
+            # code rides along so an expired-auth hold keeps its sign-in tag.
+            if exc.backoff:
+                _catalog_cache.failure = exc.error
+                _catalog_cache.failure_code = exc.code
+                _catalog_cache.failed_at = time.monotonic()
+            raise
         finally:
             # Release the single-flight slot the moment this attempt ends,
             # win or lose, so a failed fetch does not wedge every later poll.
@@ -1249,6 +1368,8 @@ def _shared_catalog_fetch() -> "asyncio.Task[list[dict]]":
         bounded = _bounded_catalog(models)
         _catalog_cache.models = bounded
         _catalog_cache.fetched_at = time.monotonic()
+        _catalog_cache.failure = None
+        _catalog_cache.failure_code = _CATALOG_UNAVAILABLE_CODE
         return bounded
 
     task = asyncio.ensure_future(_run())
@@ -1296,6 +1417,17 @@ async def api_models(request: web.Request) -> web.Response:
                 request, backend, configured_default=_scoped_default(cfg, backend)
             )
         )
+    # KAS from Crew's own engine bundle: no kiro-cli to list models with, so the
+    # readiness gate, the ``--list-models`` spawn and the ``_entitled_kiro_models``
+    # narrowing below never apply (the engine's select is already the signed-in
+    # account's list). Decided per ROUTE (backend AND the bundle switch), not per
+    # backend, which is why it is not a capability-set branch like the one above.
+    # The one shared predicate (``agent_sdk.kas_bundle``); it re-reads config, so
+    # off the loop. Deferred like the handler module's own engine probe.
+    from kiro_crew.agent_sdk import kas_bundle
+
+    if await asyncio.to_thread(kas_bundle.kas_bundle_route):
+        return await api_models_kas_bundle(request)
     # Signed-out gateways must never reach the spawn below. kiro-cli auto-opens
     # an interactive browser login for ANY subcommand run unauthenticated
     # (--no-interactive does not suppress it, and there is no opt-out env var),
@@ -1308,9 +1440,10 @@ async def api_models(request: web.Request) -> web.Response:
     # Keep the tight destructive bound here: this endpoint polls only while the
     # model list is a degraded fallback and stops the instant a live fetch wins
     # (website/src/providers/modelListHealth.ts), so it is not polled at all when
-    # healthy and gains no latency from a wider window. It has no server-side
-    # cooldown on its kiro-cli spawn, so a wide stale-authorize window would let a
-    # stale ready=True latch spawn a browser-opening login on most degraded ticks.
+    # healthy and gains no latency from a wider window. Its only server-side
+    # cooldown is the short failure backoff below, so a wide stale-authorize window
+    # would still let a stale ready=True latch spawn a browser-opening login on
+    # most degraded ticks.
     blocked = await reject_if_kiro_unverified(request)
     if blocked is not None:
         return blocked
@@ -1321,7 +1454,9 @@ async def api_models(request: web.Request) -> web.Response:
             # behind the reply (stale-while-revalidate). Entitlement narrowing
             # still runs on every request, so a plan change is reflected now even
             # when the catalog rows themselves are a few minutes old.
-            if time.monotonic() - _catalog_cache.fetched_at >= _LIST_MODELS_CATALOG_TTL_SECS:
+            # A refresh that just failed is not retried until its backoff ends.
+            stale = time.monotonic() - _catalog_cache.fetched_at >= _LIST_MODELS_CATALOG_TTL_SECS
+            if stale and _catalog_cache.recent_failure() is None:
                 _shared_catalog_fetch()
             models = await _entitled_kiro_models(request, list(cached))
             return web.json_response(models)
@@ -1332,6 +1467,13 @@ async def api_models(request: web.Request) -> web.Response:
         # cancelled: it runs on under its own longer ceiling and warms the cache,
         # so the next 8s poll is served from its result instead of starting
         # another doomed cold start.
+        #
+        # A fetch that failed inside the backoff window answers the same 503
+        # straight from the negative entry: no spawn, no new WARNING line.
+        failure = _catalog_cache.recent_failure()
+        if failure is not None:
+            message, code = failure
+            raise _CatalogUnavailable(message, code=code)
         task = _shared_catalog_fetch()
         try:
             models = await asyncio.wait_for(
@@ -1342,13 +1484,19 @@ async def api_models(request: web.Request) -> web.Response:
             # (shield already detached it from this await) so the next poll lands
             # on the warmed cache rather than re-spawning.
             logger.warning("api_models: --list-models slower than the request bound; returning 503")
-            return web.json_response({"error": "model list timed out"}, status=503)
+            return web.json_response(
+                {"error": "model list timed out", "code": _CATALOG_UNAVAILABLE_CODE}, status=503
+            )
         models = await _entitled_kiro_models(request, list(models))
         return web.json_response(models)
     except _CatalogUnavailable as exc:
         # A degraded fetch outcome (binary unresolved, timeout, non-zero exit,
-        # empty / invalid output). The carried body is the 503 for that outcome.
-        return web.json_response({"error": exc.error}, status=503)
+        # empty / invalid output). The carried body is the 503 for that outcome,
+        # with a machine ``code`` the dashboard keys on: the generic
+        # ``model_list_unavailable`` renders the config-load notice, while an
+        # expired / signed-out login carries ``kiro_prerequisite_required`` and
+        # renders the one actionable "run kiro-cli login" message.
+        return web.json_response({"error": exc.error, "code": exc.code}, status=503)
     except EntitlementRevalidating:
         # An entitlement revalidation is in flight past the read deadline. The
         # picker snapshot might narrow the catalog on an un-revalidated answer,
@@ -1390,7 +1538,9 @@ async def api_models(request: web.Request) -> web.Response:
         # Spawn failure, JSON parse error, etc. — degraded, not "zero models".
         # 503 so the client retries instead of caching an empty picker.
         logger.warning("api_models failed; returning 503 for client retry", exc_info=True)
-        return web.json_response({"error": "model list unavailable"}, status=503)
+        return web.json_response(
+            {"error": "model list unavailable", "code": _CATALOG_UNAVAILABLE_CODE}, status=503
+        )
 
 
 async def api_effort_levels(request: web.Request) -> web.Response:
@@ -1420,6 +1570,11 @@ async def api_effort_levels(request: web.Request) -> web.Response:
 async def api_slash_commands(request: web.Request) -> web.Response:
     """GET /api/slash-commands — list available slash commands (provider-aware)."""
     cfg = KiroCrewConfig.load()
+    # This global endpoint has no session/member key; the configured default
+    # backend is its capability authority, independent of the provider label.
+    blocked_commands = _BLOCKED_SLASH_COMMANDS
+    if capabilities_for(cfg.agent.acp_backend).supports_native_todos:
+        blocked_commands = blocked_commands - {"/todos"}
     if is_claude_code(cfg.agent.provider):
         state: DashboardState = request.app["state"]
         cc_commands: list[str] = []
@@ -1442,7 +1597,7 @@ async def api_slash_commands(request: web.Request) -> web.Response:
         result = [
             {"name": f"/{c}", "description": SLASH_COMMAND_DESCRIPTIONS.get(f"/{c}", "")}
             for c in cc_commands
-            if f"/{c}" not in _BLOCKED_SLASH_COMMANDS
+            if f"/{c}" not in blocked_commands
         ]
         for command in ("/side", "/workflow"):
             if not any(item["name"] == command for item in result):
@@ -1455,11 +1610,16 @@ async def api_slash_commands(request: web.Request) -> web.Response:
     # explicit "not available in the dashboard" rejection in chat_runner), but
     # the suggestion payload must not advertise them: a menu entry that only
     # ever produces a warning is an inert affordance.
+    offered = _SLASH_COMMANDS - blocked_commands
+    # The same holds for a harness with no command channel: the slash gate
+    # answers each of its harness commands with a notice, so list only what the
+    # dashboard serves there. /compact stays: it has a gate of its own, which
+    # sends the engine's compaction verb or explains that the harness compacts
+    # by itself, and never gives that notice.
+    if cfg.agent.acp_backend in ACP_BACKENDS_LOCAL_HARNESS_COMMANDS:
+        offered = offered & (_DASHBOARD_SERVED_SLASH_COMMANDS | {"/compact"})
     return web.json_response(
-        [
-            {"name": c, "description": SLASH_COMMAND_DESCRIPTIONS.get(c, "")}
-            for c in sorted(_SLASH_COMMANDS - _BLOCKED_SLASH_COMMANDS)
-        ]
+        [{"name": c, "description": SLASH_COMMAND_DESCRIPTIONS.get(c, "")} for c in sorted(offered)]
     )
 
 
@@ -1508,12 +1668,21 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 
     redact = request.app.get("state") is None or not is_owner_dashboard_request(request)
+    state: DashboardState | None = request.app.get("state")
+
+    # A legacy built-in binding (``builtin``, no member id) is listed once its DM
+    # thread holds a message, the rule ``GET /api/members`` applies to every
+    # non-dashboard-created row. The binding and transcript reads are file IO:
+    # one thread hop for the candidates, then the live-slot check on the loop.
+    # Through the members facade, so a patch on it reaches this read too.
+    from kiro_crew.dashboard.handlers.members import unchatted_legacy_bindings
+
+    hidden = await unchatted_legacy_bindings(cfg, state)
     agents = [
         _agent_roster_row(name, "global", agent_cfg, redact=redact)
         for name, agent_cfg in cfg.agents.items()
+        if name not in hidden
     ]
-
-    state: DashboardState | None = request.app.get("state")
 
     # Project rows come from a directory scan, so it runs on the discovery
     # pool — same rule as every other agent listing: no filesystem I/O on the
@@ -1611,7 +1780,9 @@ def _pin_entitlement_backend(cfg: Any) -> str:
     return default_backend
 
 
-async def _revalidate_crew_pin(model: str, request: web.Request) -> str | None:
+async def _revalidate_crew_pin(
+    model: str, request: web.Request, *, for_workers: bool = False
+) -> str | None:
     """Revalidate the snapshot a crew's model pin is about to be judged by.
 
     Awaited BEFORE the handlers take the config lock: :func:`_model_pin_rejected`
@@ -1624,6 +1795,9 @@ async def _revalidate_crew_pin(model: str, request: web.Request) -> str | None:
     Skips the cases the locked check answers without the live list -- inherit,
     the retained claude_code seam and a known wrong-flavour spelling -- so no probe
     is spent on a value the snapshot does not decide.
+
+    ``for_workers`` names the crew's ``worker_model``: it is judged against the
+    harness the crewmate's worker runs on (``mate_worker.crewmate_worker_backend``).
     """
     if not model or model == "auto" or model_registry.acp_id_correction(model):
         return None
@@ -1632,10 +1806,10 @@ async def _revalidate_crew_pin(model: str, request: web.Request) -> str | None:
         return None
     # circular import: see _model_pin_rejected.
     from kiro_crew.dashboard.handlers.core import _revalidate_role_pin_evidence
+    from kiro_crew.mate_worker import crewmate_worker_backend
 
-    return await _revalidate_role_pin_evidence(
-        model, request, backend=_pin_entitlement_backend(cfg)
-    )
+    backend = crewmate_worker_backend(cfg.agent) if for_workers else _pin_entitlement_backend(cfg)
+    return await _revalidate_role_pin_evidence(model, request, backend=backend)
 
 
 def _model_pin_rejected(
@@ -1661,7 +1835,8 @@ def _model_pin_rejected(
     per-role validator so the crew form, the role pins and the session-init
     withhold apply one predicate. ``""``/``"auto"`` mean inherit and always
     pass; an unknown advertised set means entitlement is unknowable, and the
-    validator accepts rather than accusing on no evidence.
+    validator accepts, except a pin on an ``acp``-namespace backend that
+    ``lacks_acp_id`` flags.
     """
     # The retained claude_code seam accepts canonical and registered Bedrock
     # wire ids that the ACP correction and advertised-id comparison below
@@ -1685,7 +1860,7 @@ def _model_pin_rejected(
         # plausible-intent user into a quieter capability change than the one
         # they asked for. Report the mapping, show what is actually served, and
         # let them choose.
-        served = ", ".join(model_registry.available_models("acp")[:8]) or "auto"
+        served = ", ".join(model_registry.available_models("acp")) or "auto"
         return (
             f"{model!r} is not a model kiro-cli serves. The registry maps that "
             f"spelling to {correction!r} — confirm that is the model you want, or "
@@ -1775,7 +1950,7 @@ async def api_kirocrew_agent_avatar_get(request: web.Request) -> web.Response:
 # ``kiro_crew.dashboard.handlers.agents.<name>`` reaches it wherever it lives;
 # see ``kiro_crew.dashboard.agent_admin``. Run once, after this body has bound every
 # name.
-_agent_admin.compose(
+_facade_compose(
     globals(),
     (
         _owner_app_mcp_ownership,

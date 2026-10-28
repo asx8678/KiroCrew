@@ -10,11 +10,12 @@
  * without loading the trees runtime, and `/api/file-grep` is stubbed so the
  * results list is asserted against a known payload rather than a live walk.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
-  render, screen, waitFor, fireEvent, within, cleanup, renderHook,
+  render, screen, waitFor, fireEvent, within, cleanup, renderHook, act,
 } from '@testing-library/react'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClient, QueryClientProvider, focusManager } from '@tanstack/react-query'
+import { refocusWindow } from './focusBarrier'
 import type { ReactNode } from 'react'
 import { consumeChatHandoff, recordError } from '../utils/errorReport'
 
@@ -23,6 +24,7 @@ const H = vi.hoisted(() => ({
   api: {
     projectTree: vi.fn(),
     projectGitStatus: vi.fn(),
+    fileSearch: vi.fn(),
   },
   fileGrep: vi.fn(),
 }))
@@ -39,21 +41,35 @@ vi.mock('../pierre/tree', () => ({
     searchQuery?: string | null
     selectedPath?: string | null
     onFileOpen?: (abs: string) => void
+    onOpenFolder?: (folder: string) => void
+    reveal?: { path: string; nonce: number } | null
+    active?: boolean
   }) => (
-    <button
-      data-testid="tree"
-      data-mode={p.mode}
-      data-dir={p.projectDir}
-      data-query={p.searchQuery ?? ''}
-      data-selected={p.selectedPath ?? ''}
-      onClick={() => p.onFileOpen?.(H.OPENED)}
-    >
-      tree
-    </button>
+    <>
+      {/* Stands in for the limit row under a cut folder: present only when
+          the rail hands the tree an opener, as the real row's action is. */}
+      {p.onOpenFolder && (
+        <button data-testid="tree-open-folder" onClick={() => p.onOpenFolder?.('big/cut')}>
+          open folder
+        </button>
+      )}
+      <button
+        data-testid="tree"
+        data-mode={p.mode}
+        data-dir={p.projectDir}
+        data-query={p.searchQuery ?? ''}
+        data-selected={p.selectedPath ?? ''}
+        data-reveal={p.reveal?.path ?? ''}
+        data-active={String(p.active)}
+        onClick={() => p.onFileOpen?.(H.OPENED)}
+      >
+        tree
+      </button>
+    </>
   ),
 }))
 
-import FileBrowserRail, { useTreeState } from '../pages/chat/FileBrowserRail'
+import FileBrowserRail, { useTreeState, CONTENT_DEBOUNCE_MS, NAME_SEARCH_DEBOUNCE_MS } from '../pages/chat/FileBrowserRail'
 import { ApiError } from '../api/apiError'
 
 const RAIL_W_KEY = 'mc-files-rail-w'
@@ -63,24 +79,31 @@ function newClient() {
   return new QueryClient({ defaultOptions: { queries: { retry: false } } })
 }
 
-function mount(props: { onFileOpen?: (p: string, d: boolean) => void; selectedPath?: string | null; projectDir?: string; active?: boolean } = {}) {
+function mount(props: { onFileOpen?: (p: string, d: boolean) => void; selectedPath?: string | null; projectDir?: string; active?: boolean; onOpenFolder?: (abs: string) => void } = {}) {
   const qc = newClient()
   const onFileOpen = props.onFileOpen ?? vi.fn()
-  const utils = render(
+  const ui = (active: boolean | undefined) => (
     <QueryClientProvider client={qc}>
-      <FileBrowserRail projectDir={props.projectDir ?? DIR} onFileOpen={onFileOpen} selectedPath={props.selectedPath} active={props.active} />
-    </QueryClientProvider>,
+      <FileBrowserRail projectDir={props.projectDir ?? DIR} onFileOpen={onFileOpen} selectedPath={props.selectedPath} active={active} onOpenFolder={props.onOpenFolder} />
+    </QueryClientProvider>
   )
-  return { qc, onFileOpen, ...utils }
+  const utils = render(ui(props.active))
+  return { qc, onFileOpen, ...utils, setActive: (active: boolean) => utils.rerender(ui(active)) }
 }
 
 const rail = () => screen.getByRole('separator').nextElementSibling as HTMLElement
 const tree = () => screen.getByTestId('tree')
 
+afterEach(() => {
+  vi.useRealTimers()
+  focusManager.setFocused(undefined)
+})
+
 beforeEach(() => {
   localStorage.clear()
   H.api.projectTree.mockReset().mockResolvedValue({ root: DIR, paths: [], repo: true })
   H.api.projectGitStatus.mockReset().mockResolvedValue({ repo: true, files: [] })
+  H.api.fileSearch.mockReset().mockResolvedValue({ results: [], root: DIR })
   H.fileGrep.mockReset().mockResolvedValue({
     results: [], truncated: false, engine: 'rg', skipped_docs: 0, root: DIR,
   })
@@ -138,16 +161,27 @@ describe('FileBrowserRail mode segment', () => {
     expect(await within(screen.getByLabelText('Changed')).findByText('3')).toBeInTheDocument()
   })
 
-  it('pauses the git-status poll while kept mounted but inactive', async () => {
-    const poll = (qc: QueryClient) => qc.getQueryCache().find({ queryKey: ['git-status', DIR] })!.observers[0].options
-    const shown = mount()
+  it('reads nothing while kept mounted but inactive, not even on a window focus', async () => {
+    const { qc } = mount({ active: false })
+    expect(await screen.findByLabelText('Changed')).toBeInTheDocument()
+    await refocusWindow(qc)
+    expect(H.api.projectTree).not.toHaveBeenCalled()
+    expect(H.api.projectGitStatus).not.toHaveBeenCalled()
+  })
+
+  it('reads the tree and the status once it becomes active', async () => {
+    const { setActive } = mount({ active: false })
+    setActive(true)
+    await waitFor(() => expect(H.api.projectTree).toHaveBeenCalledWith(DIR))
     await waitFor(() => expect(H.api.projectGitStatus).toHaveBeenCalledWith(DIR))
-    expect(poll(shown.qc).refetchInterval).toBe(5_000)
+  })
+
+  it('hands its own visibility to the tree, so the tree pauses its polls with it', async () => {
+    mount({ active: false })
+    expect((await screen.findByTestId('tree')).dataset.active).toBe('false')
     cleanup()
-    const hidden = mount({ active: false })
-    await waitFor(() => expect(hidden.qc.getQueryCache().find({ queryKey: ['git-status', DIR] })?.observers.length).toBe(1))
-    expect(poll(hidden.qc).refetchInterval).toBe(false)
-    expect(poll(hidden.qc).refetchOnWindowFocus).toBe(false)
+    mount()
+    expect((await screen.findByTestId('tree')).dataset.active).toBe('true')
   })
 
   it('omits the badge when the working tree is clean', async () => {
@@ -835,6 +869,24 @@ describe('FileBrowserRail search-mode toggle', () => {
     await waitFor(() => expect(screen.queryByTestId('tree')).toBeNull())
   })
 
+  it('runs no content search while inactive: neither a settling debounce nor a window focus', async () => {
+    H.fileGrep.mockResolvedValue(GREP_PAYLOAD)
+    const { qc, setActive } = mount()
+    await searchContents('needle')
+    expect(H.fileGrep).toHaveBeenCalledTimes(1)
+    // A refinement typed just before the tab is left settles while hidden: the
+    // debounce is run past on a fake clock, installed after the render settled.
+    vi.useFakeTimers()
+    fireEvent.change(screen.getByLabelText('Search in files…'), { target: { value: 'needles' } })
+    setActive(false)
+    await act(async () => { await vi.advanceTimersByTimeAsync(CONTENT_DEBOUNCE_MS + 1) })
+    vi.useRealTimers()
+    await refocusWindow(qc)
+    expect(H.fileGrep).toHaveBeenCalledTimes(1)
+    setActive(true)
+    await waitFor(() => expect(H.fileGrep).toHaveBeenLastCalledWith(DIR, 'needles'))
+  })
+
   it('keeps Content mode across a remount', async () => {
     H.fileGrep.mockResolvedValue(GREP_PAYLOAD)
     mount()
@@ -1113,4 +1165,108 @@ describe('FileBrowserRail content results', () => {
     expect(prompt).toContain('403')
     expect(prompt).toContain('sensitive_path')
   })
+})
+
+
+describe('FileBrowserRail past the tree row cap', () => {
+  const truncatedTree = { root: DIR, paths: ['a.txt'], directories: ['big'], repo: false, truncated: true, truncatedDirectories: ['big'] }
+
+  it('opens a cut folder in a folder tab, as an absolute path, from its limit row', async () => {
+    H.api.projectTree.mockResolvedValue(truncatedTree)
+    const onOpenFolder = vi.fn()
+    mount({ onOpenFolder })
+    await waitFor(() => expect(H.api.projectTree).toHaveBeenCalled())
+    fireEvent.click(await screen.findByTestId('tree-open-folder'))
+    expect(onOpenFolder).toHaveBeenCalledWith(`${DIR}/big/cut`)
+    // Opening the tab starts no search of its own in the rail.
+    expect(H.api.fileSearch).not.toHaveBeenCalled()
+  })
+
+  it('offers no folder-tab action when the host cannot open one', async () => {
+    H.api.projectTree.mockResolvedValue(truncatedTree)
+    mount()
+    await waitFor(() => expect(H.api.projectTree).toHaveBeenCalled())
+    expect(screen.queryByTestId('tree-open-folder')).toBeNull()
+  })
+
+  it('keeps a whole tree on the local filter', async () => {
+    mount()
+    fireEvent.change(screen.getByLabelText('Filter files…'), { target: { value: 'late' } })
+    await waitFor(() => expect(tree().dataset.query).toBe('late'))
+    // The search results are never mounted for a whole tree, so no search can be sent.
+    expect(screen.queryByTestId('rail-name-search')).toBeNull()
+    expect(H.api.fileSearch).not.toHaveBeenCalled()
+  })
+
+  it('sends the filter to the filename search and reveals a folder hit', async () => {
+    H.api.projectTree.mockResolvedValue(truncatedTree)
+    H.api.fileSearch.mockResolvedValue({
+      root: DIR,
+      results: [
+        { path: `${DIR}/big/late`, name: 'late', size: 0, mtime: 0, kind: 'dir' },
+        { path: `${DIR}/big/late/x.ts`, name: 'x.ts', size: 0, mtime: 0, kind: 'file' },
+      ],
+    })
+    const { onFileOpen } = mount()
+    await waitFor(() => expect(H.api.projectTree).toHaveBeenCalled())
+    fireEvent.change(screen.getByLabelText('Filter files…'), { target: { value: 'late' } })
+    await waitFor(() => expect(H.api.fileSearch).toHaveBeenCalledWith('late', DIR, expect.anything(), undefined, 50))
+    const results = await screen.findByTestId('rail-name-search')
+    fireEvent.click(await within(results).findByText('big/late/x.ts'))
+    expect(onFileOpen).toHaveBeenCalledWith(`${DIR}/big/late/x.ts`, false)
+    fireEvent.click(within(results).getByText('big/late'))
+    await waitFor(() => expect(tree().dataset.reveal).toBe('big/late'))
+    expect((screen.getByLabelText('Filter files…') as HTMLInputElement).value).toBe('')
+  })
+
+  it('sends no filename search while inactive: neither a settling debounce nor a window focus', async () => {
+    H.api.projectTree.mockResolvedValue(truncatedTree)
+    const { qc, setActive } = mount()
+    await waitFor(() => expect(H.api.projectTree).toHaveBeenCalled())
+    fireEvent.change(screen.getByLabelText('Filter files…'), { target: { value: 'late' } })
+    await waitFor(() => expect(H.api.fileSearch).toHaveBeenCalledTimes(1))
+    vi.useFakeTimers()
+    fireEvent.change(screen.getByLabelText('Filter files…'), { target: { value: 'later' } })
+    setActive(false)
+    await act(async () => { await vi.advanceTimersByTimeAsync(NAME_SEARCH_DEBOUNCE_MS + 1) })
+    vi.useRealTimers()
+    await refocusWindow(qc)
+    expect(H.api.fileSearch).toHaveBeenCalledTimes(1)
+    setActive(true)
+    await waitFor(() => expect(H.api.fileSearch).toHaveBeenLastCalledWith('later', DIR, expect.anything(), undefined, 50))
+  })
+
+  it('adds the rows the cut tree already holds that the search missed', async () => {
+    H.api.projectTree.mockResolvedValue({ ...truncatedTree, paths: ['a.txt', 'big/late-note.md'] })
+    H.api.fileSearch.mockResolvedValue({ root: DIR, results: [] })
+    mount()
+    await waitFor(() => expect(H.api.projectTree).toHaveBeenCalled())
+    fireEvent.change(screen.getByLabelText('Filter files…'), { target: { value: 'late' } })
+    const results = await screen.findByTestId('rail-name-search')
+    expect(await within(results).findByText('big/late-note.md')).toBeInTheDocument()
+  })
+
+  it('keeps the cut tree\'s own matches when the search fails', async () => {
+    H.api.projectTree.mockResolvedValue({ ...truncatedTree, paths: ['a.txt', 'big/late-note.md'] })
+    H.api.fileSearch.mockRejectedValue(new Error('forbidden'))
+    mount()
+    await waitFor(() => expect(H.api.projectTree).toHaveBeenCalled())
+    fireEvent.change(screen.getByLabelText('Filter files…'), { target: { value: 'late' } })
+    const results = await screen.findByTestId('rail-name-search')
+    expect(await within(results).findByText('big/late-note.md')).toBeInTheDocument()
+    expect(await within(results).findByTestId('rail-name-search-error')).toBeInTheDocument()
+  })
+
+  it('reveals a folder hit from a Windows gateway', async () => {
+    const WIN = 'C:\\proj'
+    H.api.projectTree.mockResolvedValue({ ...truncatedTree, root: 'C:/proj' })
+    H.api.fileSearch.mockResolvedValue({ root: WIN, results: [{ path: `${WIN}\\big\\late`, name: 'late', size: 0, mtime: 0, kind: 'dir' }] })
+    mount({ projectDir: 'C:/proj' })
+    await waitFor(() => expect(H.api.projectTree).toHaveBeenCalled())
+    fireEvent.change(screen.getByLabelText('Filter files…'), { target: { value: 'late' } })
+    const results = await screen.findByTestId('rail-name-search')
+    fireEvent.click(await within(results).findByText('big/late'))
+    await waitFor(() => expect(tree().dataset.reveal).toBe('big/late'))
+  })
+
 })

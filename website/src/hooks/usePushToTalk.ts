@@ -54,12 +54,15 @@ import {
   PTT_CHANGED_EVENT,
   type PttConfig,
   isBareModifier,
+  matchesBindingWithShift,
+  shiftKeepsDraft,
   stillHeld,
 } from '../lib/pushToTalk'
 import {
   createPttSession,
   type PttPhase,
   type PttSession,
+  type StopIntent,
   type VoiceControls,
 } from '../lib/pttSession'
 
@@ -81,8 +84,20 @@ type Phase = PttPhase
 type KeyOwner = 'gesture' | 'latch'
 
 export interface UsePushToTalkOpts {
-  /** Disable entirely (e.g. STT off, or a modal owns the keyboard). */
+  /**
+   * Stop the key from starting capture (e.g. STT off, or a modal owns the
+   * keyboard). A press, release or reconciling keystroke that ENDS a capture
+   * already running still works, so disabling never strands an open mic.
+   */
   disabled?: boolean
+  /**
+   * Accept Shift plus the binding as the press that stops a running capture
+   * and keeps a draft. Only meaningful under `stt.submit_on_release`, where a
+   * plain stopping press sends; with it off that chord stays ignored, as it
+   * always was, so typing a Shift-modified character during a latched capture
+   * does not end the recording.
+   */
+  shiftDraftStop?: boolean
 }
 
 /**
@@ -94,7 +109,20 @@ function isTerminalTarget(target: EventTarget | null): boolean {
   return !!el && typeof el.closest === 'function' && !!el.closest('.xterm')
 }
 
-export function usePushToTalk(voice: VoiceControls, { disabled }: UsePushToTalkOpts = {}) {
+/** An open modal dialog (ARIA-marked, or a Radix dialog in its open state)
+ *  owns the keyboard, so the key may not START a capture under it. No composer
+ *  that owns the binding lives inside a dialog, so any open one blocks. A Radix
+ *  Popover also renders `role="dialog"` + `data-state="open"`, but it is
+ *  non-modal and sits in a popper wrapper, so it does not count. */
+function hasBlockingOverlay(): boolean {
+  if (document.querySelector('[aria-modal="true"]')) return true
+  for (const el of document.querySelectorAll('[role="dialog"][data-state="open"]')) {
+    if (!el.closest('[data-radix-popper-content-wrapper]')) return true
+  }
+  return false
+}
+
+export function usePushToTalk(voice: VoiceControls, { disabled, shiftDraftStop = false }: UsePushToTalkOpts = {}) {
   const [cfg, setCfg] = useState<PttConfig>(() => loadPttConfig())
   // Mirrored so the keydown handler reads the CURRENT phase without being
   // re-created (and re-bound) on every transition.
@@ -112,6 +140,8 @@ export function usePushToTalk(voice: VoiceControls, { disabled }: UsePushToTalkO
   cfgRef.current = cfg
   const disabledRef = useRef(disabled)
   disabledRef.current = disabled
+  const shiftDraftStopRef = useRef(shiftDraftStop)
+  shiftDraftStopRef.current = shiftDraftStop
 
   /**
    * Late-bound seams the session core calls back into. `disarm` and the reset
@@ -176,8 +206,14 @@ export function usePushToTalk(voice: VoiceControls, { disabled }: UsePushToTalkO
   }, [clearTimers, session, setPhase])
   coreSeamsRef.current.resetToIdle = resetToIdle
 
-  /** Leave any armed/holding state, committing (`stop`) or discarding as told. */
-  const disarm = useCallback((commit: boolean) => {
+  /**
+   * Leave any armed/holding state, committing (`stop`) or discarding as told.
+   *
+   * `intent` is passed only by a release the person chose (see `StopIntent`).
+   * The core's cap timer, blur, visibility loss and the reconciliation paths
+   * call this without one, so they commit the audio and never send it.
+   */
+  const disarm = useCallback((commit: boolean, intent?: StopIntent) => {
     const was = phaseRef.current
     clearTimers()
     session.bumpGeneration()
@@ -198,7 +234,7 @@ export function usePushToTalk(voice: VoiceControls, { disabled }: UsePushToTalkO
         // backstop for a startup that ignores this teardown and goes live
         // anyway, and bumping the sequence would make it read as stale and skip.
         session.setOwner(null)
-        if (voiceRef.current.recording) voiceRef.current.stop()
+        if (voiceRef.current.recording) voiceRef.current.stop(commit ? intent : undefined)
         else voiceRef.current.cancel()
       } else {
         session.setOwner(null)
@@ -213,7 +249,7 @@ export function usePushToTalk(voice: VoiceControls, { disabled }: UsePushToTalkO
         // capture had not begun — a no-op — and the original startup went live
         // afterwards with the phase already back to idle and no owner watching
         // it. `cancel()` is the only call that aborts a pre-capture startup.
-        if (commit && voiceRef.current.recording) voiceRef.current.stop()
+        if (commit && voiceRef.current.recording) voiceRef.current.stop(intent)
         else voiceRef.current.cancel()
       }
     } else if (was === 'arming') {
@@ -231,13 +267,36 @@ export function usePushToTalk(voice: VoiceControls, { disabled }: UsePushToTalkO
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (disabledRef.current) return
+      // While disabled the key never ARMS a gesture, but it can still END one:
+      // a press that stops a running capture (idle phase, capturing) or the
+      // reconciliation of an armed/held press (non-idle phase). Without this a
+      // latch that was running when the host disabled the hook had no key left
+      // to stop it, and the mic kept recording into a chat the user could not
+      // see. Every path below that would start capture requires an idle phase
+      // with nothing capturing, which this guard still turns away.
+      if (disabledRef.current) {
+        const endable = phaseRef.current !== 'idle'
+          || voiceRef.current.recording
+          || (session.startPending() && session.owner() !== null)
+        if (!endable) return
+      }
+      // The user turned the key trigger off in Settings: the mic button is the
+      // only way in, so no keystroke arms or reconciles. Unlike the `disabled`
+      // opt above, this one turns the key off entirely.
+      if (!cfgRef.current.enabled) return
       // Auto-repeat: a held key fires keydown ~30x/sec. Only the first is an arm.
       if (e.repeat) return
       const { binding, mode, holdMs } = cfgRef.current
 
+      // The binding pressed with Shift added, while a capture is running: the
+      // press that stops it and keeps the transcript as a draft.
+      const capturing = voiceRef.current.recording
+        || (session.startPending() && session.owner() !== null)
+      const shiftedStop = shiftDraftStopRef.current && phaseRef.current === 'idle' && capturing
+        && matchesBindingWithShift(e, binding)
+
       // Any non-matching keystroke is also our chance to reconcile.
-      if (!matchesBinding(e, binding)) {
+      if (!shiftedStop && !matchesBinding(e, binding)) {
         const phase = phaseRef.current
         if (phase === 'idle') return
         // The bound modifier is no longer physically down, so we missed its
@@ -251,10 +310,15 @@ export function usePushToTalk(voice: VoiceControls, { disabled }: UsePushToTalkO
         // what stops the release from counting as a tap. Commit while holding:
         // a real utterance survives an accidental keypress, and a chord held
         // barely past the threshold yields a blob too short to transcribe.
+        // Committed with no intent, so it never sends: this is also how Shift
+        // pressed during a bare-modifier hold keeps the transcript as a draft.
         disarm(phase === 'holding')
         return
       }
       if (isTerminalTarget(e.target)) return
+      // Capture-phase listening runs before a dialog can isolate its keys.
+      // Only a fresh start checks overlays; stops and reconciliation stay live.
+      if (phaseRef.current === 'idle' && !capturing && hasBlockingOverlay()) return
       // A chord binding's primary key would type a character (Space) or scroll;
       // claim it. A bare modifier produces nothing, so leave it alone — calling
       // preventDefault on a lone modifier can suppress legitimate chords the
@@ -272,9 +336,9 @@ export function usePushToTalk(voice: VoiceControls, { disabled }: UsePushToTalkO
       // previous teardown already disowned is on its way out (its settle handler
       // will stop it), so a fresh press must be free to arm a new gesture rather
       // than "ending" a session nobody holds.
-      if (phaseRef.current === 'idle'
-          && (voiceRef.current.recording
-              || (session.startPending() && session.owner() !== null))) {
+      if (phaseRef.current === 'idle' && capturing) {
+        // A press that ends a running capture is a deliberate stop.
+        const intent: StopIntent | undefined = shiftedStop ? undefined : 'finish'
         const pending = session.startPending()
         // Clear the owner so the settle handler stops the session if the startup
         // lands anyway, but leave the sequence alone so that handler still runs.
@@ -283,9 +347,9 @@ export function usePushToTalk(voice: VoiceControls, { disabled }: UsePushToTalkO
           // Startup still in flight: commit only if capture has actually begun
           // (`recording`), otherwise `stop()` is a no-op and the startup would
           // go live after this press — only `cancel()` aborts it.
-          if (voiceRef.current.recording) voiceRef.current.stop()
+          if (voiceRef.current.recording) voiceRef.current.stop(intent)
           else voiceRef.current.cancel()
-        } else voiceRef.current.stop()
+        } else voiceRef.current.stop(intent)
         return
       }
       if (phaseRef.current !== 'idle') return
@@ -328,7 +392,9 @@ export function usePushToTalk(voice: VoiceControls, { disabled }: UsePushToTalkO
       if (was === 'holding') {
         // A pending startup is torn down synchronously inside `disarm`; the
         // settle handler is the backstop if it goes live regardless.
-        disarm(true)
+        // Releasing the key is the deliberate finish; Shift still down at that
+        // moment keeps the transcript as a draft.
+        disarm(true, shiftKeepsDraft(e, binding) ? undefined : 'finish')
         return
       }
       // Released before the threshold — a TAP.

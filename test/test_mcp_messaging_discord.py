@@ -108,6 +108,17 @@ def test_description_states_what_discord_does_and_what_it_refuses() -> None:
 # ── The tool ──
 
 
+def _channels_policy(allowed: str):
+    """A ``channels`` governance double that permits only the ``allowed`` transport."""
+
+    def _vet(_caller: str, transport: str, tool_name: str = "send_message") -> str | None:
+        if transport == allowed:
+            return None
+        return f"messaging via {transport} blocked by governance policy"
+
+    return _vet
+
+
 @pytest.fixture
 def cron_caller():
     """Run the tool as a cron, the caller whose bare sends default to Slack."""
@@ -131,21 +142,30 @@ def test_discord_session_is_vetted_on_discord_and_not_on_slack(cron_caller) -> N
     """
     with (
         patch("kiro_crew.mcp_core._post") as post,
-        patch("kiro_crew.mcp_core._vet_channel_governance", return_value=None) as vet,
+        patch(
+            "kiro_crew.mcp_core._vet_channel_governance", side_effect=_channels_policy("discord")
+        ) as vet,
     ):
         post.return_value = {"ok": True, "delivered_to": "discord"}
-        _call_tool("send_message", {"text": "hi", "session": "discord"})
+        result = _call_tool("send_message", {"text": "hi", "session": "discord"})
     assert [call.args[1] for call in vet.call_args_list] == ["discord"]
+    assert not result.startswith("Error:"), result
+    assert "discord" in result
 
 
 def test_slack_session_is_still_vetted_on_slack(cron_caller) -> None:
     with (
         patch("kiro_crew.mcp_core._post") as post,
-        patch("kiro_crew.mcp_core._vet_channel_governance", return_value=None) as vet,
+        patch(
+            "kiro_crew.mcp_core._vet_channel_governance", side_effect=_channels_policy("discord")
+        ) as vet,
     ):
         post.return_value = {"ok": True, "delivered_to": "slack"}
-        _call_tool("send_message", {"text": "hi", "session": "slack"})
+        result = _call_tool("send_message", {"text": "hi", "session": "slack"})
     assert [call.args[1] for call in vet.call_args_list] == ["slack"]
+    assert result.startswith("Error:"), result
+    assert "via slack blocked" in result
+    post.assert_not_called()
 
 
 def test_governance_denial_stops_the_discord_send(cron_caller) -> None:
@@ -604,6 +624,22 @@ async def test_a_failed_channel_delivery_is_reported_not_swallowed(audit) -> Non
         payload = await resp.json()
         assert payload["ok"] is False
         assert payload["code"] == "channel_delivery_failed"
+
+
+@pytest.mark.asyncio
+async def test_a_send_whose_answer_was_lost_is_not_reported_as_failed(audit) -> None:
+    """A DM send that timed out may have landed, so the caller is told it was not
+    confirmed: a caller told "delivery failed" sends the message again."""
+    transport = _discord_transport()
+    transport.client.send_message = AsyncMock(side_effect=TimeoutError())
+    async with TestClient(TestServer(_app(_state(transport)))) as client:
+        resp = await client.post("/api/send-message", json={"text": "hi", "session": "discord"})
+        assert resp.status == 502
+        payload = await resp.json()
+        assert payload["code"] == "channel_delivery_failed"
+        assert payload["error"].startswith("discord delivery was not confirmed")
+        assert "delivery failed" not in payload["error"]
+    transport.client.send_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio

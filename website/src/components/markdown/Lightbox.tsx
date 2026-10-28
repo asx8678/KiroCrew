@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { Check, Copy, Download, MoreHorizontal, Minus, Plus, Search, X } from 'lucide-react'
 import Clickable from '../Clickable'
 import { DOUBLE_TAP_MS, DOUBLE_TAP_SLOP, DOUBLE_TAP_ZOOM, usePinchZoom } from '../../hooks/usePinchZoom'
@@ -11,9 +11,21 @@ import {
 } from '../ui/dropdown-menu'
 import { i18nT } from '../../i18n/t'
 import { fmtNumber } from '../../i18n/format'
+import { useLocalCrewHidden } from '../overlayRoot'
+import { overlayCaptionClearancePx } from '../../lib/electron'
+import { ReactReduxContext } from 'react-redux'
+import { setActiveId } from '../../store/instancesSlice'
 
 type LightboxImage = { src: string; alt: string }
 type LightboxDetail = { images: LightboxImage[]; index: number }
+
+/** `margin-top` that drops the top-anchored toolbar (and the "copied" pill under
+ *  it) below a frameless window's caption band; undefined when there is none, so
+ *  the `top-safe-offset-*` class stands alone. See overlayCaptionClearancePx. */
+function captionClearanceStyle(): React.CSSProperties | undefined {
+  const px = overlayCaptionClearancePx()
+  return px > 0 ? { marginTop: `${px}px` } : undefined
+}
 
 /** Lightbox zoom (enlarge) bounds. `1` is fit-to-screen; each step scales the
  *  fit box up so the image can overflow the viewport and be panned via the
@@ -124,6 +136,14 @@ export function dispatchLightbox(target: HTMLImageElement): void {
  *  (clamped at the ends). Accepts both the structured { images, index }
  *  payload and the legacy { src, alt } single-image shape. */
 export function Lightbox() {
+  // Behind a remote Crew the viewer is hidden with its Crew (components/overlayRoot)
+  // and its keys belong to the Crew in front; the image and zoom survive.
+  const crewHidden = useLocalCrewHidden()
+  const crewHiddenRef = useRef(crewHidden)
+  crewHiddenRef.current = crewHidden
+  // Read through the context so a viewer rendered without a store (isolated
+  // tests) still works; there is no Crew to switch then.
+  const store = useContext(ReactReduxContext)?.store
   const [state, setState] = useState<LightboxDetail | null>(null)
   // A fresh mirror of `state`, so handlers subscribed once per open — the global
   // keydown listener's download shortcut, and the paging gesture's read of the
@@ -483,6 +503,9 @@ export function Lightbox() {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as Partial<LightboxDetail> & Partial<LightboxImage> | undefined
       if (!detail) { setState(null); return }
+      // An image opened from content that stays on screen across a switch (a
+      // Radix dialog) while this viewer is hidden: show the local Crew it opens in.
+      if (crewHiddenRef.current) store?.dispatch(setActiveId(null))
       if (Array.isArray(detail.images) && detail.images.length > 0) {
         const raw = Number.isInteger(detail.index) ? (detail.index as number) : 0
         const idx = Math.max(0, Math.min(raw, detail.images.length - 1))
@@ -493,7 +516,7 @@ export function Lightbox() {
     }
     window.addEventListener('lightbox', handler)
     return () => window.removeEventListener('lightbox', handler)
-  }, [])
+  }, [store])
   const isOpen = state !== null
   // Reset the zoom whenever the lightbox opens/closes or the shown image
   // changes, so each image starts fit-to-screen rather than inheriting the
@@ -523,7 +546,7 @@ export function Lightbox() {
   // off-screen. Runs post-layout, so offsetWidth already reflects the new box.
   useEffect(() => { setPan(p => (zoom <= LIGHTBOX_ZOOM_MIN ? { x: 0, y: 0 } : clampPan(p.x, p.y))) }, [zoom, clampPan, setPan])
   useEffect(() => {
-    if (!isOpen) return
+    if (!isOpen || crewHidden) return
     const onKey = (e: KeyboardEvent) => {
       // While the actions menu is open it owns Escape (close the menu) and the
       // arrows (move between items). This capture-phase listener runs first, so
@@ -534,6 +557,12 @@ export function Lightbox() {
       if (e.key === 'Escape') {
         if (menuOpen) return
         e.preventDefault()
+        // Consume the event so it reaches no bubble-phase host handler. A host
+        // that checks `defaultPrevented` (the Modal family) is already spared by
+        // preventDefault, but the artifact panel's Escape handler
+        // (ArtifactPanel/MarkdownPanel) does not — so without this the Escape
+        // that closes this viewer also closes the underlying artifact (#20630).
+        e.stopPropagation()
         setState(null)
       } else if (e.key === 'ArrowLeft') {
         if (menuOpen) return
@@ -579,7 +608,7 @@ export function Lightbox() {
     // modal open and Escape closes only the viewer.
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [isOpen, zoomIn, zoomOut, setZoom, copyCurrentImage])
+  }, [isOpen, crewHidden, zoomIn, zoomOut, setZoom, copyCurrentImage])
   if (!state) return null
   const img = state.images[state.index]
   const zoomed = zoom > LIGHTBOX_ZOOM_MIN
@@ -704,8 +733,13 @@ export function Lightbox() {
       </div>
       {/* Control cluster sits on its own translucent, blurred pill so the
           white icons stay legible even when a light/enlarged image is panned
-          up behind the toolbar. */}
-      <div className="fixed top-safe-offset-4 right-safe-offset-4 flex items-center gap-0.5 rounded-full bg-black/60 backdrop-blur-md ring-1 ring-white/15 shadow-lg px-1 py-1">
+          up behind the toolbar. On a frameless desktop window it drops below
+          the caption band (#11732). */}
+      <div
+        className="fixed top-safe-offset-4 right-safe-offset-4 flex items-center gap-0.5 rounded-full bg-black/60 backdrop-blur-md ring-1 ring-white/15 shadow-lg px-1 py-1"
+        style={captionClearanceStyle()}
+        data-testid="lightbox-toolbar"
+      >
         {/* Zoom segment: − / reset (magnifier) / + always visible as a group. */}
         <button
           aria-label={i18nT('components.markdownRenderer.zoom_out')}
@@ -813,6 +847,7 @@ export function Lightbox() {
         className={copyState === 'ok'
           ? 'fixed top-safe-offset-16 right-safe-offset-4 rounded-full bg-black/60 backdrop-blur-md ring-1 ring-white/15 shadow-lg px-3 py-1 text-sm text-white/90'
           : 'sr-only'}
+        style={copyState === 'ok' ? captionClearanceStyle() : undefined}
       >
         {copyState === 'ok' ? i18nT('components.markdownRenderer.image_copied') : ''}
       </div>
@@ -822,7 +857,10 @@ export function Lightbox() {
           navigate away from unsaved work (same decision as MarkdownTable /
           MermaidBlock). */}
       {copyState === 'failed' && (
-        <div className="fixed top-safe-offset-16 left-1/2 -translate-x-1/2 max-w-[min(22rem,calc(100vw-2rem))]">
+        <div
+          className="fixed top-safe-offset-16 left-1/2 -translate-x-1/2 max-w-[min(22rem,calc(100vw-2rem))]"
+          style={captionClearanceStyle()}
+        >
           <ErrorNotice
             variant="inline"
             className="rounded-full bg-black/60 backdrop-blur-md ring-1 ring-white/15 shadow-lg px-3 py-1"

@@ -2,8 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Check, MessageCircleQuestionMark, RotateCcw, CornerUpRight } from 'lucide-react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { api } from '../../api/client'
-import { useAppSelector, useAppDispatch } from '../../store'
-import { sideClose, sideOptimisticAppend, sideOptimisticRollback, sseSideQueue, sideReleaseConsumed, queueEditBroadcastAt, stageToMainComposer } from '../../store/chatSlice'
+import { sendTurn, SEND_ABORT_MS, type SendReceipt } from '../../chat-core/transport/sendTurn'
+import { sendFailureCopy, deliveryUnconfirmedCopy } from '../../chat-core/transport/receiptCopy'
+import { sideTurnWire } from './sideTurnWire'
+import { useAppSelector, useAppDispatch, useAppStore } from '../../store'
+import { beginSideQueueEdit, finishSideQueueEdit, forgetSideSteerSubmittedText, readSideSteerSubmittedText, recordSideSteerSubmittedText, setSideQueueEditDraft, sideClose, sideOptimisticAccepted, sideOptimisticAppend, sideOptimisticRollback, restoreSideConversation, awaitSideRestore, sseSideQueue, sideReleaseConsumed, sideSendStatus, queueEditBroadcastAt, stageToMainComposer, takeSideQueueDroppedByClose, takeSideSteerDroppedByClose, transcriptTsMs, type SideStandingNotice } from '../../store/chatSlice'
 import QueueStack from '../../components/QueueStack'
 import ChatMessageList from '../../app-sdk/ChatMessageList'
 import FollowUpBar from '../../components/FollowUpBar'
@@ -17,6 +20,7 @@ import { consumeSideChatSeed, readSideChatDraft, restoreSideChatDraft, writeSide
 import type { PasteBlock } from '../../utils/pasteTokens'
 import { buildOutgoingTurn, isEmptyTurn } from '../../chat-core/composer/outgoingTurn'
 import { mergeIntoDraft as appendToDraft } from '../../utils/chatDrafts'
+import { activeElementIsEditable } from '../../utils/editableTarget'
 import type { SideMessage, SideQueueEntry } from '../../store/chatSlice'
 import type { ChatMessage } from '../../types'
 import { searchableText } from '../../utils/searchableText'
@@ -44,6 +48,10 @@ const EMPTY_SIDE_QUEUE: SideQueueEntry[] = []
  *  from state its own optimistic update already changed. */
 /** `slot` is captured at submit time: the panel's prop can change under an in-flight
  *  request, and a response must land where the question was asked. */
+/** The `/side/turn` acceptance body, as `api.sideTurn` types it. Read off the
+ *  transport receipt's `body` passthrough on `dispatched` / `queued`. */
+type SideTurnBody = Awaited<ReturnType<typeof api.sideTurn>>
+
 type SideSubmit = { q: string; steer: boolean; optimistic: boolean; slot: string;
   /** True when `q` came from a follow-up chip rather than the composer, so the draft the
    *  user is still writing must survive the send. */
@@ -58,11 +66,8 @@ type SideSubmit = { q: string; steer: boolean; optimistic: boolean; slot: string
  *  released text has no other home (its card or its request is already gone), so
  *  it cannot be the one dropped. Appending keeps both and leaves the user to
  *  edit — visible, undoable by hand, and never a silent loss. */
-/** Raw submitted texts retained for restore-on-cancel. Only the recent past can
+/** Raw queued texts retained for restore-on-cancel. Only the recent past can
  *  still be cancelled, so a small window is enough. */
-/** Namespaces steer-ledger keys in `submittedRaw` so they cannot collide with
- *  queue ids. */
-const STEER_RAW_PREFIX = 'steer:'
 const MAX_SUBMITTED_RAW = 50
 
 function relativeTime(iso: string): string | null {  const diff = Date.now() - new Date(iso).getTime()
@@ -71,24 +76,68 @@ function relativeTime(iso: string): string | null {  const diff = Date.now() - n
   if (diff < 24 * 3600_000) return `${Math.floor(diff / 3600_000)}h`
   return `${Math.floor(diff / (24 * 3600_000))}d`
 }
+type SendRecovery = { text?: string; pastes?: PasteBlock[]; error?: string; notice?: SideStandingNotice }
+/** What a send that was not accepted hands back to the composer: the payload as
+ *  the user SAW it (collapsed paste tokens plus their blocks) when the submit
+ *  carried one, else the text that went on the wire. */
+function handBack(vars: SideSubmit): Pick<SendRecovery, 'text' | 'pastes'> {
+  return vars.pastes?.length && vars.display ? { text: vars.display, pastes: vars.pastes } : { text: vars.q }
+}
 
-export default function SideChat({ slot }: { slot: string }) {
+
+/** How long the Select-to-Ask caret nudge waits for a composer that is still
+ *  lazy-loading (the Lexical editor) before it gives up on placing the caret. */
+const SEED_FOCUS_WAIT_MS = 5000
+
+export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
+  slot: string
+  /** Open a path named in a side reply as a Files tab of the panel this chat
+   *  sits in — the same opener the host hands the main transcript. Capability
+   *  by omission: absent, a path chip falls back to `MarkdownRenderer`'s own
+   *  OS reveal (a clipboard copy on a remote dashboard), a path link stays a
+   *  plain link. */
+  onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
+  /** Open an artifact link as an artifact tab of the same panel; absent, the
+   *  link navigates away from the chat. */
+  onArtifactOpen?: (slug: string) => void
+}) {
   const connected = useConnected()
   const dispatch = useAppDispatch()
-  // The footer describes what the backend enforces, so it follows the selected
-  // harness: the derived `<agent>--readonly` spec is a kiro-cli mechanism, and on
-  // any other backend the side turn runs with no tools at all (REJECT_ALL). The
-  // kiro backend is the empty string (`ACP_BACKEND_KIRO`), so an unloaded or
-  // absent value reads as kiro — the default the gateway itself falls back to.
-  const cfgQ = useQuery<{ agent?: { acp_backend?: string } }>({
-    queryKey: ['kirocrewConfig'],
-    queryFn: () => api.kirocrewConfig(),
+  const chatStore = useAppStore()
+  // The footer describes what the backend enforces, so it asks the gateway the
+  // question the side turn asks itself: the selected harness, and on claude
+  // whether the installed adapter honours the read-only session options. Keyed
+  // under `kirocrewConfig` so a config change, which invalidates that prefix,
+  // asks again. The footer claims nothing until the answer arrives. Each failure
+  // is said in its own words: a config that did not load means the turn runs
+  // with no tools, while a failed request only means this panel cannot say
+  // which tools work.
+  const sideToolsQ = useQuery({
+    queryKey: ['kirocrewConfig', 'sideTools'],
+    queryFn: () => api.sideTools(),
   })
-  // Mirrors the backend: the read-only allowance is granted only when the
-  // loaded config names the kiro backend; a turn whose config cannot load runs
-  // with no tools, so the footer claims nothing until the config is loaded and
-  // says so when the load failed.
-  const readOnlyToolsAvailable = cfgQ.isSuccess && !(cfgQ.data?.agent?.acp_backend ?? '')
+  const postureError = sideToolsQ.data?.config_unavailable === true
+  const readOnlyToolsAvailable = sideToolsQ.data?.read_only_tools === true
+  // A page reload empties this panel, but the gateway keeps the side
+  // conversation, and the next question joins it. So the panel reads the
+  // gateway's copy once per page and merges it in (`restoreSideConversation`),
+  // and shows the conversation the model is in. Every send waits for that read
+  // (`sendMutation` below), so no question joins a conversation this panel has
+  // not drawn; while the read has failed, a send hands its text back.
+  const sideRestored = useAppSelector(s => s.chat.slotSideRestored?.[slot] === true)
+  const restoreQ = useQuery({
+    queryKey: ['sideRestore', slot],
+    queryFn: async () => {
+      await dispatch(restoreSideConversation(slot)).unwrap()
+      return true
+    },
+    enabled: !!slot && !sideRestored,
+    staleTime: 0,
+    gcTime: 0,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  })
+  const restoreFailed = restoreQ.isError && !sideRestored
   const reduxSide = useAppSelector(s => s.chat.slotSide[slot])
   const parentTurnCount = useAppSelector(s =>
     s.chat.messages.filter(m => m.role === 'user' || m.role === 'assistant').length
@@ -102,8 +151,15 @@ export default function SideChat({ slot }: { slot: string }) {
   // ErrorNotice, which is for an operation that went wrong. It stays until the
   // draft changes (the user is acting on it) or a send goes out.
   const [lengthHint, setLengthHint] = useState<string | null>(null)
+  // A notice that describes a STANDING state (an unconfirmed send whose text is
+  // back in the composer) rather than a moment. It holds until the next submit
+  // clears it: auto-dismissing it would leave restored text with no explanation
+  // for a user who looks back after the TTL, and the text would be resent.
+  // Lives in the store, per slot, beside the text it explains (see SideState.sendStatus).
+  const sendStatus = reduxSide?.sendStatus
 
-  // Retire the notice on its own so it cannot outlive the moment it describes.
+  // Retire the transient notice on its own so it cannot outlive the moment it
+  // describes.
   useEffect(() => {
     if (!localNotice) return
     const t = setTimeout(() => setLocalNotice(null), NOTICE_TTL_MS)
@@ -178,7 +234,7 @@ export default function SideChat({ slot }: { slot: string }) {
 
   /** Derived from the same helper the main chat uses, so "options only after the answer
    *  settles" and "a later user message clears them" behave identically. */
-  const { followUpOptions } = useMemo(
+  const { followUpOptions, followUpMulti, followUpSourceKey } = useMemo(
     () => deriveFollowUpOptions(transcript, isStreaming),
     [transcript, isStreaming]
   )
@@ -208,11 +264,28 @@ export default function SideChat({ slot }: { slot: string }) {
   // remount restores both, and neither outlives the page), are expanded at
   // send, and clear with the text.
   const onPasteBlocksChange = useCallback((next: PasteBlock[]) => { writeSideChatPastes(slot, next) }, [slot])
-  const composer = useComposerDraft({ followUpOptions, maxBytes: MAX_QUESTION_BYTES, maxHeight: MAX_INPUT_H, draft: storedDraft, onDraftChange })
+  const composer = useComposerDraft({ followUpOptions, multi: followUpMulti, sourceKey: followUpSourceKey, maxBytes: MAX_QUESTION_BYTES, maxHeight: MAX_INPUT_H, draft: storedDraft, onDraftChange })
   const {
     draft, setDraft,
     picked: pickedOptions, toggleOption, mergeIntoDraft, exceedsByteLimit,
   } = composer
+  // The standing notice asserts "your text is back in the composer"; once the
+  // user empties the composer (they checked the transcript and the send did
+  // land, so they deleted the restored copy) it would be asserting text that
+  // is no longer there. Retire it with the draft.
+  // Only a draft the user EMPTIED counts: the notice lands in the store in the
+  // same tick the restored text is merged into React state, and the store's
+  // re-render can run before that state flushes -- an "empty draft" seen then
+  // is the pre-restore composer, not a user action.
+  const restoredDraftSeen = useRef(false)
+  useEffect(() => {
+    if (!sendStatus?.notice?.restoredDraft) { restoredDraftSeen.current = false; return }
+    if (draft.trim()) { restoredDraftSeen.current = true; return }
+    if (restoredDraftSeen.current) {
+      restoredDraftSeen.current = false
+      dispatch(sideSendStatus({ slot, notice: null }))
+    }
+  }, [draft, sendStatus, slot, dispatch])
 
   /** Hand text back to the draft of the slot it belongs to — ALWAYS through the
    *  store, never through the composer's `mergeIntoDraft`: in controlled mode
@@ -243,8 +316,26 @@ export default function SideChat({ slot }: { slot: string }) {
     writeSideChatDraft(target, appendToDraft(readSideChatDraft(target), text))
   }, [])
 
+  // A send's failure or unconfirmed receipt hands text back to the composer of
+  // the slot the send was FOR. The panel is one instance across slots
+  // (ActivityViewer re-props it rather than re-keying) and may be unmounted
+  // before the receipt lands, so the text goes through `restoreDraftTo` -- the
+  // per-slot draft store -- never the mounted composer: a receipt for slot A
+  // then lands in A's draft whether the panel shows A, shows B, or is gone,
+  // and it is there when A's panel is next on screen. The status that explains
+  // it (error line / standing notice) lives in the store per slot for the same
+  // reason, so it reappears with the text and never shows under another slot.
+  // A paste that was collapsed goes back collapsed -- the TOKEN text with its
+  // blocks (`restoreSideChatDraft` carries them in) -- never as the expanded
+  // lines, which would lose the tokens' identity on the retry.
+  const recoverFor = useCallback((forSlot: string, r: SendRecovery) => {
+    if (r.text && r.pastes?.length) restoreSideChatDraft(forSlot, r.text, r.pastes)
+    else if (r.text) restoreDraftTo(forSlot, r.text)
+    if (r.error || r.notice) dispatch(sideSendStatus({ slot: forSlot, error: r.error, notice: r.notice }))
+  }, [restoreDraftTo, dispatch])
+
   /** Wrapper around the native composer; the Select-to-Ask seed resolves the
-   *  textarea through it (`textarea[data-composer-input]`) instead of a
+   *  composer through it (`[data-composer-input]`, textarea or Lexical div) instead of a
    *  dedicated ref prop on ChatInput. */
   const composerWrapRef = useRef<HTMLDivElement | null>(null)
 
@@ -252,10 +343,10 @@ export default function SideChat({ slot }: { slot: string }) {
   // replaced: the released text has no other home once the server let it go, and
   // an in-progress draft is typed work too — so neither may be discarded.
   // queue_id -> the RAW text this client submitted for it. Broadcast payloads
-  // are redacted on the wire, so for a credential-bearing question the frames
-  // are the wrong source to restore from; the submission itself is the only
-  // place the raw text exists on the client. A ref, not state: it feeds an
-  // event handler and must never trigger a render.
+  // are redacted on the wire, so for a credential-bearing queued question the
+  // submission itself is the only honest restore source. A ref, not state: it
+  // feeds event handlers and must never trigger a render. Requeued steer text
+  // lives in the per-slot module record because this panel may be unmounted.
   const submittedRaw = useRef<Map<string, string>>(new Map())
   const releasedText = reduxSide?.releasedText
   // The release this component has already merged, so draining is idempotent.
@@ -285,31 +376,51 @@ export default function SideChat({ slot }: { slot: string }) {
     dispatch(sideReleaseConsumed({ slot, consumed: releasedText }))
   }, [releasedText, slot, dispatch, mergeIntoDraft])
 
-  // A requeued steer's card arrives from the socket with its content REDACTED, and the
-  // reducer's cancel path releases the card's own content — it cannot reach the raw-text
-  // map, which lives in a ref here. Rewrite the card as soon as both halves are known.
-  // Fixing the CARD rather than each reader is what makes every path correct at once.
+  // A requeued steer's card can arrive from the socket with its content redacted or
+  // identical to the submitted text, but without the `raw` ownership marker. Rewrite
+  // the card as soon as both halves are known, and only while it lacks the marker: a
+  // marked card already holds this tab's latest wording, a saved edit included. The
+  // module record survives a slot switch or unmount so the socket close path can apply
+  // the same ownership repair when this effect cannot see the card.
   const sideQueue = reduxSide?.queue
   useEffect(() => {
     if (!sideQueue?.length) return
     for (const entry of sideQueue) {
       if (!entry.steerId) continue
-      const raw = submittedRaw.current.get(STEER_RAW_PREFIX + entry.steerId)
-      if (raw && entry.content !== raw) {
+      const raw = readSideSteerSubmittedText(slot, entry.steerId)
+      if (raw && !entry.raw) {
         dispatch(sseSideQueue({ slot, action: 'edit', queue_id: entry.id, content: raw, raw: true }))
       }
     }
   }, [sideQueue, slot, dispatch])
 
+  // The send goes through the chat-core transport over the side wire, so the
+  // receipt is classified by the shared rule (deadline, refused vs unreadable
+  // vs transport failure) and this panel only decides how to REACT per status.
+  // `sendTurn` never rejects; the mutation's error slot is kept for the truly
+  // unexpected throw only.
   const sendMutation = useMutation({
-    mutationFn: async ({ q, steer, slot: target }: SideSubmit) => {
-      await api.sideOpen(target)
-      return api.sideTurn(target, q, steer ? { steer: true } : undefined)
+    // The restore read lands before the turn is asked, the way `/side` waits for
+    // it: a question sent ahead of it would join the gateway's conversation before
+    // this panel shows it. A read in flight is shared, so this usually waits
+    // milliseconds, and never longer than the send's own deadline. A read that
+    // fails or overruns sends nothing, and one that overruns stops being shared,
+    // so the next send asks the gateway again (`awaitSideRestore`). Its receipt is
+    // `refused`, the status for a send that definitely did not go out, so the text
+    // is handed back. Its `reason` says the conversation has not loaded, which is
+    // true in both cases: after a failed read, the restore notice and its Retry sit
+    // beside it; while the read is still in flight past the deadline, nothing else
+    // says why the text came back.
+    mutationFn: async ({ q, steer, slot: target }: SideSubmit): Promise<SendReceipt> => {
+      const restored = await dispatch(awaitSideRestore({ slot: target, ms: SEND_ABORT_MS })).unwrap()
+      if (restored !== 'restored') return { status: 'refused', body: {}, reason: i18nT('pages.chat.sideChat.send_blocked_not_loaded') }
+      return sendTurn({ message: q, slot: target, wire: sideTurnWire(target, steer) })
     },
     onMutate: ({ q, optimistic, slot: target, override }: SideSubmit) => {
       setLocalError(null)
       setLocalNotice(null)
       setLengthHint(null)
+      dispatch(sideSendStatus({ slot: target, error: null, notice: null }))
       if (optimistic) {
         const message: SideMessage = { role: 'user', content: q, ts: new Date().toISOString() }
         dispatch(sideOptimisticAppend({ slot: target, message }))
@@ -320,7 +431,60 @@ export default function SideChat({ slot }: { slot: string }) {
       // whose token left the text, which for an empty text is all of them.
       if (!override) setDraft('')
     },
-    onSuccess: (res, vars) => {
+    onSuccess: (receipt, vars) => {
+      // Receipt policy for the side panel:
+      // - `refused` / `transport-error`: nothing was accepted -- the same path
+      //   the mutation's onError took before the transport: roll the optimistic
+      //   bubble back and hand the text back, merged, not chosen (the user may
+      //   have started a new draft while the request was in flight). The
+      //   server's own reason shows when there is one (a 429 "side queue is
+      //   full" is actionable), FRAMED as a send failure -- a raw reason reads
+      //   as the agent erroring mid-work; otherwise the transport copy.
+      // - `response-late`: the deadline fired with no answer. The text is
+      //   handed back under a STANDING "unconfirmed" notice (the ChatEmbed
+      //   policy; held until the next submit, not auto-dismissed): a late turn
+      //   the server does honour will show up in the transcript (its SSE frame
+      //   appends the user row), and the user is told to look before resending.
+      //   An idle send's optimistic bubble is rolled back too: unlike ChatPane,
+      //   this panel has no slot poll that could ever clear `pending`, so a
+      //   bubble kept "pending" for a turn the server may never have received
+      //   would strand the panel busy for good -- refresh disabled, a thinking
+      //   indicator that never ends, the next send demoted to a queue entry
+      //   behind a phantom turn. A chip send (`override`) never consumed the
+      //   draft, so its notice says "tap the suggestion again" rather than claiming
+      //   a restore -- and nothing is merged into a draft the user may be
+      //   mid-writing.
+      // - `unknown`: a 2xx was received, only the body was unreadable -- a
+      //   stream cut mid-body. The server probably has the question, but the
+      //   same outage can swallow the terminal SSE frame that is the ONLY
+      //   thing (besides an explicit rollback) that ever clears this panel's
+      //   `pending`, and reconnect refetches slots, not side state. Left
+      //   alone, the bubble would sit "thinking" for good with refresh
+      //   disabled. So it takes the `response-late` recovery: roll the bubble
+      //   back and hand the text back under the standing notice, which tells
+      //   the user to look before resending -- a turn the server did take
+      //   shows up in the transcript through its SSE frames.
+      // - `dispatched` / `queued`: the acceptance body below is the one
+      //   `api.sideTurn` always returned; its handling is unchanged.
+      if (receipt.status === 'refused' || receipt.status === 'transport-error') {
+        if (vars.optimistic) dispatch(sideOptimisticRollback(vars.slot))
+        // Copy is the core's (`receiptCopy.ts`, shared with ChatEmbed): a
+        // composer submit hands the draft back, so its row says so; a chip
+        // send never consumed the draft and keeps the bare framing.
+        recoverFor(vars.slot, {
+          ...(vars.override ? {} : handBack(vars)),
+          error: sendFailureCopy(receipt.reason, !vars.override),
+        })
+        return
+      }
+      if (receipt.status === 'response-late' || receipt.status === 'unknown') {
+        if (vars.optimistic) dispatch(sideOptimisticRollback(vars.slot))
+        recoverFor(vars.slot, vars.override
+          ? { notice: { text: deliveryUnconfirmedCopy(false), restoredDraft: false } }
+          : { ...handBack(vars), notice: { text: deliveryUnconfirmedCopy(true), restoredDraft: true } })
+        return
+      }
+      const res = receipt.body as SideTurnBody
       // Same two-path convergence as cancel/edit: a queued submit's card comes
       // from whichever of the HTTP response and the WS frame lands first, so a
       // dropped socket cannot leave the queue invisible. `front` is deliberately
@@ -332,6 +496,31 @@ export default function SideChat({ slot }: { slot: string }) {
       // cancel. An older backend omits the field, so treat absent as true and
       // keep the round-4 behaviour rather than silently dropping the card.
       const stillQueued = res.still_queued ?? true
+      // A pending steer stays in the running turn unless that turn requeued it and
+      // the close dropped its card. A dropped-card record for its steer id is the
+      // proof that the text is owned by neither the running turn nor the queue.
+      if (res.steer_id && !res.queued && takeSideSteerDroppedByClose(vars.slot, res.steer_id)) {
+        recoverFor(vars.slot, handBack(vars))
+        return
+      }
+      if (vars.optimistic && res.run_id && !res.queued) {
+        dispatch(sideOptimisticAccepted({ slot: vars.slot, content: vars.q, runId: res.run_id }))
+      }
+      // Another tab closed the conversation while this question was on its way, and
+      // the gateway dropped the queue with it. The close records each dropped card's
+      // queue id and, for a requeued steer, its steer id because a demoted receipt has
+      // no queue id. That record survives a replacement conversation that reopens the
+      // slot before this receipt arrives. The slot's closed flag covers a close whose
+      // card never reached this tab. A chip's question comes back too because the close
+      // took the suggestion with the transcript.
+      const droppedByClose = res.queued && stillQueued && (
+        (!!res.queue_id && takeSideQueueDroppedByClose(vars.slot, res.queue_id))
+        || (!!res.steer_id && takeSideSteerDroppedByClose(vars.slot, res.steer_id))
+      )
+      if (res.queued && stillQueued && (droppedByClose || chatStore.getState().chat.slotSideClosed[vars.slot])) {
+        recoverFor(vars.slot, handBack(vars))
+        return
+      }
       if (res.queued && res.queue_id) {
         // Record the raw text even when the entry has already drained: a cancel
         // racing the response still needs somewhere honest to restore from.
@@ -354,12 +543,12 @@ export default function SideChat({ slot }: { slot: string }) {
       // card the turn already made comes back `demoted`, not `pending`, and that reply
       // is the only place its ledger id is ever offered.
       if (res.steer_id) {
-        submittedRaw.current.set(STEER_RAW_PREFIX + res.steer_id, vars.q)
+        recordSideSteerSubmittedText(vars.slot, res.steer_id, vars.q)
         const correlated = res.steer_id
         setCorrelatedSteerIds(prev => {
           const next = new Set(prev)
           next.add(correlated)
-          // Bounded like `submittedRaw`, oldest first — insertion order is Set order.
+          // Bounded like the submitted-text record, oldest first.
           while (next.size > MAX_SUBMITTED_RAW) {
             const oldest = next.values().next().value
             if (oldest === undefined) break
@@ -367,27 +556,22 @@ export default function SideChat({ slot }: { slot: string }) {
           }
           return next
         })
-        while (submittedRaw.current.size > MAX_SUBMITTED_RAW) {
-          const oldest = submittedRaw.current.keys().next().value
-          if (oldest === undefined) break
-          submittedRaw.current.delete(oldest)
-        }
       }
-      // If the requeued card already arrived on the socket it holds the REDACTED
-      // copy, and the reducer's own cancel path reads the card, not this map. Repair
-      // the card now so every consumer sees raw text.
+      // If the requeued card already arrived on the socket, its content can be
+      // redacted or identical while still lacking the `raw` ownership marker. The
+      // reducer's cancel path reads the card, not this map, so mark and repair it.
       if (res.steer_id) {
         const existing = reduxSide?.queue?.find(e => e.steerId === res.steer_id)
-        if (existing && existing.content !== vars.q) {
+        if (existing && !existing.raw) {
           dispatch(sseSideQueue({ slot: vars.slot, action: 'edit', queue_id: existing.id, content: vars.q, raw: true }))
           setCorrelatedQueueIds(prev => new Set(prev).add(existing.id))
         }
       }
       // The client guessed idle (`optimistic: !isBusy`) but the SERVER is
-      // authoritative and says it queued this. They disagree after a reload, before
-      // the first frame restores `streaming`. Retract the bubble: while queued, the
-      // question belongs to its queue card, and claiming a transcript row would say
-      // it had already been asked.
+      // authoritative and says it queued this. They disagree after a reload, while
+      // a restored turn's deltas wait for its final frame. Retract the bubble:
+      // while queued, the question belongs to its queue card, and claiming a
+      // transcript row would say it had already been asked.
       if (res.queued && vars.optimistic) dispatch(sideOptimisticRollback(vars.slot))
       if (res.queued && res.queue_id && stillQueued) {
         dispatch(sseSideQueue({ slot: vars.slot, action: 'push', queue_id: res.queue_id, content: vars.q, raw: true }))
@@ -406,21 +590,20 @@ export default function SideChat({ slot }: { slot: string }) {
       if (res.demoted) setLocalNotice(i18nT('pages.chat.sideChat.steer_demoted_to_queue'))
     },
     onError: (_err, vars) => {
+      // `sendTurn` never rejects, so this is the unexpected-throw fallback only
+      // (a bug in the wire, not a send outcome). Same recovery as a refusal.
       // `optimistic` rides along in the vars rather than being recomputed here:
       // dispatching the bubble flips the side to busy, so re-deriving it in this
       // callback would read the post-submit state and skip the rollback.
       if (vars.optimistic) dispatch(sideOptimisticRollback(vars.slot))
-      // Nothing was accepted, so hand the text back — merged, not chosen: the
-      // user may have started a new draft while the request was in flight.
-      // Back to the slot it was SUBMITTED for (`vars.slot`), not whichever slot
-      // this panel shows now: a host can re-bind the panel while the request
-      // is in flight (split view's Ask, a member switch), and handing A's
-      // question to B's draft would lose it for A and corrupt B.
-      // A paste that was collapsed goes back collapsed — token text plus its
-      // blocks (restoreSideChatDraft carries them in) — never as the expanded
-      // lines, which would lose the tokens' identity on the retry.
-      if (vars.pastes?.length && vars.display) restoreSideChatDraft(vars.slot, vars.display, vars.pastes)
-      else restoreDraftTo(vars.slot, vars.q)
+      // Nothing was accepted, so the text goes back exactly as a refusal's does:
+      // merged into the draft of the slot it was SUBMITTED for, a collapsed paste
+      // still collapsed, with a row saying it was not sent (`recoverFor`). A chip
+      // send never took the composer's text, so none goes back.
+      recoverFor(vars.slot, {
+        ...(vars.override ? {} : handBack(vars)),
+        error: sendFailureCopy(undefined, !vars.override),
+      })
     },
   })
 
@@ -429,11 +612,11 @@ export default function SideChat({ slot }: { slot: string }) {
   // races the first and returns 404 — reporting a failure for an action that
   // worked. Tracked per id rather than as one flag so two cards stay independent.
   const [pendingQueueIds, setPendingQueueIds] = useState<ReadonlySet<string>>(() => new Set())
-  // Steer ids whose raw text this client has cached. Mirrors the `steer:` keys in
-  // `submittedRaw`, which is a ref and so cannot re-render the card when it fills.
+  // Steer ids whose raw text this client has cached in the per-slot module record.
+  // The record is not state, so this set re-renders the card when the text arrives.
   const [correlatedSteerIds, setCorrelatedSteerIds] = useState<ReadonlySet<string>>(() => new Set())
-  // Queue ids whose raw text this client has cached, for the same reason `correlatedSteerIds`
-  // exists: `submittedRaw` is a ref and cannot re-render a card when it fills.
+  // Queue ids whose raw text this client has cached. `submittedRaw` is a ref and
+  // cannot re-render a card when it fills, so this set carries that correlation.
   const [correlatedQueueIds, setCorrelatedQueueIds] = useState<ReadonlySet<string>>(() => new Set())
   const markQueuePending = useCallback((queueId: string, pending: boolean) => {
     setPendingQueueIds(prev => {
@@ -467,11 +650,11 @@ export default function SideChat({ slot }: { slot: string }) {
       // credential-bearing question that is a permanently corrupted restore. The
       // submission is the only place the raw text still exists here.
       // A requeued steer's card was never submitted AS a queue entry, so nothing is
-      // stored under its id — fall back to the steer it came from, which the card
-      // carries precisely so this lookup can succeed.
+      // stored under its id. Its steer id reaches the per-slot record that survives
+      // a slot switch or unmount.
       const entry = reduxSide?.queue?.find(e => e.id === queueId)
       const raw = submittedRaw.current.get(queueId)
-        ?? (entry?.steerId ? submittedRaw.current.get(STEER_RAW_PREFIX + entry.steerId) : undefined)
+        ?? (entry?.steerId ? readSideSteerSubmittedText(target, entry.steerId) : undefined)
       dispatch(sseSideQueue({
         slot: target,
         action: 'cancel',
@@ -482,7 +665,7 @@ export default function SideChat({ slot }: { slot: string }) {
         ...(raw !== undefined ? { raw: true } : {}),
       }))
       submittedRaw.current.delete(queueId)
-      if (entry?.steerId) submittedRaw.current.delete(STEER_RAW_PREFIX + entry.steerId)
+      if (entry?.steerId) forgetSideSteerSubmittedText(target, entry.steerId)
     },
     onError: () => {
       setLocalError(i18nT('pages.chat.sideChat.queue_cancel_failed'))
@@ -493,29 +676,34 @@ export default function SideChat({ slot }: { slot: string }) {
   const editQueued = useMutation({
     mutationFn: ({ queueId, content, slot: target }: { queueId: string; content: string; slot: string }) =>
       api.sideQueueEdit(target, queueId, content),
-    onMutate: ({ queueId, slot: target }: { queueId: string; content: string; slot: string }) => {
+    onMutate: ({ queueId, content, slot: target }: { queueId: string; content: string; slot: string }) => {
       markQueuePending(queueId, true)
+      beginSideQueueEdit(target, queueId, content)
       return { broadcastAt: queueEditBroadcastAt(target, queueId) }
     },
     onSuccess: (_res, vars) => {
+      finishSideQueueEdit(vars.slot, vars.queueId)
       // The edit supersedes what this client had cached for the card. A cancel PREFERS
       // the cached copy over the card's content, so leaving it stale would restore the
       // pre-edit text and throw the user's newer wording away.
       //
-      // Any `steer:<id>` fallback for the same card is deliberately left in place. It is
-      // only consulted once this entry has been evicted, and at that point it holds the
-      // last unredacted copy of the question — pre-edit raw text beats handing the
-      // composer the card's scrubbed rendering.
+      // The submitted-steer fallback for the same card remains until the card is
+      // handled. If this queue-id copy is evicted first, the unredacted question is
+      // still safer to restore than the card's scrubbed rendering.
       submittedRaw.current.set(vars.queueId, vars.content)
       dispatch(sseSideQueue({ slot: vars.slot, action: 'edit', queue_id: vars.queueId, content: vars.content, raw: true }))
     },
     onError: (_err, vars, ctx) => {
+      // A close already returned this submitted edit while removing its card. The
+      // request result cannot return it again, whichever path settled the edit.
+      if (finishSideQueueEdit(vars.slot, vars.queueId)) return
       // The server broadcast an edit for this card after the request went out, so the edit DID
       // land and only its response was lost. Restoring here would leave the question both
-      // queued and in the composer, and it would be asked twice. The cache is refreshed
-      // instead, because a later cancel prefers it and the server now holds this wording.
+      // queued and in the composer, and it would be asked twice. Refresh both the cache
+      // and the card because a later cancel or close must use the wording the server holds.
       if (queueEditBroadcastAt(vars.slot, vars.queueId) > (ctx?.broadcastAt ?? 0)) {
         submittedRaw.current.set(vars.queueId, vars.content)
+        dispatch(sseSideQueue({ slot: vars.slot, action: 'edit', queue_id: vars.queueId, content: vars.content, raw: true }))
         return
       }
       setLocalError(i18nT('pages.chat.sideChat.queue_edit_failed'))
@@ -599,19 +787,51 @@ export default function SideChat({ slot }: { slot: string }) {
   // member switch and back — leaves focus where the user has it.
   useEffect(() => {
     if (!seedTick) return
-    const frame = requestAnimationFrame(() => {
-      const el = composerWrapRef.current?.querySelector<HTMLTextAreaElement>('textarea[data-composer-input]')
-      if (el) {
-        el.focus()
+    const place = (el: HTMLElement) => {
+      el.focus()
+      if (el instanceof HTMLTextAreaElement) {
         const len = el.value.length
         el.setSelectionRange(len, len)
-        // Scroll to the top so the START of a long quote is visible (focusing
-        // + caret-at-end scrolls to the bottom otherwise, hiding the quote).
-        el.scrollTop = 0
+      } else {
+        // The Lexical composer (Style Markdown While Typing) is a
+        // contenteditable div; it follows the DOM selection.
+        const sel = window.getSelection()
+        sel?.selectAllChildren(el)
+        sel?.collapseToEnd()
       }
+      // Scroll to the top so the START of a long quote is visible (focusing
+      // + caret-at-end scrolls to the bottom otherwise, hiding the quote).
+      el.scrollTop = 0
+    }
+    const find = () => composerWrapRef.current?.querySelector<HTMLElement>('[data-composer-input]') ?? null
+    let observer: MutationObserver | null = null
+    let timer = 0
+    const finish = (el: HTMLElement | null, late = false) => {
+      observer?.disconnect()
+      observer = null
+      window.clearTimeout(timer)
+      // A late mount (the lazy editor chunk resolved after the first frame)
+      // must not pull focus out of a field the user moved to in the meantime;
+      // the same guard `focusComposerNow` applies. The seed is still consumed.
+      if (el && !(late && activeElementIsEditable())) place(el)
       consumeSideChatSeed(slot)
+    }
+    const frame = requestAnimationFrame(() => {
+      const el = find()
+      const wrap = composerWrapRef.current
+      if (el || !wrap) { finish(el); return }
+      // The Lexical composer is lazy-loaded, so it can be missing for a
+      // while. Wait for it to mount, up to a cap, instead of consuming the
+      // seed against an empty wrapper and leaving the quote unfocused.
+      observer = new MutationObserver(() => { const found = find(); if (found) finish(found, true) })
+      observer.observe(wrap, { childList: true, subtree: true })
+      timer = window.setTimeout(() => finish(find(), true), SEED_FOCUS_WAIT_MS)
     })
-    return () => cancelAnimationFrame(frame)
+    return () => {
+      cancelAnimationFrame(frame)
+      observer?.disconnect()
+      window.clearTimeout(timer)
+    }
   }, [seedTick, slot])
 
   // Auto-grow of the input is the SDK hook's job — the `min-h-[52px]` class below
@@ -661,12 +881,16 @@ export default function SideChat({ slot }: { slot: string }) {
     sendMutation.mutate({ q, steer, optimistic: !isBusy, slot, override: override != null, ...(blocks.length ? { display: typed, pastes: blocks } : {}) })
   }, [draft, pasteBlocks, slot, sendMutation, isBusy, exceedsByteLimit])
 
-  const sendErr = sendMutation.error
-  const displayError = sendErr
-    ? (sendErr instanceof Error ? sendErr.message : String(sendErr))
-    : localError
+  const displayError = sendStatus?.error ?? localError
 
-  const turnsBehind = reduxSide ? parentTurnCount - reduxSide.openedAtTurnCount : 0
+  // A restored conversation opened before this page loaded, so its banner counts
+  // the parent turns newer than its start, read when the panel renders: the parent
+  // transcript can arrive after the restore.
+  const openedAtMs = reduxSide?.countsTurnsSinceCreated ? transcriptTsMs(reduxSide.createdAt) : null
+  const turnsSinceOpened = useAppSelector(s => openedAtMs === null ? null : s.chat.messages.filter(m =>
+    (m.role === 'user' || m.role === 'assistant') && (transcriptTsMs(m.ts) ?? -Infinity) > openedAtMs
+  ).length)
+  const turnsBehind = reduxSide ? (turnsSinceOpened ?? parentTurnCount - reduxSide.openedAtTurnCount) : 0
   const age = reduxSide?.createdAt ? relativeTime(reduxSide.createdAt) : null
   const showBanner = !!reduxSide && messages.length > 0
   const isStale = turnsBehind >= 10 || (reduxSide?.createdAt && Date.now() - new Date(reduxSide.createdAt).getTime() >= 4 * 3600_000)
@@ -679,6 +903,10 @@ export default function SideChat({ slot }: { slot: string }) {
     refreshMutation.mutate({ slot })
   }, [refreshMutation, slot])
 
+  const handleQueueEditDraft = useCallback((queueId: string, content: string | undefined) => {
+    setSideQueueEditDraft(slot, queueId, content)
+  }, [slot])
+
   // Fire-and-forget: the terminal frame the backend broadcasts drives the UI
   // back to idle, so there is nothing to await here.
   const handleStop = useCallback(() => {
@@ -688,7 +916,7 @@ export default function SideChat({ slot }: { slot: string }) {
   return (
     <div className="flex-1 flex flex-col min-h-0">
       {showBanner && (
-        <div className={`flex items-center justify-between px-3 py-1.5 text-[12px] border-b border-border shrink-0 ${isStale ? 'bg-warn/10 text-warn' : 'bg-bg-hover/50 text-muted'}`}>
+        <div className={`flex items-center justify-between px-3 py-1.5 text-[12px] border-b border-border shrink-0 ${isStale ? 'bg-warn/10 text-warn-text' : 'bg-bg-hover/50 text-muted'}`}>
           <span className="italic">
             {i18nT('pages.chat.sideChat.context_from')} {i18nT('pages.chat.sideChat.turn', { count: turnsBehind })} {i18nT('pages.chat.sideChat.ago')}{age ? ` · ${age}` : ''}
           </span>
@@ -720,6 +948,10 @@ export default function SideChat({ slot }: { slot: string }) {
       <ChatMessageList
         messages={transcript}
         running={isBusy}
+        // The host's own openers, so a path or artifact named in a side reply
+        // opens where the main transcript opens it: a tab of this panel.
+        onFileOpen={onFileOpen}
+        onArtifactOpen={onArtifactOpen}
         transcript={{
           sessionId: `side:${slot}`,
           scrollerStyle: { paddingLeft: 12, paddingRight: 12, paddingTop: 8, paddingBottom: 8 },
@@ -744,19 +976,43 @@ export default function SideChat({ slot }: { slot: string }) {
           ) : undefined,
         }}
       />
+      {restoreFailed && (
+        <div className="px-3 py-1 border-t border-border">
+          {/* No hand-off: the unsent side-question draft in this panel's
+              composer is unsaved local state, and a navigation would discard it.
+              Retry is the recovery; until it lands, a send hands its text back. */}
+          <ErrorNotice
+            message={i18nT('pages.chat.sideChat.restore_failed')}
+            testId="side-chat-restore-failed"
+            footer={
+              <button
+                type="button"
+                onClick={() => { void restoreQ.refetch() }}
+                disabled={restoreQ.isFetching}
+                className="text-[12px] font-medium text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed px-0"
+              >
+                {i18nT('pages.chat.sideChat.restore_retry')}
+              </button>
+            }
+          />
+        </div>
+      )}
       {displayError && (
         <div className="px-3 py-1 border-t border-border">
           {/* No hand-off: the side-chat composer draft (the failed question is
-              merged back into it by the mutation's onError) is unsaved local
-              state — a navigation would discard it. */}
+              merged back into it by the send's receipt handling) is unsaved
+              local state — a navigation would discard it. */}
           <ErrorNotice variant="inline" message={displayError} />
         </div>
       )}
       {!displayError && lengthHint && (
         <div className="px-3 py-1 text-[12px] text-warn border-t border-border" role="status" data-testid="side-chat-length-hint">{lengthHint}</div>
       )}
-      {!displayError && !lengthHint && localNotice && (
-        <div className="px-3 py-1 text-[12px] text-muted border-t border-border" role="status">{localNotice}</div>
+      {!displayError && !lengthHint && (sendStatus?.notice || localNotice) && (
+        // The standing unconfirmed notice carries a decision ("check the
+        // conversation above before sending it again"), so it reads at body
+        // weight; the transient demote notice keeps the muted strip.
+        <div className={`px-3 py-1 text-[12px] border-t border-border ${sendStatus?.notice ? 'text-text' : 'text-muted'}`} role="status">{sendStatus?.notice?.text ?? localNotice}</div>
       )}
       {queueCards.length > 0 && (
         <div className="shrink-0 pt-1">
@@ -766,6 +1022,7 @@ export default function SideChat({ slot }: { slot: string }) {
             pendingIds={blockedQueueIds}
             onCancel={qid => { if (!blockedQueueIds.has(qid)) cancelQueued.mutate({ queueId: qid, slot }) }}
             onEdit={(qid, content) => { if (!blockedQueueIds.has(qid)) editQueued.mutate({ queueId: qid, content, slot }) }}
+            onEditDraft={handleQueueEditDraft}
           />
         </div>
       )}
@@ -840,22 +1097,36 @@ export default function SideChat({ slot }: { slot: string }) {
             promptOptimizer={false}
             connected={connected}
           />
-          {cfgQ.isError ? (
-            // No agent hand-off: the composer above still works (the turn runs
-            // without tools), so there is nothing for the agent to take over.
+          {postureError ? (
+            // No hand-off: navigating to the main chat would unmount Side Chat and
+            // discard the unsent side-question draft in its composer, which still
+            // works (the turn runs without tools).
             <ErrorNotice
               variant="inline"
               className="px-1 pt-1.5 text-[11px] leading-4"
               message={i18nT('pages.chat.sideChat.context_only_config_unavailable')}
               testId="side-chat-config-error"
             />
-          ) : cfgQ.isSuccess ? (
+          ) : sideToolsQ.isError ? (
+            // No hand-off: navigating to the main chat would unmount Side Chat and
+            // discard the unsent side-question draft in its composer. The turn's own
+            // posture does not depend on this answer.
+            <ErrorNotice
+              variant="inline"
+              className="px-1 pt-1.5 text-[11px] leading-4"
+              message={i18nT('pages.chat.sideChat.context_only_tools_unknown')}
+              testId="side-chat-tools-unknown"
+            />
+          ) : sideToolsQ.isSuccess ? (
             <div role="note" className="px-1 pt-1.5 text-[11px] leading-4 text-muted">
-              {i18nT(
-                readOnlyToolsAvailable
-                  ? 'pages.chat.sideChat.context_only_tools_unavailable'
-                  : 'pages.chat.sideChat.context_only_tools_unavailable_backend',
-              )}
+              {readOnlyToolsAvailable
+                ? i18nT('pages.chat.sideChat.context_only_tools_unavailable')
+                : sideToolsQ.data?.claude_adapter_outdated === true
+                  ? i18nT('pages.chat.sideChat.context_only_claude_adapter_outdated', {
+                      version: sideToolsQ.data.claude_adapter_min_version,
+                      command: sideToolsQ.data.claude_adapter_update_command,
+                    })
+                  : i18nT('pages.chat.sideChat.context_only_tools_unavailable_backend')}
             </div>
           ) : null}
         </SlotProvider>

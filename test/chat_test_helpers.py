@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import os
 from unittest.mock import AsyncMock, MagicMock
 
@@ -14,6 +15,7 @@ from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.history import ConversationLog
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
 from kiro_crew.messaging.link import ChannelLink, binding_token
+from kiro_crew.testing.wait import await_until
 
 #: Draining is a LOOP because a drained task may register another -- not because any
 #: current one does (``chat_slack`` has a single ``create_task``, and the backfill
@@ -21,6 +23,40 @@ from kiro_crew.messaging.link import ChannelLink, binding_token
 #: forever fails the test instead of hanging until the 120s pytest timeout, whose
 #: report names the timeout and not the task.
 _DRAIN_ROUNDS = 20
+
+
+def pin_harness_choice(**choices: str) -> None:
+    """Store harness choices in this test's ``config.json``, the way a user does.
+
+    Keyword names are ``agent`` keys (``acp_backend``, ``member_acp_backend``);
+    values are RUNTIME ids and are written in the config-file spelling (Kiro CLI
+    is ``"kiro"``). ``save()`` writes these keys back from disk rather than from
+    memory, so setting them on a loaded config object does not persist them.
+    """
+    from kiro_crew.acp_backends import backend_to_stored
+    from kiro_crew.config.loader import _invalidate_config_cache, config_path
+
+    path = config_path()
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    agent = data.setdefault("agent", {})
+    for key, backend in choices.items():
+        agent[key] = backend_to_stored(backend)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    _invalidate_config_cache()
+
+
+def pin_kiro_cli_harness() -> None:
+    """Record kiro-cli as the chosen harness in this test's data home.
+
+    A config with no ``agent.acp_backend`` resolves to KAS, which answers native
+    slash commands (``/tools``, ``/clear``, an in-turn agent switch) locally. A
+    test of the kiro-cli path through those commands states the choice the way a
+    user does, in ``config.json``, so every reader in the turn agrees on it.
+    """
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_KIRO
+
+    pin_harness_choice(acp_backend=ACP_BACKEND_KIRO)
 
 
 def move_transcript_past(log: ConversationLog, key: str, sig: float) -> None:
@@ -48,7 +84,7 @@ def close_before_resume(log: ConversationLog, key: str) -> None:
     3.12, so a close followed at once by a resume ties there and not on Linux. The
     precondition a close-then-resume test means is "closed BEFORE the resume
     begins", so it is stated here rather than left to clock granularity, the way
-    ``test_session_control_revive._archive`` states it.
+    ``session_control_revive_helpers._archive`` states it.
     """
     meta = log.get_metadata(key)
     assert meta.get("closed"), f"{key} is not closed"
@@ -113,7 +149,7 @@ async def run_as_slot_task(slot, coro) -> "asyncio.Task":
     """Run *coro* as ``slot.task``, the way a dispatcher does, and await it."""
     task = asyncio.ensure_future(coro)
     slot.task = task
-    await asyncio.wait_for(task, timeout=TURN_WAIT_SECS)
+    await await_until(task, what="the slot's turn")
     return task
 
 
@@ -121,7 +157,7 @@ async def await_successor(slot, predecessor) -> "asyncio.Task":
     """Await the turn *predecessor*'s queue hand-off published in ``slot.task``."""
     successor = slot.task
     assert successor is not None and successor is not predecessor, "no successor dispatched"
-    await asyncio.wait_for(successor, timeout=TURN_WAIT_SECS)
+    await await_until(successor, what="the successor turn")
     return successor
 
 
@@ -333,6 +369,7 @@ def _make_state(tmp_path, **kwargs):
     sessions.mirror_link_nonce = MagicMock(side_effect=_mirror_link_nonce)
     sessions.clear_mirror_link_if = MagicMock(side_effect=_clear_mirror_link_if)
     sessions.find_mirror_sessions = MagicMock(side_effect=_find_mirror_sessions)
+    sessions.mirror_accepts_inbound = MagicMock(side_effect=lambda key: key in _inbound_keys)
     state = DashboardState(
         sessions=sessions,
         crons=MagicMock(list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})),
@@ -377,6 +414,15 @@ def _make_app(state: DashboardState) -> web.Application:
             request["app"] = ""  # dashboard user, not an app
         if "user" not in request:
             request["user"] = "local-app"  # recognized as owner
+        # Mirror token_auth_middleware's provenance markers (token_auth.py sets
+        # is_dashboard_user = not app). A route that gates on dashboard-user
+        # provenance (e.g. the user-only mute toggle) needs these present, and
+        # an app-isolation test that injected its own app identity gets the
+        # matching is_dashboard_user=False here.
+        if "is_dashboard_user" not in request:
+            request["is_dashboard_user"] = request["app"] == ""
+        if "internal_auth" not in request:
+            request["internal_auth"] = False
         return await handler(request)
 
     # The per-slot app-ownership checkpoint runs inner to auth, as in the real

@@ -18,7 +18,7 @@ function makeVoice(overrides: Partial<VoiceControls> = {}) {
   return v
 }
 
-const MAC_ALT_RIGHT: PttConfig = { mode: 'hybrid', binding: { code: 'AltRight' }, holdMs: 500 }
+const MAC_ALT_RIGHT: PttConfig = { enabled: true, mode: 'hybrid', binding: { code: 'AltRight' }, holdMs: 500 }
 
 function down(code: string, init: KeyboardEventInit = {}) {
   act(() => {
@@ -197,7 +197,7 @@ describe('binding discrimination', () => {
 
   // A chord's primary key WOULD type a character or scroll the page.
   it('claims a chord binding keydown', () => {
-    savePttConfig({ mode: 'hybrid', binding: { code: 'Space', alt: true, shift: true }, holdMs: 500 })
+    savePttConfig({ enabled: true, mode: 'hybrid', binding: { code: 'Space', alt: true, shift: true }, holdMs: 500 })
     const voice = makeVoice()
     renderHook(() => usePushToTalk(voice))
     const ev = new KeyboardEvent('keydown', { code: 'Space', altKey: true, shiftKey: true, bubbles: true, cancelable: true })
@@ -676,7 +676,7 @@ describe('a second press cancels a startup that has not gone live yet', () => {
   }
 
   it('ends a pending toggle-mode session instead of opening a second one', async () => {
-    savePttConfig({ mode: 'toggle', binding: { code: 'AltRight' }, holdMs: 500 })
+    savePttConfig({ enabled: true, mode: 'toggle', binding: { code: 'AltRight' }, holdMs: 500 })
     // recording stays false until go(): the fake is still inside getUserMedia.
     const voice = makeSlowVoice(true)
     renderHook(() => usePushToTalk(voice))
@@ -811,5 +811,136 @@ describe('live rebinding', () => {
     })
     down('MetaRight', { metaKey: true })
     expect(voice.calls).toEqual(['start'])
+  })
+})
+
+describe('disabled key (issue #13078)', () => {
+  // The off switch in Settings: with it off the bound key must not open capture
+  // at all, leaving the mic button as the only way in. This is the user-visible
+  // behaviour the issue asks for — a key you can turn off, not only reassign.
+  it('does not arm on the bound key when disabled', () => {
+    savePttConfig({ ...MAC_ALT_RIGHT, enabled: false })
+    const voice = makeVoice()
+    renderHook(() => usePushToTalk(voice))
+
+    down('AltRight', { altKey: true })
+    act(() => { vi.advanceTimersByTime(500) })
+    up('AltRight')
+
+    expect(voice.start).not.toHaveBeenCalled()
+    expect(voice.calls).toEqual([])
+    expect(voice.recording).toBe(false)
+  })
+
+  // Flipping the toggle takes effect live, both ways, like a rebind does — the
+  // same PTT_CHANGED_EVENT path the Settings page fires. Uses hold-only (ptt)
+  // mode and full holds so each gesture is independent (no lingering latch).
+  it('stops and resumes arming when the toggle changes at runtime', () => {
+    const PTT: PttConfig = { ...MAC_ALT_RIGHT, mode: 'ptt' }
+    savePttConfig(PTT)
+    const voice = makeVoice()
+    renderHook(() => usePushToTalk(voice))
+
+    const hold = () => {
+      down('AltRight', { altKey: true })
+      act(() => { vi.advanceTimersByTime(500) })
+      up('AltRight')
+    }
+
+    // Enabled: a hold records.
+    hold()
+    expect(voice.start).toHaveBeenCalledTimes(1)
+
+    // Turn it off: the key goes dead.
+    act(() => { savePttConfig({ ...PTT, enabled: false }) })
+    hold()
+    expect(voice.start).toHaveBeenCalledTimes(1)
+
+    // Turn it back on: the key records again.
+    act(() => { savePttConfig({ ...PTT, enabled: true }) })
+    hold()
+    expect(voice.start).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('disabling the hook never strands a running capture', () => {
+  beforeEach(() => savePttConfig(MAC_ALT_RIGHT))
+
+  // A host disables the key while something covers the chat. A latch that was
+  // already running when that happened must still be stoppable with the key:
+  // the hook's blur/visibility guards skip an idle phase and the cap timer only
+  // arms for a hold, so the key is the only thing that can end it.
+  it('a press still stops a latch that was running when disabled turned on', () => {
+    const voice = makeVoice()
+    const { rerender } = renderHook(
+      ({ disabled }) => usePushToTalk(voice, { disabled }),
+      { initialProps: { disabled: false } },
+    )
+    down('AltRight', { altKey: true }); act(() => { vi.advanceTimersByTime(200) }); up('AltRight')
+    expect(voice.recording).toBe(true)
+
+    rerender({ disabled: true })
+    down('AltRight', { altKey: true })
+    expect(voice.calls).toEqual(['start', 'stop'])
+    expect(voice.recording).toBe(false)
+
+    // Stopped, still disabled: the next press must not open a new capture.
+    up('AltRight')
+    down('AltRight', { altKey: true })
+    act(() => { vi.advanceTimersByTime(500) })
+    up('AltRight')
+    expect(voice.start).toHaveBeenCalledTimes(1)
+    expect(voice.calls).toEqual(['start', 'stop'])
+  })
+
+  it('a press while disabled with nothing capturing does not start', () => {
+    const voice = makeVoice()
+    renderHook(() => usePushToTalk(voice, { disabled: true }))
+    down('AltRight', { altKey: true })
+    act(() => { vi.advanceTimersByTime(500) })
+    up('AltRight')
+    expect(voice.start).not.toHaveBeenCalled()
+    expect(voice.calls).toEqual([])
+  })
+
+  it('an unrelated key while disabled does not stop a running latch', () => {
+    const voice = makeVoice()
+    const { rerender } = renderHook(
+      ({ disabled }) => usePushToTalk(voice, { disabled }),
+      { initialProps: { disabled: false } },
+    )
+    down('AltRight', { altKey: true }); act(() => { vi.advanceTimersByTime(200) }); up('AltRight')
+    rerender({ disabled: true })
+    down('KeyA')
+    expect(voice.calls).toEqual(['start'])
+    expect(voice.recording).toBe(true)
+  })
+
+  // A hold in progress when disabled flips still reconciles a keyup the hook
+  // never saw, from the next keystroke's live modifier flags.
+  it('a held press that loses its keyup still commits after disabled turns on', () => {
+    const voice = makeVoice()
+    const { rerender } = renderHook(
+      ({ disabled }) => usePushToTalk(voice, { disabled }),
+      { initialProps: { disabled: false } },
+    )
+    down('AltRight', { altKey: true })
+    act(() => { vi.advanceTimersByTime(500) })
+    rerender({ disabled: true })
+    down('KeyA')
+    expect(voice.calls).toEqual(['start', 'stop'])
+  })
+
+  it('a held press still ends on release after disabled turns on', () => {
+    const voice = makeVoice()
+    const { rerender } = renderHook(
+      ({ disabled }) => usePushToTalk(voice, { disabled }),
+      { initialProps: { disabled: false } },
+    )
+    down('AltRight', { altKey: true })
+    act(() => { vi.advanceTimersByTime(500) })
+    rerender({ disabled: true })
+    up('AltRight')
+    expect(voice.calls).toEqual(['start', 'stop'])
   })
 })

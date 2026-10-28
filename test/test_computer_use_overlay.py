@@ -628,7 +628,7 @@ class TestSharedSingleton:
 
 
 class TestShowPointerMotion:
-    """The SYNC seam the blocking dispatcher calls (reviewer finding).
+    """The SYNC seam the blocking dispatcher calls.
 
     The dispatcher runs on a worker thread, so it cannot await the animation. This
     schedules it onto the gateway loop and returns immediately, and must never
@@ -1333,6 +1333,10 @@ class TestStructuralGuarantees:
                 modules.add(node.module)
         forbidden = {
             "kiro_crew.computer_use.macos_ffi",
+            "kiro_crew.computer_use.macos_ffi_bind",
+            "kiro_crew.computer_use.macos_ffi_cf",
+            "kiro_crew.computer_use.macos_ffi_ax",
+            "kiro_crew.computer_use.macos_ffi_window",
             "kiro_crew.computer_use.snapshot_macos",
             "kiro_crew.computer_use.capture_macos",
             "kiro_crew.computer_use.apps_macos",

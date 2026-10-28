@@ -126,6 +126,122 @@ def test_last_activity_ts_from_tool_call():
     assert d["last_activity_ts"] == "t4"
 
 
+# ── last_activity_ts normalization (store boundary) ──
+# last_activity_ts is the newest durable, non-notice row of any role, so every
+# consumer that sorts by it ranks a session by when it last moved, without its
+# own max(last_activity_ts, last_ts) derivation. last_agent_ts keeps the old
+# "newest assistant / tool row" reading for the artifact freshness nudge.
+
+
+def test_last_activity_ts_advances_to_last_ts_when_user_prompt_is_newer():
+    # A user message AFTER the last assistant turn leaves last_activity_ts stuck
+    # at the assistant row on the raw scan; the normalizer must take last_ts.
+    # Two consumers disagreed on the pre-fix behavior: byRecentActivity sorted
+    # by last_activity_ts ("t1"), while slotRecency() correctly returned "t2".
+    s = _slot(
+        {"role": "assistant", "content": "done", "ts": "t1"},
+        {"role": "user", "content": "follow-up", "ts": "t2"},
+    )
+    d = s.to_dict()
+    assert d["last_ts"] == "t2"
+    assert d["last_activity_ts"] == "t2"  # normalized to last_ts, not stale "t1"
+
+
+def test_last_activity_ts_unchanged_when_assistant_is_already_newest():
+    # When the latest row is an assistant/tool row, last_activity_ts is already
+    # the correct value; the normalizer must leave it alone.
+    s = _slot(
+        {"role": "user", "content": "do it", "ts": "t1"},
+        {"role": "assistant", "content": "done", "ts": "t2"},
+    )
+    d = s.to_dict()
+    assert d["last_activity_ts"] == "t2"
+    assert d["last_ts"] == "t2"
+
+
+def test_last_activity_ts_takes_last_ts_when_no_assistant_row():
+    # A session where only user rows exist has last_activity_ts == "" on the raw
+    # scan; the normalizer promotes the latest non-notice durable row so the
+    # slot sorts correctly.
+    s = _slot(
+        {"role": "user", "content": "hello", "ts": "t1"},
+    )
+    d = s.to_dict()
+    assert d["last_ts"] == "t1"
+    assert d["last_activity_ts"] == "t1"
+
+
+def test_last_activity_ts_does_not_advance_for_notice_rows():
+    # System-notice rows (e.g. session-reload cards) are excluded from the
+    # non-notice durable scan, so they do not count as user activity and the
+    # session is not incorrectly ranked above ones a person actually used.
+    s = _slot(
+        {"role": "assistant", "content": "done", "ts": "t1"},
+        {
+            "role": "assistant",
+            "content": "Session reloaded.",
+            "meta": {"kind": "session_reload"},
+            "ts": "t2",
+        },
+    )
+    d = s.to_dict()
+    assert d["last_ts"] == "t2"  # last_ts includes the notice row
+    assert d["last_activity_ts"] == "t1"  # notice row does not advance this
+
+
+def test_last_activity_ts_takes_newer_user_row_across_offsets():
+    # The newer user row is the SMALLER string: 09:00+08:00 is 01:00Z, and the
+    # prompt at 02:00+00:00 came an hour later. Rows mix offsets (a channel reply
+    # restored from another host, a DST change), so position decides, not text.
+    s = _slot(
+        {"role": "assistant", "content": "done", "ts": "2026-08-17T09:00:00+08:00"},
+        {"role": "user", "content": "follow-up", "ts": "2026-08-17T02:00:00+00:00"},
+    )
+    d = s.to_dict()
+    assert d["last_activity_ts"] == "2026-08-17T02:00:00+00:00"
+    assert d["last_agent_ts"] == "2026-08-17T09:00:00+08:00"
+
+
+def test_last_activity_ts_takes_newer_user_row_after_naive_agent_row():
+    # An older build wrote naive rows; a current one writes aware rows.
+    s = _slot(
+        {"role": "assistant", "content": "done", "ts": "2026-08-17T10:00:00"},
+        {"role": "user", "content": "follow-up", "ts": "2026-08-17T09:30:00+00:00"},
+    )
+    assert s.to_dict()["last_activity_ts"] == "2026-08-17T09:30:00+00:00"
+
+
+def test_last_agent_ts_stays_on_the_agent_row_after_a_user_prompt():
+    s = _slot(
+        {"role": "assistant", "content": "done", "ts": "t1"},
+        {"role": "user", "content": "follow-up", "ts": "t2"},
+    )
+    d = s.to_dict()
+    assert d["last_agent_ts"] == "t1"
+    assert d["last_activity_ts"] == "t2"
+
+
+def test_last_agent_ts_empty_without_an_agent_row():
+    d = _slot({"role": "user", "content": "hello", "ts": "t1"}).to_dict()
+    assert d["last_agent_ts"] == ""
+    assert _slot().to_dict()["last_activity_ts"] == ""
+
+
+def test_last_activity_ts_counts_a_send_queued_behind_a_running_turn():
+    # The dashboard bumps last_activity_ts on queue_push; the snapshot must agree,
+    # or the next slots frame drops the session back down the grid.
+    s = _slot(
+        {"role": "user", "content": "do it", "ts": "2026-08-17T01:00:00+00:00"},
+        {"role": "tool_call", "content": "grep ...", "ts": "2026-08-17T01:00:05+00:00"},
+    )
+    s.task = SimpleNamespace(done=lambda: False)
+    s.queue_append("and also this")
+    d = s.to_dict()
+    assert d["last_activity_ts"] == s._last_enqueue_ts
+    assert d["last_activity_ts"] != d["last_ts"]
+    assert d["last_agent_ts"] == "2026-08-17T01:00:05+00:00"
+
+
 # ── last_turn_ts ──
 # The instant the session list is ORDERED by: the last prompt or turn
 # completion, never a mid-turn row. `last_ts` (newest row of any role) advances
@@ -349,6 +465,89 @@ def test_not_interrupted_on_clean_finish():
     )
     d = s.to_dict()
     assert d["interrupted"] is False
+
+
+_QUIET_META = {"tool_call_id": "b", "tool_name": "nothing_to_do", "mcp_server": "kirocrew-core"}
+
+
+def test_not_interrupted_after_a_quiet_end():
+    # A `nothing_to_do` turn ends on its tool row: [user, tool, tool] is the
+    # same tail a mid-turn crash leaves, so the directive's persisted TRUSTED
+    # identity plus the runner's `ends_turn` stamp is what tells the two apart.
+    s = _slot(
+        {"role": "user", "content": "patrol", "ts": "t1"},
+        {"role": "tool", "content": "🔧 gh pr view", "ts": "t2", "meta": {"tool_call_id": "a"}},
+        {
+            "role": "tool",
+            "content": "🔧 @kirocrew-core/nothing_to_do",
+            "ts": "t3",
+            "meta": {**_QUIET_META, "ends_turn": True},
+        },
+    )
+    assert s.to_dict()["interrupted"] is False
+
+
+def test_a_refused_quiet_end_is_still_interrupted():
+    # Same identity, no `ends_turn`: the applier refused (a person opened the
+    # turn), so the turn is unanswered and Resume stays offered.
+    s = _slot(
+        {"role": "user", "content": "patrol", "ts": "t1"},
+        {
+            "role": "tool",
+            "content": "🔧 @kirocrew-core/nothing_to_do",
+            "ts": "t2",
+            "meta": dict(_QUIET_META),
+        },
+    )
+    assert s.to_dict()["interrupted"] is True
+
+
+def test_a_quiet_end_followed_by_more_tool_work_does_not_close_the_turn():
+    # The model broke the contract (a tool call after nothing_to_do) and the
+    # gateway then died: the quiet-end row is not the last act, so the tail
+    # reads as interrupted and Resume is offered.
+    s = _slot(
+        {"role": "user", "content": "patrol", "ts": "t1"},
+        {
+            "role": "tool",
+            "content": "🔧 @kirocrew-core/nothing_to_do",
+            "ts": "t2",
+            "meta": {**_QUIET_META, "ends_turn": True},
+        },
+        {"role": "tool", "content": "🔧 gh pr view", "ts": "t3", "meta": {"tool_call_id": "c"}},
+    )
+    assert s.to_dict()["interrupted"] is True
+
+
+def test_quiet_end_needs_the_trusted_identity_not_the_title():
+    # A shell row whose TITLE names the tool has no `_meta.kiro` identity and
+    # must not close the turn.
+    s = _slot(
+        {"role": "user", "content": "patrol", "ts": "t1"},
+        {
+            "role": "tool",
+            "content": "🔧 echo nothing_to_do",
+            "ts": "t2",
+            "meta": {"tool_call_id": "a"},
+        },
+    )
+    assert s.to_dict()["interrupted"] is True
+    # ...and the right name on a foreign server is a foreign tool.
+    s = _slot(
+        {"role": "user", "content": "patrol", "ts": "t1"},
+        {
+            "role": "tool",
+            "content": "🔧 nothing_to_do",
+            "ts": "t2",
+            "meta": {
+                "tool_call_id": "a",
+                "tool_name": "nothing_to_do",
+                "mcp_server": "other-mcp",
+                "ends_turn": True,
+            },
+        },
+    )
+    assert s.to_dict()["interrupted"] is True
 
 
 def test_not_interrupted_after_deliberate_stop():

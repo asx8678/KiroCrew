@@ -61,7 +61,9 @@ class TestProcessSlackFiles:
         assert image_paths[0].endswith(".png")
         assert os.path.exists(image_paths[0])
         os.unlink(image_paths[0])
-        assert text_blocks == []
+        folder, name = os.path.split(image_paths[0])
+        assert len(text_blocks) == 1
+        assert f"[Image {name} is saved in the folder {folder}{os.sep} " in text_blocks[0]
 
     @pytest.mark.asyncio
     async def test_image_too_large_skipped(self):
@@ -95,8 +97,7 @@ class TestProcessSlackFiles:
             }
         ]
         image_paths, text_blocks = await process_slack_files(orch, files)
-        assert len(image_paths) == 1
-        os.unlink(image_paths[0])
+        assert image_paths == []
         assert len(text_blocks) == 1
         assert "[File: code.py]" in text_blocks[0]
         assert "def hello():" in text_blocks[0]
@@ -128,7 +129,7 @@ class TestProcessSlackFiles:
                 "url_private_download": "https://files.slack.com/big.log",
                 "filetype": "log",
                 "name": "big.log",
-                "size": _MAX_OPAQUE_BYTES + 1,
+                "size": _MAX_TEXT_BYTES + 1,
             }
         ]
         image_paths, text_blocks = await process_slack_files(orch, files)
@@ -297,8 +298,7 @@ class TestProcessSlackFiles:
         ):
             await process_slack_files(orch, files)
         assert len(created_paths) == 1
-        assert os.path.exists(created_paths[0])
-        os.unlink(created_paths[0])
+        assert not os.path.exists(created_paths[0])
 
     @pytest.mark.asyncio
     async def test_empty_text_file(self):
@@ -384,14 +384,15 @@ class TestProcessSlackFiles:
         ]
         image_paths, text_blocks = await process_slack_files(orch, files)
 
-        assert len(image_paths) == 2  # image + kept text
-        for path in image_paths:
-            if os.path.exists(path):
-                os.unlink(path)
-        assert len(text_blocks) == 2  # text + pdf (could not extract)
+        assert len(image_paths) == 1
+        assert len(text_blocks) == 3  # text + image location note + pdf (could not extract)
         assert any("[File: output.log]" in b for b in text_blocks)
+        assert any("is saved in the folder" in b for b in text_blocks)
         assert any("could not extract text" in b for b in text_blocks)
         assert call_count == 3  # image + text + pdf document
+
+        for p in image_paths:
+            os.unlink(p)
 
     @pytest.mark.asyncio
     async def test_text_file_credentials_redacted(self):
@@ -461,8 +462,7 @@ class TestProcessSlackFiles:
             }
         ]
         image_paths, text_blocks = await process_slack_files(orch, files)
-        assert len(image_paths) == 1
-        os.unlink(image_paths[0])
+        assert image_paths == []
         assert len(text_blocks) == 1
         assert "[Document: narrative.docx]" in text_blocks[0]
         assert "Narrative text" in text_blocks[0]
@@ -498,8 +498,7 @@ class TestProcessSlackFiles:
             }
         ]
         image_paths, text_blocks = await process_slack_files(orch, files)
-        assert len(image_paths) == 1
-        os.unlink(image_paths[0])
+        assert image_paths == []
         assert len(text_blocks) == 1
         assert "[Document: review.pptx]" in text_blocks[0]
         assert "Deck Title" in text_blocks[0]
@@ -516,7 +515,7 @@ class TestProcessSlackFiles:
                 "url_private_download": "https://files.slack.com/huge.docx",
                 "filetype": "docx",
                 "name": "huge.docx",
-                "size": _MAX_OPAQUE_BYTES + 1,
+                "size": _MAX_DOC_BYTES + 1,
             }
         ]
         image_paths, text_blocks = await process_slack_files(orch, files)

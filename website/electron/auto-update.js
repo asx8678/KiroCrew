@@ -458,7 +458,8 @@ const DOWNLOAD_BASE = "https://download.crew.kiro.dev";
 const KNOWN_CHANNELS = new Set(["nightly", "insider", "stable"]);
 // Channels with a WINDOWS publish lane. publish-windows.yml is wired into
 // nightly.yml and both of release.yml's channels: insider publishes a fresh
-// signed build, and stable republishes the promotion bundle's installer. That is
+// signed build, and stable rebuilds by default (or, in promote mode set by
+// vars.STABLE_PROMOTE_BYTES, republishes the promotion bundle's installer). That is
 // every channel in KNOWN_CHANNELS, so Windows carries no channel restriction of
 // its own and channelHasLane needs no win32 arm -- a separate set here would be a
 // comment claiming a restriction that does not exist.
@@ -532,26 +533,37 @@ function channelForVersion(version) {
  *   mid-cycle (insider 0.2.0-insider.1 -> stable 0.1.0), which is why
  *   allowDowngrade is enabled in configureUpdater.
  *
- * Why the unset default is stable rather than the stamp: a stable release is
- * PROMOTED, meaning the exact notarized candidate bytes are re-pointed at the
- * stable channel without a rebuild, so the stable download and the insider
- * download of a promoted version are the SAME FILE and carry the same
- * prerelease stamp (`0.3.0-insider.13`). The channel therefore cannot be a
- * property of the bytes, and reading it out of the version string sends every
- * promoted-stable install to the insider feed. It is a default plus an opt-in,
+ * Why the unset default is stable rather than the stamp: a stable release
+ * rebuilds under the bare version by default, but in promote mode
+ * (vars.STABLE_PROMOTE_BYTES names the base version) the exact notarized
+ * candidate bytes are re-pointed at the stable channel without a rebuild, so
+ * the stable download and the insider download of a promoted version are the
+ * SAME FILE and carry the same prerelease stamp (`0.3.0-insider.13`). The
+ * channel therefore cannot be a property of the bytes, and reading it out of
+ * the version string sends every promoted-stable install to the insider feed. It is a default plus an opt-in,
  * which is what this function's own contract above already describes.
  *
  * `channelForVersion` deliberately keeps classifying the BYTES (it is what the
  * About panel's "you are running prerelease bytes" note is keyed on); only the
  * followed feed is decoupled from it here.
  *
+ * A channel the policy requires (`required`, see runtime/update/policy-channel.js)
+ * replaces the preference. A build that cannot follow it (a nightly install
+ * asked for another lane, or a production install asked for nightly, which is a
+ * separate side-by-side app) has no lane: null, so updates stay off.
+ *
  * @param {"nightly"|"insider"|"stable"|null} stamped - channelForVersion(version)
  * @param {"insider"|"stable"|""|null|undefined} preference - user opt-in, falsy = default
+ * @param {"nightly"|"insider"|"stable"|""} [required] - policy channel, "" = none
  * @returns {"nightly"|"insider"|"stable"|null}
  */
-function resolveChannel(stamped, preference) {
-  if (stamped === "nightly") return "nightly";
+function resolveChannel(stamped, preference, required = "") {
   if (stamped === null) return null;
+  if (required) {
+    if (stamped === "nightly") return required === "nightly" ? "nightly" : null;
+    return required === "insider" || required === "stable" ? required : null;
+  }
+  if (stamped === "nightly") return "nightly";
   if (preference === "insider" || preference === "stable") return preference;
   return "stable";
 }
@@ -927,6 +939,9 @@ function initAutoUpdate(deps) {
     Notification,
     getFlavor,
     getChannelPreference = () => "",
+    // The channel the policy requires, "" when none (an oss build). Read fresh,
+    // like the preference, which it replaces (resolveChannel).
+    getRequiredChannel = () => "",
     // Whether discovery may proceed straight to a download without a click.
     // Read FRESH per event, like getChannelPreference, so toggling it in
     // Settings takes effect on the next check with no re-init.
@@ -978,6 +993,11 @@ function initAutoUpdate(deps) {
     feedBase = process.env.KIROCREW_UPDATE_FEED || DEFAULT_FEED_BASE,
     onUpdateState = null,
     log = console,
+    // Whether a security policy provider currently governs this install's
+    // updates, making the Electron feed lane stand down. Wired by the
+    // caller (ipc-registrar.js) to a variable the renderer updates via
+    // update:notify-policy-governed once the gateway status is known.
+    isPolicyGoverned = () => false,
   } = deps;
 
   // Linux install shape. Resolved once, and BEFORE getInfo() is defined: the
@@ -1007,6 +1027,7 @@ function initAutoUpdate(deps) {
     app,
     getFlavor,
     getChannelPreference,
+    getRequiredChannel,
     getAutoDownloadPreference,
     onUpdateState,
     uiDriven,
@@ -1023,7 +1044,7 @@ function initAutoUpdate(deps) {
     isNewerVersion,
     manualDownloadUrl,
   });
-  const { currentChannel, getInfo } = reporter;
+  const { currentChannel, getInfo, policyRefusal } = reporter;
 
   // An operator or distro packager that dropped the EXTERNALLY-MANAGED marker
   // owns this install's update lifecycle: the external package manager replaces
@@ -1055,6 +1076,7 @@ function initAutoUpdate(deps) {
       managedPath,
       launchCheckDelayMs: LAUNCH_CHECK_DELAY_MS,
       checkIntervalMs: CHECK_INTERVAL_MS,
+      isPolicyGoverned,
       log,
     });
   }
@@ -1080,6 +1102,12 @@ function initAutoUpdate(deps) {
   // Evaluated once at init, while currentChannel() is read per check: switching
   // channels in Settings mid-session surfaces the ordinary failure card until
   // the next launch, which the UI already handles.
+  // The policy requires a channel this build cannot follow: updates off, rather
+  // than the stable fallback currentChannel() reports for display.
+  if (policyRefusal()) {
+    log.info(`[update] ${policyRefusal()} — auto-update disabled`);
+    return { check: () => {}, download: async () => {}, install: async () => {}, getInfo, disabled: "policy-channel" };
+  }
   if (!channelHasLane(currentChannel())) {
     log.info(`[update] ${osPlatform} has no ${currentChannel()} publish lane — auto-update disabled`);
     return { check: () => {}, download: async () => {}, install: async () => {}, getInfo, disabled: "channel" };
@@ -1167,6 +1195,7 @@ function initAutoUpdate(deps) {
     channelForVersion,
     launchCheckDelayMs: LAUNCH_CHECK_DELAY_MS,
     checkIntervalMs: CHECK_INTERVAL_MS,
+    isPolicyGoverned,
   });
 }
 

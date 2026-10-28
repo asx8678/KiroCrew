@@ -43,6 +43,7 @@ if TYPE_CHECKING:  # avoid import cycles — config.loader imports heavy modules
         EmbeddingSource,
         ExternalAccessPolicy,
         FeatureApp,
+        FeedbackTrackerProvider,
         GatewayLifecycleProvider,
         IdentityProvider,
         ImportSourceProvider,
@@ -59,6 +60,7 @@ if TYPE_CHECKING:  # avoid import cycles — config.loader imports heavy modules
         SandboxPolicy,
         SkillDiscoveryProvider,
         SlackEnterpriseGate,
+        SpeechProviderRegistry,
         TelemetryProvider,
         TipsProvider,
         TunnelProvider,
@@ -285,7 +287,7 @@ class PlatformContext:
     # ── boot-layer extension points ──
     providers: "ProviderRegistry"
     publish: "PublishRegistry"
-    # ``run_first_run_setup`` is wired (slack/gateway.py); ``managed_mcp_servers``
+    # ``run_first_run_setup`` is wired (slack/gateway_runtime/service_boot.py); ``managed_mcp_servers``
     # is [RESERVED] — see RESERVED_METHODS.
     agent_runtime: "AgentRuntime"
     agent_executable: "AgentExecutableResolver"
@@ -341,6 +343,16 @@ class PlatformContext:
     # plus whatever the edition adds), each backed by a ``LaunchEngine`` the
     # core's launch job drives. v1 addition (no CONTRACT_VERSION bump).
     remote_provisioners: "RemoteProvisionerProvider"
+    # Where Report a Problem / `kirocrew doctor` send the user to file the
+    # bundle. REPLACE-capable like ``tips``: the public pre-filled GitHub link
+    # or the edition's own URL, never a merge of the two. The backend half of
+    # the dashboard's ``setFeedbackTracker`` seam. v1 addition (no
+    # CONTRACT_VERSION bump).
+    feedback: "FeedbackTrackerProvider"
+    # Edition-registered STT / TTS providers and the edition's default choice.
+    # ADD-only: a name colliding with a built-in or ``off`` fails boot. Read by
+    # ``kiro_crew.speech_providers``. v1 addition (no CONTRACT_VERSION bump).
+    speech: "SpeechProviderRegistry"
 
     # ── bundled feature apps ──
     feature_apps: "Tuple[FeatureApp, ...]"  # [RESERVED] — see RESERVED_SLOTS
@@ -611,6 +623,12 @@ def set_context(ctx: PlatformContext) -> None:
 # must contain the phrase ``no-context answer`` so the justification is greppable
 # and cannot dodge the question it exists to answer.
 PEEK_CALLERS: "dict[str, str]" = {
+    "security/redaction.py::_token_param_exempt_prefixes": (
+        "no-context answer is the empty prefix set, which means MORE redaction: "
+        "pass 4 redacts every `token=` URL value. The lookup can only skip a "
+        "value no earlier credential pass claimed, so an absent context cannot "
+        "be the reason a credential survives."
+    ),
     "security/exfil.py::_exempt_exact_hosts": (
         "no-context answer is the empty exempt-host set, which means MORE "
         "redaction: every host runs the base64-blob / query-length heuristics. "
@@ -627,7 +645,16 @@ PEEK_CALLERS: "dict[str, str]" = {
         "its policy failed to compose — is handled separately by withholding "
         "the line's text (LOG_WITHHELD_PLACEHOLDER)."
     ),
-    "platform/governance.py::active_policy_distribution": (
+    "speech_providers.py::_installed_speech": (
+        "no-context answer is 'no registered speech providers and no edition "
+        "default', which is the standalone answer: the built-in STT and TTS sets. "
+        "An unknown stored name then keeps its built-in fallback (STT fails closed "
+        "to off, TTS falls back to the local default), so an absent context can only "
+        "NARROW what is selectable, never route audio anywhere. It must peek: the STT "
+        "half runs inside KiroCrewConfig.load(), and current_context() with nothing "
+        "installed loads config, which would re-enter that load."
+    ),
+    "platform/governance_parts/carriers.py::active_policy_distribution": (
         "no-context answer is an unconfigured PolicyDistribution, i.e. no "
         "central fetch. It is reached only when boot never installed a context, "
         "and then this process holds no ceiling to refresh and runs no refresher "
@@ -992,7 +1019,19 @@ def _scan_verdict(kind: str, raw: bytes, scan: "Callable[[bytes], bool]") -> boo
     key costs the event loop nothing even at the read cap.
     """
     generation = governance_generation()
-    key = (kind, hashlib.sha256(raw).digest(), generation)
+    # Content-addressed cache key, not a security digest: ``raw`` is hashed only to
+    # recognize the same bytes again, never stored or compared as a credential, so
+    # ``usedforsecurity=False`` states that intent and the strength of the hash
+    # guards nothing here -- a collision would at worst reuse a verdict, which the
+    # generation and degrade guards already retire. CodeQL's ``py/weak-sensitive-
+    # data-hashing`` flow heuristic flags the sink because a scanned buffer can
+    # carry credential bytes (that is what these functions exist to FIND); the same
+    # false-positive class is suppressed the repo-standard ``lgtm`` way elsewhere
+    # (see ``auto_improvement/spine/archive.py``).
+    digest = hashlib.sha256(  # noqa: S324 -- content key, not a security digest
+        raw, usedforsecurity=False
+    ).digest()  # lgtm[py/weak-sensitive-data-hashing]
+    key = (kind, digest, generation)
     with _SCAN_VERDICTS_LOCK:
         cached = _SCAN_VERDICTS.get(key)
         if cached is not None:
@@ -1096,15 +1135,16 @@ def binary_content_is_flagged(raw: bytes) -> bool:
     NUL-interleaved ASCII is valid UTF-8, so the wide pass cannot live behind this
     function's decode-failure entry condition alone.
 
+    Latin-1 also splits a UTF-8 multi-byte space after ``Bearer``, so the
+    ``errors="replace"`` UTF-8 projection is joined on and scanned in the same
+    pass, mask and all.
+
     Four gates guard the ``file_send`` delivery path -- the MCP tool before any
     byte is copied, ``POST /api/outbox/notify``, ``GET /api/outbox/{filename}``,
-    and the ``_gate_upload_file`` shared by the Slack and channel upload legs. All
-    four must agree on what counts as flagged content, for two different reasons.
-    The three owner-facing gates each read the one durable grant
-    :mod:`kiro_crew.file_delivery_consent` records, so a disagreement among them
-    turns that grant into "delivered, card rendered, download refused". The upload
-    legs read no grant at all and refuse regardless, so a disagreement there
-    splits one file's verdict across two delivery legs instead. Agreement is why
+    and the ``_gate_upload_file`` shared by the Slack and channel upload legs. The
+    owner gets their own file unscanned; a non-owner outbox download and the upload
+    legs scan, and they must agree on what counts as flagged content, or one
+    file's verdict splits across two delivery legs. Agreement is why
     this lives here as one function rather than as the same three lines written
     out four times.
 
@@ -1133,7 +1173,7 @@ def binary_content_is_flagged(raw: bytes) -> bool:
     off the GIL, which the regex engine holds for a whole match call; that is why
     scans run one at a time and a verdict is kept (:func:`_scan_verdict`).
     """
-    text = raw.decode("latin-1")
+    text = raw.decode("latin-1") + "\n" + raw.decode("utf-8", errors="replace")
     if redact_via_context(text) != text:
         masked = _baseline_symbol_tables_masked(text)
         if masked is text or redact_via_context(masked) != masked:
@@ -1157,6 +1197,28 @@ def redact_owner_view_via_context(text: str) -> str:
     from kiro_crew.security.redaction_switch import owner_view
 
     with owner_view():
+        return redact_via_context(text)
+
+
+def redact_code_via_context(text: str) -> str:
+    """:func:`redact_via_context` for text known to be CODE: it spares an alphabet and a data URI.
+
+    Runs the same context-aware redaction -- a loaded companion's extra patterns and
+    exfiltration carve-outs apply -- inside a ``redaction_switch.code_text`` scope, where pass 3
+    of the core credential pass leaves alone an ordered alphabet and a data URI payload of 64
+    characters or more, and judges every other run as it does anywhere. That pass reads a run
+    of letters and digits as a key by its entropy and shape: in prose it errs towards masking,
+    in code it rewrites an alphabet or a base64 data URI that the program reads back, which
+    breaks the program with no error. Every other rule still runs, so a key id, a PEM block,
+    a JWT or a prefixed token written into code is masked as anywhere else, and so is a key in
+    any shape a script holds it. Only text that is code may be served as this returns it.
+    ``member_dashboard._template_text_safe`` takes :func:`redact_via_context` over a whole
+    page as its baseline and puts this function's result in place of the baseline's for the
+    text of the page's ``<script>`` and ``<style>`` elements.
+    """
+    from kiro_crew.security.redaction_switch import code_text
+
+    with code_text():
         return redact_via_context(text)
 
 

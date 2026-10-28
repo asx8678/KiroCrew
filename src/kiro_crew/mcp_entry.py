@@ -23,6 +23,8 @@ from typing import Callable
 SLIM_SERVERS: dict[str, tuple[str, str]] = {
     "mcp-core": ("kiro_crew.mcp_core", "run_mcp_core_server"),
     "mcp-cron": ("kiro_crew.mcp_cron", "run_mcp_server"),
+    "mcp-guide": ("kiro_crew.mcp_guide", "run_mcp_server"),
+    "mcp-mate": ("kiro_crew.mcp_mate", "run_mcp_server"),
     "mcp-panel": ("kiro_crew.mcp_panel", "run_mcp_server"),
     "mcp-dashboard": ("kiro_crew.mcp_dashboard", "run_mcp_server"),
     # The same dispatch in cli.main, and the same light import (no aiohttp,
@@ -111,13 +113,18 @@ def slim_server(argv: list[str]) -> Callable[[], None] | None:
         return None  # the full CLI prints the port error
 
     from kiro_crew import platform_compat
+    from kiro_crew._llama_lib_path import drop_inherited_lib_path
     from kiro_crew._ssl_compat import _ensure_ssl_certs
     from kiro_crew.config import config_dir, ensure_data_home
 
     # Module-scope steps of kiro_crew.cli, in its order.
     _ensure_ssl_certs()
+    drop_inherited_lib_path()
     # cli.main, in its order, for an ``mcp-*`` command.
     platform_compat.ensure_utf8_console()
+    from kiro_crew import sandbox_launch_mark
+
+    sandbox_launch_mark.note()  # the governance tier reads it after the pop below
     os.environ.pop("KIROCREW_SANDBOX_ACTIVE", None)
     os.environ.pop("KIROCREW_SANDBOX_LEVEL", None)
     if not os.environ.get("KIROCREW_PROJECT_DIR"):
@@ -134,6 +141,9 @@ def slim_server(argv: list[str]) -> Callable[[], None] | None:
     ensure_data_home()
     if _stderr_is(config_dir() / "gateway.log"):
         return None  # detached: the full CLI owns that logging shape
+    from kiro_crew.config.validation import prime_extension_config_keys
+
+    prime_extension_config_keys()
     _setup_logging(config_dir())
 
     from kiro_crew.config import KiroCrewConfig

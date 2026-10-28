@@ -7,7 +7,6 @@ publication, and its cancellation at shutdown.
 from __future__ import annotations
 
 import asyncio
-import functools
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -72,14 +71,7 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
                         "came back incomplete, say that plainly and state what is "
                         "still unknown."
                     )
-                    # The usage row names the workflow whose result this turn
-                    # answers. Applies when the turn starts now; a queued twin is
-                    # drained without it, like its actor.
-                    started = slot.enqueue_or_run_prompt(
-                        prompt,
-                        functools.partial(_run_chat, _usage_service=f"workflow_result:{name}"),
-                        state,
-                    )
+                    started = slot.enqueue_or_run_prompt(prompt, _run_chat, state)
                     state.push_slots_update()
                     logger.info(
                         "workflow %s result -> chat slot %s: agent turn %s",
@@ -91,18 +83,8 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
                     logger.warning("workflow %s auto-turn failed", run_id, exc_info=True)
 
             try:
-                # 'off': the injected result IS the deliverable; no model turn.
-                # The callback (which is what enqueues the parent-agent turn)
-                # is simply not passed, so the injection path stays identical.
-                on_injected = _auto_turn if _wf_completion_turn == "chat" else None
-                if on_injected is None:
-                    logger.info(
-                        "workflow %s finished with completion_turn=off; injecting "
-                        "the result without a parent-agent turn",
-                        run_id,
-                    )
                 delivery = asyncio.create_task(
-                    inject_bound_workflow_result(state, run_id, snapshot, on_injected=on_injected)
+                    inject_bound_workflow_result(state, run_id, snapshot, on_injected=_auto_turn)
                 )
                 state._background_tasks.add(delivery)
                 delivery.add_done_callback(state._background_tasks.discard)
@@ -121,15 +103,9 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
         _wf_concurrency = 4
         # The run ceiling is unaffected by that and IS config-driven.
         _wf_timeout_secs: int | None = None
-        # completion_turn: whether a finished slot-bound workflow ALSO runs one
-        # parent-agent turn on that slot ('chat', the default) or just injects
-        # its result ('off' — no model turn). Read at boot; hot-apply takes
-        # effect on the next gateway restart.
-        _wf_completion_turn = "chat"
         try:
             cfg = await asyncio.to_thread(KiroCrewConfig.load)
             _wf_timeout_secs = int(cfg.agent.workflow_run_timeout_secs)
-            _wf_completion_turn = str(getattr(cfg.agent, "workflow_completion_turn", "chat"))
         except Exception:
             logger.debug("workflow run-ceiling config unavailable; using default", exc_info=True)
 
@@ -176,6 +152,9 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
         state.workflow_service = service
         state.workflow_startup_status = "ready"
         logger.info("WorkflowService ready (run ceiling=%ss)", service.timeout_secs)
+        # The chats of runs the restart ended were promised a result on
+        # completion; each gets the failure through the normal completion notice.
+        service.registry.notify_runs_ended_by_restart()
     except asyncio.CancelledError:
         state.workflow_startup_status = "stopped" if state.workflow_startup_stopping else "failed"
         raise

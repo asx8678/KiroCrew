@@ -174,7 +174,14 @@ MAX_APP_NAME_CHARS = 120
 # Source hook events that have a same-meaning event on the agent hook surface
 # (``agent.kiro_hooks``). The surface is operator configuration and not an app
 # contribution, so even a mapped event is NOT emitted into the app manifest --
-# it is reported. See mapping doc diffs D1 and D2.
+# it is reported. See the ``hooks`` rows in
+# docs/system-specs/modules/harness-plugin-mapping.md.
+#
+# This is one row short of kiro_hooks._KAS_TRIGGER_TO_EVENT on purpose: that map
+# also sends ``SessionStart`` to ``agentSpawn``. Here ``SessionStart`` is reported
+# as having no counterpart, as the mapping spec lists ``Session*``. Whether plugin
+# import should pair them is an open maintainer question.
+# test_plugin_import pins that the two maps differ by exactly that row.
 AGENT_HOOK_EVENT_EQUIVALENT = {
     "PreToolUse": "preToolUse",
     "PostToolUse": "postToolUse",
@@ -1573,10 +1580,9 @@ def _convert_into(
         emitted["mcpServers"] = mcp_servers
 
     # Bounded HERE, over the assembled dict, rather than at each field as it is
-    # read. Three review rounds found three different unbounded fields in this
-    # same structure -- mcpServers, then the carried block and keywords, then
-    # displayName and description -- because a per-field bound only ever covers
-    # the fields someone remembered, and every one of them is foreign text this
+    # read. A per-field bound only ever covers the fields someone remembered
+    # (mcpServers, the carried block, keywords, displayName, description all
+    # live in this one structure), and every one of them is foreign text this
     # converter WRITES into app.json, which is read on every runtime load. One
     # pass over the finished dict covers a field added later too.
     #

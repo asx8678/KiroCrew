@@ -7,13 +7,16 @@ import i18next from 'i18next'
 import { api } from '../../../api/client'
 import { useSimplifiedToolNames } from '../../../hooks/useSimplifiedToolNames'
 import { useAppDispatch, useAppSelector, useAppStore } from '../../../store'
-import { createSlot, resumeFromHistory, switchSlot } from '../../../store/chatSlice'
+import { selectSlotsWithLiveLastTs } from '../../../store/slotLastTs'
+import { resumeFromHistory, switchSlot } from '../../../store/chatSlice'
+import { createChatForView, showCreatedChat } from '../../../lib/createdChatView'
 import { focusComposerForOpenedSession, focusComposerForResumedSession } from '../../../pages/chat/composerFocus'
 import type { ChatSlot, ChatFolder, CronJob } from '../../../types'
 import type { Result, ResourceProvider } from '../types'
 import { toolStatusLabel, type ToolStatusDetail } from '../../../utils/toolStatusLabel'
 
 import { i18nT } from '../../../i18n/t'
+import { sessionDisplayTitle } from '../../../utils/sessionDisplayTitle'
 import { fmtDateFields, fmtRelative, toDate } from '../../../i18n/format'
 import { slotRecency } from '../slotRecency'
 
@@ -247,7 +250,7 @@ export function useRecentsProvider(): ResourceProvider {
   const store = useAppStore()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const slots = useAppSelector((s) => s.dashboard.slots)
+  const slots = useAppSelector(selectSlotsWithLiveLastTs)
   const unread = useAppSelector((s) => s.dashboard.unreadSlots)
   const slotStatusDetail = useAppSelector((s) => s.chat.slotStatusDetail ?? {})
   const simplifiedToolNames = useSimplifiedToolNames()
@@ -301,7 +304,7 @@ export function useRecentsProvider(): ResourceProvider {
           return {
             id: `recents:cur:${s.key}`,
             providerId: 'recents',
-            title: s.title || s.key,
+            title: sessionDisplayTitle(s),
             subtitle: st.subtitle,
             icon: sessionIcon(),
             score: 0,
@@ -323,7 +326,7 @@ export function useRecentsProvider(): ResourceProvider {
               // focused once the switch has LANDED (#15732), never while the gateway
               // round trip is still in flight -- a caret placed before that would
               // file the keystrokes typed meanwhile under a slot a 404 then evicts.
-              const switched = dispatch(switchSlot({ key: s.key, announceOnMissing: true })).unwrap()
+              const switched = dispatch(switchSlot({ key: s.key, announceOnMissing: true, gesture: true })).unwrap()
               navigate('/chat')
               focusComposerForOpenedSession(switched, s.key, store)
             },
@@ -347,11 +350,11 @@ export function useRecentsProvider(): ResourceProvider {
             onActivate: () => {
               // Await the create BEFORE navigating: landing on /chat with no
               // active slot triggers ChatPage's auto-create, which would race
-              // this thunk into a duplicate session.
-              void dispatch(createSlot(undefined))
-                .unwrap()
+              // this thunk into a duplicate session. A failed create, or one
+              // the user moved away from, leaves the user where they are.
+              void createChatForView(dispatch, store.getState, { defaultFolder: true })
+                .then((view) => { showCreatedChat(view, navigate) })
                 .catch(() => {})
-                .finally(() => navigate('/chat'))
             },
           })
         }
@@ -389,7 +392,7 @@ export function useRecentsProvider(): ResourceProvider {
           .map((s) => ({
             id: `recents:old:${s.key}`,
             providerId: 'recents',
-            title: s.title || s.key,
+            title: sessionDisplayTitle(s),
             subtitle: s.preview || undefined,
             icon: sessionIcon(),
             score: 0,
@@ -403,6 +406,7 @@ export function useRecentsProvider(): ResourceProvider {
               // the resume has entered the session, nothing on failure (#15732).
               focusComposerForResumedSession(
                 dispatch(resumeFromHistory({ key: s.key, title: s.title || s.key })).unwrap(),
+                store,
               )
               navigate('/chat')
             },

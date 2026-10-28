@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { AnimatePresence, motion, useReducedMotion, type TargetAndTransition } from 'framer-motion'
 import { i18nT } from '../../i18n/t'
 import { useAppDispatch, useAppSelector } from '../../store'
 import { ackNotification } from '../../store/notificationsSlice'
+import { setActiveId } from '../../store/instancesSlice'
+import { useLocalCrewHidden } from '../overlayRoot'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import { useGuardedLeave } from '../NavigationLeaveGuard'
 import Clickable from '../Clickable'
@@ -11,6 +13,7 @@ import Glass from '../Glass'
 import ErrorNotice from '../ErrorNotice'
 import { MC_LIVE_NOTIFICATION_EVENT, type McLiveNotificationDetail } from '../../hooks/notificationEvent'
 import { isWindowAway } from '../../hooks/windowAway'
+import { getViewedThreadSlot } from '../../lib/viewedThread'
 import {
   BANNER_AUTO_HIDE_MS, BANNER_DECK_DEPTH, BANNER_EXPANDED_MAX, MC_BANNER_SETTING_CHANGED_EVENT,
   loadBannerEnabled, shouldBannerNote,
@@ -18,6 +21,8 @@ import {
 import type { Notification } from '../../types'
 import { notePriority, safeInternalUrl } from './notifMeta'
 import NotificationCard, { CARD_RADIUS, type NotificationCardAction } from './NotificationCard'
+import SwipeToDismiss from './SwipeToDismiss'
+import { CrewmateRosterError, noteMember } from './CrewmateNoteFace'
 
 /** Where a leaving card travels: the vector from its own top-right corner to
  *  the bell's centre, so with `transform-origin: top right` the card shrinks
@@ -73,12 +78,14 @@ type ExitDeltas = Record<string, ExitDelta | undefined>
  * The host (the bell button) lends its `bellRef` for the exit vector and its
  * open-on-note mechanics; the banner owns no selection state of its own.
  */
-export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }: {
+export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote, after }: {
   bellRef: RefObject<HTMLButtonElement | null>
   /** The bell popover is on screen (open or animating shut). */
   popoverOpen: boolean
   /** Open the bell popover with this note selected (the host acks it). */
   onOpenNote: (ts: string) => void
+  /** Host content stacked in flow under the cards, sharing this corner instead of overlapping it. */
+  after?: ReactNode
 }) {
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
@@ -249,6 +256,9 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
         // The complement of the OS toast's gate (useNativeNotification): the
         // two surfaces split the same line, so a live note lands on exactly one.
         windowFocused: !isWindowAway(),
+        // Read at arrival, like focus: the Members page registers its thread
+        // only while it is visible and focused.
+        viewedThread: getViewedThreadSlot(),
       })
       if (!ok) return
       const next = [note, ...pendingRef.current.filter(n => n.ts !== note.ts)]
@@ -299,6 +309,13 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
   }, [pending, removeNotes])
 
   // ---- actions ----------------------------------------------------------------
+  // The banner shows over every Crew, but its actions land in the local one (a
+  // navigation, the leave-guard prompt), so over a remote Crew each brings the
+  // local Crew forward first.
+  const crewHidden = useLocalCrewHidden()
+  const showLocalCrew = useCallback(() => {
+    if (crewHidden) dispatch(setActiveId(null))
+  }, [crewHidden, dispatch])
   const openNote = useCallback((n: Notification) => {
     removeNotes([n.ts])
     onOpenNote(n.ts)
@@ -310,6 +327,7 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
   // card in place with a notice instead of a vanished card and a note the
   // server still holds unread.
   const runAction = useCallback((n: Notification, url: string) => {
+    showLocalCrew()
     leave(async () => {
       const result = await dispatch(ackNotification(n.ts))
       if (ackNotification.rejected.match(result)) {
@@ -320,17 +338,18 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
       removeNotes([n.ts])
       navigate(url)
     }, url)
-  }, [dispatch, removeNotes, leave, navigate])
+  }, [dispatch, removeNotes, leave, navigate, showLocalCrew])
 
   // "+N more in your inbox" goes where the popover's own "Open inbox" goes --
   // the /notifications page -- so the word names one place. Guarded like every
   // other navigation out of a floating surface.
   const openInbox = useCallback(() => {
+    showLocalCrew()
     leave(() => {
       removeNotes(pendingRef.current.map(n => n.ts))
       navigate('/notifications')
     }, '/notifications')
-  }, [removeNotes, leave, navigate])
+  }, [removeNotes, leave, navigate, showLocalCrew])
 
   const anyCritical = pending.some(n => notePriority(n) === 'critical')
   // Mobile shows the newest card alone: there is no room for a deck, and the
@@ -340,6 +359,11 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
   const overflow = expanded && !isMobile ? pending.length - visible.length : 0
   const deckHidden = !expanded && !isMobile ? pending.length - 1 : 0
   const moreLabel = i18nT('components.notifications.notificationBanner.show_more_notifications_count', { count: deckHidden })
+  // A failed crewmate-roster read is reported once on the banner, on the first
+  // full card showing a crewmate's note. Deck shells draw no face, so they
+  // never carry it. The bell popover and the inbox, which report it on their
+  // own, suppress the banner while they are on screen.
+  const rosterReportTs = visible.find((n, idx) => (expanded || isMobile || idx === 0) && noteMember(n))?.ts
 
   const setCardEl = (ts: string) => (el: HTMLElement | null) => {
     if (el) cardEls.current.set(ts, el); else cardEls.current.delete(ts)
@@ -447,30 +471,41 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
                     onClick={() => setExpanded(true)}
                   />
                 ) : (
-                  <NotificationCard
-                    n={n}
-                    onOpen={() => openNote(n)}
-                    openLabel={i18nT('components.notifications.notificationBanner.open_notification', { title: n.title })}
-                    onDismiss={() => removeNotes([n.ts])}
-                    dismissLabel={i18nT('components.notifications.notificationBanner.dismiss_notification')}
-                    dismissTestId="notification-banner-dismiss"
-                    dismissVisible={isMobile}
-                    actions={actions}
-                    actionsAlign="end"
-                    footer={ackFailed[n.ts] ? (
-                      /* No hand-off: this card floats over whatever page the
-                         user is on, which may hold an unsaved draft (a chat
-                         composer, a settings form) that the hand-off's
-                         navigation to the chat would destroy. The action
-                         button on the card is the retry. */
-                      <ErrorNotice
-                        variant="inline"
-                        testId="notification-banner-ack-failed"
-                        message={i18nT('components.notifications.notificationBanner.mark_read_failed')}
-                        onDismiss={() => setAckFailed(prev => { const { [n.ts]: _drop, ...rest } = prev; void _drop; return rest })}
-                      />
-                    ) : null}
-                  />
+                  // On a phone the card also goes with a horizontal swipe,
+                  // through the SAME removal the X performs, so a swiped note
+                  // waits in the bell exactly as a closed one does. The X stays
+                  // visible there for keyboard and screen-reader users.
+                  <SwipeToDismiss enabled={isMobile} reduced={reduced} onDismiss={() => removeNotes([n.ts])}>
+                    <NotificationCard
+                      n={n}
+                      onOpen={() => openNote(n)}
+                      openLabel={i18nT('components.notifications.notificationBanner.open_notification', { title: n.title })}
+                      onDismiss={() => removeNotes([n.ts])}
+                      dismissLabel={i18nT('components.notifications.notificationBanner.dismiss_notification')}
+                      dismissTestId="notification-banner-dismiss"
+                      dismissVisible={isMobile}
+                      actions={actions}
+                      actionsAlign="end"
+                      footer={ackFailed[n.ts] || n.ts === rosterReportTs ? (
+                        <>
+                          {ackFailed[n.ts] && (
+                            /* No hand-off: this card floats over whatever page the
+                               user is on, which may hold an unsaved draft (a chat
+                               composer, a settings form) that the hand-off's
+                               navigation to the chat would destroy. The action
+                               button on the card is the retry. */
+                            <ErrorNotice
+                              variant="inline"
+                              testId="notification-banner-ack-failed"
+                              message={i18nT('components.notifications.notificationBanner.mark_read_failed')}
+                              onDismiss={() => setAckFailed(prev => { const { [n.ts]: _drop, ...rest } = prev; void _drop; return rest })}
+                            />
+                          )}
+                          {n.ts === rosterReportTs && <CrewmateRosterError />}
+                        </>
+                      ) : null}
+                    />
+                  </SwipeToDismiss>
                 )}
               </motion.div>
             )
@@ -499,6 +534,7 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
           >{i18nT('components.notifications.notificationBanner.more_count', { count: deckHidden })}</Clickable>
         )}
       </div>
+      {after}
     </div>
   )
 }

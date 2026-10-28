@@ -23,6 +23,7 @@ from typing import Any
 from kiro_crew import mcp_core
 from kiro_crew.context import RECALL_ROLES
 from kiro_crew.history import ConversationLog, TranscriptBusy, TranscriptWithheld
+from kiro_crew.history_search import split_title_scope
 from kiro_crew.validation import (
     GET_CHAT_SESSION_SCHEMA,
     LIST_SESSIONS_SCHEMA,
@@ -111,10 +112,17 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "list_sessions",
             "description": (
-                "List your recent sessions in this workspace, newest first (title, agent,"
-                " message volume, last activity): the overview for 'what are you working "
-                "on?'. search_chat_history finds one thread by keyword. "
-                "Incognito/temporary sessions are never listed; read-only."
+                "List your recent conversation sessions in this workspace so you "
+                "can see the work in flight and what you've been doing — titles, "
+                "owning agent, approximate message volume, and created time, "
+                "ordered by newest activity first. Use this when the user asks 'what are you working on?', "
+                "'what sessions are open?', 'what have we been doing?', or when you "
+                "need a bird's-eye view of your own workspace before acting. This "
+                "is a READ — it never modifies memory or history. It complements "
+                "search_chat_history (which finds a specific past thread by "
+                "keyword): list_sessions is the browse/overview, search is the "
+                "lookup. Scoped to your current workspace by default; "
+                "incognito/temporary sessions are never listed."
             ),
             "inputSchema": {
                 "type": "object",
@@ -141,6 +149,26 @@ def schemas() -> list[dict[str, Any]]:
             },
         },
     ]
+
+
+#: Seconds a search waits for the gateway to split its Chinese runs. The first
+#: Chinese query on a host also loads the dictionary there (about 0.15 s).
+_SEGMENT_TIMEOUT_SECS = 2.0
+
+
+def gateway_cjk_words(runs: list[str]) -> list[Any] | None:
+    """The gateway's dictionary split of *runs*, or ``None`` on any failure.
+
+    :func:`kiro_crew.mcp_core.run_mcp_core_server` registers this as the process's
+    segmenter, so a core process never loads the dictionary itself (about 45 MB
+    each). Every answer is validated by the search parse before it becomes a
+    needle, and ``None`` keeps today's character path for the query.
+    """
+    answer = mcp_core._post("/api/search/segment", {"runs": runs}, timeout=_SEGMENT_TIMEOUT_SECS)
+    if not isinstance(answer, dict) or answer.get("ok") is not True:
+        return None
+    words = answer.get("words")
+    return words if isinstance(words, list) else None
 
 
 def search_chat_history(name: str, args: dict[str, Any]) -> str:
@@ -176,6 +204,10 @@ def search_chat_history(name: str, args: dict[str, Any]) -> str:
     # the first page could otherwise starve a caller whose real matches rank
     # lower, returning "no results" while hits exist.
     ranked: list[dict] = cl.search_sessions(query, limit=mcp_core._SEARCH_HISTORY_SCAN)
+    # A leading ``title:`` term only picks which titles qualify; the transcript
+    # was searched for the text after it, so the excerpt looks for that text too.
+    scope = split_title_scope(query)
+    snippet_query = query if scope is None else scope.rest
 
     results: list[dict] = []
     for meta in ranked:
@@ -209,7 +241,7 @@ def search_chat_history(name: str, args: dict[str, Any]) -> str:
             rows_for_snippet = cl.derive_messages(key)
         except TranscriptWithheld:
             continue
-        snippet = mcp_core._extract_history_snippet(rows_for_snippet, query)
+        snippet = mcp_core._extract_history_snippet(rows_for_snippet, snippet_query)
         results.append(
             {
                 "session_key": key,

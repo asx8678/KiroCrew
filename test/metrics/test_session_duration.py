@@ -1017,16 +1017,14 @@ class TestReviewFixes:
         assert len(_crumbs(home)) == 1
 
     def test_a_superseded_start_leaves_only_the_successors_crumb(self, home, rec, monkeypatch):
-        """Review rounds 3-5 all lived here; the inline write ended the class.
+        """The crumb is written inline, under the lock that installs the start.
 
         A deferred write could land after its own session ended, or after a
-        SUCCESSOR registered under the same key. Guarding it with an ended-key
-        set, then with a generation compared before and after the write, both
-        failed -- the post-write check acted on the path the successor SHARES, so
-        a late predecessor deleted the crumb its successor had just written and
-        lost that session's crash. Writing under the lock that installs the start
-        removes the interleaving rather than detecting it: there is no window in
-        which two starts are both mid-write.
+        SUCCESSOR registered under the same key. A post-write check cannot guard
+        it: it acts on the path the successor SHARES, so a late predecessor would
+        delete the crumb its successor had just written and lose that session's
+        crash. Writing under the lock removes the interleaving rather than
+        detecting it: there is no window in which two starts are both mid-write.
         """
         _stamp_starts(monkeypatch, _FIRST_START, _SECOND_START)
         _start("dashboard:chat-1")
@@ -1103,7 +1101,12 @@ class TestReviewFixes:
         from kiro_crew import session_lifecycle
 
         found = TestTeardownPathsAreWired._reasons_recorded_by("retire_kiro_identity_sessions")
-        assert found == ["END_REASON_RETIRED"]
+        # The retire path has exactly TWO commit points, each recording
+        # END_REASON_RETIRED under its own lock hold: the keys retired under the
+        # selection lock, and the spare_children candidates committed at the async
+        # teardown. Pinned exactly (not a set) so a third recorder, or dropping one,
+        # trips this.
+        assert found == ["END_REASON_RETIRED", "END_REASON_RETIRED"]
         assert session_lifecycle.END_REASON_RETIRED in sess.END_REASONS
 
     def test_the_compaction_recycle_path_records_an_end(self):
@@ -1136,9 +1139,12 @@ class TestReviewFixes:
     def test_the_boot_hook_no_longer_blocks_readiness(self):
         from pathlib import Path
 
-        src = (Path(sess.__file__).resolve().parent.parent / "slack" / "gateway.py").read_text(
-            encoding="utf-8"
-        )
+        src = (
+            Path(sess.__file__).resolve().parent.parent
+            / "slack"
+            / "gateway_runtime"
+            / "service_boot.py"
+        ).read_text(encoding="utf-8")
         i = src.index("_backfill_unclean_session_telemetry")
         window = src[i : i + 900]
         assert "asyncio.to_thread" in window, "the scan must not run on the loop"
@@ -1352,8 +1358,8 @@ class TestEveryRegistryRemovalRecordsAnEnd:
     def test_the_gate_can_actually_fail(self):
         """A gate that has stopped detecting anything reads as a green signal."""
         modules = self._owning_modules()
-        assert "session_lifecycle" in modules, "discovery missed the lifecycle module"
-        removals = self._removal_functions("session_lifecycle")
+        assert "session_lifecycle_parts.fleet" in modules, "discovery missed the lifecycle module"
+        removals = self._removal_functions("session_lifecycle_parts.fleet")
         assert removals, "the AST walk found no registry removals at all"
         assert "drain_all_providers" in removals, "the mass-pop path must be in scope"
 
@@ -1417,11 +1423,17 @@ class TestTeardownPathsAreWired:
         """
         import ast
         import inspect
+        import sys
 
         from kiro_crew import session_lifecycle
 
         recorders = {"record_session_ended", "record_sessions_ended"}
-        tree = ast.parse(inspect.getsource(session_lifecycle))
+        tree = ast.parse(
+            "".join(
+                inspect.getsource(sys.modules[name])
+                for name in (session_lifecycle.__name__, *session_lifecycle._OWNERS)
+            )
+        )
         found: list[str] = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.AsyncFunctionDef) or node.name != method_name:
@@ -1449,7 +1461,12 @@ class TestTeardownPathsAreWired:
     def test_the_boot_backfill_is_wired_into_gateway_startup(self):
         from pathlib import Path
 
-        gateway = Path(sess.__file__).resolve().parent.parent / "slack" / "gateway.py"
+        gateway = (
+            Path(sess.__file__).resolve().parent.parent
+            / "slack"
+            / "gateway_runtime"
+            / "service_boot.py"
+        )
         src = gateway.read_text(encoding="utf-8")
         assert "backfill_crashed_sessions" in src
         # Ordering against the orphan sweep is deliberately NOT asserted any
@@ -1464,6 +1481,10 @@ class TestTeardownPathsAreWired:
         from pathlib import Path
 
         root = Path(sess.__file__).resolve().parent.parent
-        for rel in ("session_allocation.py", "session_background.py"):
+        for rel in (
+            "session_allocation.py",
+            "session_allocation_parts/get_or_create.py",
+            "session_background.py",
+        ):
             src = (root / rel).read_text(encoding="utf-8")
             assert "record_session_started" in src, rel

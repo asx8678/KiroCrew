@@ -22,12 +22,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import file_delivery_consent, mcp_core
+from kiro_crew import mcp_core
 from kiro_crew.constants import CHANNEL_OWNER_DM_NAMESPACES
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes
-from kiro_crew.platform import binary_content_is_flagged
 from kiro_crew.platform import redact_via_context as redact
-from kiro_crew.platform import wide_content_is_flagged
 from kiro_crew.security import BINARY_MIME_ALLOWLIST, redact_credentials, redact_exfiltration_urls
 from kiro_crew.tool_result_cap import tool_json
 from kiro_crew.validation import _SLACK_TS_RE, CHANNEL_ID_RE, CHANNEL_MAX_LEN
@@ -93,14 +91,51 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "send_message",
             "description": (
-                "Send the user a message; by default a dashboard notification only. Use "
-                "whenever someone should be told proactively, e.g. from a silent cron. "
-                "Route with ONE of: `session` (owner DM on slack/discord/telegram/..., "
-                'or "origin" for the cron\'s dashboard session); `channel_type` (the '
-                "non-Slack conversation you are talking in) with optional `target_id`; "
-                "or the Slack-only `channel`/`user`/`blocks`/`thread_ts` options. "
-                "Mixing a Slack-only option with a non-Slack route is REFUSED, not "
-                "ignored. Unreachable routes fall back to the notification and say so."
+                "Send a message to the user. By default delivers a dashboard "
+                "notification only. Use this whenever you decide someone should "
+                "be notified — most commonly in silent cron jobs, but applicable "
+                "any time proactive notification is needed."
+                "\n\nsession param (optional):"
+                "\n  omitted   — dashboard notification only (default)."
+                '\n  "slack"   — Slack DM + dashboard notification.'
+                '\n  a channel name ("discord", "telegram", "webex", "teams",'
+                ' "whatsapp", "imessage", "feishu") — a DM to'
+                " that channel's own configured owner + dashboard notification."
+                " Only a destination the user already allow-listed for that channel"
+                " is reachable, and only when exactly one is configured: an"
+                " ambiguous allow-list, a channel that is not connected, and a"
+                " channel that cannot DM proactively all fall back to the"
+                " dashboard notification and say so rather than reporting success."
+                ' Not "wecom" or "weixin": each advertises peers learned from'
+                " inbound traffic beside configured ones, so an owner cannot be told"
+                " apart from whoever messaged the bot. Reach those with channel_type,"
+                " which addresses a conversation instead of inferring a recipient."
+                '\n  "origin"  — inject into the dashboard session that spawned'
+                " this cron. Falls through to notification-only if origin is"
+                " unreachable (tab closed, history deleted, or cron has no origin)."
+                "\n\nSlack only: set 'channel' to target a tracked channel, or "
+                "'user' to DM an allowed user, at most one, not both, and either "
+                "one always sends to Slack. channel, user, blocks, thread_ts, "
+                "reply_broadcast and unfurl_links/unfurl_media are Slack protocol "
+                "options: combining any of them with a channel session is REFUSED, "
+                "not silently ignored."
+                "\n\nOn a non-Slack messaging channel (Telegram, Discord, Teams, "
+                "Webex, WeCom, Weixin, WhatsApp, iMessage, Feishu) set 'channel_type' to "
+                "that channel's name to post into the conversation you are already "
+                "talking in. Use it in preference to a channel session whenever you "
+                "are talking on that channel — it reaches the conversation at hand, "
+                "where a channel session reaches the channel's configured owner "
+                "wherever the call came from. The Slack-only options above are "
+                "rejected alongside it."
+                "\n\nTo reach a NON-Slack channel (Webex, Telegram, Discord, …) at"
+                " a specific destination, pass channel_type plus target_id, where"
+                " target_id is one of the opaque ids that channel exposes as a"
+                " configured destination. The channel's own allow-list is"
+                " re-checked when the message is sent, so an id that is no longer"
+                " configured is refused. This pair addresses the destination"
+                " directly, so combining it with session or any Slack option"
+                " (channel, user, blocks, thread_ts, reply_broadcast, unfurl_*) is"
+                " REFUSED, not silently ignored."
             ),
             "inputSchema": {
                 "type": "object",
@@ -133,8 +168,20 @@ def schemas() -> list[dict[str, Any]]:
                     "channel_type": {
                         "type": "string",
                         "description": (
-                            "Non-Slack transport this session talks over (telegram, "
-                            "discord, teams, webex, wecom, weixin, whatsapp, imessage)."
+                            "Deliver into the non-Slack messaging conversation this "
+                            "session belongs to, named by its transport: "
+                            '"telegram", "discord", "teams", "webex", "wecom", '
+                            '"weixin", "whatsapp", "imessage" or "feishu". Use it when the '
+                            "[RUNTIME] marker says you are talking over one of "
+                            "those channels and you want a proactive message "
+                            "(a silent cron's report, a finished background task) "
+                            "to reach the user THERE rather than only in the "
+                            'dashboard bell. Not for Slack — use session="slack". '
+                            "Cannot be combined with 'channel', 'user' or "
+                            "'thread_ts', which are Slack-only routing fields. "
+                            "Pass target_id alongside it to name an EXPLICIT "
+                            "destination on that transport instead of this "
+                            "session's own conversation."
                         ),
                     },
                     "target_id": {
@@ -183,8 +230,12 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "send_notification",
             "description": (
-                "Publish a bell-feed notification only (never a chat message or DM), with"
-                " priority, a dashboard deep link and group stacking. Use for glanceable "
+                "Publish a notification to the Kiro Crew notification center "
+                "(bell feed) through the system.agent channel. Unlike "
+                "send_message, this is a pure notification: "
+                "it never sends chat messages or DMs. "
+                "Supports priority tiers, a dashboard-internal "
+                "deep link, and group stacking. Use for structured, glanceable "
                 "signals (job done, threshold crossed); use send_message for "
                 "conversational delivery."
             ),
@@ -203,7 +254,8 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "string",
                         "enum": ["critical", "default", "passive"],
                         "description": (
-                            "critical = badge+sound+banner, default = badge+sound, "
+                            "critical = badge+sound+banner, default = badge, with "
+                            "sound and banner per the channel's settings, "
                             "passive = feed-only. Omit for the channel default."
                         ),
                     },
@@ -229,7 +281,7 @@ def schemas() -> list[dict[str, Any]]:
                             '{"id": str (<=64), "label": str (<=40), "url"?: '
                             "dashboard-internal path (<=500)}. Rendered on the "
                             "notification card; url-less actions are legal but "
-                            "render nothing today."
+                            "render nothing."
                         ),
                         "items": {
                             "type": "object",
@@ -325,13 +377,28 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "file_send",
             "description": (
-                "Send the user a file: copies it to the outbox and posts a dashboard "
-                "download link; a Telegram-linked session also gets it natively, else "
-                "Slack when the caller's identity permits. Any text file is accepted; "
-                "binaries only when audio, video, an image or a PDF (zip, tar and Office "
-                "files are refused: give the path). Native delivery is not guaranteed; "
-                "the result reports skips. To show an IMAGE inline in a conversation, "
-                "write ![alt](/abs/path) in your reply instead."
+                "Send a file to the user. Copies the file to the outbox and "
+                "notifies the dashboard with a download link. When this "
+                "session is linked to a Telegram, Discord or WeCom "
+                "conversation the file is also delivered there natively; "
+                "otherwise it uploads to "
+                "Slack when the caller's Slack identity permits it. Use "
+                "when you've generated a report, export or artifact the "
+                "user should receive. Any text file is accepted, but a "
+                "binary file only when it is audio, video, an image or a "
+                "PDF: other binary formats (zip, tar, Office "
+                "documents) are refused, so give the user their path "
+                "instead. Native channel delivery is "
+                "not guaranteed: the result reports skips and failures, and "
+                "a Slack-linked session reports a successful Slack upload. "
+                "If neither delivers, the file remains available from the "
+                "dashboard. To put an IMAGE inline in a "
+                "messaging conversation, reference it in your reply as "
+                "![alt](/abs/path) from the session's working directory or "
+                "the browser tool's own output directory "
+                "($PLAYWRIGHT_MCP_OUTPUT_DIR, where playwright-cli screenshots "
+                "land) — the channel renderer uploads it as a native picture, "
+                "which this tool's outbox copy is not eligible for."
             ),
             "inputSchema": {
                 "type": "object",
@@ -818,7 +885,8 @@ def _describe_channel_skip(reason: str) -> str:
         # extraction uploads a real image referenced inline in the reply.
         return (
             f"{head}; for an inline image on a messaging channel, reference it as "
-            "![alt](/abs/path) from the session's working directory instead)"
+            "![alt](/abs/path) from the session's working directory or the browser "
+            "tool's output directory instead)"
         )
     return f"{head})"
 
@@ -873,23 +941,12 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             outcome="denied",
             error=f"sensitive_filename: {redact(clean_name)}",
         )
-        file_delivery_consent.audit_refusal(
-            file_delivery_consent.CLASS_OWNER_DASHBOARD,
-            leg="file_send",
-            name=redact(clean_name),
-            reason="flagged name",
-        )
         return "Error: filename contains sensitive content. Rename the file first."
-    # Content is scanned whichever way it decodes: UTF-8 text through ``redact``,
-    # non-UTF-8 bytes through the shared ``binary_content_is_flagged``. Binary
-    # must also carry an allow-listed MIME type (deny-by-default), and that check
-    # runs first so bytes of a type this path refuses outright are never scanned.
-    # ``wide_content_is_flagged`` runs on BOTH branches: NUL-interleaved ASCII is
-    # valid UTF-8, so a wide-encoded credential decodes cleanly and its characters
-    # arrive NUL-separated, which the contiguous-ASCII detectors do not match.
-    flagged = False
+    # The owner's own outbox and dashboard get the bytes as-is: no content scan
+    # here. Binary still needs an allow-listed MIME type. The Slack and channel
+    # upload legs scan on their own in ``_gate_upload_file``.
     try:
-        text = raw.decode("utf-8")
+        raw.decode("utf-8")
     except UnicodeDecodeError:
         guessed = mimetypes.guess_type(clean_name)[0] or ""
         if guessed not in BINARY_MIME_ALLOWLIST:
@@ -901,47 +958,6 @@ def file_send(name: str, args: dict[str, Any]) -> str:
                 error=f"binary_mime_not_allowed: {guessed}",
             )
             return f"Error: binary file type not allowed: {guessed or 'unknown'}. Allowed: audio, video, image, PDF."
-        flagged = binary_content_is_flagged(raw)
-    else:
-        flagged = redact(text) != text or wide_content_is_flagged(raw)
-    # A positive here is almost always CORRECT -- the reported case (a VPN device
-    # private key) matches the PEM branch, the highest-confidence detector in the
-    # catalogue -- so the remedy is not a looser scan but an owner who can say
-    # "that is mine". The grant covers ONLY this machine's outbox and the owner's
-    # own authenticated dashboard; the Slack and channel upload legs route through
-    # ``_gate_upload_file``, which does not read the consent store and refuses them
-    # regardless (see file_delivery_consent for why that is structural).
-    delivered_under_consent = False
-    if flagged:
-        if not file_delivery_consent.is_granted(file_delivery_consent.CLASS_OWNER_DASHBOARD):
-            mcp_core.sel().log_tool_invocation(
-                session_key="mcp_core",
-                source="mcp",
-                tool_name="file_send",
-                outcome="denied",
-                error="sensitive_content_detected",
-            )
-            # The error string below reaches the AGENT. This entry is what reaches
-            # the OWNER, so it carries the name: the panel it points them at asks
-            # them to allow delivery, and an owner who cannot see which of their
-            # files was stopped has nothing to base that on.
-            file_delivery_consent.audit_refusal(
-                file_delivery_consent.CLASS_OWNER_DASHBOARD,
-                leg="file_send",
-                name=clean_name,
-                reason="flagged content",
-            )
-            return (
-                "Error: file content contains sensitive data; send aborted. The owner "
-                "can allow delivery to this machine's outbox and their own dashboard "
-                "in Settings > Security > Flagged-file delivery (owner-gated; no agent "
-                "can write it). That panel ARMS the request via POST "
-                "/api/file-delivery/consent?destination_class=owner_dashboard; the grant "
-                "is then RECORDED only by running `kirocrew file-delivery approve` on the "
-                "host, so arming alone leaves delivery blocked. The Slack and channel "
-                "upload legs can never be granted."
-            )
-        delivered_under_consent = True
     dest = mcp_core.outbox_dir() / clean_name
     try:
         with dest.open("xb") as f:
@@ -952,26 +968,6 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             / f"{Path(clean_name).stem}_{uuid.uuid4().hex}{Path(clean_name).suffix}"
         )
         dest.write_bytes(raw)
-    if delivered_under_consent:
-        # Emitted once the bytes are on disk. A full outbox or a read-only
-        # workspace is an ordinary operational condition, and only
-        # ``FileExistsError`` is recovered above, so any other write error
-        # propagates from here; a record written before the copy would claim a
-        # consented delivery that never happened and there is no retraction
-        # entry to correct it. Over-reporting a release of flagged content is the
-        # direction an incident review cannot afford.
-        mcp_core.sel().log_tool_invocation(
-            session_key="mcp_core",
-            source="mcp",
-            tool_name="file_send",
-            outcome="completed",
-            error="sensitive_content_delivered_with_consent",
-        )
-        file_delivery_consent.audit_decision(
-            file_delivery_consent.CLASS_OWNER_DASHBOARD,
-            outcome="delivered",
-            detail=f"file_send: {clean_name}",
-        )
     mcp_core.sel().log_tool_invocation(
         session_key="mcp_core",
         source="mcp",
@@ -991,20 +987,6 @@ def file_send(name: str, args: dict[str, Any]) -> str:
     )
     if d.get("error"):
         return f"Error: {d['error']}"
-    # Under an owner grant the third-party legs are not attempted AT ALL. The
-    # shared ``_gate_upload_file`` would refuse them anyway -- it does not read the
-    # consent store, which is what makes that refusal structural rather than a
-    # check someone could invert -- but handing flagged bytes to a handler that
-    # will refuse them is a needless hop for content the owner scoped to their own
-    # dashboard. Returning here keeps the grant's blast radius to exactly the
-    # destination class it names, and belt-and-braces means neither layer is load
-    # bearing alone.
-    if delivered_under_consent:
-        msg = f"File sent: {dest.name} ({desc})" if desc else f"File sent: {dest.name}"
-        return (
-            f"{msg} (delivered to the dashboard under the owner's file-delivery "
-            "consent; Slack and channel upload skipped)"
-        )
     # Native channel delivery first: when the caller's session is linked to a
     # non-Slack conversation with a document-capable transport (a Telegram
     # chat today), the file belongs THERE — the user who asked for it is

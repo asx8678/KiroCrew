@@ -8,6 +8,7 @@ import {
   markStartupVideoHandled,
   startupVideoHandledThisLaunch,
 } from '../../components/startupVideoGate'
+import { slotRowByKey } from '../../store/slotIndex'
 
 // Lazy, like the update-found popup `App.tsx` mounts: the startup feature clip pulls in
 // a video element and the whole share-card graph, and most launches never show
@@ -43,7 +44,7 @@ export function useStartupVideo({
   const { data: desktopUpdateState } = useQuery<UpdateState | null>({
     queryKey: ['update-state'],
     queryFn: () => null,
-    enabled: false, // populated by useUpdateSubscription, which `App.tsx` calls
+    enabled: false, // populated by useUpdateSubscription, which `shell/appShell.tsx` calls
     staleTime: Infinity,
   })
   const updateStaged = !!desktopUpdateState
@@ -64,7 +65,7 @@ export function useStartupVideo({
   // not get asked. Read off the ACTIVE slot, matching where `memory_mode` is
   // authoritative everywhere else.
   const activeSlotMemoryMode = useAppSelector(
-    s => s.dashboard.slots.find(x => x.key === s.chat.activeSlot)?.memory_mode,
+    s => slotRowByKey(s.dashboard.slots, s.chat.activeSlot)?.memory_mode,
   )
   // The slot list is filled by a fetch that lands AFTER mount. Until it does, the
   // active slot resolves to nothing and `activeSlotMemoryMode` is undefined --

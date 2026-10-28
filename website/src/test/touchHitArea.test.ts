@@ -2,7 +2,7 @@
  * The `mc-touch-hit*` classes grow a small icon control's HIT AREA to 44px on a
  * coarse pointer, and do nothing at all for a mouse.
  *
- * Asserted against SOURCE TEXT, as scrollbarOverlayTouch.test.ts and
+ * Asserted against SOURCE TEXT, as scrollbarRevealOnly.test.ts and
  * noPageZoom.test.ts do for this stylesheet: jsdom never loads index.css, and
  * a media query has no computed representation to read even if it did. The
  * geometry is then evaluated from the declared `inset` values, which is how the
@@ -10,10 +10,9 @@
  * left/right against its width).
  */
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { readIndexCss } from './indexCssSource'
 
-const CSS = readFileSync(resolve(__dirname, '../index.css'), 'utf8')
+const CSS = readIndexCss()
 
 /** The `@layer components { @media (pointer: coarse) { ... } }` block that owns the classes. */
 const BLOCK = /@layer components \{\n {2}@media \(pointer: coarse\) \{\n([\s\S]*?)\n {2}\}\n\}/.exec(CSS)

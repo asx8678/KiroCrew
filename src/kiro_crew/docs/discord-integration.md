@@ -140,7 +140,7 @@ Portal or clear the thread allow-list and restart in DM-only mode.
 | Gateway closes with 4004 | Bad or reset token | Reset the token, update `.env`, restart |
 | Gateway closes with 4014 after adding a thread | Message Content Intent is disabled | Enable it on the Bot page, then restart |
 | DMs are ignored | User ID is missing/wrong | Add the numeric user ID; inspect `kirocrew security events` |
-| Thread is ignored but DMs work | Thread ID missing/wrong, bot cannot view it, or Message Content Intent is off | Copy the thread's Channel ID, check permissions/membership, enable the intent, restart |
+| Thread is ignored but DMs work | Thread ID missing/wrong, bot cannot view it, or Message Content Intent is off. For a thread the bot opened: its parent channel was removed from `allowed_channel_ids`, or someone else opened the thread | Copy the thread's Channel ID, check permissions/membership, enable the intent, restart. A thread a person opened needs its ID in `allowed_thread_ids` |
 | Parent channel is ignored | The channel is not in `allowed_channel_ids` | Use an approved thread, or add the parent channel ID to `allowed_channel_ids` to open public turn threads |
 | Bot can read but cannot reply in a thread | Missing guild permission or private-thread membership | Grant View Channel, Read Message History, Send Messages in Threads; add the bot to private threads |
 | Logs are silent on successful connection | `agent.log_level` is `WARNING` | Trust the Connected badge or lower the log level |
@@ -161,6 +161,15 @@ Portal or clear the thread allow-list and restart in DM-only mode.
   public thread a turn runs in, so only add a channel whose whole membership may
   read what the agent writes. Each thread the bot opens that way is recorded in
   the audit log.
+- **Opened threads survive a restart.** After a restart or update, your next
+  message or command in a thread the bot opened is answered again once Discord
+  confirms the bot opened it under a channel that is still in
+  `allowed_channel_ids`. Replies from the dashboard reach that thread again after
+  that first message. To stop the bot answering in every thread it opened
+  under a channel, remove that channel from `allowed_channel_ids` and restart
+  the gateway. A config reload alone keeps those threads answering until the
+  next restart. Removing one thread's ID from `allowed_thread_ids` stops that
+  thread at once, and the bot does not re-admit it until the next restart.
 - **Slash commands answer privately.** A `/` command reply is ephemeral, so only
   the person who ran it sees it, which is what keeps a refusal or a status line
   out of a shared thread.
@@ -192,6 +201,7 @@ works, including before the `applications.commands` scope is installed.
 | `!new` / `!start` | Start a fresh conversation (shared for the current thread) |
 | `!compact` | Compress the current conversation context |
 | `!model` / `!models` | Pick the model from a button list of what your account can use |
+| `!agent [name]` | Show the agent and the ones you can pick; `!agent <name>` switches, `!agent default` goes back |
 | `!status` | Show runtime stats, the active agent, and whether auto-approve is on |
 | `!sessions` / `!session` | In a DM, pick a recent dashboard or same-DM session and continue it here (owner only) |
 | `!link` / `!unlink` | Resume or stop mirroring dashboard replies here (on by default) |
@@ -240,18 +250,29 @@ reads as "the feature isn't installed" rather than "you typed it wrong".
 A resumed session is **two-way**: what you type in the dashboard is also
 delivered to Discord, and Discord messages arrive in that session. Because that
 is otherwise invisible from the dashboard side, the resumed session shows a chip
-in its chat header — `Driven from Discord DM` — with a **Release** action, and its
-session menu lists `Connected: Discord DM` with a **Two-way** badge.
+in its chat header — `Driven from Discord DM`. The chip opens a menu with the
+session's linked surfaces for Discord, the same rows the session menu lists. Each
+row carries a **Two-way** or **One-way** tag and offers:
 
-Release is the dashboard-side equivalent of `!unlink`, which used to be the only
-way out of a resumed session. It confirms first, and re-attaching is done with
-`!sessions` from the channel. A one-way `!link` mirror is labelled **Mirror** and
-offers **Stop mirroring** instead, so the two are not confused.
+- **Pause replies to Discord DM** — replies stop going to Discord, but the
+  connection stays; **Resume replies to Discord DM** turns them back on.
+- **Unlink from Discord DM** — removes the connection, the dashboard-side
+  equivalent of `!unlink`. Re-attach with `!sessions` from the channel.
 
 The binding is stored per session and survives a gateway restart. A session can
 only be active in one place at a time — if it is already attached to Slack or
 another channel, Kiro Crew refuses and tells you where it lives, rather than
 moving it silently.
+
+A dashboard reply mirrored to a Discord DM keeps arriving across gateway
+restarts. If the gateway's token-signing key is rotated, that delivery stops
+until you link the session again from the dashboard.
+
+If you message a resumed session while it is busy with a turn started on the
+dashboard, your message is steered into that turn or queued in that dashboard
+session, by the same `!steer` / `!queue` / default-mode rules. The DM confirms
+which one happened. A message with attachments, one that meets a full queue, and
+one for a session that was closed or moved are refused, and the DM says so.
 
 `!sessions` is **owner-only and requires exactly one entry in
 `discord.allowed_user_ids`**. Session listing and resume can reach any dashboard
@@ -263,7 +284,11 @@ credentials and suspicious URLs before they reach Discord.
 
 While a reply is running, prefix a message with `!steer` to fold it into the
 running turn or `!queue` to answer it afterward. `[OPTIONS:]` choices render as
-buttons, and interactive tool approvals render as Approve/Deny buttons.
+buttons, and interactive tool approvals render as Approve/Deny buttons. A
+sub-agent spawn started from Discord asks for approval the same way, with
+Approve/Deny buttons in the DM or thread it came from; there is no Trust button,
+because standing trust is granted only on the dashboard. With `messaging.dm_scope` set to `unified`, a DM session cannot be traced back to
+one conversation, so its spawn approvals go to Slack or the dashboard instead.
 
 ## Related docs
 

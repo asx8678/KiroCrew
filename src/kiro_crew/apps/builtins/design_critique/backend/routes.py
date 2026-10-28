@@ -472,7 +472,9 @@ def _sweep_clones() -> None:
     for child in victims:
         try:
             if now - child.stat().st_mtime > _CLONE_TTL_SEC:
-                shutil.rmtree(child, ignore_errors=True)
+                # Counted as swept even if a file survives: the probe-cache purge below
+                # keys on this list, and a half-removed directory must not stay served.
+                platform_compat.rmtree_force(child)
                 removed.append(str(child))
         except OSError:
             continue
@@ -1060,7 +1062,7 @@ async def _discover_repo_job(value: str, vetted: list[str], git_bin: str) -> dic
     for ip in vetted:
         pin_args += ["-c", f"http.curloptResolve={pu.hostname}:{pin_port}:{ip}"]
     clone_id = uuid.uuid4().hex[:12]
-    target = _clones_dir() / clone_id
+    target = (await asyncio.to_thread(_clones_dir)) / clone_id
     rc, out, cerr = await _run(
         # Pin remote-helper transports off and pass the URL after `--` so a
         # crafted value can neither run a helper nor be read as an option.
@@ -1090,7 +1092,7 @@ async def _discover_repo_job(value: str, vetted: list[str], git_bin: str) -> dic
         # now instead of waiting for the TTL sweep, so repeated failures cannot
         # accumulate and exhaust disk (ENOSPC). This does not change the success
         # path — a good clone is kept and rendered as before.
-        await asyncio.to_thread(shutil.rmtree, target, ignore_errors=True)
+        await asyncio.to_thread(platform_compat.rmtree_force, target)
         # GitHub says "Repository not found" for both a missing repo and a private
         # one you cannot read; do not guess which.
         return {
@@ -1167,7 +1169,7 @@ async def _handle_discover(request: web.Request) -> web.Response:
                     "handle": "",
                 }
             )
-        git_bin = _tool("git")
+        git_bin = await asyncio.to_thread(_tool, "git")
         if git_bin is None:
             return web.json_response(
                 {

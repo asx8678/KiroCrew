@@ -28,6 +28,7 @@ from kiro_crew.artifact_store.model import (
     ArtifactStillPublishedError,
     ArtifactValidationError,
 )
+from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.config.loader import config_dir
 
 if TYPE_CHECKING:
@@ -53,13 +54,13 @@ MAX_FOLDER_DEPTH = 20
 class ArtifactFolderStore:
     """Filesystem-backed store for the nested artifact-library folder tree.
 
-    Mirrors the chat-folder subsystem (``dashboard/state.py`` folders): a flat
+    Mirrors the chat-folder subsystem (``dashboard/state_parts/sidebar_stores.py`` folders): a flat
     JSON list persisted to ``artifact_folders.json`` in the config dir, with
     nesting expressed via ``parent_id`` pointers rather than nested storage or
     path strings. Membership lives on the artifact record (``Artifact.folder_id``),
     not here. Thread-safe via a coarse lock.
 
-    A folder record is ``{id, name, order, parent_id, icon}``:
+    A folder record is ``{id, name, order, parent_id, icon, color}``:
 
     * ``id`` — opaque 12-char hex (rename-safe handle).
     * ``name`` — display name (<= 100 chars).
@@ -155,7 +156,7 @@ class ArtifactFolderStore:
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            os.replace(tmp, str(self._path))
+            replace_with_retry(tmp, str(self._path))
         except Exception:
             try:
                 os.unlink(tmp)
@@ -212,8 +213,8 @@ class ArtifactFolderStore:
             return [dict(f) for f in self._ordered()]
 
     def _ordered(self) -> _List[dict[str, Any]]:
-        # Stable pre-order-ish ordering: siblings by (order, name); the frontend
-        # does its own tree flatten, so this is a convenience for CLI/MCP output.
+        # Shallowest first: every folder at one depth comes before any deeper one,
+        # and folders at the same depth sort by (order, name) whatever their parent.
         return sorted(
             self._folders,
             key=lambda f: (self._depth(f["id"]), int(f.get("order", 0)), str(f.get("name", ""))),

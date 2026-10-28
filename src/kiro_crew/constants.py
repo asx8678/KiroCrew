@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import re
 from collections.abc import Iterator
 
@@ -11,7 +12,7 @@ from collections.abc import Iterator
 # tree KiroCrew spawns (the ACP provider, MCP probes, gateway pool backends).
 # Children inherit the environment, so marking the provider process
 # transitively marks every MCP server it launches. The untracked-orphan sweep
-# (``session_pid.py``) reads it back from ``/proc/<pid>/environ`` to positively
+# (``session_pid_orphan_scan.py``) reads it back from ``/proc/<pid>/environ`` to positively
 # identify escaped MCP launcher processes whose *cmdline* carries no KiroCrew
 # fingerprint (e.g. ``npx @playwright/mcp`` -> node) without ever risking a
 # kill of a user's own identically-named processes. Constant by design: it must
@@ -31,6 +32,13 @@ KIROCREW_SPAWN_INSTANCE_ENV = "KIROCREW_SPAWN_INSTANCE"
 # this is what tells this install's runtime from a sibling install's on the same
 # uid. Read only to WITHHOLD a kill: absent or different means not ours.
 KIROCREW_SPAWN_HOME_ENV = "KIROCREW_SPAWN_HOME"
+# The authored agent an ``AcpRuntime`` child is spawned for, set beside the
+# instance and inherited the same way. A host that takes its agent on the command
+# line shows it in argv; a host that binds the agent over the wire (the KAS relay)
+# shows nothing there, so this is the one carrier that names the agent for every
+# runtime regardless of host. Read back out of ``/proc/<pid>/environ`` by the
+# process-leak gate to tell the gateway's own background runtime from a session's.
+KIROCREW_RUNTIME_AGENT_ENV = "KIROCREW_RUNTIME_AGENT"
 # Set on every tree spawned through ``sandbox.sandboxed_spawn_argv`` -- a build, an
 # ``npx`` install, a ``git``/``gh`` read, a provisioning run -- and inherited by that
 # whole tree exactly as KIROCREW_SPAWNED is. It says what KIROCREW_SPAWNED does not:
@@ -52,6 +60,14 @@ KIROCREW_SPAWN_HOME_ENV = "KIROCREW_SPAWN_HOME"
 KIROCREW_SANDBOX_TOOL_ENV = "KIROCREW_SANDBOX_TOOL"
 KIROCREW_SANDBOX_TOOL_VALUE = "1"
 
+#: The desktop app's staged KAS engine root, exported by the Electron shell when
+#: the build staged the pinned engine for this architecture
+#: (``website/electron/gateway-env.js``, ``bundledKasEnvironment``). Lives here
+#: rather than in ``acp.kas_bundle`` because ``sandbox`` seals the directory it
+#: names (:func:`sandbox_tiers._resolved_install_root_targets`) and must not import the
+#: ACP tree to learn the env name.
+BUNDLED_KAS_DIR_ENV = "KIROCREW_BUNDLED_KAS_DIR"
+
 # Canonical truthy set for boolean environment variables (KIROCREW_NO_JAIL,
 # KIROCREW_DEV_MODE, …).  Use ``env_flag_enabled`` rather than ``bool(os.environ
 # .get(...))`` — a bare bool() treats ``"0"``/``"false"`` as truthy, which for a
@@ -61,6 +77,11 @@ ENV_TRUTHY = frozenset({"1", "true", "yes", "on"})
 # Canonical falsy set, the explicit opt-out for the crew log, which defaults ON. See
 # ``crew_log_enabled``.
 ENV_FALSY = frozenset({"0", "false", "no", "off"})
+
+# Longest prefix a generated Coder workspace name may carry: names are at most 32
+# characters and the registry adds two separators and an 8-character binding id,
+# so 21 leaves one owner character. Homed here so every boundary refuses at one number.
+CODER_WORKSPACE_PREFIX_MAX_CHARS = 21
 
 
 # Minimum supported Node.js version (major, minor, patch), shared by the startup
@@ -103,13 +124,114 @@ def node_version_meets_floor(
     return tuple(version) >= tuple(floor)
 
 
+# Minimum glibc the OFFICIAL Node.js >= 18 Linux binaries (nodejs.org and the
+# prebuilt tarballs nvm/mise fetch) are linked against. Amazon Linux 2 ships
+# glibc 2.26, so those binaries are present on PATH but fail to LOAD with
+# "GLIBC_2.28 not found" -- which means the usual "install from nodejs.org / nvm
+# install" advice sends an AL2 user in a circle. ``ensure-node.sh`` already
+# resolves this by unpacking the nodejs "unofficial-builds" glibc-217 variant
+# (compiled against glibc 2.17); the message below points there instead on a
+# host whose glibc is below this floor.
+_OFFICIAL_NODE_GLIBC_FLOOR: tuple[int, int] = (2, 28)
+
+
+def _host_glibc_version() -> tuple[int, int] | None:
+    """This host's glibc (major, minor), or ``None`` when it cannot be read.
+
+    ``None`` on any non-glibc or unreadable host (macOS, Windows, musl, or an
+    unparseable version string) so the caller stays with the default remedy
+    rather than guessing. Uses ``platform.libc_ver`` -- the same reader
+    ``wheel_engine._no_wheel_message`` relies on -- and never raises.
+    """
+    if platform.system() != "Linux":
+        return None
+    try:
+        name, ver = platform.libc_ver()
+    except Exception:
+        return None
+    if name != "glibc" or not ver:
+        return None
+    m = re.match(r"^(\d+)\.(\d+)", ver)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)))
+
+
+def _glibc217_ensure_node_path() -> str | None:
+    """Path to the bundled ``ensure-node.sh`` when it ships here, else ``None``.
+
+    Returns ``None`` on a pip/wheel install, which ships no shell script
+    (``env._ensure_node_script`` returns ``None`` there). Independent of CPU --
+    the caller gates the x86_64 requirement separately -- so a path here means
+    "the auto-provisioner is available", not "it will succeed". Never raises.
+    """
+    try:
+        from kiro_crew.env import _ensure_node_script
+
+        script = _ensure_node_script()
+    except Exception:
+        return None
+    return str(script) if script is not None else None
+
+
 def node_too_old_message(
     version: tuple[int, int, int], floor: tuple[int, int, int] = MIN_NODE_VERSION
 ) -> str:
-    """User-facing line naming the found version, the exact floor, and the fix."""
-    return (
+    """User-facing line naming the found version, the exact floor, and the fix.
+
+    On a host whose glibc is older than the official Node binaries' floor
+    (Amazon Linux 2 ships glibc 2.26), the usual nodejs.org / nvm advice fails
+    to LOAD -- the binaries exist but raise "GLIBC_2.28 not found". The remedy
+    then depends on the host, and the action is stated FIRST:
+
+    * x86_64 with the bundled script -> ``bash <path>`` auto-installs the
+      glibc-2.17 Node build.
+    * x86_64 without the script (pip/wheel install) -> that same glibc-2.17
+      build DOES run here, so install it from unofficial-builds.nodejs.org (or
+      move to a newer base image).
+    * aarch64/Graviton -> no glibc-2.17 build is published for ARM, so move to a
+      newer base image (Amazon Linux 2023, Ubuntu 22.04+) or build from source.
+    """
+    base = (
         f"Node.js v{format_node_version(version)} is too old: Kiro Crew needs "
-        f"v{format_node_version(floor)} or newer. Update Node.js: install 24 LTS "
+        f"v{format_node_version(floor)} or newer."
+    )
+    glibc = _host_glibc_version()
+    if glibc is not None and glibc < _OFFICIAL_NODE_GLIBC_FLOOR:
+        # Official Node binaries will not load here. The remedy is per-host, and
+        # the ACTION comes first; the glibc explanation trails it.
+        why = (
+            f"This host's glibc ({glibc[0]}.{glibc[1]}) is older than the official "
+            f"Node.js builds require (glibc {_OFFICIAL_NODE_GLIBC_FLOOR[0]}."
+            f"{_OFFICIAL_NODE_GLIBC_FLOOR[1]}+), so a nodejs.org / nvm install "
+            'would fail to run with "GLIBC_... not found".'
+        )
+        if platform.machine() == "x86_64":
+            script = _glibc217_ensure_node_path()
+            if script is not None:
+                action = (
+                    f"Run `bash {script}` to install the glibc-2.17 Node build "
+                    "that runs here, or move to a newer base image "
+                    "(Amazon Linux 2023, Ubuntu 22.04+)."
+                )
+            else:
+                # pip/wheel install: no bundled script, but the x64 glibc-2.17
+                # build still runs -- point at it directly, not a migration.
+                action = (
+                    "Install the glibc-2.17 Node build from "
+                    "https://unofficial-builds.nodejs.org, or move to a newer "
+                    "base image (Amazon Linux 2023, Ubuntu 22.04+)."
+                )
+        else:
+            # aarch64/Graviton: upstream publishes no arm64 glibc-2.17 build.
+            action = (
+                "No glibc-2.17 Node build is published for this CPU; move to a "
+                "newer base image (Amazon Linux 2023, Ubuntu 22.04+) or build "
+                "Node from source."
+            )
+        return f"{base} {action} ({why})"
+    return (
+        f"{base} Update Node.js: install 24 LTS "
         "from https://nodejs.org, or run `nvm install 24` / `mise use -g node@24`."
     )
 
@@ -171,13 +293,13 @@ def crew_log_enabled() -> bool:
 # Outer wall-clock cap on a single ``_run_chat`` invocation (any dispatch site:
 # primary user turn, queue-drain, cron injection, subagent injection, Slack first
 # turn). Sized to match the inner ACP ``_DEFAULT_PROMPT_TIMEOUT`` (14400s) in
-# ``acp/client.py`` so the dashboard layer doesn't bound below the transport.
+# ``acp/client_timeouts.py`` so the dashboard layer doesn't bound below the transport.
 # Four hours is the longest single turn the shipped budgets can legitimately
 # produce (the task runner's 90-minute test command plus a fix and a re-run, or a
 # blocking subagent wave at its 2h wait cap plus synthesis); work that outlives
 # it belongs to the loop mechanisms, which end the turn between cycles.
 # Wedged-session detection is handled by ``_STALE_TURN_TIMEOUT`` (90s, also in
-# ``acp/client.py``); this cap is the upper safety ceiling for genuinely runaway
+# ``acp/client_timeouts.py``); this cap is the upper safety ceiling for genuinely runaway
 # work, not a "this turn took too long" guard.
 CHAT_TURN_TIMEOUT = 14400.0
 
@@ -215,7 +337,7 @@ COMPACT_WAIT_TIMEOUT_SECS = 300.0
 SUBAGENT_TIMEOUT_SECS = 10800
 
 # Budget for an agent backend's ``initialize`` handshake, in seconds. Spent by
-# ``acp.runtime`` (which re-exports it as ``_INITIALIZE_TIMEOUT`` and documents why
+# ``acp.runtime_spawn_launch`` (which binds it as ``_INITIALIZE_TIMEOUT`` and documents why
 # the value is what it is), and read by the subagent startup watchdog, whose window
 # has to cover a handshake that spends all of it
 # (``SubagentManager._startup_deadline``). Owned here because that second reader is
@@ -236,7 +358,7 @@ DEFAULT_SPAWN_MIN_MEMORY_GB = 2.0
 
 # Default of ``agent.subagent_queue_max_wait_secs``: how long a spawn the memory
 # floor keeps deferring (durable or in memory) may wait before it ends with the
-# delivered terminal ``never started: waiting for memory``. Finite by owner
+# delivered terminal ``QUEUED_WAIT_EXPIRED_TEXT``. Finite by owner
 # decision (a memory wait is never unbounded); one number for the config default,
 # the loader fallback and the manager's boot value.
 DEFAULT_SUBAGENT_QUEUE_MAX_WAIT_SECS = 1800
@@ -354,6 +476,9 @@ _MARKER_CLOSE_CLASS = "[" + re.escape(MARKER_CLOSERS) + "]"
 #: by construction rather than by which opener happens to carry the guard.
 MARKER_OPENERS = "[\u3010\uff3b\u3014"
 _MARKER_OPEN_CLASS = "[" + re.escape(MARKER_OPENERS) + "]"
+#: Its negation, derived from the same string: what a pattern that must apply a
+#: per-opener rule may consume WITHOUT applying it. Closers are not excluded.
+_MARKER_NON_OPEN_CLASS = "[^" + re.escape(MARKER_OPENERS) + "]"
 #: Every bracket the grammar knows -- all openers and all closers -- as the
 #: characters the body's NEGATED classes exclude. This is the disjointness
 #: invariant in one place: a character that can START a bracket form (an opener)
@@ -524,6 +649,8 @@ _MARKER_WRAP_RUN = rf"{_MARKER_WRAP_CLASS}{{0,3}}"
 
 #: Label body, spelled once per regex so LINE and TRAILER cannot drift. LINE
 #: stops at a newline; TRAILER spans them (``DOTALL``, as the old ``.*`` did).
+#: No part of the LINE pattern may match ``\n``: :func:`_line_marker_candidates`
+#: scans only the lines holding the head, which is equivalent only while that holds.
 #: The one body-shaped pattern NOT derived from these is
 #: :data:`_OPTIONS_TAIL_PREFIX_RE`, which is a prefix closure and has to stay
 #: looser -- see the reason there before "fixing" it to match.
@@ -648,6 +775,29 @@ def _marker_labels_have_unmatched_opener(labels: str) -> bool:
     return bool(open_stack)
 
 
+def _line_marker_candidates(pattern: re.Pattern[str], text: str) -> Iterator[re.Match[str]]:
+    """``pattern.finditer(text)`` for the LINE pattern, run only on lines holding the head.
+
+    Every LINE match contains the literal ``[OPTIONS:`` and stays on its line: the
+    body, closer, tic, wrapper run and trailing ``[ \\t]*`` all exclude ``\\n``, and
+    each lookahead is bounded by them. So a line without the head cannot match, and
+    skipping it returns the same matches. It matters because the optional
+    ``^``-anchored wrapper prefix is attempted at every position, which makes a
+    whole-text scan cost the whole message for every call. Under ``re.MULTILINE``
+    ``^`` holds at ``pos`` (offset 0 or just after a newline) and ``$`` at
+    ``endpos`` (a newline or the end of the text), the anchors the whole-text scan
+    sees there. TRAILER spans newlines, so it never comes through here.
+    """
+    head = text.find("[OPTIONS:")
+    while head != -1:
+        start = text.rfind("\n", 0, head) + 1
+        end = text.find("\n", head)
+        if end == -1:
+            end = len(text)
+        yield from pattern.finditer(text, start, end)
+        head = text.find("[OPTIONS:", end)
+
+
 class _MarkerMatcher:
     """A candidate pattern plus the balance decision the pattern cannot make.
 
@@ -670,7 +820,11 @@ class _MarkerMatcher:
 
     def finditer(self, text: str) -> Iterator[re.Match[str]]:
         """Every candidate whose terminator is its own, in order."""
-        for match in self._pattern.finditer(text):
+        if self._pattern is _RAW_OPTIONS_RE_LINE:
+            candidates = _line_marker_candidates(self._pattern, text)
+        else:
+            candidates = self._pattern.finditer(text)
+        for match in candidates:
             if not _marker_labels_have_unmatched_opener(match.group("labels")):
                 yield match
 
@@ -1152,8 +1306,8 @@ def strip_control_comments(text: str, *, hide_partial: bool = False) -> str:
 #: :func:`split_trailing_protocol_suffix`'s unfinished-marker probe: a tail is
 #: a STILL-STREAMING marker only when every byte it holds so far could extend
 #: into a complete marker. ``[OPTIONS`` must be followed by ``:`` and then a
-#: PREFIX CLOSURE of :data:`OPTIONS_RE_TRAILER`'s body (DOTALL; ``[`` admitted
-#: only when not opening a nested ``[OPTIONS:``) -- deliberately LOOSER than
+#: PREFIX CLOSURE of :data:`OPTIONS_RE_TRAILER`'s body (DOTALL; EVERY opener
+#: admitted only when not opening a nested ``[OPTIONS:``) -- deliberately LOOSER than
 #: that body, and the one place the "spelled once" rule in
 #: :data:`_MARKER_BODY_LINE` does not apply. It has to be: a prefix of a legal
 #: body need not itself be a legal body. ``[OPTIONS: A ]`` mid-stream holds a
@@ -1162,6 +1316,8 @@ def strip_control_comments(text: str, *, hide_partial: bool = False) -> str:
 #: that tail dead and publish the marker as raw text. Widening this to the
 #: grammar is what ``test_options_marker_closers.py``'s
 #: ``test_closer_inside_an_unfinished_label_is_still_unfinished`` forbids.
+#: The nested-head guard is the one part that must AGREE: the body refuses a head
+#: after every opener, so a tail holding one can never become legal.
 #: ``[STEERING`` follows the steer-ack
 #: grammar (``messaging/driver.py``): whitespace gap, literal ``steer-``, a
 #: nonempty hex/dash id, then an optional ``:`` summary -- spelled as nested
@@ -1170,7 +1326,7 @@ def strip_control_comments(text: str, *, hide_partial: bool = False) -> str:
 #: acknowledgment``, ``steer-:``) is prose and stays visible. Case-sensitive
 #: on purpose: these probe the exact sentinels the detach walk locates.
 _OPTIONS_TAIL_PREFIX_RE = re.compile(
-    r"\[OPTIONS(?::(?:[^[]|\[(?!OPTIONS:))*)?\Z",
+    rf"\[OPTIONS(?::(?:{_MARKER_NON_OPEN_CLASS}|{_MARKER_OPEN_CLASS}(?!OPTIONS:))*)?\Z",
     re.DOTALL,
 )
 _STEERING_TAIL_PREFIX_RE = re.compile(
@@ -1368,6 +1524,36 @@ def md_link_destination(char_class: str) -> str:
 # a `startswith` written against one silently misses the other.
 SUBAGENT_COMPLETION_PREFIX = "[Subagent completion event]"
 SUBAGENT_BATCH_COMPLETION_PREFIX = "[Subagent batch completion event]"
+
+#: What a parent is told beside the result of a sub-agent run that completed
+#: without making a single tool call. Such a run wrote no file, ran no command
+#: and made no commit, yet it can still answer a task that asked for one by
+#: narrating the steps as though it had taken them -- the usual shape for a
+#: reasoning-only agent (``"tools": []``) handed write work, and possible for any
+#: agent that answered from memory. The signal is the run's own observed tool
+#: activity (``SubagentInfo.made_no_tool_calls``), so the note needs no reading
+#: of specs or backends. The dispatch is not refused, because whether a task needs writes is
+#: not decidable from its prose; the parent is told instead to treat any reported
+#: change as a claim and check it. Prefixed with the agent's label by each caller.
+NO_TOOL_CALLS_NOTE = (
+    "made no tool calls in this run, so it did not itself write a file, run a "
+    "command or make a commit. Treat any such change it reports as a claim: check "
+    "it on disk before relying on it."
+)
+
+#: What a parent is told beside the result of a sub-agent run that ended
+#: normally but whose final text carries a tool call written as prose instead
+#: of executed (``SubagentInfo.leaked_tool_call``). That call never ran, so the
+#: output it was meant to produce may be missing even though the run reads as
+#: completed. Notice-only, like the dashboard's mixed-turn leak notice: calls
+#: earlier in the run may already have taken effect, so the run is not marked
+#: failed and nothing is re-issued. Prefixed with the agent's label by each caller.
+LEAKED_TOOL_CALL_NOTE = (
+    "ended with a tool call written as text instead of run, so that last call "
+    "did not execute and the output it was meant to produce may be missing. "
+    "Earlier calls in the run may have taken effect. Check the result before "
+    "treating this step as done."
+)
 
 # Key under a completion message's ``meta`` where the gateway stamps the
 # structured header facts (outcome, tallies, chunk index, agent id) the

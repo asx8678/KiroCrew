@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from kiro_crew.agent_switch_command import switch_channel_agent
 
 if TYPE_CHECKING:
     from kiro_crew.agent_discovery import AgentInfo
@@ -346,7 +349,75 @@ def _installed_agent_names() -> list[str]:
     )
 
 
-def _agent_choices(self: TelegramDispatcher, names: list[str]) -> tuple[tuple[str, str], ...]:
+#: Longest crew label a button shows. Telegram sets no documented cap on button
+#: text, but a long label is cut by the client mid-word; a display name is
+#: free text a user typed, so it is bounded here instead.
+_AGENT_LABEL_MAX = 48
+
+
+def _agent_labels() -> dict[str, str]:
+    """Readable button labels for crew-private agent specs, keyed by spec name.
+
+    A crew's private copy of a template is published as ``crew-<random hex>``
+    (``agent_capabilities``), a name that tells the user nothing. When the
+    crew named by the copy's ``private_to`` is still BOUND to it in
+    ``config.json`` (the same corroboration ``fork_refresh`` requires), the
+    label is that crew's display name, else its name. Any other spec keeps its
+    own name: a shared template can serve many crews, and an orphaned copy no
+    longer belongs to the crew it records. Labels only; the button still
+    resolves to the exact spec name.
+    """
+    from kiro_crew.telegram import transport_dispatch as facade
+
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig  # circular import
+
+        crews = KiroCrewConfig.load().agents
+    except Exception:
+        logger.warning("telegram /agent: config unreadable, showing agent ids", exc_info=True)
+        return {}
+    bound = {crew.kiro_agent for crew in crews.values()}
+    labels: dict[str, str] = {}
+    for info in facade.list_agents():
+        crew = crews.get(info.private_to) if info.private_to else None
+        if crew is not None and crew.kiro_agent == info.name:
+            label = (crew.display_name or "").strip() or info.private_to
+        elif _is_crewless_copy(info.name, info.private_to, bound):
+            label = f"No crew ({_short_id(info.name)})"
+        else:
+            continue
+        if len(label) > _AGENT_LABEL_MAX:
+            label = label[: _AGENT_LABEL_MAX - 1] + "…"
+        labels[info.name] = label
+    return labels
+
+
+#: The name ``agent_capabilities`` gives a crew's private copy of a template.
+_PRIVATE_COPY_NAME = re.compile(r"crew-[0-9a-f]{24}")
+
+
+def _is_crewless_copy(name: str, private_to: str, bound: set[str]) -> bool:
+    """Whether *name* is a crew's private copy that no crew is bound to.
+
+    A copy records its crew in ``private_to``; one whose sidecar entry is gone
+    is still recognisable by the ``crew-<24 hex>`` name it was published
+    under. Either way it counts only when no crew's ``kiro_agent`` names it.
+    That is all this checks: a chat pick or a cron may still name the copy,
+    so the label says "no crew", never "unused".
+    """
+    if name in bound:
+        return False
+    return bool(private_to) or _PRIVATE_COPY_NAME.fullmatch(name) is not None
+
+
+def _short_id(name: str) -> str:
+    """``crew-3cc49292…`` -> ``crew-3cc4…``: enough of the id to tell copies apart."""
+    return name if len(name) <= 9 else name[:9] + "…"
+
+
+def _agent_choices(
+    self: TelegramDispatcher, names: list[str], labels: dict[str, str] | None = None
+) -> tuple[tuple[str, str], ...]:
     """``(agent_id, label)`` rows to offer, "" first for the configured default.
 
     Sourced from the installed agent specs, so the list is what this machine
@@ -362,7 +433,8 @@ def _agent_choices(self: TelegramDispatcher, names: list[str]) -> tuple[tuple[st
     """
     configured = self._configured_agent()
     rows: list[tuple[str, str]] = [("", f"Default ({configured})")]
-    rows.extend((name, name) for name in names[:_PICKER_LIMIT])
+    known = labels or {}
+    rows.extend((name, known.get(name) or name) for name in names[:_PICKER_LIMIT])
     return tuple(rows)
 
 
@@ -382,11 +454,17 @@ async def _handle_agent(
     except Exception:
         logger.warning("telegram /agent: agent discovery failed", exc_info=True)
         names = []
-    choices = self._agent_choices(names)
+    try:
+        labels = await asyncio.to_thread(self._agent_labels) if names else {}
+    except Exception:
+        # A label lookup failure costs readability only, never the picker.
+        logger.warning("telegram /agent: agent label lookup failed", exc_info=True)
+        labels = {}
+    choices = self._agent_choices(names, labels)
     if len(choices) <= 1:
         await self._reply(chat_id, "No agent list available on this machine.", thread=thread)
         return
-    current = self._agent_pref.get(route, "")
+    current = self._agent_picks.get(route)
     current_label = next((label for aid, label in choices if aid == current), current or "Default")
     header = f"Current agent: {current_label}\nPick one:"
     if arg.strip():
@@ -415,36 +493,54 @@ async def _handle_agent(
     )
 
 
-async def _apply_agent(self: TelegramDispatcher, route: tuple[str, str], agent_id: str) -> str:
-    """Record *agent_id* for *route* and report what it changed.
+async def _apply_agent(
+    self: TelegramDispatcher, route: tuple[str, str], agent_id: str, label: str = ""
+) -> str:
+    """Switch *route* to *agent_id* and report what it changed.
 
-    The agent is part of the session key, so a pick necessarily opens a FRESH
-    conversation — there is no in-place swap to claim, and the message says so
-    rather than implying the running conversation changed spec. The previous
+    The switch itself is :func:`switch_channel_agent`, the step every channel's
+    ``/agent`` shares: it refuses while a reply is streaming (everything about
+    a running turn — ``_active_renderers`` for the steer chip, the queue
+    receipt, ``/stop``'s provider lookup — is keyed on the session key, so
+    moving the key would leave that turn with no route back), sets the pick,
+    and reseeds the route's generation from the new agent's own saved
+    conversations, so a later ``/new`` never lands on one of them. Only the
+    picker's wording lives here.
+
+    The agent is part of the session key, so a pick necessarily LEAVES the
+    running conversation — there is no in-place swap to claim, and the message
+    says so rather than implying the running conversation changed spec. What it
+    lands on is the new agent's latest saved conversation when it has one (the
+    reseed), else a fresh one, so the reply promises neither. The previous
     conversation is not destroyed: switching back reaches the same key again.
-
-    REFUSED while a reply is streaming, for the same reason ``/compact``
-    refuses: everything about a running turn is keyed on the session key —
-    ``_active_renderers`` for the steer chip, the queue receipt, ``/stop``'s
-    provider lookup — so moving the key out from under it would leave that
-    turn running with no route back to it, and a ``/stop`` would report
-    nothing running while the answer kept arriving.
     """
-    label = agent_id or f"Default ({self._configured_agent()})"
-    key = self._session_key(route)
-    if self.sessions.is_busy(key):
+    configured = self._configured_agent()
+    # *label* is the pressed button's text, so the reply names what the user
+    # chose rather than a ``crew-<hex>`` spec id.
+    label = label or agent_id or f"Default ({configured})"
+    # Compared as the agent each side RUNS, like the text channels: pressing the
+    # row already marked "•" (or the Default row with no pick) is not a switch,
+    # and must not reseed — the in-memory generation can be ahead of disk after
+    # a rotation or a /new whose save failed, and a reseed would hand the next
+    # message back to the conversation the user already left.
+    if (agent_id or configured) == (self._agent_picks.get(route) or configured):
+        return f"ℹ️ Already using {label}."
+    outcome = switch_channel_agent(
+        self._agent_picks,
+        route,
+        agent_id,
+        conv=self._conv,
+        sessions=self.sessions,
+        session_key=lambda: self._session_key(route),
+    )
+    if outcome == "busy":
         return (
             f"⏳ Still working on your last message — send /agent again once "
             f"it finishes to switch to {label}."
         )
-    had = self.sessions.has_session(key)
-    if agent_id:
-        self._agent_pref[route] = agent_id
-    else:
-        self._agent_pref.pop(route, None)
-    if not had:
+    if outcome == "fresh":
         return f"✅ Agent set to {label}."
     return (
-        f"✅ Agent set to {label} — this starts a fresh conversation. "
-        f"Switch back to return to the previous one."
+        f"✅ Agent set to {label} — this leaves the current conversation. "
+        f"Switch back to return to it."
     )

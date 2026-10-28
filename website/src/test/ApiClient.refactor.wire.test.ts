@@ -1,9 +1,10 @@
 /**
  * Wire contracts the domain split of `api/client.ts` must carry over unchanged.
  *
- * `ApiClient.coverage.test.tsx` pins the transport and the non-trivial URL/body
- * builders. This file pins what moving an endpoint between modules could
- * quietly change and the generic sweep there cannot see: which methods talk
+ * `ApiClient.coverage.test.tsx` pins the transport and
+ * `ApiClient.coverage.construction.test.tsx` the non-trivial URL/body builders.
+ * This file pins what moving an endpoint between modules could quietly change
+ * and the generic sweep in `ApiClient.coverage.methods.test.tsx` cannot see: which methods talk
  * raw `fetch` and therefore send NO session key, the exact request of methods
  * whose bodies are caller-owned, and that the endpoints issue the same requests
  * as the blessed `apiTransport`.
@@ -146,7 +147,7 @@ describe('owner-only refusals stay errors', () => {
 })
 
 describe('the nested namespaces keep their wire', () => {
-  // The whole-surface sweep in ApiClient.coverage probes top-level functions
+  // The whole-surface sweep in ApiClient.coverage.methods probes top-level functions
   // only, so the two namespaces get their requests pinned here.
   it.each([
     ['teams.list', () => api.teams.list(), ['/api/teams']],
@@ -253,5 +254,22 @@ describe('the endpoints and apiTransport issue identical requests', () => {
     await expect(apiTransport.j(refusal)).rejects.toBeInstanceOf(ApiError)
     fetchMock.mockResolvedValue(res(500, 'boom'))
     await expect(api.status()).rejects.toBeInstanceOf(ApiError)
+  })
+})
+
+describe('chatSlotAgent body', () => {
+  const sentBody = () => JSON.parse(String(lastCall()[1]?.body ?? '{}'))
+
+  it('the picker shapes carry no announce flag', async () => {
+    await api.chatSlotAgent('s', 'fable')
+    expect(sentBody()).toEqual({ agent: 'fable' })
+    await api.chatSlotAgent('s', 'fable', 'template')
+    expect(sentBody()).toEqual({ agent: 'fable', agent_kind: 'template' })
+  })
+
+  it('the typed /agent shape asks for the transcript line', async () => {
+    await api.chatSlotAgent('s', 'fable', 'template', { announce: true })
+    expect(lastCall()[0]).toBe('/api/chat/slots/s/agent')
+    expect(sentBody()).toEqual({ agent: 'fable', agent_kind: 'template', announce: true })
   })
 })

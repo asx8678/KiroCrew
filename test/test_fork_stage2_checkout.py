@@ -16,10 +16,8 @@ reports "no verdict", and because these lanes are read by `PR Readiness`, a
 blocking one turns into a permanent block on all external contributions -- the
 exact outcome the same-repo callers' fork skip exists to avoid.
 
-This is pinned as a test because five sibling lanes already agreed on it and
-nothing enforced it: `fork-internal-content-scan.yml` shipped for review without
-either setting, and it took two full review rounds to find. A unanimous
-convention that no test asserts is a convention the sixth copy silently breaks.
+This is pinned as a test because every fork lane must agree on it: a unanimous
+convention that no test asserts is a convention the next copy silently breaks.
 
 WHY THE INVARIANT IS BOUND TO THE DIFFING JOB, not to every checkout
 --------------------------------------------------------------------
@@ -150,8 +148,8 @@ def _audit(paths: list[pathlib.Path]) -> tuple[list[str], int]:
                 checked += 1
                 ref = str(with_.get("ref") or "")
                 depth = with_.get("fetch-depth")
-                # The EXACT expression, not a substring: `test_ai_review_workflows.py`
-                # pins the same literal for the review lanes, and two spellings of one
+                # The EXACT expression, not a substring: `test_ai_review_workflows*.py`
+                # pin the same literal for the review lanes, and two spellings of one
                 # invariant drift apart. Pinning the canonical forms here keeps this
                 # structural check the stricter of the two rather than a looser
                 # restatement that would quietly permit a variant.

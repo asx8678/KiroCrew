@@ -13,8 +13,15 @@ degrades to root rather than to an error.
 
 Three pieces, kept apart so each is testable on its own:
 
-* :func:`fold_tree` -- pure. :class:`OpenedRecord` in, one :class:`TreeNode`
-  per slot out.
+* :func:`fold_citations` -- pure, and the only piece that is NOT about sessions.
+  ``(node, cited_parent)`` pairs plus later decisions in, one
+  :class:`TreePlacement` per node out, with the orphan and cycle handling. A
+  caller whose nodes are not slots -- a dashboard block binding a tree of work
+  boards, artifacts or issues -- uses this directly.
+* :func:`fold_tree` -- pure, and the SESSION caller of the above.
+  :class:`OpenedRecord` in, one :class:`TreeNode` per slot out. What it adds is
+  the session part: which log is older, which decision per slot is newest, and
+  the slot names its consumers read.
 * :func:`fold_slot_chain` -- pure. The same records in, one slot's logs out,
   newest first, with the reason the walk stopped.
 * :class:`SessionTree` -- the scanner. It reads the header and the first entry
@@ -91,6 +98,7 @@ from kiro_crew.crew_log.errors import CrewLogError
 from kiro_crew.crew_log.schema import KIND_SESSION, Entry
 from kiro_crew.crew_log.store import (
     find_last_tree_edge,
+    find_spawned_entries,
     newest_segment,
     oldest_segment,
     read_head,
@@ -116,6 +124,18 @@ TYPE_RELEASED: Final[str] = "session/released"
 
 #: Both of them, for a reader deciding whether an entry carries an edge at all.
 EDGE_TYPES: Final[frozenset[str]] = frozenset({TYPE_ADOPTED, TYPE_RELEASED})
+
+#: The creating edge as the CREATOR records it, at ``session_create`` time. Written on
+#: the other side from every type above: the child has no log until its first turn, so
+#: this is the only durable record of the edge before that turn. The fold reads it as
+#: the child's creating edge only when none of the child's own ``session/opened``
+#: entries names a parent (see :func:`fold_tree`).
+TYPE_SPAWNED: Final[str] = "session/spawned"
+
+#: How many ``session/spawned`` entries one unit contributes. Far above any real
+#: creator (``MAX_SLOTS_PER_CREATOR`` caps live children much lower); a reader holds
+#: what it reads, so the read is bounded here rather than by the log's length.
+SPAWNED_PER_UNIT_CAP: Final[int] = 1024
 
 #: How many session-log units one scan ADMITS -- probes, lists, reads, caches
 #: and folds. The ONE bound on everything the scanner does and holds, and every
@@ -342,6 +362,10 @@ class TreeReading:
     #: Whether the LISTING faulted. A fault no unit can be named for: the units it hid
     #: are absent from ``records`` and nothing says which slots they belong to.
     unattributed_fault: bool = False
+    #: Every ``session/spawned`` this scan read, as :class:`EdgeRecord` keyed on the
+    #: CHILD's slot and the creator's unit. Empty when the caller did not ask for edges,
+    #: for the reason ``edges`` is.
+    spawned: tuple[EdgeRecord, ...] = ()
 
 
 @dataclass
@@ -531,10 +555,114 @@ def log_rank_of(records: Iterable[OpenedRecord]) -> dict[str, tuple[int, int, st
     return {sid: (depth.get(sid, 0), record.created_at, sid) for sid, record in by_sid.items()}
 
 
+@dataclass(frozen=True)
+class TreePlacement:
+    """Where ONE node sits in a tree of any node kind: its parent, and whether it
+    lies on a cycle.
+
+    The node-kind-free counterpart of :class:`TreeNode`. The two carry the same three
+    facts and differ only in what they call them: this one says ``node``/``parent``
+    because its caller's nodes are not slots, and :class:`TreeNode` keeps
+    ``slot``/``parent_slot`` because its consumers read those names.
+
+    ``parent`` is the citation, retained even where the tree could not FOLLOW it (the
+    cited parent is not a node here, or the citation lies on a cycle): it is the
+    child's record, not the fold's, and a consumer that nests reads ``cycle`` to know
+    not to. Depth is not carried, for :class:`TreeNode`'s reason -- a consumer that
+    nests walks the parent chain itself.
+    """
+
+    node: str
+    parent: str | None
+    cycle: bool
+
+
+def fold_citations(
+    citations: Iterable[tuple[str, "str | None"]],
+    overrides: "Mapping[str, str | None] | None" = None,
+) -> dict[str, TreePlacement]:
+    """Every node's placement, from citations of ANY node kind. Pure.
+
+    THE tree machinery, with the session slot taken out of it. :func:`fold_tree` is
+    now one caller: it maps a session log's records onto these citations and maps the
+    result back onto :class:`TreeNode`. A second caller -- a dashboard block binding a
+    tree of work boards by ``parent_item``, of artifacts by folder, of issues by a
+    blocked-by link -- supplies its own ids and its own edge source and gets the same
+    orphan and cycle handling, which is the part that is hard to get right and was
+    already right here.
+
+    *citations* are ``(node, cited_parent)`` pairs and the CALLER owns their order,
+    which is the one obligation this signature moves outward. The rule applied over
+    them is the session tree's own: a node's parent is the one its FIRST citation
+    carrying a parent names, and a citation with no parent never retracts it -- so
+    "first" is a question about order, and a caller whose order is arbitrary gets an
+    arbitrary answer to it rather than a wrong one it cannot see. :func:`fold_tree`
+    answers it with :func:`log_rank_of`; a caller whose nodes have no succession
+    history can pass them in any stable order it can defend. A pair with no node is
+    dropped: it places nothing.
+
+    *overrides* are the later DECISIONS, each REPLACING its node's citation outright
+    rather than merging with it -- so ``None`` here is the one way a parent is taken
+    away, where ``None`` in a citation only means that citation did not repeat one.
+    Only nodes that exist among *citations* can be overridden: an override onto
+    anything else would name a node this tree does not have. A caller with several
+    rival decisions per node reduces them to one first (:func:`latest_edges` is how
+    the session caller does it).
+
+    THE NODES ARE EXACTLY THE CITED SUBJECTS, and that is what makes an edge
+    followable or not. A cited parent that is not itself a node is a citation and not
+    a place in the tree, so the child is a ROOT that still carries its parent --
+    degrading to root rather than to an error, which is the posture this whole module
+    takes. A cycle, reachable through damaged or forged records and through a takeover
+    recorded against a stale reading of the tree, marks every node ON it so a consumer
+    nests none of them; a node merely hanging off a cycle member keeps its edge to it.
+    Self-citation is a cycle of one.
+    """
+    exists: set[str] = set()
+    cited: dict[str, str | None] = {}
+    for node, parent in citations:
+        if not node:
+            continue
+        exists.add(node)
+        if parent and node not in cited:
+            cited[node] = parent
+
+    for node, parent in (overrides or {}).items():
+        if node in exists:
+            cited[node] = parent
+
+    # Which citations the tree can FOLLOW, which is the only input the colouring takes:
+    # an unfollowable edge cannot be part of a cycle, and a self-citation is one on its
+    # own without needing the walk to find it.
+    followed: dict[str, str] = {}
+    on_cycle: set[str] = set()
+    for node, parent in cited.items():
+        if not parent:
+            continue
+        if parent == node:
+            on_cycle.add(node)
+        elif parent in exists:
+            followed[node] = parent
+    on_cycle |= _cycle_members(followed)
+
+    return {
+        node: TreePlacement(node=node, parent=cited.get(node), cycle=node in on_cycle)
+        for node in exists
+    }
+
+
 def fold_tree(
-    records: Iterable[OpenedRecord], edges: Iterable[EdgeRecord] = ()
+    records: Iterable[OpenedRecord],
+    edges: Iterable[EdgeRecord] = (),
+    spawned: Iterable[EdgeRecord] = (),
 ) -> dict[str, TreeNode]:
     """Every slot's node, from the records of every session log. Pure.
+
+    THE SESSION CALLER of :func:`fold_citations`. What lives here is the part that is
+    about sessions -- which log is older (:func:`log_rank_of`), which decision per slot
+    is newest (:func:`latest_edges`), and the slot names its consumers read -- while
+    the placement rules themselves, including the orphan and cycle handling described
+    below, are that function's and are shared with any other kind of tree.
 
     Input order does not matter: records are folded oldest log first, by the
     header's ``createdAt`` and then id, so two scans of the same files agree.
@@ -564,6 +692,21 @@ def fold_tree(
     written: the writer checks the tree as it stands at that moment, while a fold
     sees a checkpoint and a replayed tail whose decisions can reach it in an order
     no writer ever saw.
+
+    *spawned* are the creators' own records of a ``session_create``: ``slot`` is the
+    child, ``parent_slot`` the creator, ``sid`` the creator's unit. One fills the
+    child's creating citation only for a child that has NO log of its own -- the child
+    between ``session_create`` and its first turn, which no other record can speak for
+    after a restart. A child that opened a log speaks for itself: its own
+    ``session/opened`` and any later edge decide where it hangs, and the spawn is not
+    consulted for it. That restriction is also what keeps a released or adopted child
+    from snapping back under its creator once retention removes the unit recording the
+    move: the long-lived spawn in the creator's log outlives that unit, so citing the
+    creator from it would re-establish the very edge the move took away. Only a creator
+    that still has a log can be cited this way, since the record was read FROM that log.
+    When a child is cited by more than one creator record (only damage produces that),
+    the earliest by ``(at, seq, sid)`` wins, so the answer does not depend on input
+    order.
     """
     # ONE order for the records and for the decisions below, from ``log_rank_of``: within a
     # slot's succession chain it is the ``previous_sid`` link the store wrote, so neither
@@ -580,42 +723,61 @@ def fold_tree(
     ordered = sorted(
         population, key=lambda record: rank.get(record.sid, (0, record.created_at, record.sid))
     )
+    # The slots that have a log of their own. ``fold_citations`` has no notion of a
+    # session log, so the session-only facts -- which slot opened a log, and the
+    # creators' spawn records for a child that has not yet -- are resolved HERE into
+    # the ``(node, cited_parent)`` citations it folds. A slot's record citations come
+    # first, in the sorted log order, so :func:`fold_citations`' "first citation with a
+    # parent wins" rule answers "which record is the slot's oldest" the same way the
+    # inline fold did.
     has_log: set[str] = set()
-    cited: dict[str, str | None] = {}
     for record in ordered:
-        if not record.slot:
+        if record.slot:
+            has_log.add(record.slot)
+    citations: list[tuple[str, str | None]] = [
+        (record.slot, record.parent_slot) for record in ordered
+    ]
+
+    # The creators' own records, for a child that has NO log of its own yet -- the
+    # child between ``session_create`` and its first turn, which no other record can
+    # speak for after a restart. A child that opened a log speaks for itself: its own
+    # ``session/opened`` and any later edge decide where it hangs, so the spawn is not
+    # consulted for it. Restricting the spawn to a logless child is also what keeps a
+    # released or adopted child from snapping back under its creator once retention
+    # removes the unit that recorded the move: the long-lived spawn in the creator's log
+    # outlives that unit, and re-citing the creator from it would bring the old edge back
+    # -- the very edge ``trusted_creator`` refuses to re-establish for this reason. Only
+    # a creator that still has a log can be cited this way, since the record was read
+    # FROM that log. A spawn citation names a child that is otherwise no node, so it is
+    # what makes a logless child appear in the tree at all.
+    spawn_cited: set[str] = set()
+    for spawn in sorted(spawned, key=lambda s: (s.at, s.seq, s.sid, s.slot)):
+        child = spawn.slot
+        if not child or not spawn.parent_slot or child in spawn_cited or child in has_log:
             continue
-        has_log.add(record.slot)
-        if record.parent_slot and record.slot not in cited:
-            cited[record.slot] = record.parent_slot
-
-    # The decisions are placed by the SAME log order the records above were folded in,
-    # handed to the comparison rather than re-derived inside it (see
-    # :func:`edge_supersedes`): two orderings of one slot's logs could disagree, and the
-    # tree would then contradict itself about which of its own records is newer.
-    for slot, edge in latest_edges(edges, rank).items():
-        if slot in has_log:
-            cited[slot] = edge.parent_slot
-
-    edge_of: dict[str, str] = {}
-    on_cycle: set[str] = set()
-    for slot, parent_slot in cited.items():
-        if not parent_slot:
+        if spawn.parent_slot not in has_log:
             continue
-        if parent_slot == slot:
-            on_cycle.add(slot)
-        elif parent_slot in has_log:
-            edge_of[slot] = parent_slot
-    on_cycle |= _cycle_members(edge_of)
+        citations.append((child, spawn.parent_slot))
+        spawn_cited.add(child)
 
-    nodes: dict[str, TreeNode] = {}
-    for slot in has_log:
-        nodes[slot] = TreeNode(
-            slot=slot,
-            parent_slot=cited.get(slot),
-            cycle=slot in on_cycle,
-        )
-    return nodes
+    # The decisions are placed by that SAME log order, handed to the comparison rather
+    # than re-derived inside it (see :func:`edge_supersedes`): two orderings of one
+    # slot's logs could disagree, and the tree would then contradict itself about which
+    # of its own records is newer. An edge is applied only to a slot that has a log of
+    # its own, for the reason the docstring gives: this fold's followable nodes are the
+    # slots with logs, so an edge onto a logless (spawn-only) child would re-aim a
+    # citation the spawn rule placed and must not.
+    overrides = {
+        slot: edge.parent_slot
+        for slot, edge in latest_edges(edges, rank).items()
+        if slot in has_log
+    }
+
+    placements = fold_citations(citations, overrides)
+    return {
+        slot: TreeNode(slot=slot, parent_slot=placement.parent, cycle=placement.cycle)
+        for slot, placement in placements.items()
+    }
 
 
 def _cycle_members(edge: Mapping[str, str]) -> set[str]:
@@ -1154,6 +1316,44 @@ def edge_record(slot: str, sid: str, entry: Entry | None) -> EdgeRecord | None:
     )
 
 
+def spawned_record(creator_slot: str, creator_sid: str, entry: Entry | None) -> EdgeRecord | None:
+    """The creating edge a ``session/spawned`` entry contributes, or ``None``.
+
+    Keyed on the CHILD: ``slot`` is the child named in the entry, ``parent_slot`` the
+    creator, ``sid`` the creator's unit the entry was read from. The creator is taken
+    from the identity the caller passes -- the unit's own proven head -- and never from
+    the entry, so an entry can only ever name the session whose log it is in as the
+    creator.
+
+    Bounded on the same limits as :func:`edge_record`, and refused rather than
+    truncated for the same reason. A child naming its own creator is refused: it is
+    not an edge.
+    """
+    if entry is None or entry.type != TYPE_SPAWNED:
+        return None
+    if not _bounded(creator_slot, MAX_SHORT_STRING):
+        return None
+    if not _bounded(creator_sid, MAX_ACP_SESSION_ID_LEN):
+        return None
+    child = entry.data.get("child")
+    if not isinstance(child, dict):
+        return None
+    child_slot = child.get("slot")
+    if not isinstance(child_slot, str) or not _bounded(child_slot, MAX_SHORT_STRING):
+        return None
+    if child_slot == creator_slot:
+        return None
+    at = entry.time
+    seq = entry.seq
+    return EdgeRecord(
+        slot=child_slot,
+        parent_slot=creator_slot,
+        at=at if isinstance(at, int) and not isinstance(at, bool) else 0,
+        sid=creator_sid,
+        seq=seq if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0 else 0,
+    )
+
+
 def header_unreadable(segment: Path) -> bool:
     """Whether "no header" means the header could not be READ.
 
@@ -1290,6 +1490,7 @@ class SessionTree:
         *,
         with_edges: bool = False,
         faults: "_ScanFaults | None" = None,
+        spawned_out: "list[EdgeRecord] | None" = None,
     ) -> tuple[list[OpenedRecord], list[EdgeRecord], bool, bool]:
         """:meth:`records`, plus the later decisions when asked for, plus whether any
         unit's bytes could not be READ, plus whether the population ran past the cap.
@@ -1323,6 +1524,7 @@ class SessionTree:
         """
         out: list[OpenedRecord] = []
         edges: list[EdgeRecord] = []
+        spawn_units: list[tuple[Path, OpenedRecord]] = []
         seen: set[str] = set()
         faulted = False
         with self._lock:
@@ -1370,6 +1572,40 @@ class SessionTree:
                         faults.sids.append(record.sid)
                     if edge is not None:
                         edges.append(edge)
+                if spawned_out is not None and record is not None and record.slot:
+                    # Deferred to a second pass below: a creator's spawn is dead weight
+                    # once the child has a parent edge of its own, and which children
+                    # do is known only once every unit in this scan has been read.
+                    spawn_units.append((directory, record))
+            # Children whose OWN log already names a parent -- the fold applies that
+            # over any spawn, so a spawn for such a child neither helps when kept nor
+            # makes the reading any less whole when dropped past the per-unit cap.
+            self_parented = {rec.slot for rec in out if rec.slot and rec.parent_slot}
+            # ``spawn_units`` is populated only when ``spawned_out`` was given, so it is
+            # non-None here whenever there is anything to do.
+            if spawned_out is not None:
+                for directory, record in spawn_units:
+                    # The children this unit's session created. Not cached: only the
+                    # projection's cold seed asks, once per process, and the
+                    # projection keeps the answer from then on.
+                    try:
+                        entries, cut, _hit_cap = find_spawned_entries(
+                            directory, SPAWNED_PER_UNIT_CAP, self_parented
+                        )
+                    except (OSError, ValueError):
+                        entries, cut = [], True
+                    if cut:
+                        # A fault, or more LOAD-BEARING spawns than the bound: either
+                        # way this unit's children are not all here, so the reading
+                        # says so. This cold scan holds no per-unit identity cache, so
+                        # it needs no hit_cap signal -- it always re-reads.
+                        faulted = True
+                        if faults is not None:
+                            faults.sids.append(record.sid)
+                    for entry in entries:
+                        spawn = spawned_record(record.slot, record.sid, entry)
+                        if spawn is not None:
+                            spawned_out.append(spawn)
             # Evict what this scan did not admit: a unit that is gone, and one
             # that fell past the cap because the population grew in front of it.
             for gone in [name for name in self._heads if name not in seen]:
@@ -1377,6 +1613,48 @@ class SessionTree:
             for gone in [name for name in self._edges if name not in seen]:
                 del self._edges[gone]
         return out, edges, faulted, over_cap
+
+    def read_named(self, unit_id: str) -> tuple[OpenedRecord | None, bool]:
+        """One NAMED unit's record and whether its read faulted: one directory lookup
+        and :meth:`_read` (one ``stat`` on a cache hit), never a listing. No directory
+        is the store answering "none", not a fault."""
+        directory = unit_dir_for(KIND_SESSION, unit_id) if unit_id else None
+        if directory is None:
+            return None, False
+        with self._lock:
+            record, faulted = self._read(directory)
+            self._trim_heads_locked()
+        return record, faulted
+
+    def _chain_records(self, head_sid: str) -> tuple[list[OpenedRecord], bool]:
+        """*head_sid*, then each ``previous_sid`` cited while the walk stays on the
+        head's slot, read by name: at most :data:`SLOT_CHAIN_CAP` units, the most
+        :func:`fold_slot_chain` follows. A foreign step is read so the fold refuses it."""
+        records: list[OpenedRecord] = []
+        faulted = False
+        seen: set[str] = set()
+        sid: str | None = head_sid
+        for _ in range(SLOT_CHAIN_CAP):
+            if not sid or sid in seen:
+                break
+            seen.add(sid)
+            record, read_faulted = self.read_named(sid)
+            faulted = faulted or read_faulted
+            if record is None:
+                break
+            records.append(record)
+            if record.slot != records[0].slot:
+                break
+            sid = record.previous_sid
+        return records, faulted
+
+    def _trim_heads_locked(self) -> None:
+        """Keep the head cache within :data:`TREE_UNIT_CAP` entries, oldest first: a
+        named read has no scan's admitted set to evict against."""
+        excess = len(self._heads) - TREE_UNIT_CAP
+        if excess > 0:
+            for name in list(islice(self._heads, excess)):
+                del self._heads[name]
 
     def _read_edge(self, directory: Path, head: OpenedRecord) -> tuple[EdgeRecord | None, bool]:
         """One unit's newest DECISION, from the cache when its newest segment is
@@ -1561,11 +1839,16 @@ class SessionTree:
         """
         try:
             faults = _ScanFaults()
+            spawned: list[EdgeRecord] = []
             records, edges, faulted, over_cap = self._records_with_fault(
-                preferred, with_edges=with_edges, faults=faults
+                preferred,
+                with_edges=with_edges,
+                faults=faults,
+                spawned_out=spawned if with_edges else None,
             )
             return TreeReading(
-                nodes=fold_tree(records, edges),
+                nodes=fold_tree(records, edges, spawned),
+                spawned=tuple(spawned),
                 incomplete=faulted or over_cap,
                 records=tuple(records),
                 edges=tuple(edges),
@@ -1596,27 +1879,22 @@ class SessionTree:
         the whole store.
 
         *head_sid* is the log to walk back from -- for a dashboard caller, the unit
-        a slot key resolves to. It is admitted FIRST, ahead of *preferred*, because
-        a walk that cannot read its own starting log answers
-        :data:`CHAIN_END_UNKNOWN` and nothing else is worth scanning for.
+        a slot key resolves to. *preferred* is accepted for compatibility and not read.
+        The records are the chain's own units, read by name (:meth:`_chain_records`),
+        so a request costs the chain's length, never a listing, and a cited id with no
+        log really has none.
 
-        ``incomplete`` matters more here than it does for the tree, and a caller
-        must not collapse it into ``ended``. A predecessor this scan did not admit
-        -- past :data:`TREE_UNIT_CAP`, or a unit whose bytes faulted -- is absent
-        from the records, so the walk reports :data:`CHAIN_END_MISSING` for a log
-        that is on disk and readable. The walk cannot tell those apart; only the
-        scan can, and it says so here. So an incomplete reading downgrades every
-        end reason except :data:`CHAIN_END_FIRST` to "this is where MY scan
-        stopped", which is why the two travel in one object taken from one call.
+        ``incomplete`` is set when a predecessor's bytes FAULTED: the walk then reports
+        :data:`CHAIN_END_MISSING` for a log on disk, so a caller must not collapse the
+        bit into ``ended``; it downgrades every end but :data:`CHAIN_END_FIRST` to
+        "this is where MY read stopped".
 
         Never raises, for the reason :meth:`snapshot` does not: a whole-life figure
         is an enrichment, and a store fault must not take its page down.
         """
         try:
-            records, _, faulted, over_cap = self._records_with_fault([head_sid, *preferred])
-            return ChainReading(
-                chain=fold_slot_chain(records, head_sid), incomplete=faulted or over_cap
-            )
+            records, faulted = self._chain_records(head_sid)
+            return ChainReading(chain=fold_slot_chain(records, head_sid), incomplete=faulted)
         except Exception:  # pragma: no cover -- defensive; the store calls are guarded
             logger.warning(
                 "session chain scan failed for %s; reporting no succession",
@@ -1628,8 +1906,55 @@ class SessionTree:
             )
 
 
+def _nearest_open_ancestor(
+    node: TreeNode,
+    live_key_of: Mapping[str, str],
+    own_key: str,
+    nodes: Mapping[str, TreeNode],
+) -> str | None:
+    """The live key of the nearest OPEN ancestor above *node*'s closed creator, or ``None``.
+
+    Called only once the creator itself answered no live key. The walk steps up the
+    citations the fold already holds -- a closed session's records stay in the
+    projection, which only a retention removal drops -- and stops at the first slot
+    that has one.
+
+    Three ways it answers ``None``, and each is a real tree rather than a defect: a
+    chain whose every member is closed, a chain that leaves the fold (a creator whose
+    own log is past :data:`TREE_UNIT_CAP` or was never admitted), and a chain that
+    reaches this row again. A ``None`` here keeps the base answer, so every one of them
+    renders the orphan the surface drew before this walk existed.
+
+    Bounded twice over. ``seen`` is the real terminator -- a citation chain visits each
+    slot once, so it stops at the chain's own length -- and the hop ceiling is
+    :data:`TREE_UNIT_CAP`, which is already the most records a scan holds and therefore
+    the most slots any chain can run through. A node marked ``cycle`` is not followed,
+    the same refusal :func:`parent_payload` applies to the child's own node.
+    """
+    seen = {node.slot}
+    cursor: str | None = node.parent_slot
+    for _ in range(TREE_UNIT_CAP):
+        if cursor is None or cursor in seen:
+            return None
+        seen.add(cursor)
+        up = nodes.get(cursor)
+        if up is None or up.cycle or up.parent_slot is None:
+            return None
+        key = live_key_of.get(up.parent_slot)
+        if key == own_key:
+            # The chain leads back to this row, which is not an edge it can nest on.
+            return None
+        if key is not None:
+            return key
+        cursor = up.parent_slot
+    return None
+
+
 def parent_payload(
-    node: TreeNode | None, live_key_of: Mapping[str, str], own_key: str
+    node: TreeNode | None,
+    live_key_of: Mapping[str, str],
+    own_key: str,
+    nodes: Mapping[str, TreeNode] | None = None,
 ) -> dict[str, Any] | None:
     """The ``parent`` a session row carries on the wire, or ``None``.
 
@@ -1640,10 +1965,34 @@ def parent_payload(
     creator is not running (the child stays a root), when the node sits on a
     cycle, and when the citation would point at the row itself. ``slot`` is the
     child's own citation and survives all of those.
+
+    *nodes* is the fold the caller read, and it is what lets a child whose own creator
+    is CLOSED nest under the nearest ancestor that is still open: a lead opens a
+    conductor, the conductor opens three workers, the conductor is closed, and the
+    workers belong under the lead rather than at the top level pretending nobody owns
+    the run. ``ancestor`` is then ``True`` and ``key`` names that ancestor instead of
+    the creator -- the one case where the two differ, so a surface nesting on ``key``
+    still knows to read ``slot`` as a creator that is gone. Omitted, never ``False``,
+    so an ordinary edge is the same payload it has always been.
+
+    Passing no *nodes* is the base answer and the whole of it: the creator is live or
+    the row is a root. Only a caller that holds a fold can offer the walk, and the two
+    that do (both halves of :func:`~kiro_crew.dashboard.session_memory.lineage_parents`)
+    pass the one they read.
     """
     if node is None or node.parent_slot is None:
         return None
+    if node.cycle:
+        return {"slot": node.parent_slot, "key": None}
     parent_key = live_key_of.get(node.parent_slot)
-    if node.cycle or parent_key == own_key:
-        parent_key = None
-    return {"slot": node.parent_slot, "key": parent_key}
+    if parent_key == own_key:
+        # A citation pointing at the row itself is not an edge, and neither is the
+        # chain above it: walking on would nest the row under its own descendant.
+        return {"slot": node.parent_slot, "key": None}
+    if parent_key is not None:
+        return {"slot": node.parent_slot, "key": parent_key}
+    if nodes:
+        ancestor_key = _nearest_open_ancestor(node, live_key_of, own_key, nodes)
+        if ancestor_key is not None:
+            return {"slot": node.parent_slot, "key": ancestor_key, "ancestor": True}
+    return {"slot": node.parent_slot, "key": None}

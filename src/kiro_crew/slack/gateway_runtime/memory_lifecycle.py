@@ -4,8 +4,8 @@ The one gateway-lifetime preparation worker behind ``MemoryStartup`` and its fen
 the paced member-store repair loop, in-process embeddings with the model download,
 and the one-shot legacy markdown-to-vector migration with its re-embed sweep.
 
-The service construction itself (``_init_services``) stays in the facade: the
-memory-store seam and hot-reload audits read it there.
+The service construction itself (``_init_services``) lives in ``service_boot.py``,
+where the memory-store seam and hot-reload audits read it.
 
 Composed by :mod:`kiro_crew.slack.gateway`, whose globals its functions run on;
 see :mod:`kiro_crew.slack.gateway_runtime`.
@@ -20,7 +20,6 @@ if TYPE_CHECKING:
         Any,
         GatewayOrchestrator,
         asyncio,
-        embed_executor,
         embedding_model_is_custom,
         get_shared_embedder,
         logger,
@@ -90,14 +89,50 @@ def _initialize_memory_worker(self: GatewayOrchestrator) -> bool:
                 )
                 if startup.stopped:
                     return False
+                # Preparation walks every memory row through SQLite's B-tree, one
+                # page at a time out of file order; on a cold page cache that is
+                # a random read per page. Read the files front to back first, and
+                # then the knowledge library, whose first search reads every
+                # item's vector the same way (14.2 s on a 435 MB library, against
+                # 1.3 s in order). Started after readiness, so the read never
+                # competes with the boot path, and after the pending restores,
+                # which rename these files: on Windows an open read handle would
+                # make that rename fail.
+                try:
+                    from kiro_crew.page_cache import prefetch as _prefetch_pages
+
+                    _knowledge = getattr(self.dashboard_state, "_knowledge_store", None)
+                    _prefetch_pages(
+                        (
+                            getattr(self.vector_memory, "_db_path", None),
+                            getattr(memory, "_index_db", None),
+                            getattr(_knowledge, "_db_path", None),
+                        ),
+                        name="kc-memory-prefetch",
+                    )
+                except Exception:  # noqa: BLE001 -- a hint only
+                    logger.debug("Memory page prefetch skipped", exc_info=True)
                 if "default" not in startup.store_errors:
+                    opening_vectors = False
                     try:
                         memory.init()
+                        opening_vectors = True
                         self.vector_memory.init()
+                        opening_vectors = False
                         indexed = memory.rebuild_index()
                         logger.info("Global memory ready: FTS indexed %d files", indexed)
                     except Exception as exc:
-                        startup.fail_store("default", exc)
+                        from kiro_crew.memory_startup import damaged_database_remedy
+
+                        # The remedy names memory.db, so only its own open earns it.
+                        remedy = (
+                            damaged_database_remedy(
+                                getattr(self.vector_memory, "_db_path", None), exc
+                            )
+                            if opening_vectors
+                            else ""
+                        )
+                        startup.fail_store("default", exc, remedy=remedy)
                         self.vector_memory.close()
                 if restored:
                     logger.info("Activated memory restores for %s", ", ".join(restored))
@@ -185,7 +220,12 @@ def _schedule_memory_preparation(self: GatewayOrchestrator) -> "asyncio.Task[Non
 
 async def _wait_for_memory_preparation(self: GatewayOrchestrator) -> bool:
     """Keep consumers dormant during recovery while observing owner shutdown."""
-    from kiro_crew.memory_startup import MemoryStartupUnavailable, require_memory_prepared
+    from kiro_crew.memory_startup import (
+        MEMORY_PREPARATION_DEADLINE_SECONDS,
+        MemoryStartupUnavailable,
+        memory_startup_preparing,
+        require_memory_prepared,
+    )
 
     task = self._schedule_memory_preparation()
     if task is None:
@@ -197,10 +237,41 @@ async def _wait_for_memory_preparation(self: GatewayOrchestrator) -> bool:
         )
     stopping = asyncio.create_task(shutdown_event.wait())
     try:
-        done, _ = await asyncio.wait({task, stopping}, return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait(
+            {task, stopping},
+            timeout=MEMORY_PREPARATION_DEADLINE_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
         if stopping in done or shutdown_event.is_set():
             startup.stop()
             return False
+        if task not in done:
+            # The preparation pass crossed its last-resort backstop with no
+            # result. The ceiling sits well above the realistic worst case (see
+            # MEMORY_PREPARATION_DEADLINE_SECONDS), so crossing it means a
+            # wedged file lock or a stuck store open that will not return on its
+            # own, not merely a slow pass. The worker thread cannot be
+            # cancelled, so flip the fence to a terminal failure instead of
+            # leaving it preparing forever — turns then get an actionable error
+            # naming a restart rather than endlessly answering that recovery is
+            # "still running". Keep the owner recovery shell reachable until the
+            # owner requests shutdown.
+            if memory_startup_preparing():
+                startup.fail(
+                    MemoryStartupUnavailable(
+                        "Memory preparation did not finish within "
+                        f"{int(MEMORY_PREPARATION_DEADLINE_SECONDS)}s and appears stuck "
+                        "(a restore or store open is not returning)."
+                    )
+                )
+                logger.error(
+                    "Memory preparation exceeded its %ss deadline; marking it failed so "
+                    "agent turns stop blocking. Dashboard recovery remains available.",
+                    int(MEMORY_PREPARATION_DEADLINE_SECONDS),
+                )
+                await stopping
+                startup.stop()
+                return False
         await task
         if startup.stopped:
             return False
@@ -277,10 +348,14 @@ def _repair_member_memory_once(self: GatewayOrchestrator) -> None:
 
 async def _repair_member_memory(self: GatewayOrchestrator) -> None:
     """Run one paced repair loop across already-open V1 and V2 stores."""
+    from kiro_crew.executors import memory_background_executor
+
     loop = asyncio.get_running_loop()
     while not self._memory_repair_stop.is_set():
         try:
-            await loop.run_in_executor(embed_executor(), self._repair_member_memory_once)
+            await loop.run_in_executor(
+                memory_background_executor(), self._repair_member_memory_once
+            )
         except asyncio.CancelledError:
             self._memory_repair_stop.set()
             raise
@@ -463,19 +538,18 @@ async def _auto_migrate_memory(self: GatewayOrchestrator) -> None:
             reconcile_store_embedding_space(store)
             return store.backfill_missing_embeddings()
 
-        # embed_executor(), NOT maintenance_executor(): pacing turns this
-        # from a ~72-minute worst case into a multi-hour one, and mc-maint is
-        # a 4-worker pool documented as "reserved for the FAST periodic
-        # sweeps + overlay rewrites" — parking one of its four slots
-        # (mostly asleep) for a working day contradicts that reservation.
-        # mc-embed is the bulkhead built for exactly this: its
-        # rationale is that embed work "queues behind ITSELF instead of
-        # starving" everything else, it has 8 workers, and the same
-        # atexit shutdown hook already covers it. Interactive embeds are
-        # unaffected either way — LlamaCppEmbedder serializes every call
-        # onto one owned inference thread, so the model lock is the
-        # bottleneck there, not a pool slot.
-        await loop.run_in_executor(embed_executor(), _wait_then_backfill)
+        # memory_background_executor(), NOT maintenance_executor(): pacing
+        # turns this from a ~72-minute worst case into a multi-hour one, and
+        # mc-maint is a 4-worker pool documented as "reserved for the FAST
+        # periodic sweeps + overlay rewrites" — parking one of its four slots
+        # (mostly asleep) for a working day contradicts that reservation. Nor
+        # mc-embed: turn context assembly runs there, and a sweep that
+        # holds one of its workers for hours is one fewer for every turn. The
+        # small mc-membg pool is shared only with consolidation, and the same
+        # atexit shutdown hook covers it.
+        from kiro_crew.executors import memory_background_executor
+
+        await loop.run_in_executor(memory_background_executor(), _wait_then_backfill)
     except asyncio.CancelledError:
         raise
     except Exception:

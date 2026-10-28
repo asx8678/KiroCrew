@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react'
 import { createImeLatch } from './useImeGuard'
+import { useLocalCrewHidden } from '../components/overlayRoot'
+import { usePointerMotion } from './usePointerMotion'
 
 /**
  * Shared list keyboard-navigation hook for picker-menu / palette surfaces
@@ -32,6 +34,9 @@ import { createImeLatch } from './useImeGuard'
  * The selection is mirrored into {@link selectedRef} so callbacks captured in
  * effects can read the live value without re-subscribing, matching the
  * existing FilePickerMenu pattern.
+ *
+ * Pointer hover selects a row through {@link ListKeyboardNav.hoverSelect},
+ * which moves the selection only when the pointer really moved. See its doc.
  */
 export interface UseListKeyboardNavOptions {
   /** Whether the owning surface is open. The listener is only attached while true. */
@@ -95,6 +100,14 @@ export interface ListKeyboardNav {
    * the sanctioned spelling.
    */
   claimKey: (e: globalThis.KeyboardEvent) => boolean
+  /**
+   * Select row `index` from a pointer event, but only when the pointer moved
+   * (see `usePointerMotion`). Wire it as the row's
+   * `onMouseMove={e => hoverSelect(i, e)}`, never as `onMouseEnter`: a row
+   * re-ranked under a resting pointer must not overwrite the host's reset to
+   * the best match, or Enter would choose the row under the cursor.
+   */
+  hoverSelect: (index: number, e: { clientX: number; clientY: number }) => void
 }
 
 export function useListKeyboardNav(opts: UseListKeyboardNavOptions): ListKeyboardNav {
@@ -262,11 +275,14 @@ export function useListKeyboardNav(opts: UseListKeyboardNavOptions): ListKeyboar
     }
   }, [open])
 
+  // Behind a remote Crew the list is hidden with its Crew (components/overlayRoot);
+  // its keys belong to the Crew in front until it is back. Selection survives.
+  const crewHidden = useLocalCrewHidden()
   useEffect(() => {
-    if (!open) return
+    if (!open || crewHidden) return
     document.addEventListener('keydown', onKey, true)
     return () => document.removeEventListener('keydown', onKey, true)
-  }, [open, onKey])
+  }, [open, crewHidden, onKey])
 
   // Expose a synced setter that keeps selectedRef in lockstep with the state,
   // so external callers (e.g. resetting to 0 after new results) don't leave the
@@ -284,5 +300,11 @@ export function useListKeyboardNav(opts: UseListKeyboardNavOptions): ListKeyboar
     [],
   )
 
-  return { selected, setSelected: setSelectedSynced, selectedRef, itemRefs, claimKey }
+  const pointerMoved = usePointerMotion(open)
+  const hoverSelect = useCallback((index: number, e: { clientX: number; clientY: number }) => {
+    if (!pointerMoved(e) || selectedRef.current === index) return
+    move(index)
+  }, [move, pointerMoved])
+
+  return { selected, setSelected: setSelectedSynced, selectedRef, itemRefs, claimKey, hoverSelect }
 }

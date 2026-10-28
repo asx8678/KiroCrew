@@ -1491,7 +1491,7 @@ class TestReadEffectiveModel:
         assert read_effective_model(inner) == "claude-haiku-4.5"
 
     def test_walks_nested_handle_two_levels_down(self):
-        # The default Kiro turn shape: providers/acp.py assigns an
+        # The default Kiro turn shape: providers/acp_runtime_start.py assigns an
         # AcpSessionProvider to _client, which holds the handle on _handle, so
         # the resolved id sits at provider.client._handle.
         handle = _Inner("auto")
@@ -1577,7 +1577,7 @@ class TestReadEffectiveAgent:
 
     def test_reads_agent_off_the_runtime(self):
         # The session-provider shape: the agent is held only by the spawned CLI
-        # runtime (runtime.py:273), reached via provider -> _handle -> _runtime.
+        # runtime (AcpRuntime._agent), reached via provider -> _handle -> _runtime.
         runtime = type("Runtime", (), {"_agent": "kirocrew"})()
         handle = type("Handle", (), {"_runtime": runtime})()
         provider = type("SessionProvider", (), {"_handle": handle})()

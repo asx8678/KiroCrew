@@ -177,8 +177,8 @@ jobs:
             | ($lines | index("### Release channel")) as $i
             | if $i == null then "" else
                 ($lines[$i+1:]) as $rest
-                | ($rest | map(startswith("### ")) | index(true)) as $end
-                | (if $end == null then $rest else $rest[0:$end] end)
+                | ($rest | map(startswith("### ")) | index(true)) as $stop
+                | (if $stop == null then $rest else $rest[0:$stop] end)
                   | map(gsub("^\\s+|\\s+$"; ""))
                   | map(select(length > 0))
                   | (if length == 1 then .[0] else "" end)
@@ -277,7 +277,7 @@ jobs:
         id: creds
         if: steps.collect.outputs.skip == 'false' && env.ROLE_ARN != ''
         continue-on-error: true
-        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region: us-west-2

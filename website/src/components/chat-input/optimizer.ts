@@ -3,6 +3,7 @@ import { useMutation } from '@tanstack/react-query'
 import type { useAppStore } from '../../store'
 import { selectSlotMessages } from '../../store/chatSlice'
 import { pruneBlocks, type PasteBlock } from '../../utils/pasteTokens'
+import { parseDirTokens } from '../../utils/fileTokens'
 import { i18nT } from '../../i18n/t'
 import type { ComposerControl } from '../composerControl'
 import { terminalCommand } from '../../hooks/useTerminalCommand'
@@ -13,7 +14,17 @@ import type { ChatInputProps } from './props'
    that asked, or goes to `onOptimizeResult` when that slot is no longer the
    one on screen. */
 
-export function usePromptOptimizer({ slotId, chatStore, valueRef, pasteBlocks, onChange, onOptimizeResult, lexicalComposer, lexicalLoadFailed, composerControl, inputRef, valueFromUserRef, optimizingRef, appendUndoBoundary, terminalCommands }: {
+/** Whether `rewrite` mentions exactly the folders `draft` does. A folder chip
+ *  is derived from its `@rel/` token in the text in every composer, so a
+ *  rewrite that rewords, drops or adds a folder token changes the folders the
+ *  message attaches. */
+function keepsFolderMentions(draft: string, rewrite: string): boolean {
+  const before = new Set(parseDirTokens(draft).map(t => t.rel))
+  const after = parseDirTokens(rewrite).map(t => t.rel)
+  return after.length === before.size && after.every(rel => before.has(rel))
+}
+
+export function usePromptOptimizer({ slotId, chatStore, valueRef, pasteBlocks, onChange, onOptimizeResult, lexicalComposer, lexicalLoadFailed, composerControl, inputRef, valueFromUserRef, optimizingRef, appendUndoBoundary, terminalCommands, optimizerMentionGuard, composerDisabled }: {
   slotId: string | null
   chatStore: ReturnType<typeof useAppStore>
   valueRef: React.MutableRefObject<string>
@@ -29,6 +40,9 @@ export function usePromptOptimizer({ slotId, chatStore, valueRef, pasteBlocks, o
   optimizingRef: React.MutableRefObject<boolean>
   appendUndoBoundary: (v: string) => void
   terminalCommands?: ChatInputProps['terminalCommands']
+  optimizerMentionGuard?: ChatInputProps['optimizerMentionGuard']
+  /** The host's `disabled`: the Lexical root stays non-editable on Cancel while it is set. */
+  composerDisabled?: boolean
 }) {
   // Tracks the prior render's raw pending state so the completion effect can
   // record a single undo boundary when an optimize actually finishes (as
@@ -43,6 +57,8 @@ export function usePromptOptimizer({ slotId, chatStore, valueRef, pasteBlocks, o
   // In-composer report of a rejected optimize request (the restored prompt
   // alone says nothing about why the optimizer did not run).
   const [optimizeError, setOptimizeError] = useState('')
+  // The in-flight request's abort handle, so the overlay's Cancel can end it.
+  const abortRef = useRef<AbortController | null>(null)
 
   const setTextUndoable = useCallback((text: string) => {
     if (lexicalComposer && !lexicalLoadFailed) {
@@ -85,11 +101,15 @@ export function usePromptOptimizer({ slotId, chatStore, valueRef, pasteBlocks, o
   const optimizeMutation = useMutation({
     onMutate: () => { setOptimizeError('') },
     mutationFn: async (
-      { prompt, context, pastes }: {
+      { prompt, context, pastes, signal }: {
         prompt: string
         context: string
         pastes?: Array<{ seq: number; content: string }>
+        /** The mention check, taken with `prompt` (see onSuccess). */
+        keepsMentions?: (rewrite: string) => boolean
         slotId: string | null
+        /** Aborted by `cancelOptimize`; onError reads it to tell a cancel from a failure. */
+        signal?: AbortSignal
       },
     ) => {
       const resp = await fetch('/api/optimizer/optimize', {
@@ -97,11 +117,24 @@ export function usePromptOptimizer({ slotId, chatStore, valueRef, pasteBlocks, o
         headers: { 'Content-Type': 'application/json', 'x-session-key': 'dashboard:ui' },
         credentials: 'same-origin',
         body: JSON.stringify({ prompt, context, pastes }),
+        signal,
       })
       if (!resp.ok) throw new Error('optimizer failed')
       return resp.json()
     },
     onSuccess: (data, variables) => {
+      // Cancel landed after the body was read: the user already has the draft
+      // back and may be typing, so the rewrite is dropped.
+      if (variables.signal?.aborted) return
+      // A rewrite that would change what the draft attaches is discarded, the
+      // way the server discards one that breaks a paste placeholder: it
+      // replaces the whole draft, so a picked file or folder mention it
+      // dropped or reworded would remove that chip with no user edit and the
+      // send would leave the file or folder out. The draft stays as the user
+      // wrote it.
+      const rewrite: string | null = data.changed && data.optimized && (variables.keepsMentions?.(data.optimized) ?? true)
+        ? data.optimized
+        : null
       // Originating session is still the one on screen: write the result here,
       // undoable. The textarea stayed readOnly for the whole optimize on this
       // session so the value can't have diverged from what we sent; the
@@ -109,16 +142,21 @@ export function usePromptOptimizer({ slotId, chatStore, valueRef, pasteBlocks, o
       // unforeseen divergence (drop rather than clobber).
       if (variables.slotId === slotId) {
         if (valueRef.current.trim() !== variables.prompt.trim()) return
-        setTextUndoable(data.changed && data.optimized ? data.optimized : valueRef.current.trim())
+        setTextUndoable(rewrite ?? valueRef.current.trim())
         return
       }
       // The user navigated to a different session mid-optimize. Route the
       // result back to the session that started it instead of writing into the
       // session now on screen (wrong session) or dropping it (lost work). Fall
       // back to the original prompt when the optimizer returned no change.
-      onOptimizeResult?.(variables.slotId, data.changed && data.optimized ? data.optimized : variables.prompt)
+      onOptimizeResult?.(variables.slotId, rewrite ?? variables.prompt)
     },
     onError: (err, variables) => {
+      // A cancel is the user's own choice, not a failure: no notice, and the
+      // draft needs no restore because it stayed read-only and untouched for
+      // the whole request. Cancel is only reachable from the overlay, which
+      // only renders on the originating session, so there is nothing to route.
+      if (variables.signal?.aborted) return
       // eslint-disable-next-line no-console -- surface prompt-optimizer failures to the dev console
       console.warn('optimizer failed', err)
       // The user must learn the optimizer failed: restoring the prompt alone is
@@ -222,8 +260,49 @@ export function usePromptOptimizer({ slotId, chatStore, valueRef, pasteBlocks, o
     // send. Only referenced blocks are sent (pruneBlocks drops stale ones).
     const referenced = pruneBlocks(txt, pasteBlocks)
     const pastes = referenced.map(b => ({ seq: b.seq, content: b.content }))
-    runOptimize({ prompt: txt, context, pastes, slotId })
-  }, [runOptimize, pasteBlocks, slotId, chatStore, valueRef, terminalCommands])
+    // The mention checks, taken against THIS draft now, so the result is
+    // judged against the attachments it was asked about even if it lands
+    // after a session switch: the draft's folder tokens, and the host's
+    // file-mention guard when it has one.
+    const keepsFiles = optimizerMentionGuard?.(txt)
+    const keepsMentions = (rewrite: string) => keepsFolderMentions(txt, rewrite) && (keepsFiles?.(rewrite) ?? true)
+    const controller = new AbortController()
+    abortRef.current = controller
+    runOptimize({ prompt: txt, context, pastes, keepsMentions, slotId, signal: controller.signal })
+  }, [runOptimize, pasteBlocks, slotId, chatStore, valueRef, terminalCommands, optimizerMentionGuard])
 
-  return { optimizeError, setOptimizeError, optimizePending, optimizing, optimizePrompt }
+  // Abort the in-flight request. The draft is read-only while it runs, so
+  // aborting is enough to hand it back: the rejection settles the mutation,
+  // which clears `optimizing` (overlay, readOnly, disabled Send) on its own.
+  // Focus goes back to the composer here, inside the tap, because the Cancel
+  // button unmounts with the overlay and mobile browsers only raise the
+  // keyboard for a focus() made during the user's gesture. readOnly is cleared
+  // on the element first for the same reason setTextUndoable does it. The
+  // Lexical root is still contenteditable="false" until React re-renders, and
+  // a non-editable root takes no focus, so it is made editable here too; the
+  // re-render's setEditable(!disabled && !readOnly) then agrees with it. A
+  // disabled host keeps it non-editable: that render's setEditable(false) is a
+  // no-op on an editor already non-editable, so it would not undo a DOM write.
+  const cancelOptimize = useCallback(() => {
+    abortRef.current?.abort()
+    abortRef.current = null
+    const end = valueRef.current.length
+    if (lexicalComposer && !lexicalLoadFailed) {
+      const control = composerControl()
+      const root = control?.getRootElement()
+      if (root && !composerDisabled) root.contentEditable = 'true'
+      control?.setSelection(end, end)
+      control?.focus()
+      return
+    }
+    const el = inputRef.current
+    if (!el) return
+    // Same rule as the Lexical root: a disabled host keeps the lock, because
+    // readOnly={optimizing || disabled} stays true and React will not rewrite it.
+    el.readOnly = !!composerDisabled
+    el.focus()
+    el.setSelectionRange(end, end)
+  }, [valueRef, lexicalComposer, lexicalLoadFailed, composerControl, inputRef, composerDisabled])
+
+  return { optimizeError, setOptimizeError, optimizePending, optimizing, optimizePrompt, cancelOptimize }
 }

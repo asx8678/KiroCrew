@@ -272,6 +272,126 @@ class TestEmitMcpOAuthRequest:
         assert "idp.example[REDACTED: credential]" in m["meta"]["error"]
         assert token not in json.dumps(m, ensure_ascii=False)
 
+    # A PKCE-shaped authorize URL the MCP client synthesizes for a local server
+    # after a failed connect: http, explicit port, ~250-char query.
+    _LOOPBACK_AUTHORIZE_QUERY = (
+        "?response_type=code&client_id=kiro-cli-mcp-client-0123456789abcdef"
+        "&redirect_uri=http%3A%2F%2Flocalhost%3A49954%2Foauth%2Fcallback"
+        "&state=Zk3mQ9pL2vX8rT5wN1bC7hJ4yA6sD0eF"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+    )
+
+    @pytest.mark.parametrize(
+        "host",
+        ["localhost:3100", "127.0.0.1:3100", "[::1]:3100"],
+    )
+    def test_loopback_rejection_points_at_a_retry_not_the_allowlist(self, host):
+        """A loopback authorize URL is still REJECTED, but the banner
+        must not send the user to ``oauth_endpoints.json`` -- that file refuses
+        loopback hosts and the gate never relaxes http/port, so the advice is
+        unactionable. It names the endpoint and suggests reconnecting."""
+        url = f"http://{host}/authorize{self._LOOPBACK_AUTHORIZE_QUERY}"
+        # Premise: the guard verdict itself is unchanged by this fix.
+        assert oauth_url_contains_credential(url)
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "tidal-knowledge", url)
+        m = slot.messages[0]
+        assert m["meta"]["failed"] is True
+        assert m["meta"]["rejected_url"] is True
+        assert "oauth_url" not in m["meta"]
+        assert "remedy" not in m["meta"]
+        assert "oauth_endpoints.json" not in m["content"]
+        # The failed banner renders meta["error"], not content: the retry
+        # advice and the endpoint must both ride there.
+        error = m["meta"]["error"]
+        assert "/authorize" in error
+        assert "start a new chat" in error
+        assert "credential or exfiltration pattern" not in error
+        assert "oauth_endpoints.json" not in error
+        serialized = json.dumps(m, ensure_ascii=False)
+        assert "Zk3mQ9pL2vX8rT5wN1bC7hJ4yA6sD0eF" not in serialized
+        assert "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM" not in serialized
+
+    def test_non_loopback_rejection_keeps_the_allowlist_remedy(self):
+        """The loopback branch must not swallow a real remote IdP rejection."""
+        url = f"https://idp.example/authorize{self._LOOPBACK_AUTHORIZE_QUERY}"
+        assert oauth_url_contains_credential(url)
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "self-hosted", url)
+        m = slot.messages[0]
+        assert m["meta"]["remedy"] == "oauth_endpoints.json"
+        assert "oauth_endpoints.json" in m["content"]
+
+    # A Cloudflare Access per-tenant consent URL with a real-world shape:
+    # PKCE + state + redirect push the query past the 200-char length gate, and
+    # the host can never be a builtin (host, path) pair.
+    _CF_ACCESS_URL = (
+        "https://asu.cloudflareaccess.com/cdn-cgi/access/oauth/authorization"
+        "?response_type=code&client_id=Qm9hcmRJZGVudGl0eUNsaWVudA"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A49152%2Fcallback"
+        "&scope=openid%20profile%20email%20offline_access"
+        "&state=Zk3pQ9rT2vWx8yLmN4bC7dHs1aJ6eUoI"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+    )
+
+    def test_remedy_reaches_the_rendered_error_with_a_working_entry(self):
+        """The failed banner renders ONLY meta["error"], so the
+        oauth_endpoints.json remedy must ride there, as a copy-ready entry --
+        and writing exactly that entry must clear the rejection."""
+        from kiro_crew.config.loader import oauth_endpoints_path
+
+        url = self._CF_ACCESS_URL
+        assert oauth_url_contains_credential(url), "fixture must trip the gate"
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "jenkins-iden", url)
+        m = slot.messages[0]
+        assert m["meta"]["failed"] is True
+        assert m["meta"]["rejected_url"] is True
+        assert "oauth_url" not in m["meta"]
+        error = m["meta"]["error"]
+        entry = {
+            "host": "asu.cloudflareaccess.com",
+            "path": "/cdn-cgi/access/oauth/authorization",
+        }
+        assert json.dumps(entry) in error
+        assert "additional_authorization_endpoints" in error
+        assert str(oauth_endpoints_path()) in error
+        # PKCE/state material never reaches any surfaced field.
+        serialized = json.dumps(m, ensure_ascii=False)
+        assert "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM" not in serialized
+        assert "Zk3pQ9rT2vWx8yLmN4bC7dHs1aJ6eUoI" not in serialized
+        # The advertised remedy works: write exactly that entry (into the
+        # test-isolated crew home) and the same URL then passes the gate.
+        path = oauth_endpoints_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"additional_authorization_endpoints": [entry]}))
+        assert not oauth_url_contains_credential(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Fixed credential: refused again even at an approved endpoint.
+            "https://evil.com/auth?key=AKIAIOSFODNN7EXAMPLE",
+            # http and an explicit port: the carve-out never relaxes either.
+            _CF_ACCESS_URL.replace("https://", "http://", 1),
+            _CF_ACCESS_URL.replace(".com/", ".com:8443/", 1),
+            # A loopback host the extension loader refuses.
+            _CF_ACCESS_URL.replace("asu.cloudflareaccess.com", "localhost", 1),
+        ],
+    )
+    def test_no_remedy_in_error_when_the_entry_could_not_work(self, url):
+        """Only a rejection the allowlist can clear gets the remedy in the
+        rendered error; anything else keeps the bare reason."""
+        assert oauth_url_contains_credential(url)
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "self-hosted", url)
+        m = slot.messages[0]
+        assert m["meta"]["failed"] is True
+        assert "additional_authorization_endpoints" not in m["meta"]["error"]
+        assert "If you trust" not in m["meta"]["error"]
+
     def test_rejection_banner_survives_unparseable_url(self):
         """A URL that cannot be parsed to a hostname still rejects with the
         original unnamed banner — no endpoint fields, no crash."""
@@ -414,13 +534,21 @@ class TestMarkMcpOAuthCompleted:
         prior_call_count = state.broadcast_ws.call_count
         _mark_mcp_oauth_completed(state, slot, "linear", success=True)
         assert state.broadcast_ws.call_count == prior_call_count
+        # The closed banner keeps its recorded failure rather than flipping to completed.
+        m = slot.messages[0]
+        assert m["meta"]["failed"] is True
+        assert m["meta"]["error"] == "boom"
+        assert "completed" not in m["meta"]
 
     def test_no_matching_banner_is_noop(self):
         slot = _ChatSlot("s1")
         state = MagicMock()
-        # No mcp_oauth message has been appended for "phantom".
+        # Only another server's banner exists; marking "phantom" must not touch it.
+        _emit_mcp_oauth_request(MagicMock(), slot, "linear", "https://mcp.linear.app/authorize")
         _mark_mcp_oauth_completed(state, slot, "phantom", success=True)
         state.broadcast_ws.assert_not_called()
+        assert len(slot.messages) == 1
+        assert "completed" not in slot.messages[0]["meta"]
 
     def test_completion_resolves_the_row_by_mid_on_a_ts_collision(self):
         """The completion path shares the supersede path's row-identity problem.
@@ -446,9 +574,9 @@ class TestMarkMcpOAuthCompleted:
         state = MagicMock()
         _mark_mcp_oauth_completed(state, slot, "linear", success=True)
 
-        assert second["meta"].get("completed") is True, (
-            "the completion landed on the wrong row -- ts is not a row identity"
-        )
+        assert (
+            second["meta"].get("completed") is True
+        ), "the completion landed on the wrong row -- ts is not a row identity"
         assert first["meta"].get("completed") is None
         _, payload = state.broadcast_ws.call_args[0]
         assert payload["mid"] == second["meta"]["mid"]
@@ -748,9 +876,9 @@ class TestSupersededOAuthBanners:
         state = MagicMock()
         _supersede_open_mcp_oauth_banners(state, slot, "miro", False)
 
-        assert all(m["meta"].get("superseded") is True for m in slot.messages), (
-            "a ts collision left a banner open, still offering a dead loopback link"
-        )
+        assert all(
+            m["meta"].get("superseded") is True for m in slot.messages
+        ), "a ts collision left a banner open, still offering a dead loopback link"
         assert all("oauth_url" not in m["meta"] for m in slot.messages)
         # Each row patched exactly once -- not the first one twice.
         assert state.broadcast_ws.call_count == 2
@@ -1420,8 +1548,10 @@ def _own(tmp_path, monkeypatch, servers) -> None:
 
 def _pending(*names):
     return _FakeProviderClient(
-        [{"serverName": n, "oauthUrl": f"https://{n}.example.com/authorize?client_id=x"}
-         for n in names]
+        [
+            {"serverName": n, "oauthUrl": f"https://{n}.example.com/authorize?client_id=x"}
+            for n in names
+        ]
     )
 
 
@@ -1559,9 +1689,7 @@ class TestAnnotationFailsOpen:
         """Both halves of the predicate must fail open, not just the store read."""
         _own(tmp_path, monkeypatch, {CARDED_SLUG: {"url": "https://mcp.notion.com/mcp"}})
         slot = _ChatSlot("s1")
-        with patch(
-            f"kiro_crew.dashboard.chat_runner.{broken}", side_effect=RuntimeError("boom")
-        ):
+        with patch(f"kiro_crew.dashboard.chat_runner.{broken}", side_effect=RuntimeError("boom")):
             await _drain_session_init_oauth_requests(MagicMock(), slot, _pending(CARDED_SLUG))
         assert _owned_flags(slot) == [False]
 
@@ -1593,9 +1721,7 @@ class TestDrainDoesNoBlockingWorkOnTheLoop:
         assert _owned_flags(slot) == [True]
 
     @pytest.mark.asyncio
-    async def test_lookup_is_skipped_entirely_when_nothing_is_pending(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_lookup_is_skipped_entirely_when_nothing_is_pending(self, tmp_path, monkeypatch):
         """Session init is the hot path and the common case is zero requests."""
         _own(tmp_path, monkeypatch, {CARDED_SLUG: {"url": "https://mcp.notion.com/mcp"}})
         calls: list[int] = []
@@ -1643,9 +1769,7 @@ class TestMidTurnRequestsAreNeverAnnotated:
 
     def test_annotation_is_opt_in_per_call(self):
         slot = _ChatSlot("s1")
-        _emit_mcp_oauth_request(
-            MagicMock(), slot, "acme", LEGIT_OAUTH_URLS[0][1], card_owned=True
-        )
+        _emit_mcp_oauth_request(MagicMock(), slot, "acme", LEGIT_OAUTH_URLS[0][1], card_owned=True)
         assert slot.messages[0]["meta"]["card_owned"] is True
 
 

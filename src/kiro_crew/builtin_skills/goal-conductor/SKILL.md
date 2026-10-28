@@ -36,14 +36,20 @@ patrol cycle.
 
 ### User-visible Dynamic Dashboard
 
-For a long run, load the `artifacts` skill's Dynamic Dashboard contract. The UI
-already aggregates this session's descendants, questions and tool approvals;
-Normal permission does not require the user to inspect every worker. An
-authorized descendant can publish a `task-dashboard` HTML artifact designed
-for this goal, with milestone updates to the same slug. Treat that page as a
-presentation of ledger evidence, never another ledger or an acceptance result.
-Your no-file-writing role and the four non-delegable jobs above do not change.
-Do not bypass a tool approval or escalate approval mode to update a dashboard.
+You own your dashboard page; it shows ledger evidence; workers report to you and
+do not publish that page. For a long run load the `dashboard` skill, which
+carries the page, its flow and its honesty rules. The page is the one the
+`[DASHBOARD]` block names. Where no board page is named there is nothing for a
+reader to open, so the `task-dashboard` artifact stays as it is today: an
+authorized descendant publishes it for this goal, with milestone updates to the
+same slug, read as a presentation of ledger evidence and never another ledger or
+an acceptance result. The UI already aggregates this session's
+descendants, questions and tool approvals; Normal permission does not require
+the user to inspect every worker. Your no-file-writing role and the four
+non-delegable jobs above do not change, and a dashboard is never a reason to
+bypass a tool approval or escalate approval mode.
+A crewmate named `kirocrew-conductor` that adopted no other page gets the `kirocrew-conductor` page in its Dashboard tab; the `[DASHBOARD]` block names the page you have. That page draws every task from your work ledger. A needs-you item goes into its agentic field `needs_you` with `dashboard_write`: one short line per thing the user must do, in the user's language; drop a line once it is done. `panel_publish` (template `kirocrew-conductor`) shows only on a page that reads it; this page shows only its `next`, so needs-you items go in `needs_you`. It takes `{needs_you, done: "N of M", updated, next, repo?: "owner/name", tasks: [{task, state, step, pr?}]}` (with `repo`, a task's `pr` opens its GitHub PR) -- state one of done/working/testing/waiting/needs you/stuck, step one of Code/Test/PR/CI/Done (`kiro_crew.conductor_board_contract`).
+On the `goal-board` page only: it gives every needs-you item a Reply button. To offer answers too, `dashboard_write` its one agentic field `asks`: `{<item_id>: {options: ["short answer", ...]}}`, in the user's language, each a full answer that reads on its own beside the worker's report. Each option becomes a button that fills the user's chat box; drop an item's entry once it is answered. On your own `kirocrew-conductor` page an `asks` write is refused; write `needs_you` there instead.
 
 ### Work-item qualification
 
@@ -53,8 +59,13 @@ A candidate qualifies only if **all three** hold:
    candidates that hand off to each other are one sequence inside a single item.
 2. **Assertable** — you can name its completion condition *now*, before
    dispatching, as one of the evaluator's kinds: `pr_checks` (a PR's checks all
-   green via `gh`), `file` (a path existing), or `human_approval` (the user
-   accepts it — legitimate for design reviews and go/no-go gates, but never
+   green via `gh`; always set `repo` to `owner/name` — without it `gh` resolves
+   the PR number against whatever checkout the evaluator runs in, which can be
+   another repository's PR, and outside a checkout it cannot be evaluated),
+   `pr_merged` (a PR has merged, also via `gh`, with `repo` required: an open
+   PR reads `pending`, one closed without merging reads `fail`),
+   `file` (a path existing), or `human_approval` (the user accepts it —
+   legitimate for design reviews and go/no-go gates, but never
    machine-evaluated). **There is deliberately no "run this command" kind**, so
    "the test suite passes" is expressed as `pr_checks` on the PR that carries the
    work — CI runs the suite, and its verdict is the one that counts. If an item's
@@ -181,8 +192,8 @@ For each item in the round, in **exactly this order**:
 
 **A `pr_checks` seed says how the pull request is opened.** Tell the worker to open it non-draft — `gh pr create` without `--draft` — or to run `gh pr ready` before it reports done. A completion claim that arrives on a draft whose checks have not finished costs a whole verify cycle that answers `refused`, which you surface to the user rather than retry.
 
-**A `pr_checks` seed may name the PR procedure.** The worker is a custom agent
-and sees no skill catalog, so nothing auto-loads `kirocrew-prepare-pr` for it. If the
+**A `pr_checks` seed may name the PR procedure.** The worker gets no per-message
+skill matching, so nothing auto-loads `kirocrew-prepare-pr` for it. If the
 worker will open a pull request, you can add one line to the seed: it may
 read `<crew-home>/skills/kirocrew-dev/kirocrew-prepare-pr/SKILL.md` (`<crew-home>` is
 `KIROCREW_HOME` when set, else `~/.kiro/crew`) and follow its loop to drive
@@ -196,6 +207,14 @@ independent pieces where a failed one should re-run without redoing the rest,
 record them as separate ledger items (dependent ones in order) and dispatch each,
 instead of asking one worker to orchestrate them. A single task or a one-shot
 fan-out stays one item; the worker does those itself.
+
+**A seed MUST name the observable outcome or invariant that makes the work
+correct.** A `pr_checks` acceptance verifies only that the delivered PR's checks
+are green; it does not replace that outcome. Give the one repro, then ask the
+worker to list nearby inputs that reach the same code and show, before `done`,
+which it tested. For a fix that must hold under inputs the worker did not think
+of, the seed MAY ask a fresh subagent that sees the change, but not the worker's
+reasoning, for one independent attempt to break it.
 
 **Bind BEFORE you seed.** The opposite order — seed first, record after —
 protects against a ledger row with no session behind it. This one protects
@@ -213,9 +232,12 @@ cycle; an unbound running worker is neither visible nor recoverable.
 | decomposes into two or more independently acceptable sub-items | `kirocrew-conductor` |
 | `select_crew` names a specialist crew that fits | that crew |
 
-`depth` is computed at `create` time and capped at 2, so you may dispatch a
-conductor and its own workers may not conduct. A `depth_exceeded` error
-means the item has to be flattened into leaves, not retried.
+`depth` is computed when a child first opens its ledger (its first `goal` or
+`create`) and capped at 2 by default (the operator's `work_ledger.max_depth`
+setting raises it; `work_ledger_read` reports the value in force as `max_depth`),
+so at the default you may dispatch a conductor and its own workers may not
+conduct. A `depth_exceeded` error means the item has to be
+flattened into leaves, not retried.
 
 A specialist crew that does not mount `@kirocrew-work` cannot report to the
 ledger. Dispatch it anyway when it is the right crew for the item, and fall back
@@ -231,9 +253,235 @@ misconfigured. `select_crew` and `session_create` are also **not wired**:
 `select_crew` returns a crew's resolved configuration and binds nothing, so you
 pass the agent name to `session_create` yourself.
 
+**A worker needs no memory of its own.** Always dispatch `kirocrew-worker` with
+`agent_kind: "template"`: the worker then runs the `kirocrew-worker` template on
+YOUR memory, which is what a one-item worker needs; nothing else about the
+dispatch changes. The reason is an install shape you cannot see from here: on
+some installs an older agent sync also enrolled `kirocrew-worker` as a crew
+member with private memory, and a bare `agent: "kirocrew-worker"` then selects
+that member. When your session may not bind that member's memory — you run as a
+crew member on the shared store, or a parent conductor created you —
+`session_create` refuses it with `memory_delegation_denied`, and that refusal is
+not a setting to change: a crew member's memory binding is immutable and
+Settings offers no control for it.
+
 ### Patrol
 
-After dispatching, arm a loop on your own session with `monitor_start`, with the check AND the exit condition in the message. `watch="work-ledger"` is mandatory. The interval is 300 to 900 seconds, and the bounds come from the script, not from you: `scripts/patrol_budget.py check`. Read [`references/patrol.md`](references/patrol.md#patrol) before you arm the loop: it carries the bounds, renewal, the per-cycle `work_ledger_read`, the three statuses you act on, and how to verify every `done` with the evaluator rather than the child's claim.
+**Dispatch means monitor**, default `watch="work-ledger"` (one PR URL only when
+that PR is all you wait on). Every `session_create` and `bind` reply ends
+`patrol=<outcome> (<reason>)`. Anything but `armed` or
+`existing (active-work-ledger)` means nobody reads your ledger until you arm
+the loop below.
+
+After dispatching, arm a loop on your own session with `monitor_start`. Put the
+check AND the exit condition in the message, and pass explicit positive
+`interval_secs`, `max_cycles` and `max_runtime_secs`.
+
+**`watch="work-ledger"` is mandatory.** It gates the loop on the ledger you
+dispatched into: a cycle where no worker reported anything costs no turn, and a
+worker's report of `blocked`, `question` or `done` pulls the next cycle forward
+to within seconds. Nothing else pulls it forward — a `progress` report, a
+worker ending its turn, a worker's session closing — so a worker that stops to
+wait costs you nothing, and one that crashed or went silent is found by the
+item's `stale` or `orphaned` flag on an ordinary cycle. The interval therefore
+sets how often a silent fleet is re-checked, not how fast a report reaches you.
+A loop armed without it is a plain timer that pays a turn every interval. If you find yours
+without it, fix that FIRST, before anything else that cycle, with
+`monitor_update(watch="work-ledger")` rather than re-arming.
+
+**The interval is 300 to 900 seconds**, never outside that band, whatever the
+round is waiting on. Take the runtime from the operator's time budget, or 86,400
+seconds when none is set. **The bounds come from the script, not from you:**
+
+```bash
+python3 <this skill's dir>/scripts/patrol_budget.py check \
+  --interval-secs <I> --max-cycles <C> --max-runtime-secs <R>
+```
+
+Exit 0 means arm with those numbers. Exit 20 means arm with the `suggest` block
+it prints instead: an interval outside 300..900 is clamped into it, a long
+interval with few cycles ends the loop hours before
+its runtime, while work is still live, and an interval longer than 10% of the
+runtime lets the loop expire without one cycle in the renewal window. The
+script never raises the user's runtime: it only shortens the interval, down to
+300. Exit 21 means even 300 does not fit (a runtime under 3000 seconds): do not
+arm a longer loop yourself; tell the user and ask for a longer runtime. Run the same check
+before any `monitor_update` that changes a bound. Record the bounds you armed
+with as `patrol_base` (`cycles=<C> runtime=<R>`) in your own session ledger's
+artifacts: renewal reads it back.
+
+**Renew the loop yourself, before it runs out.** A capped loop's nudge carries a
+second line, `[patrol budget: cycle N/M, Xs/Rs runtime left]`. Once the cap is
+spent the loop deactivates and you never get the turn you would renew in. When
+10% or less of either budget is left the line ends `; 10% or less left`. On that cycle,
+and only then (the script prompts for approval like any shell call), pass the
+line verbatim. The 10% margin is the time a person has to approve that prompt;
+if nobody does, the loop ends at its cap as it would have without renewal.
+
+```bash
+python3 <this skill's dir>/scripts/patrol_budget.py renew \
+  --line '<the [patrol budget: ...] line>' \
+  --base-cycles <C> --base-runtime-secs <R> --open-items <items not terminal>
+```
+
+| exit | what you do |
+|---|---|
+| 0 | call `monitor_update` with its `monitor_update` numbers, then carry on. If `monitor_update` refuses the new bounds (an operator runtime ceiling below 7 days), treat it as exit 30 |
+| 10 | nothing; more than 10% is left |
+| 20 | nothing to renew for; the stop conditions below decide |
+| 30 | the renewal cap is spent (3 renewals, or one more full base budget would pass 1000 cycles or 7 days; those two ceilings come from the budget line alone, so they hold even if `patrol_base` is lost): ask the user for another budget with `ask_question`. This is the runaway backstop, not a finish: say which items are still open |
+
+`monitor_start` is create-only, so every change after arming is a
+`monitor_update`. Then end your turn.
+
+Each cycle:
+
+1. **Read the ledger first, every cycle.** A cycle a worker's report woke you
+   for arrives with a `[work-ledger wake]` line naming each item that moved and
+   a `[work-ledger]` line telling you to read. The wake is a notification, not
+   the state: it says WHICH item moved and nothing about the rest of the board.
+   So read before you act — `work_ledger_read` with `item_id=<id>` for the item
+   a wake named, or `work_ledger_read` with `compact=true` for the whole board
+   on a scheduled patrol tick.
+
+   The compact read returns the
+   conductor record and, per item, the status columns plus the derived
+   `orphaned`, `stale` and `acceptance_concrete` flags — no events, acceptance or
+   `accept_batch`. This one read replaces the whole transcript-reading cycle, and
+   it stays small however many items the board holds. The full read (no
+   `compact`) adds every field, the newest events and a ready-to-pipe
+   `accept_batch`; take it when a `done` item needs its bar (step 3). A full
+   read too large for the tool-result limit
+   comes back trimmed with `truncated: true` and says what it left out. An item is never `stale` on the strength of silence alone: its worker
+   also has to be not running, and its last word has to have left the next move
+   with the worker, so a `done` item waiting on you is not flagged. An item whose
+   `report_undelivered` is set had a worker that TRIED to report or read its brief
+   and the harness never delivered the call: check that worker's `session_status`
+   and its pull request, and tell the user what you find ("couldn't send its
+   report") instead of calling it stalled.
+2. **Act on three statuses, and only three:**
+
+   | status | what it means | what you do |
+   |---|---|---|
+   | `progress` | informational | nothing |
+   | `done` | the worker CLAIMS acceptance is met | verify (step 3) |
+   | `blocked` | an external dependency stopped the work | clear it or re-plan around it; when you answer the worker, `session_send` it, then `work_ledger_record` `action=decide` |
+   | `question` | your own decision is needed | `session_send` the answer, then `work_ledger_record` `action=decide`; `session_read_message` the reply |
+
+   `blocked` and `question` differ by who must act. That is why they are separate
+   values, and why you must not treat one as the other.
+
+   A `blocked` or `question` row may also carry the worker's `reason`: `approval`
+   (a tool approval timed out) or `needs_human` (only a person can unblock it).
+   No reason means the item moves on its own (a build, a service). Tell your workers to
+   report `blocked` with `reason=approval` the moment a tool approval times out.
+   When every open item waits on a person (`approval` or `needs_human`), put the
+   ask in front of the user on that turn: your patrol then holds, takes no
+   turns and does not extend, and the goal popover shows it waiting on the user.
+   A worker's new report releases it; your own writes (decide, goal, close) do
+   not, so answer the user's question or re-dispatch to move it.
+3. **Verify every `done` with the evaluator — never by reading the child's
+   transcript and judging, and never by believing the claim.** Take the
+   `accept_batch` from a full `work_ledger_read` (no `compact`), **keep only the entries
+   whose item is currently `status: done`** — each entry carries that status, so
+   the filter is a read of the document you already have — and pipe that filtered
+   document through a **quoted heredoc**:
+
+   ```bash
+   python3 <this skill's dir>/scripts/accept_eval.py <<'ACCEPT_BATCH'
+   <the accept_batch document, with every non-done entry removed>
+   ACCEPT_BATCH
+   ```
+
+   **The filter is yours to apply, and it is not optional.** `accept_batch` is
+   composed from every open item whose `acceptance` is concrete, whatever its
+   status. An item whose bar still carries a placeholder (a `TBD` or blank `pr`,
+   an unknown kind) is already left out, and its `acceptance_concrete` flag says
+   so. It is the two-phase promotion seam, not a verdict gate. The evaluator
+   answers a world-state question ("does this file exist", "are this PR's checks
+   green"), and a worker that is still `progress` can have made that true early:
+   a stub written before the real content, a PR that is green before the last
+   commit. Evaluating that item returns a genuine `pass` on unfinished work, and
+   recording it with `action=verdict` then `action=close` closes the item under
+   the worker. A `done` is the worker saying the world-state now means what the
+   condition says; only then is the evaluator's answer an acceptance. Never pipe
+   the unfiltered document.
+
+   **The heredoc is load-bearing, not style.** `acceptance` holds text you built
+   from ingested content — an issue title, a file path a worker named — and a
+   `file` path carrying a single quote would end a `'...'` string early and hand
+   the rest of the value to the shell as a command, which `execute_bash` then runs
+   after one approval. A heredoc whose delimiter is quoted (`<<'ACCEPT_BATCH'`) is
+   the one form the shell copies to stdin without interpreting anything inside it.
+   Never paste the document into a `printf '%s' '...'` or `echo '...'` argument,
+   and never let the document contain a line that is exactly `ACCEPT_BATCH`.
+
+   **Resolve `<this skill's dir>` from where this SKILL.md was actually loaded
+   from** — the skill index names its absolute path. Do NOT hardcode a path under
+   the default skills root: a `KIROCREW_HOME` override moves it, so on such an
+   install that path does not exist and every evaluator call would fail before
+   patrol ever ran.
+
+   Evaluate **every `done` item in ONE call** — each invocation costs one
+   approval prompt — then record each answer with `work_ledger_record`
+   `action=verdict` (with `fails` when you are counting retries).
+
+   Verdicts: `pass` / `fail` are final for this cycle. `pending` means keep
+   waiting, within the budget below. `refused` means the spec asked for
+   something the evaluator will not do — most often naming a command, which it
+   does not accept from a spec at all. Re-express the condition as `pr_checks`
+   (or ask the user for a purpose-built kind); never try to route around a
+   refusal. `error` is a broken spec or environment — fix the spec or ask.
+
+   **A `pending` acceptance has a budget.** An item whose `pending_overdue` flag is true has read `pending` for 24 hours on end: a check that never reports, a runner that never frees up, a fork run nobody approves. Evaluate it once more with the rest of the batch, so the evidence you show is current. If it still answers `pending`, surface it the way you surface a `refused` verdict: ask the user with `ask_question`, quoting that evidence, whether to keep waiting or drop it, and do not evaluate it again before they answer. To keep waiting, write its bar again with `action=accept`: that ends the run, so the next `pending` verdict starts a fresh 24 hours. To drop it, close it `abandoned`. Either answer clears the flag, so after a restart or a compaction there is nothing to ask again; a card that expires or is withdrawn is handled as for a `human_approval` item below. Any verdict other than `pending` ends the run too. A `human_approval` item never goes overdue, because it is settled by asking.
+
+   **Two-phase acceptance: the server omits the item, you promote the value.** A
+   condition may name a value that only exists after the item starts — a PR number for
+   `pr_checks` is the common case. Store the condition with the value marked TBD
+   at `create`, tell the child in its seed to report the number through
+   `work_report`'s `pr`. Until you promote the real value the item is absent from
+   `accept_batch` (`acceptance_concrete: false`); a `TBD` `pr` handed to the
+   evaluator by hand would be an `error` verdict, not `pending`, which is why it
+   is left out. **The worker's claimed `pr` is
+   never read as the bar.** Promote it yourself with `work_ledger_record`
+   `action=accept` once you have looked at it, and verify on the next cycle. A
+   worker that could fill in its own acceptance could point it at anybody's
+   already-green pull request, which is exactly why the claim and the condition
+   are separate fields.
+
+   **A `human_approval` item is verified by asking.** The evaluator answers `pending` for it forever, so put the decision to the user with `ask_question`. The call BLOCKS until the user responds and returns the answers as its tool result, so your turn does not end and no later patrol cycle has to pick the answer up: read the result and record the verdict in the same turn. The card waits up to 30 minutes; if the result says it expired, was dismissed, or that the user replied in chat instead, act on that outcome (re-ask, or read their next message) rather than inventing an answer.
+
+   A result saying the card was withdrawn (dashboard restarted, tab reset) is not an answer: re-issue it.
+4. `work_ledger_record` `action=close` with the item's `state` when an item is
+   finally done with — that is what ends it. **Closing the item and closing
+   its session happen together.** When a work item reaches a terminal verdict
+   (accepted, rejected, abandoned/void) and its loop is stopped,
+   `session_close` that child session in the same cycle — a finished worker
+   has nothing left to re-arm. `session_close` archives (reopenable); it never
+   deletes. Never close a child that still has a pending human question or an
+   unmerged PR it is actively driving. **Closing an item cuts its worker's
+   report channel**: from then on its `work_report` is refused `item_closed`,
+   and it cannot `session_send` to you. The close reply warns when that
+   worker's session is still open. If the worker still has work for you,
+   `create` a new item and `bind` it to the SAME session, then `session_send`
+   it the new item's goal; its `work_brief` and `work_report` resolve to the
+   new item. A session holds one open item at a time, so binding one whose
+   item is still open is refused `worker_already_dispatched`. `action=decide` records an
+   instruction you want the worker to read out of `work_brief`; it is the ONE
+   field the worker treats as an instruction, so keep it to a decision.
+5. `session_read_message` for detail the record does not carry — a question's
+   substance, a stall's shape. Never for a verdict, and never as the routine
+   cycle read: the ledger is that.
+6. **Say nothing unless there is a real signal.** An item passing acceptance,
+   failing it, asking a question, or stalling. Never post "nothing changed":
+   a cycle with no signal ends with a `nothing_to_do` call, because a turn
+   that stops bare after its tool calls keeps the empty-response recovery.
+
+**Shell exists for the two bundled scripts, not for work.** `execute_bash` is
+granted so patrol can run `accept_eval.py` and `patrol_budget.py`. Running a work item's build, test, or fix
+yourself through it is the boundary violation this skill exists to prevent — if
+you need a command run to MAKE something true, that is a work item; the evaluator
+only CHECKS what is already true.
 
 ### Close the round
 
@@ -248,29 +496,65 @@ original plan did not have. Re-planning mid-round is not: let the round finish.
 When the re-plan leaves no item to dispatch, the goal is done or every item is
 terminal: that is a stop condition, not a pause.
 
-**Rounds are not gated, but spend is bounded.** The item cap is no longer
-yours to count: it is durable state on the conductor header, and the STORE
-enforces it (LOOP-18). `work_ledger_read` compact shows `item_budget` and
-`created_total` beside each other, so `items used: N of B` reads straight off
-the board and a compaction cannot make you lose count.
+**Rounds are not gated, but spend is bounded.** A cap on parallel work, an
+advisory line on the total and a no-progress check replace the old per-round
+pause. Count all three from `work_ledger_read`, not from memory, and read the item
+total from its `conductor.goal_items_used`, not by counting `items`:
 
-- **Item cap.** When the user set no budget of their own, a goal may hold at
-  most **20 ledger items** in total — every round's items, re-plans included;
-  the store refuses a create past it with `item_budget_exceeded` and nothing is
-  written. On that refusal do not retry the create: dispatch nothing new, keep
-  patrolling what is in flight, and ask the user with `ask_question` whether to
-  raise the budget. A budget the user set replaces the default (set it with
-  `work_ledger_record action=goal item_budget=<n>` when the user approves), and
-  a Round-0 plan the user approved with more than 20 items sets the budget to
-  that plan's size the same way. Structural caps still stand behind the budget:
-  32 open items at once and 256 stored over the board's life.
+- **Concurrency cap.** When the user set no bound of their own, a goal may hold
+  at most **6 ledger items open at once**. The ledger enforces it: a `create`
+  past the cap is refused with `goal_concurrency_cap_reached`. That refusal is
+  about how much runs in parallel, never about the total: keep patrolling what
+  is in flight and dispatch the next item when one lands. Ask the user with
+  `ask_question` only when you want more running at once than the cap allows;
+  when they agree, raise it with `work_ledger_record` `action=goal`
+  `concurrency_cap=<N>`. A bound the user set, or a Round-0 plan the user
+  approved with more than 6 parallel items, sets `concurrency_cap` the same way
+  before the first `create`.
+- **Item cap (advisory).** A goal is expected to hold at most **20 ledger
+  items** in total — every round's items, re-plans included (`item_cap`, set
+  with `action=goal` `item_cap=<N>`). Nothing is refused past it. Read
+  `goal_items_used` and `cap_exceeded` off `work_ledger_read`'s `conductor`
+  block and put `items used: N of <item_cap>` in every round report; when
+  `cap_exceeded` is true, say so in that report so the user can decide whether
+  the goal is spending more than they meant, then carry on. Only a goal the
+  user replaced starts a new count: record it with `action=goal`
+  `new_goal=true`. Rewording the goal keeps the count.
 - **No progress.** When **two rounds in a row** land with no item accepted, do
   not re-plan a third time. Ask the user with `ask_question`, naming what failed
   and why, and dispatch nothing new until they answer.
 
-Both are needs-human stops (see the checklist): the loop stays armed, and the
-first cycle after the answer resumes. Put `items used: N of 20` in every round
-report.
+The no-progress check is a needs-human stop (see the checklist): pause and
+ask, do not stop the loop. It stays armed, and the first cycle after the answer
+resumes. A concurrency refusal is not a stop at all — the next landing frees a
+seat.
+
+**Then drop your chat.** Every patrol turn re-sends your whole conversation,
+and a conductor that runs for days pays for it on every quiet cycle. Your state
+already lives in the two ledgers, and each wake carries their snapshot. So once
+the next round is dispatched, end that same turn with two calls, in order:
+
+1. `session_ledger_record` with everything the next turn needs:
+   - `goal` — the goal, one line;
+   - `next` — the round number, and for each open item its item id, its
+     worker key and its PR number (or "no PR yet");
+   - `patrol_base` — unchanged from Patrol (`cycles=<C> runtime=<R>`).
+
+   Check the item ids, worker keys and PRs against a fresh `work_ledger_read`,
+   not against memory: the work ledger is the record, `next` is the pointer.
+2. `reset_conversation`, as the last call of the turn. It lands at the turn
+   boundary; the next wake starts from the ledger snapshot alone.
+
+Never reset when:
+
+- a question to the user is unanswered — the answer would arrive in a chat
+  that no longer holds the question;
+- the round is still running — reset only at a round close;
+- the session ledger write failed — the reset would drop the only copy.
+
+The gateway refuses a reset from a loop it cannot vouch for, or while a
+question card or tool approval is pending. A refused reset changes nothing:
+carry on in the same chat and try again at the next round close.
 
 ### Goal changes mid-flight
 
@@ -280,8 +564,20 @@ finished work.
 
 One exception: if their message directly invalidates an item that is still
 running, deal with that item now — `session_stop` it and `close` its ledger item,
-or `session_send` the correction straight into it. Do not tear down the whole
-round for one item.
+or `session_send` the correction straight into it with `steer: true`. Do not
+tear down the whole round for one item.
+
+**Steer corrections, queue everything else.** A plain `session_send` to a busy
+worker waits for its current turn to end, so a correction sent that way arrives
+only after the worker has spent the whole turn — a build, a long investigation —
+going the wrong way. Pass `steer: true` for a correction, a changed direction,
+or "stop, that is already done": it lands in the running turn, and when the
+worker is idle or mid-turn injection is unavailable it starts or queues a turn
+exactly like a plain send, so it is never dropped. Leave `steer` off for answers
+to a `question`, seeds, and anything that can wait for the turn boundary.
+A steer does not withdraw what is already queued: if `session_read_message`
+reports a non-zero `queue_depth`, those messages still run after the turn, so
+say in the steered message which earlier instruction it supersedes.
 
 ## When a conductor dispatched you
 
@@ -308,13 +604,15 @@ So the worker contract applies to you on top of everything in this skill:
   every item in your own ledger is accepted — put the evidence in `artifacts`
   and the pull request, if the acceptance names one, in `pr`.
 - **`work_brief` never prompts; `work_report` does, on purpose.** The read only
-  touches your own bound item, so it is granted like the two ledger verbs — your
+  touches your own bound item, so it is granted like the ledger verbs — your
   first call as a nested conductor runs unattended. The report writes into your
   parent's record across a dispatch relationship, so it prompts. Reporting at
   round boundaries keeps that to a handful of approvals per goal.
 
-Depth is capped at 2, so your own children may be workers only — a
-`depth_exceeded` on `create` means flatten, not retry.
+Depth is capped at 2 by default (`work_ledger.max_depth`), so your own children
+may be workers only unless `work_ledger_read` shows a larger `max_depth` than
+your `depth` plus one — a `depth_exceeded` on a child's first `goal` or `create`
+means flatten, not retry.
 
 ## Stop conditions
 
@@ -332,8 +630,11 @@ These cases look like stops but are handled while the loop keeps going:
   `rejected` and report it. The `fails` counter you record with
   `action=verdict` is what survives compaction and feeds this.
 - **A decision seems to need a person.** Run the needs-human checklist below.
-- **The item cap or the no-progress check fires** (Close the round). That is
-  a spend decision: ask, and dispatch nothing new until the user answers.
+- **The no-progress check fires** (Close the round). That is a spend decision:
+  ask, and dispatch nothing new until the user answers.
+- **A `create` is refused `goal_concurrency_cap_reached`** (Close the round).
+  Too much is running at once, not too much spent: dispatch the next item when
+  one lands, and ask only if you want a higher cap.
 
 ### Needs-human checklist
 
@@ -341,7 +642,8 @@ Run it before you ask, and run it again on every cycle while the ask is open —
 the item may no longer need it. The risk check comes FIRST: a default never
 settles a risky choice. A `human_approval` item skips steps 1 and 2: its
 acceptance IS a person's answer, so it is always asked (step 3 still parks it
-alone).
+alone). So does a `pending_overdue` item: its budget exists to put it to a
+person.
 
 1. **Is it credentials, spend, deleting or overwriting someone's work, or
    irreversible?** Then do not pick a default for it, even if one exists. If
@@ -369,11 +671,15 @@ work.
 
 Two records, and confusing them is the mistake this section exists to prevent.
 
-**The work ledger** (`work_ledger_read` / `work_ledger_record`) holds the items:
+**The work ledger** (`work_ledger_read` / `work_ledger_record`, with
+`work_ledger_rebuild` for recovery) holds the items:
 each one's `title`, `acceptance`, `round`, your `decision`, the worker's reported
 `status` and `summary`, its claimed `artifacts` and `pr`, your recorded `verdict`
 and `fails`, and its `state`. It is keyed to your session, it survives
 compaction, and it is the only place an item's acceptance condition lives.
+The ledger files are a cache of the crew log: when a ledger call is refused with
+`cache_dirty`, or the ledger reads as damaged or missing, run
+`work_ledger_rebuild` (no arguments) to rebuild it from that record.
 
 **Your own session ledger** (`session_ledger_read` / `session_ledger_record`)
 holds YOUR state, and nothing about individual items:
@@ -418,5 +724,98 @@ what the composer renders:
 
 ## Known limits of this version
 
-Among them: a question card can be displaced by your own later turns, the session and ledger tools may not be in your tool list yet, and anything that touches another session prompts. Read [`references/known-limits.md`](references/known-limits.md#known-limits-of-this-version) before you rely on a tool, a question card or a cron dispatch, and state a limit rather than work around it.
-
+- **A question card holds your turn open.** `ask_question` blocks until the user responds, so nothing else runs in this session meanwhile; keep patrol work out of the turn that asks, and ask only when the goal genuinely cannot advance without the answer.
+- **The session and ledger tools may not be in your tool list yet.** With MCP
+  Tool Search active their specs are deferred, so a first `session_create` fails
+  with `A tool with the name 'session_create' does not exist`. That means
+  DEFERRED, not missing: load it with
+  `tool_search(tool_id="kirocrew-dashboard::session_create")` — `tool_search` is
+  auto-approved for exactly this, so the load never prompts — then repeat the
+  call. `chat_folder_create` is on the same server; `monitor_start` is served by
+  `kirocrew-core` (`kirocrew-core::monitor_start`); the three ledger verbs are
+  `kirocrew-work::work_ledger_read`, `kirocrew-work::work_ledger_record` and
+  `kirocrew-work::work_ledger_rebuild`.
+- **`work_brief` and `work_report` answer `not_bound` to a ROOT conductor.**
+  They are the worker half of the same server, and with no parent there is
+  nothing for them to read. A second-level ledger conductor IS bound as a worker
+  to its own parent, so for it they answer — `work_brief` without a prompt,
+  `work_report` through the approval gate. See "When a conductor dispatched you"
+  for what to report and when.
+- **A `question` costs a human click.** Answering means `session_send`, which
+  prompts by design. So you cannot answer a worker's question unattended, and a
+  question-heavy goal is that much less autonomous. Plan for it rather than
+  waiting on an approval nobody is there to give.
+- **A cron job may dispatch into the sessions it created**, so a fleet can be
+  stood up and driven from a schedule instead of only from a live chat session.
+  Session control is on by default: the agent config is the grant.
+- **Never dispatch a work item onto a conductor spec expecting it to write** —
+  neither `kirocrew-conductor` nor this agent can write a file, so such an item
+  would look stalled rather than misconfigured. Dispatch a conductor only when
+  the item genuinely decomposes.
+- **The grant is the agent's MCP mount, not a feature switch.** The session tools
+  come from `@kirocrew-dashboard` and the ledger tools from `@kirocrew-work`; an
+  agent whose spec does not mount one never sees it. `agent.session_control`
+  defaults to true and exists only as a single withdrawal — if an operator set it
+  to `false`, every session tool answers `session_control_disabled`. If you see
+  that error, say which switch to flip; do not retry.
+- **Reads and creates do not prompt; anything that touches another session does.**
+  Auto-approved by name: `chat_folder_tree`, `chat_folder_create`,
+  `chat_folder_file_self` (it writes only your own placement),
+  `session_create`, `session_read_message`, `session_status`,
+  `work_ledger_read`, `work_ledger_record`, `work_ledger_rebuild`, `work_brief`
+  — so a patrol cycle that wakes on a nudge with nobody at
+  the keyboard never blocks, and filing rides the create itself (the `folder`
+  argument), so it costs no extra approval. The `@kirocrew-core` verbs are
+  granted by name too, and only these: `monitor_start`, `monitor_update`,
+  `autonudge_stop`, `wait`, `resource_status`, `list_sessions`,
+  `session_ledger_read`, `session_ledger_record`, `skill_search`, `skill_fetch`,
+  `select_crew`, `send_message`, `send_notification`, `ask_question`,
+  `nothing_to_do`, `reset_conversation`. That covers
+  every core call this procedure asks you to make; **any other core tool is
+  mounted but prompts**, including `task_run`, `workflow_run` and the `spawn_*`
+  family, which this charter forbids you to route a work item to in the first
+  place. **`session_send` and `session_stop` are deliberately NOT
+  auto-approved**, because each writes to a session that is not yours: a seed
+  runs as the target's own turn, and a stop discards the target's in-flight work.
+  You ingest external content by design, so the prompt is the only call-time
+  check on both. Expect one approval per item at dispatch (the seed), one per
+  question you answer, and one if you ever stop an item. `session_close` sits on
+  the same footing — it writes to a session that is not yours, even though it
+  archives rather than deletes — so budget one approval per child you close out.
+  `execute_bash` also still prompts, so **each patrol cycle that verifies
+  anything blocks on one approval for the `accept_eval.py` invocation**. Size
+  the nudge interval for that, and batch. `patrol_budget.py` prompts the same
+  way, which is why it runs once at arm time and then only on
+  `10% or less left` cycles. On a host with a governance ceiling
+  even the granted verbs prompt; if you see approvals where this says you
+  should not, that is why.
+- **`session_send` reports delivery, not completion.** `started: true` means the
+  target began a turn on your message; `started: false` means it queued. Neither
+  says the work succeeded — acceptance is still the evaluator's job.
+- **A worker's `summary` is text you read, and the only bound on it is its cap.**
+  It is 500 characters of agent-authored prose, separated by design from every
+  field you decide on. Decide from `verdict`, `status` and the evaluator; read
+  `summary` for context. A conductor that decides from prose is misbehaving
+  against this skill, and no store can prevent that.
+- **An orphaned item keeps accumulating writes.** `orphaned` is derived at read
+  time by asking whether your slot still exists, so it self-heals if the session
+  is reopened, and the worker's binding stays valid meanwhile. Its reports simply
+  go unread until someone takes the item over or stops it.
+- **Some targets are out of bounds by design.** Incognito/temporary sessions,
+  app-scoped sessions, channel-linked or mirrored sessions,
+  and sessions in another workspace are all refused by the shared guard. Plan
+  work items onto plain persistent dashboard sessions only.
+- **Shell is for the two bundled scripts only, and the evaluator runs no
+  command you name.** `execute_bash` exists so patrol can run `accept_eval.py`
+  and `patrol_budget.py`; every call is
+  audit-logged and every call prompts. The evaluator accepts **no command, argv
+  array, or shell string from a spec** — it builds every argv it runs from a
+  fixed template, so `pr_checks` becomes `gh pr checks <n>`, `pr_merged`
+  becomes `gh pr view <n> --repo <owner/name> --json state`, and nothing else
+  executes. That is deliberate and load-bearing: this script is invoked as an
+  approved wrapper, so a spec that could name a command would turn it into a
+  general way to run one, and Kiro Crew's denied-command floor cannot see inside
+  it (the floor reads the `execute_bash` string, which says
+  `python3 accept_eval.py`). Widening happens by adding a purpose-built kind that
+  constructs its own argv — never by accepting one. A `refused` verdict is a spec
+  to re-express, never a list to route around.

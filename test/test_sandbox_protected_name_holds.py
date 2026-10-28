@@ -284,12 +284,12 @@ class TestLeafOnlyPopulationIsRecorded:
     #: home it protects (the two ``$HOME``-joined ``_CREW_HOME_PREFIXES`` plus
     #: the resolved ``config_dir()`` when it is a third place, as the relocated
     #: ``KIROCREW_HOME`` the conftest pins always is), so one new root-level
-    #: leaf is three entries in every tier. Six landed after the first
+    #: leaf is three entries in every tier. Seven landed after the first
     #: measurement, all at the data-home root, whose parent no stand-in can
     #: hold, so leaf-only is the only hold available to them:
     #:
     #: * ``credential_redaction.json`` -- the owner's credential-redaction
-    #:   switch, on the same read-only floor as ``file_delivery_consent.json``;
+    #:   switch, on the same read-only floor as ``aws_service_consent.json``;
     #: * ``auth-store-staging`` -- the masked directory the two gateway auth
     #:   stores publish through, so the temp holding a full signing key or
     #:   refresh-chain state is never listable from inside the namespace;
@@ -308,6 +308,8 @@ class TestLeafOnlyPopulationIsRecorded:
     #:   member-store admission. A forged file would admit a session to a peer
     #:   member's private memory, so it sits at the root, masked, rather than
     #:   under the sandbox read-write ``trust/``. Leaf-only for the same reason.
+    #: * ``pinned-order`` -- the person's pinned-session order, person-only by
+    #:   route, masked so an agent cannot rewrite it on disk.
     #:
     #: One more root-level leaf landed since, three more entries per tier:
     #:
@@ -321,7 +323,77 @@ class TestLeafOnlyPopulationIsRecorded:
     #: launch fingerprints; ``mcp/resolved`` holds executables substituted for an
     #: approved launch. Each sits beside writable siblings, so no parent stand-in
     #: can hold it.
-    EXPECTED: dict[str, int] = {"standard": 265, "cc": 272, "strict": 273}
+    #:
+    #: One more root-level leaf, three more entries per tier:
+    #:
+    #: * ``gateway_id`` -- the id the Remote Crew cycle guard compares, sealed
+    #:   read-only so an agent cannot choose whether a chaining loop is detected.
+    #:   The spawn mints it before sealing and it never changes after that, so no
+    #:   later host-side replace lands on the bound name.
+    #: * ``microvm_crews.json`` -- the microvm lane's crew records. Each row
+    #:   carries the ``microvm_id`` that ``teardown`` hands to
+    #:   ``launcher.terminate``, with no tag to disagree with it and no
+    #:   describe-and-confirm step in front of it, so a writable copy lets a
+    #:   sandboxed process choose which of the owner's VMs the next delete
+    #:   destroys. It sits at the data-home root beside ``cloud.json`` and
+    #:   ``cloud_launch_state.json``, which the gateway writes and which the root
+    #:   itself must stay writable for, so no enclosing directory mask can hold
+    #:   it and leaf-only is the only hold available -- the same reason those two
+    #:   are leaf-only.
+    #:
+    #: One entry per tier for the secret vault at a relocated data home. The
+    #: tier lists hold ``.vault`` only at the two ``$HOME``-joined spellings,
+    #: so the resolved ``config_dir()`` spelling is a third, leaf-only name,
+    #: the same hold ``kas`` gets there.
+    #:
+    #: ``models`` holds downloaded weights and the speech decoder, sealed read-only
+    #: so a sandboxed shell cannot swap the bytes between a loader's digest check
+    #: and its reopen. A data-home root leaf, three entries per tier, held by its
+    #: own name for the same reason as the root leaves above.
+    #:
+    #: ``skill-projection`` holds the skill projection's side files: the ownership
+    #: sidecars and view ledger a stored ``kirocrew-skill-view-*`` name is mapped
+    #: back through to the agent a resumed conversation runs as, plus its leases and
+    #: lock. Sealed read-only so a sandboxed shell cannot forge that mapping (the
+    #: agents tree it moved out of was already sealed). A data-home root leaf,
+    #: three entries per tier, leaf-only for the same reason as the root leaves above.
+    #:
+    #: One more root-level directory, three entries per tier:
+    #:
+    #: * ``engines`` -- the KAS engine bundles ``kirocrew kas install`` lays down
+    #:   (``acp/kas_bundle.py``), sealed read-only like ``playwright-cli`` so a
+    #:   sandboxed session cannot rewrite the engine code and Node runtime its
+    #:   next session runs. At the data-home root beside writable siblings, so
+    #:   leaf-only is the only hold available.
+    #:
+    #: One more root-level directory, three entries per tier:
+    #:
+    #: * ``seed-provenance`` -- the settings-seed record, moved out of the root-level
+    #:   ``settings_seeds.json`` file into its own directory so the gateway's
+    #:   ``atomic_write`` of the record renames INSIDE the sealed name rather than
+    #:   over it. That is the move this module asks for: the directory's own inode
+    #:   stays the same on a republish. It sits at the data-home root beside
+    #:   writable siblings, so it is counted leaf-only like ``skill-projection``.
+    #: * ``app-agent-launch`` -- the empty directory kiro-cli runs an app agent's
+    #:   launch copy from (``apps.agent_launch.launch_process_cwd``), sealed read-only
+    #:   so no sandboxed writer can plant the spec kiro-cli reads there. At the
+    #:   data-home root beside writable siblings, so leaf-only is the only hold.
+    #:   Three more entries per tier.
+    #:
+    #: One more root-level directory, three entries per tier:
+    #:
+    #: * ``member-records`` -- each crewmate's permanent rules, goals and DM
+    #:   binding, which the gateway writes on a person's action. Masked at the
+    #:   data-home root beside ``crew-teams`` rather than under the sandbox
+    #:   read-write ``trust/``, so leaf-only for the same reason.
+    #:
+    #: One more root-level directory, three entries per tier:
+    #:
+    #: * ``web-push`` -- the Web Push VAPID key and device subscription secrets
+    #:   (``notifications/push_store.py``), masked as a whole directory so the
+    #:   ``atomic_write`` temps they publish through are hidden too. At the data-home
+    #:   root beside writable siblings, so leaf-only is the only hold.
+    EXPECTED: dict[str, int] = {"standard": 296, "cc": 303, "strict": 304}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:

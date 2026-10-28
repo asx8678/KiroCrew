@@ -57,7 +57,7 @@ _VENDORED_LLAMA = (
 def _make_recording_llama_class(dim: int = embeddings_mod._DEFAULT_DIM):
     """Fake Llama class that records the kwargs its constructor was handed.
 
-    Mirrors ``_make_fake_llama_class`` in test/test_embeddings.py: it never loads
+    Mirrors ``_make_fake_llama_class`` in test/embeddings_helpers.py: it never loads
     a real model and returns a fixed-width embedding for ``create_embedding``.
     """
 
@@ -87,8 +87,13 @@ def _load_embedder(tmp_path: pathlib.Path, monkeypatch):
     monkeypatch.setattr("kiro_crew.embeddings._load_llama_class", lambda: fake_cls)
     model = _write_model_file(tmp_path / "model.gguf")
     emb = LlamaCppEmbedder(model_path=model)
-    assert emb.wait_ready(timeout=5), "fake model failed to load"
-    assert fake_cls.instances, "Llama constructor was never called"
+    try:
+        assert emb.wait_ready(timeout=5), "fake model failed to load"
+        assert fake_cls.instances, "Llama constructor was never called"
+    finally:
+        # Only the constructor's kwargs are read, so the loaded model (and the idle
+        # evictor a published model starts) ends here rather than with the worker.
+        emb.close()
     return fake_cls.instances[0].kwargs
 
 
@@ -123,6 +128,22 @@ def test_embedder_keeps_the_full_logical_batch(tmp_path: pathlib.Path, monkeypat
     # n_ubatch is a separate, already-tuned lever and stays below n_batch.
     assert kwargs["n_ubatch"] == embeddings_mod._N_UBATCH
     assert kwargs["n_ubatch"] < kwargs["n_batch"]
+
+
+def test_shipped_decoder_micro_batch_is_128(tmp_path: pathlib.Path, monkeypatch) -> None:
+    """The shipped model decodes in 256-token micro-batches, with the full window kept.
+
+    A literal on purpose: the value is a measured choice, not a derived one. On the
+    shipped Qwen3 file and the vendored Linux CPU runtime, 256 and 512 gave
+    byte-identical vectors over short queries, transcript, code and CJK inputs up
+    to the clipped maximum, alone and packed eight to a call, and 256 held 317 MiB
+    less anonymous memory after a long input at the same latency. Raising it gives
+    that memory back; lowering it further changes the micro-batch shapes stored
+    vectors were made with, which needs the same real-model proof again
+    (``test_embed_bounded_decode.py::TestRealModel``).
+    """
+    kwargs = _load_embedder(tmp_path, monkeypatch)
+    assert (kwargs["n_ctx"], kwargs["n_batch"], kwargs["n_ubatch"]) == (2048, 2048, 128)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -517,7 +517,11 @@ class TestLayering:
     #: ``kiro_crew.slack`` transitively, so a RUNTIME import of either -- at any
     #: nesting depth -- is the ``messaging -> slack`` edge in disguise. Typing-only
     #: imports under ``if TYPE_CHECKING:`` are the sanctioned way to name them.
-    _DUCK_TYPED_SERVICES = ("kiro_crew.subagent", "kiro_crew.taskrunner")
+    _DUCK_TYPED_SERVICES = (
+        "kiro_crew.subagent",
+        "kiro_crew.taskrunner",
+        "kiro_crew.taskrunner_parts",
+    )
 
     def test_the_duck_typed_services_are_never_imported_at_runtime(self) -> None:
         """A deferred in-function import is still an edge: the channel ``spawn``
@@ -697,6 +701,17 @@ class TestSpawn:
         assert reply.startswith("⚠️ Subagent `r2` was not started: waiting for memory")
 
     @pytest.mark.asyncio
+    async def test_a_spawn_stopped_before_it_started_is_not_announced(self) -> None:
+        """Stopped while it waited: queued, done and user-stopped with no error.
+        Nothing runs, so the reply must not announce a start."""
+        manager = MagicMock(max_concurrent=2)
+        manager.spawn.return_value = SimpleNamespace(
+            id="s1", queued=True, done=True, user_stopped=True, error=""
+        )
+        reply = await spawn_task_reply("do it", manager) or ""
+        assert reply == "⚠️ Subagent `s1` was stopped before it started; nothing ran."
+
+    @pytest.mark.asyncio
     async def test_an_empty_argument_declines(self) -> None:
         assert await spawn_task_reply("", MagicMock()) is None
         assert await spawn_command_reply("spawn    ", MagicMock()) is None
@@ -856,6 +871,21 @@ class TestCron:
 
 
 class TestTaskRunner:
+    @pytest.mark.asyncio
+    async def test_a_disabled_task_runner_app_refuses_the_start(self, tmp_path: Any) -> None:
+        spec = tmp_path / "plan.yaml"
+        spec.write_text("steps: []", encoding="utf-8")
+        runner = MagicMock(running=False)
+        runner.start_background = AsyncMock()
+        with patch(
+            "kiro_crew.apps.manager._read_installed",
+            return_value=SimpleNamespace(enabled=False),
+        ) as read:
+            out = await task_command_reply(f"task run {spec}", runner) or ""
+        assert "Task Runner is disabled" in out
+        read.assert_called_once_with("projects")
+        runner.start_background.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_project_run_is_accepted_as_an_alias(self, tmp_path: Any) -> None:
         spec = tmp_path / "plan.yaml"

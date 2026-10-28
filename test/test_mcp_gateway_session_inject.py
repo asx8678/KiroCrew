@@ -20,7 +20,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 import pytest
@@ -32,6 +31,7 @@ from kiro_crew.mcp_gateway.session_servers import (
     injection_server_names,
     pooled_session_servers,
 )
+from kiro_crew.testing.wait import wait_until
 
 
 def _stub(**over):
@@ -82,6 +82,19 @@ def test_unpooled_server_env_is_never_transmitted(tmp_path):
     )
     assert pooled_session_servers(overlay, "kirocrew") == []
     assert "s3cr3t" not in json.dumps(pooled_session_servers(overlay, "kirocrew"))
+
+
+@pytest.mark.parametrize("vendor", ["creds-agent", "local-creds-agent-mcp"])
+def test_a_stale_overlay_never_injects_a_credential_vendor(tmp_path, vendor):
+    """An overlay written before the vendors joined ``UNPOOLABLE_SERVERS`` (or kept
+    by a failed regeneration) can still hold a vendor's stub. Injecting it would
+    run the vendor's shared backend outside the chat sandbox, so the reader skips
+    it and the session resolves the vendor from its agent spec instead. The
+    vendor is left out of ``injection_server_names`` too, or the spec's own copy
+    would be withheld and the session would get no vendor at all."""
+    overlay = _write_overlay(tmp_path, "kirocrew", {vendor: _stub(), "pooled": _stub()})
+    assert [e["name"] for e in pooled_session_servers(overlay, "kirocrew")] == ["pooled"]
+    assert injection_server_names(overlay, "kirocrew") == frozenset({"pooled"})
 
 
 def test_stub_name_is_preserved_so_it_shadows_the_spec_entry(tmp_path):
@@ -541,7 +554,7 @@ def test_every_call_site_passes_the_session_checkout():
     whether the scope reached it. Covers the ``asyncio.to_thread(fn, ...)`` form,
     which is how four of the sites call these. A keyword carrying a DEAD value is
     invisible here by construction, which is what the client-seam test in
-    ``test_acp_session_mcp.py`` covers instead.
+    ``test_acp_session_mcp_client_seam.py`` covers instead.
     """
     import ast
 
@@ -866,15 +879,15 @@ def test_real_kiro_cli_prefers_session_injected_server():
             timeout=180,
             check=False,
         )
-        deadline = time.time() + 5
-        while time.time() < deadline and not (root / "marks" / "INJECTED").exists():
-            time.sleep(0.2)
-        assert (root / "marks" / "INJECTED").exists(), (
-            "session/new-injected server never launched — ACP injection is not "
-            "taking effect at all; pooling cannot work through this channel\n"
-            f"driver exit: {result.returncode}\n"
-            f"driver stdout: {result.stdout[-2000:]}\n"
-            f"driver stderr: {result.stderr[-2000:]}"
+        wait_until(
+            (root / "marks" / "INJECTED").exists,
+            describe=lambda: (
+                "session/new-injected server never launched — ACP injection is not "
+                "taking effect at all; pooling cannot work through this channel\n"
+                f"driver exit: {result.returncode}\n"
+                f"driver stdout: {result.stdout[-2000:]}\n"
+                f"driver stderr: {result.stderr[-2000:]}"
+            ),
         )
         assert not (root / "marks" / "FROM_SPEC").exists(), (
             "the agent spec's same-named server ALSO launched: session/new "

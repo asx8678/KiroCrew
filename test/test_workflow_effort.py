@@ -79,9 +79,9 @@ def test_the_pool_identity_includes_the_effort() -> None:
     """Two steps with different efforts must land on two distinct sub-pool
     identity keys, so a warm worker built at one effort never serves a call
     that asked for another."""
-    from kiro_crew.workflows.agent_pool import build_pooled_agent_fn
-
     import asyncio
+
+    from kiro_crew.workflows.agent_pool import build_pooled_agent_fn
 
     sessions = _RecordingSessions()
     fn, pool = build_pooled_agent_fn(sessions, run_id="wf-eff3", max_workers=1)

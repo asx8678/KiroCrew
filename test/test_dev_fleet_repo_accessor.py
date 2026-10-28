@@ -35,10 +35,16 @@ from kiro_crew.apps.builtins.dev_fleet import (
     fleet_state,
     http_api,
     live,
+    live_leases,
+    live_plan,
+    live_service,
     repository,
     runtime,
     server,
     worktree_ops,
+    worktree_ops_pods,
+    worktree_ops_removal,
+    worktree_ops_sync,
 )
 
 # The accessor is the ONLY function whose body may read the bare global: it IS
@@ -50,8 +56,14 @@ _DEV_FLEET_MODULES = (
     runtime,
     repository,
     live,
+    live_leases,
+    live_service,
+    live_plan,
     fleet_state,
     worktree_ops,
+    worktree_ops_sync,
+    worktree_ops_pods,
+    worktree_ops_removal,
     http_api,
     server,
 )
@@ -129,7 +141,31 @@ def test_main_repo_loads_only_via_accessor_or_truthiness() -> None:
 
 def test_repo_accessor_raises_on_unresolved_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(repository, "MAIN_REPO", "")
+    monkeypatch.setattr(repository, "_REPO_CFG_UNREADABLE_MSG", None)
     with pytest.raises(repository.RepoNotConfigured):
+        repository._repo()
+
+
+def test_repo_accessor_surfaces_a_config_parse_failure_over_the_missing_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The config-parse message outranks the missing-checkout message.
+
+    When a config file is present but will not parse, Dev Fleet refuses to resolve a
+    checkout — the deliberate behaviour — so ``MAIN_REPO`` stays empty. A message
+    attached only to the resolved-but-invalid-path slot would never surface, because
+    ``_repo()`` tests ``MAIN_REPO`` for truthiness before it and would raise
+    ``RepoNotConfigured`` ("no Kiro Crew checkout found"), sending the operator to look
+    for a checkout that was never the problem. ``_REPO_CFG_UNREADABLE_MSG`` is checked
+    BEFORE that gate, so the operator is told which file failed to read or parse.
+    """
+    monkeypatch.setattr(repository, "MAIN_REPO", "")
+    monkeypatch.setattr(
+        repository,
+        "_REPO_CFG_UNREADABLE_MSG",
+        "config.local.json is present but could not be read or parsed",
+    )
+    with pytest.raises(repository.RepoUnreadable, match="config.local.json"):
         repository._repo()
 
 

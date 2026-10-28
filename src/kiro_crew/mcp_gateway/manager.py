@@ -33,7 +33,8 @@ from kiro_crew import platform_compat
 from kiro_crew.code_fingerprint import code_fingerprint, warm_code_fingerprint
 from kiro_crew.config.paths import config_dir
 from kiro_crew.env import mcp_runtime_path, resolve_krb5_ccname
-from kiro_crew.mcp_gateway import transport
+from kiro_crew.jsonl_util import rotate_jsonl_at
+from kiro_crew.mcp_gateway import backend_record, transport
 from kiro_crew.mcp_gateway.pool import READ_BUFFER_LIMIT_BYTES
 from kiro_crew.mcp_gateway.shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
 from kiro_crew.metrics.events import (
@@ -46,6 +47,9 @@ from kiro_crew.recovery.ladder import L4_GATEWAYD, LADDER, default_ladder
 from kiro_crew.sandbox import _SENSITIVE_ENV_PREFIXES as _SANDBOX_SENSITIVE_ENV_PREFIXES
 
 logger = logging.getLogger(__name__)
+
+# Size past which a gatewayd spawn moves ``mcp-gatewayd.stdout`` to ``.1``.
+_GATEWAYD_LOG_MAX_BYTES = 10 * 1024 * 1024
 
 # Max time to wait for the gateway's unix socket to appear after spawn.
 _SOCKET_READY_TIMEOUT_SECS = 5.0
@@ -158,7 +162,7 @@ _GATEWAYD_MODULE = "kiro_crew.mcp_gateway.gatewayd"
 # session.
 #
 # We deliberately do NOT scrub ``sandbox._AGENT_DENIED_ENV_KEYS``
-# (SLACK_BOT_TOKEN/APP/USER, KIROCREW_OWNER_ID). config/loader.py seeds those
+# (SLACK_BOT_TOKEN/APP/USER, KIROCREW_OWNER_ID). config/loader_config.py seeds those
 # into os.environ specifically so TRUSTED children — the gateway, its pooled
 # MCP backends, and cron — inherit them (a pooled slack-mcp needs its Slack
 # token). The sandbox strips those keys from the LLM *agent* subprocess via
@@ -636,8 +640,7 @@ class GatewayManager:
         # answer -- fingerprint warming, prewarm, socket setup -- so the fast
         # bound can time out against a daemon that is coming up correctly, and
         # killing it reports the start as failed and drops every stub to
-        # per-session exec, which is the process pile-up this change exists to
-        # avoid.
+        # per-session exec, a process pile-up.
         pong = await self._ping_with_escalation()
         if pong is None:
             logger.warning("mcp-gateway ping failed — treating start as failure")
@@ -761,6 +764,9 @@ class GatewayManager:
             log_path.parent.chmod(0o700)
         except OSError:
             pass
+        # Nothing else rotates this file and every spawn appends to it, so bound
+        # it here: past the cap it moves to ``.1`` and this spawn starts fresh.
+        await asyncio.to_thread(rotate_jsonl_at, log_path, _GATEWAYD_LOG_MAX_BYTES)
         # 0600 from creation: this log captures every pooled backend's
         # stdout/stderr, which routinely includes tokens / API keys in error
         # output — never world-readable on a multi-user host. fchmod also
@@ -1321,8 +1327,8 @@ class GatewayManager:
                     # evidence the escalation already provides. The owned path
                     # can afford its grace because its own socket stays bound
                     # while it waits, so waiting there costs nothing.
-                    # The load misverdict this change exists to fix is already
-                    # handled by the escalation: a daemon that answers either
+                    # A load misverdict is already handled by the escalation:
+                    # a daemon that answers either
                     # probe is alive and is never displaced.
                     pong = await self._ping_with_escalation(observe=True)
                     if pong is not None:
@@ -1590,10 +1596,10 @@ class GatewayManager:
         Not used by the one-shot assessment gates (start-up election, the
         post-respawn incumbent check) or by the public status probe. For the
         status probe that is deliberate: a UI poll is waiting on it. For the
-        assessment gates it is only a scope boundary — their miss path can
-        unlink a LIVE daemon's socket, because ``transport.probe_live`` reads a
-        saturated accept backlog as not-live. See the daemon-lifecycle spec;
-        that defect belongs to the endpoint lifecycle, not to this verdict.
+        assessment gates it is only a scope boundary: their miss path goes
+        through ``transport.remove_stale``, which leaves an endpoint that
+        ``transport.probe_live`` reports live in place. See the daemon-lifecycle
+        spec.
 
         Observability (``observe=True`` only): the escalation itself is the
         precursor state to every kill/reconnect cycle — the fast bound missed,
@@ -1678,31 +1684,13 @@ class GatewayManager:
 
     async def _reap_orphaned_backends(self) -> None:
         """Best-effort tree-kill of pooled backends left orphaned by a SIGKILLed
-        gatewayd, read from the ``<socket>.backends`` sidecar the daemon
-        maintains. Each recorded pid is a session leader (pid == pgid) on POSIX;
-        on Windows there is no process group (spawn's ``start_new_session`` is
-        inert there), so the recorded pid is treated as a tree root instead."""
-        pidfile = Path(f"{self._spec.socket_path}.backends")
-        try:
-            raw = pidfile.read_text(encoding="utf-8")
-        except OSError:
-            return
-        for token in raw.split():
-            try:
-                pid = int(token)
-            except ValueError:
-                continue
-            # platform_compat rather than os.killpg: that name is absent on
-            # Windows and the handler below would not catch the AttributeError.
-            # Async variant required — this is awaited from
-            # _terminate_process, and the Windows branch spawns taskkill with a
-            # 5s timeout once per recorded pid, which would stall the loop.
-            with contextlib.suppress(
-                ProcessLookupError, PermissionError, OSError, ValueError
-            ):
-                await platform_compat.kill_process_tree_async(pid, platform_compat.SIGKILL)
-        with contextlib.suppress(OSError):
-            pidfile.unlink()
+        gatewayd, read from the ``<socket>.backends`` record the daemon
+        maintains. Only entries whose start id still matches the live process
+        are signalled (:mod:`~kiro_crew.mcp_gateway.backend_record`)."""
+        await backend_record.reap(
+            backend_record.record_path(self._spec.socket_path),
+            reason="supervisor SIGKILLed a wedged gatewayd",
+        )
 
     async def _clear_stale_socket(self) -> None:
         """Remove an endpoint left behind by a prior crash.

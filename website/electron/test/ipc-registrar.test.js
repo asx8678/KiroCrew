@@ -31,9 +31,15 @@ const SHELL_HANDLES = [
   "browser:set-inactive",
   "browser:set-overlay",
   "browser:track-session",
+  "close-action:get",
+  "close-action:set",
   "crash-reports:get",
   "crash-reports:reveal",
+  "dashboard:can-pick-folder",
   "dashboard:open-file",
+  "dashboard:pick-folder",
+  "external-terminal:detect",
+  "external-terminal:open",
   "global-hotkey:get",
   "local-gateway:get",
   "local-gateway:set",
@@ -178,6 +184,7 @@ function harness({
   wslOwner = { fake: "wsl-owner" },
   wslGatewayLocal = true,
   primaryPortOwner = "kirocrew",
+  isCurrentBundleGateway = true,
   crashScan,
   revealThrows = false,
   openPathResult = "",
@@ -186,6 +193,12 @@ function harness({
   // process state that only holds for the duration of the native launch (the
   // narrowed launcher PATH openPathHardened installs and then restores).
   onOpenPath = null,
+  // What the fake native folder dialog answers: a value, or a function of the
+  // call's arguments so a test can hold the dialog open.
+  dialogResult = { canceled: true, filePaths: [] },
+  externalTerminal = undefined,
+  internalSecret = "",
+  getRequiredChannel = undefined,
   detectWsl = async () => ({
     available: true,
     distros: [],
@@ -195,12 +208,14 @@ function harness({
   const order = [];
   const shellCalls = [];
   const crashScans = [];
+  const secretReads = [];
   const windowCalls = [];
   const gatewayCalls = [];
   const appCalls = [];
   const notifications = [];
   const sentUpdates = [];
   const wslDetections = [];
+  const dialogCalls = [];
   const handlers = new Map();
   const listeners = new Map();
   const store = fakeStore(storeValues);
@@ -245,7 +260,13 @@ function harness({
       focus: (...args) => appCalls.push(["focus", ...args]),
       setBadgeCount: (...args) => appCalls.push(["setBadgeCount", ...args]),
     },
-    dialog: { fake: "dialog" },
+    dialog: {
+      fake: "dialog",
+      showOpenDialog: async (...args) => {
+        dialogCalls.push(args);
+        return typeof dialogResult === "function" ? dialogResult(...args) : dialogResult;
+      },
+    },
     Notification: FakeNotification,
     ipcMain,
     shell: {
@@ -309,6 +330,13 @@ function harness({
     diagnostics: {
       memorySample: recordWindow("diagnostics.memorySample"),
     },
+    closeAction: {
+      get: recordWindow("closeAction.get", "background"),
+      set: (...args) => {
+        windowCalls.push(["closeAction.set", ...args]);
+        return args[0] === "quit" ? "quit" : "background";
+      },
+    },
   };
   for (const name of [
     "open",
@@ -333,12 +361,16 @@ function harness({
     return result;
   };
   const gateway = {
-    stopGracefully: recordGateway("stopGracefully", Promise.resolve("stopped")),
+    stopForUpdate: recordGateway("stopForUpdate", Promise.resolve("stopped")),
     onInstallDispatched: recordGateway("onInstallDispatched"),
     onInstallFailed: recordGateway("onInstallFailed"),
     probePrimaryPortOwner: recordGateway(
       "probePrimaryPortOwner",
       Promise.resolve(primaryPortOwner),
+    ),
+    isCurrentBundleGateway: recordGateway(
+      "isCurrentBundleGateway",
+      Promise.resolve(isCurrentBundleGateway),
     ),
   };
   const logs = [];
@@ -360,6 +392,14 @@ function harness({
       return typeof crashScan === "function" ? crashScan() : crashScan;
     },
     glog: (line) => logs.push(line),
+    ...(externalTerminal ? { externalTerminal } : {}),
+    ...(getRequiredChannel ? { getRequiredChannel } : {}),
+    // Like main.js's readInternalSecret: the secret belongs to one gateway
+    // URL, so a read that names no URL gets nothing.
+    readInternalSecret: (gatewayUrl) => {
+      secretReads.push(gatewayUrl);
+      return gatewayUrl === backendUrl ? internalSecret : "";
+    },
   });
 
   return {
@@ -380,6 +420,8 @@ function harness({
     wslDetections,
     shellCalls,
     crashScans,
+    secretReads,
+    dialogCalls,
     logs,
   };
 }
@@ -454,13 +496,13 @@ test("registerShell owns the exact shell channel set and is idempotent", () => {
 
   assert.deepEqual([...h.handlers.keys()].sort(), SHELL_HANDLES);
   assert.deepEqual([...h.listeners.keys()].sort(), SHELL_LISTENERS);
-  assert.equal(h.handlers.size + h.listeners.size, 36);
+  assert.equal(h.handlers.size + h.listeners.size, 42);
 
   // boot-complete is a further non-update host channel, but it is deliberately
   // gateway-owned and scoped to a single connecting WebContents. Registering it
   // globally here would weaken its sender check and leak listeners.
   assert.match(GATEWAY_SOURCE, /ipcMain\.on\("boot-complete", onComplete\)/);
-  assert.equal(h.handlers.size + h.listeners.size + 1, 37);
+  assert.equal(h.handlers.size + h.listeners.size + 1, 43);
   assert.equal(h.handlers.has("boot-complete"), false);
   assert.equal(h.listeners.has("boot-complete"), false);
 
@@ -1034,6 +1076,277 @@ test("dashboard:open-file hardens the launcher PATH across the native launch", a
   }
 });
 
+// The native folder chooser for the project picker. Opening a dialog is an
+// action on the machine in front of the user, so both channels take the full
+// three-gate local-dashboard check; the availability probe answers `false`
+// where the pick itself would be refused, and neither ever reaches the dialog
+// from a rejected sender.
+const PICK_REJECTIONS = [
+  ["wrong origin", {}, "https://remote.example/chat"],
+  ["remote window", { wslOwner: { fake: "remote-window" }, wslGatewayLocal: false }, undefined],
+  ["foreign port owner", { primaryPortOwner: "foreign" }, undefined],
+  ["unknown port owner", { primaryPortOwner: "unknown" }, undefined],
+];
+
+test("dashboard:pick-folder is refused outside the local dashboard and opens no dialog", async () => {
+  for (const [label, options, url] of PICK_REJECTIONS) {
+    const h = harness({
+      ...options,
+      dialogResult: { canceled: false, filePaths: [path.resolve(os.tmpdir(), "never")] },
+    });
+    h.registrar.registerShell();
+    await assert.rejects(
+      () => h.handlers.get("dashboard:pick-folder")(wslEvent(url)),
+      (error) => {
+        assert.equal(
+          error && error.message,
+          "dashboard:pick-folder is restricted to the local dashboard",
+          label,
+        );
+        return true;
+      },
+    );
+    assert.equal(h.dialogCalls.length, 0, `${label}: a rejected sender must not open a dialog`);
+  }
+});
+
+test("dashboard:can-pick-folder answers false wherever the pick is refused", async () => {
+  for (const [label, options, url] of PICK_REJECTIONS) {
+    const h = harness(options);
+    h.registrar.registerShell();
+    assert.equal(await h.handlers.get("dashboard:can-pick-folder")(wslEvent(url)), false, label);
+    assert.equal(h.dialogCalls.length, 0, `${label}: the probe must never open a dialog`);
+  }
+});
+
+test("dashboard:can-pick-folder answers true on the local dashboard without opening a dialog", async () => {
+  for (const portOwner of ["kirocrew", "service"]) {
+    const h = harness({ primaryPortOwner: portOwner });
+    h.registrar.registerShell();
+    assert.equal(await h.handlers.get("dashboard:can-pick-folder")(wslEvent()), true, portOwner);
+    assert.equal(h.dialogCalls.length, 0);
+  }
+});
+
+test("dashboard:pick-folder returns null when the dialog yields no absolute folder", async () => {
+  for (const [label, dialogResult] of [
+    ["cancelled", { canceled: true, filePaths: [] }],
+    ["cancelled with a stale path", { canceled: true, filePaths: [path.resolve(os.tmpdir(), "x")] }],
+    ["no paths", { canceled: false, filePaths: [] }],
+    ["relative path", { canceled: false, filePaths: ["relative/dir"] }],
+    ["empty path", { canceled: false, filePaths: [""] }],
+    ["non-string path", { canceled: false, filePaths: [42] }],
+    ["malformed result", null],
+  ]) {
+    const h = harness({ dialogResult });
+    h.registrar.registerShell();
+    assert.equal(await h.handlers.get("dashboard:pick-folder")(wslEvent()), null, label);
+    assert.equal(h.dialogCalls.length, 1, `${label}: exactly one dialog`);
+  }
+});
+
+test("dashboard:pick-folder returns the chosen folder and ignores renderer-supplied options", async () => {
+  const chosen = path.resolve(os.tmpdir(), "picked-project");
+  const owner = { fake: "dashboard-window" };
+  const h = harness({ wslOwner: owner, dialogResult: { canceled: false, filePaths: [chosen] } });
+  h.registrar.registerShell();
+  const event = wslEvent();
+  const result = await h.handlers.get("dashboard:pick-folder")(
+    event,
+    { defaultPath: "/etc", properties: ["openFile", "multiSelections"], filters: [] },
+    "/root",
+  );
+  assert.equal(result, chosen);
+  // The dialog is parented to the sender's own window and takes ONLY the fixed
+  // options: the renderer chooses no default path, properties or filters.
+  assert.deepEqual(h.dialogCalls, [[owner, { properties: ["openDirectory"] }]]);
+  assert.deepEqual(
+    lastCall(h.windowCalls, "windowForWebContents").slice(1),
+    [event.sender],
+  );
+  assert.equal(
+    h.logs.some((line) => line.includes(chosen) || line.includes("picked-project")),
+    false,
+    "the chosen folder must never be logged",
+  );
+});
+
+test("dashboard:pick-folder opens one dialog at a time", async () => {
+  const chosen = path.resolve(os.tmpdir(), "first-pick");
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const h = harness({ dialogResult: () => pending });
+  h.registrar.registerShell();
+  const handler = h.handlers.get("dashboard:pick-folder");
+
+  const first = handler(wslEvent());
+  // The gate's port probe is asynchronous: wait until the first call has
+  // actually reached the dialog before asking again.
+  for (let hop = 0; hop < 50 && h.dialogCalls.length === 0; hop += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(h.dialogCalls.length, 1);
+  assert.equal(await handler(wslEvent()), null, "a second pick while one is open answers null");
+  assert.equal(h.dialogCalls.length, 1, "the second pick must not open another dialog");
+
+  release({ canceled: false, filePaths: [chosen] });
+  assert.equal(await first, chosen);
+
+  // Once the first dialog has settled, a new pick opens a new dialog.
+  await handler(wslEvent());
+  assert.equal(h.dialogCalls.length, 2);
+});
+
+test("dashboard:pick-folder rejects when the dialog fails to open, without naming a path", async () => {
+  const h = harness({
+    dialogResult: () => { throw new Error("dialog backend unavailable"); },
+  });
+  h.registrar.registerShell();
+  await assert.rejects(
+    () => h.handlers.get("dashboard:pick-folder")(wslEvent()),
+    (error) => {
+      assert.equal(error && error.message, "dashboard:pick-folder could not open the folder dialog");
+      return true;
+    },
+  );
+  assert.ok(
+    h.logs.some((line) => line === "dashboard:pick-folder failed: dialog backend unavailable"),
+    h.logs.join("\n"),
+  );
+  // The in-flight latch is released by a failure too.
+  h.electron.dialog.showOpenDialog = async () => ({ canceled: true, filePaths: [] });
+  assert.equal(await h.handlers.get("dashboard:pick-folder")(wslEvent()), null);
+});
+
+// ── external terminal ─────────────────────────────────────────────────────
+
+/** A stand-in for external-terminal.js that records what the registrar asks. */
+function fakeExternalTerminal({ installed = ["kitty", "wezterm"], launchResult = { ok: true, app: "kitty" } } = {}) {
+  const calls = [];
+  const labels = { kitty: "kitty", wezterm: "WezTerm" };
+  return {
+    calls,
+    detectTerminals: () => {
+      calls.push(["detect"]);
+      return installed.map((id) => ({ id, label: labels[id] || id }));
+    },
+    launchFromGrant: async (grant, deps) => {
+      calls.push(["launch", grant, deps]);
+      return launchResult;
+    },
+  };
+}
+
+const GRANT = "g".repeat(43);
+
+// The three ways a window fails the local-dashboard gate, each as harness
+// options plus the event it sends.
+const NOT_LOCAL_WINDOWS = [
+  // Wrong origin: a connection window pointed at a remote gateway.
+  ["a remote origin", {}, () => wslEvent("https://remote.example/chat")],
+  // Right origin but the window's gateway is remote (an SSH tunnel on loopback).
+  ["a remote gateway behind a tunnel", { wslGatewayLocal: false }, () => wslEvent()],
+  // The primary port is held by something other than this shell's gateway.
+  ["a foreign port holder", { primaryPortOwner: "foreign" }, () => wslEvent()],
+];
+
+test("external-terminal:open rejects a sender that is not the local dashboard", async () => {
+  for (const [why, opts, event] of NOT_LOCAL_WINDOWS) {
+    const ext = fakeExternalTerminal();
+    const h = harness({ externalTerminal: ext, ...opts });
+    h.registrar.registerShell();
+    await assert.rejects(
+      () => h.handlers.get("external-terminal:open")(event(), GRANT),
+      { message: "external-terminal:open is restricted to the local dashboard" },
+    );
+    assert.deepEqual(ext.calls, [], `${why}: a rejected sender reaches no launch`);
+  }
+});
+
+// A desktop window reaching a remote crew through an SSH tunnel reads as a
+// direct-local request to that crew, so the renderer does ask. The answer is
+// "not capable", not a rejection: a rejection reads as a failed check, whose
+// notice and Retry could never clear for that window.
+test("external-terminal:detect answers a window that is not the local dashboard as not capable", async () => {
+  for (const [why, opts, event] of NOT_LOCAL_WINDOWS) {
+    const ext = fakeExternalTerminal();
+    const h = harness({ externalTerminal: ext, ...opts });
+    h.registrar.registerShell();
+    assert.deepEqual(
+      await h.handlers.get("external-terminal:detect")(event()),
+      { apps: [], capable: false },
+      `${why}: answered as not capable`,
+    );
+    assert.deepEqual(ext.calls, [], `${why}: a refused window reaches no detection`);
+    assert.ok(
+      h.logs.some((line) => line.startsWith("external-terminal:detect rejected")),
+      `${why}: the refusal is still logged`,
+    );
+  }
+});
+
+test("external-terminal:detect lists the installed allowlisted apps only", async () => {
+  const h = harness({ externalTerminal: fakeExternalTerminal() });
+  h.registrar.registerShell();
+  assert.deepEqual(await h.handlers.get("external-terminal:detect")(wslEvent()), {
+    apps: [{ id: "kitty", label: "kitty" }, { id: "wezterm", label: "WezTerm" }],
+    capable: true,
+  });
+  assert.equal(h.store.writes.length, 0, "the pick lives in gateway config, not the shell's store");
+});
+
+test("external-terminal:detect still rejects when detection itself fails on a local window", async () => {
+  const ext = fakeExternalTerminal();
+  ext.detectTerminals = () => { throw new Error("probe failed"); };
+  const h = harness({ externalTerminal: ext });
+  h.registrar.registerShell();
+  await assert.rejects(() => h.handlers.get("external-terminal:detect")(wslEvent()), { message: "probe failed" });
+});
+
+test("external-terminal:open launches only through a gateway grant redeemed with the internal secret", async () => {
+  const ext = fakeExternalTerminal();
+  const h = harness({ externalTerminal: ext, internalSecret: "s3cret" });
+  h.registrar.registerShell();
+  // A second argument naming an app, a path or an argv is ignored: the renderer
+  // hands over the opaque grant and nothing else.
+  const result = await h.handlers.get("external-terminal:open")(wslEvent(), GRANT, "/bin/sh", ["-c", "x"]);
+  assert.deepEqual(result, { ok: true, app: "kitty" });
+  const launches = ext.calls.filter(([n]) => n === "launch");
+  assert.equal(launches.length, 1);
+  const [, grant, deps] = launches[0];
+  assert.equal(grant, GRANT);
+  assert.equal(deps.backendUrl, "http://localhost:5476", "redeemed at this shell's own gateway");
+  assert.equal(deps.getSecret(), "s3cret");
+  assert.equal(typeof deps.fetchFn, "function");
+  assert.equal(h.shellCalls.length, 0, "nothing reaches shell.openPath or any shell method");
+});
+
+test("external-terminal:open reads the internal secret for this shell's own gateway URL", async () => {
+  const ext = fakeExternalTerminal();
+  const h = harness({ externalTerminal: ext, internalSecret: "s3cret" });
+  h.registrar.registerShell();
+  await h.handlers.get("external-terminal:open")(wslEvent(), GRANT);
+  const [, , deps] = ext.calls.find(([n]) => n === "launch");
+  // redeemGrant calls getSecret() with no argument, so the registrar's
+  // getSecret must name the gateway URL itself.
+  assert.equal(deps.getSecret(), "s3cret");
+  assert.deepEqual(h.secretReads, ["http://localhost:5476"]);
+});
+
+test("external-terminal:open passes a refusal through for the renderer to fall back", async () => {
+  const ext = fakeExternalTerminal({ launchResult: { ok: false, error: "no-grant" } });
+  const h = harness({ externalTerminal: ext });
+  h.registrar.registerShell();
+  assert.deepEqual(
+    await h.handlers.get("external-terminal:open")(wslEvent(), GRANT),
+    { ok: false, error: "no-grant" },
+  );
+});
+
+test("the registrar's default external terminal is the real allowlist module", () => {
+  assert.match(SOURCE, /externalTerminal = require\("\.\/external-terminal"\)/);
+});
+
 test("bind and unregister remain owned by the dedicated hotkey helper", () => {
   const h = harness({ storeValues: { globalHotkey: "Ctrl+Alt+Test" } });
   const bound = h.registrar.bindGlobalHotkey();
@@ -1067,7 +1380,10 @@ test("registerUpdater owns six handlers and preserves lazy gateway hooks", async
 
   assert.strictEqual(h.registerUpdater(h.registrar), updater);
   assert.deepEqual([...h.handlers.keys()].sort(), UPDATE_HANDLES);
-  assert.equal(h.listeners.size, 0);
+  // One listener: update:notify-policy-governed (ipcMain.on, not ipcMain.handle).
+  assert.equal(h.listeners.size, 1);
+  assert.equal(h.listeners.has("update:notify-policy-governed"), true,
+    "registerUpdater must install the update:notify-policy-governed listener");
   assert.equal(initCalls, 1);
   assert.strictEqual(deps.app, h.electron.app);
   assert.strictEqual(deps.autoUpdater, h.updaterPackage.autoUpdater);
@@ -1082,13 +1398,13 @@ test("registerUpdater owns six handlers and preserves lazy gateway hooks", async
   deps.onInstallDispatched();
   deps.onInstallFailed();
   assert.deepEqual(h.gatewayCalls.map(([name]) => name), [
-    "stopGracefully",
+    "stopForUpdate",
     "onInstallDispatched",
     "onInstallFailed",
   ]);
 
   deps.onUpdateState({ phase: "available" });
-  assert.deepEqual(h.sentUpdates, [["update-state", { phase: "available" }]]);
+  assert.deepEqual(h.sentUpdates, [["update-state", { phase: "available", policyGoverned: false }]]);
 
   deps.notifyUpdateFound("3.0.0", { autoDownload: true });
   assert.equal(h.notifications.length, 1);
@@ -1100,11 +1416,101 @@ test("registerUpdater owns six handlers and preserves lazy gateway hooks", async
     version: "2.0.0",
     packaged: true,
     disabled: "test-disabled",
+    policyGoverned: false,
   });
   assert.deepEqual(h.handlers.get("update:check")(), { ok: true });
   assert.deepEqual(h.handlers.get("update:download")(), { ok: true });
   assert.deepEqual(await h.handlers.get("update:install")(), { ok: true });
   assert.deepEqual(updater.calls, ["check", "download", "install"]);
+
+  // The policy-governed listener wires isPolicyGoverned in initAutoUpdate.
+  // It must be a function (not a static boolean) so the lane re-checks each call.
+  assert.strictEqual(typeof deps.isPolicyGoverned, "function",
+    "isPolicyGoverned must be a live function, not a captured boolean");
+  assert.equal(deps.isPolicyGoverned(), false, "governance must start false");
+
+  // Build a minimal fake event that satisfies assertLocalDashboard's three gates.
+  // The harness's windows mock already returns true for isGatewayLocalForWindow
+  // and resolves "kirocrew" from probePrimaryPortOwner.
+  let nextId = 1;
+  const makeEvent = (url = "http://localhost:5476/") => {
+    const id = nextId++;
+    const destroyedListeners = [];
+    const sender = {
+      id,
+      getURL: () => url,
+      once: (event, fn) => { if (event === "destroyed") destroyedListeners.push(fn); },
+    };
+    return {
+      sender,
+      senderFrame: { url },
+      _destroy: () => destroyedListeners.forEach(fn => fn()),
+    };
+  };
+
+  // Basic set/clear from the same origin.
+  const ev1 = makeEvent();
+  await h.listeners.get("update:notify-policy-governed")(ev1, true);
+  assert.equal(deps.isPolicyGoverned(), true, "listener must update the closure");
+  await h.listeners.get("update:notify-policy-governed")(ev1, false);
+  assert.equal(deps.isPolicyGoverned(), false);
+
+  // A sender from a different origin must NOT set governance.
+  const evForeign = makeEvent("http://other-host:5476/");
+  await h.listeners.get("update:notify-policy-governed")(evForeign, true);
+  assert.equal(deps.isPolicyGoverned(), false, "foreign origin must not set governance");
+
+  // Destroying the source window must clear governance even without an explicit false.
+  const ev2 = makeEvent();
+  await h.listeners.get("update:notify-policy-governed")(ev2, true);
+  assert.equal(deps.isPolicyGoverned(), true, "governance set before destroy");
+  ev2._destroy();
+  assert.equal(deps.isPolicyGoverned(), false, "destroyed source window must clear governance");
+
+  // Multi-window: closing one window must NOT clear governance while another window
+  // is still governed. This is the bug where `governanceSourceId` was a single id.
+  const evA = makeEvent();
+  const evB = makeEvent();
+  await h.listeners.get("update:notify-policy-governed")(evA, true);
+  await h.listeners.get("update:notify-policy-governed")(evB, true);
+  assert.equal(deps.isPolicyGoverned(), true, "both windows governed");
+  evB._destroy(); // close the second window
+  assert.equal(deps.isPolicyGoverned(), true,
+    "closing one window must not clear governance while another remains governed");
+  evA._destroy(); // close the first window too
+  assert.equal(deps.isPolicyGoverned(), false, "governance clears when all windows close");
+
+  // Remote-gateway gate: a harness that simulates a non-kirocrew port owner
+  // (SSH tunnel holding the primary port) must reject governance via gate 3.
+  {
+    let remoteDeps;
+    const remoteUpdater = updaterHandle();
+    const hRemote = harness({
+      primaryPortOwner: "ssh-tunnel",
+      initAutoUpdate(options) { remoteDeps = options; return remoteUpdater; },
+    });
+    assert.strictEqual(hRemote.registerUpdater(hRemote.registrar), remoteUpdater);
+    const evRemote = makeEvent();
+    await hRemote.listeners.get("update:notify-policy-governed")(evRemote, true);
+    assert.equal(remoteDeps.isPolicyGoverned(), false,
+      "SSH tunnel on primary port must not set governance (gate 3 rejection)");
+  }
+
+  // Different-bundle gate: a harness that simulates a gateway from another
+  // desktop bundle (isCurrentBundleGateway = false) must reject governance.
+  {
+    let otherDeps;
+    const otherUpdater = updaterHandle();
+    const hOther = harness({
+      isCurrentBundleGateway: false,
+      initAutoUpdate(options) { otherDeps = options; return otherUpdater; },
+    });
+    assert.strictEqual(hOther.registerUpdater(hOther.registrar), otherUpdater);
+    const evOther = makeEvent();
+    await hOther.listeners.get("update:notify-policy-governed")(evOther, true);
+    assert.equal(otherDeps.isPolicyGoverned(), false,
+      "gateway from another desktop bundle must not set governance (gate 4 rejection)");
+  }
 
   assert.deepEqual(h.handlers.get("update:set-channel")({}, "nightly"), {
     ok: false,
@@ -1119,6 +1525,42 @@ test("registerUpdater owns six handlers and preserves lazy gateway hooks", async
   });
   assert.equal(h.handlers.get("update:set-auto-download")({}, false).ok, true);
   assert.equal(h.store.data.autoDownloadUpdates, false);
+});
+
+test("update:set-channel refuses while the policy requires a channel, and hands it to the updater", () => {
+  const updater = updaterHandle();
+  let deps;
+  const h = harness({
+    getRequiredChannel: () => "stable",
+    initAutoUpdate(options) {
+      deps = options;
+      return updater;
+    },
+  });
+  h.registerUpdater(h.registrar);
+  assert.equal(deps.getRequiredChannel(), "stable");
+  const answer = h.handlers.get("update:set-channel")({}, "insider");
+  assert.equal(answer.ok, false);
+  assert.equal(answer.code, "locked_by_policy");
+  assert.equal(h.store.data.updateChannel, undefined, "nothing is stored");
+  assert.deepEqual(updater.calls, [], "no check is started");
+  // Naming the required channel itself is accepted, as the backend accepts it.
+  assert.equal(h.handlers.get("update:set-channel")({}, "stable").ok, true);
+  assert.equal(h.store.data.updateChannel, "stable");
+});
+
+test("an oss build hands the updater no required channel and keeps the switcher", () => {
+  let deps;
+  const h = harness({
+    initAutoUpdate(options) {
+      deps = options;
+      return updaterHandle();
+    },
+  });
+  h.registerUpdater(h.registrar);
+  assert.equal(deps.getRequiredChannel(), "");
+  assert.equal(h.handlers.get("update:set-channel")({}, "insider").ok, true);
+  assert.equal(h.store.data.updateChannel, "insider");
 });
 
 test("updater initialization is fail-open and still installs all IPC", async () => {
@@ -1137,6 +1579,7 @@ test("updater initialization is fail-open and still installs all IPC", async () 
     version: "9.8.7",
     packaged: true,
     disabled: "init-failed",
+    policyGoverned: false,
   });
   assert.deepEqual(h.handlers.get("update:check")(), { ok: true });
   assert.deepEqual(h.handlers.get("update:download")(), { ok: true });
@@ -1207,4 +1650,108 @@ test("pane:clear-http-cache is gated to the local dashboard sender", async () =>
     /restricted to the local dashboard/,
   );
   assert.equal(purges.length, 0);
+});
+
+// ── close-action:get / close-action:set (#12204) ────────────────────────────
+//
+// The setting governs only the MAIN window's close button, so both channels
+// answer only that window's own top frame on its dashboard origin, including a
+// main window on a configured REMOTE gateway. Connection windows never do.
+
+const CLOSE_ACTION_CHANNELS = [
+  ["close-action:get", []],
+  ["close-action:set", ["quit"]],
+];
+const MAIN_WINDOW_ONLY = (channel) => ({
+  message: `${channel} is restricted to the main window's dashboard`,
+});
+
+// A harness whose main window is `main`, with the sender mapped to `owner`.
+function closeActionHarness({ mainBackendUrl = "http://localhost:5476", owner = "main", ...rest } = {}) {
+  const h = harness(rest);
+  const main = { fake: "main-window", _mcBackendUrl: mainBackendUrl };
+  const other = { fake: "connection-window", _mcBackendUrl: "http://localhost:6100" };
+  h.windows.getMainWindow = () => main;
+  h.windows.windowForWebContents = () => (owner === "main" ? main : owner === "other" ? other : null);
+  h.registrar.registerShell();
+  return h;
+}
+
+// A top-frame sender on `url`.
+function mainFrameEvent(url = "http://localhost:5476/settings") {
+  const frame = { url };
+  return { sender: { id: "main-view", mainFrame: frame }, senderFrame: frame };
+}
+
+function assertCloseActionRefused(h, channel) {
+  assert.equal(
+    h.windowCalls.some(([name]) => name.startsWith("closeAction.")),
+    false,
+    `${channel}: a refused sender must not read or write the setting`,
+  );
+}
+
+test("close-action channels answer the main window's dashboard, including on a remote gateway", async () => {
+  for (const [mainBackendUrl, wslGatewayLocal, primaryPortOwner] of [
+    ["http://localhost:5476", true, "kirocrew"],
+    // A main window connected to a configured remote host through a tunnel:
+    // the three-gate check would refuse it, this one must not.
+    ["http://localhost:5476", false, "foreign"],
+  ]) {
+    const h = closeActionHarness({ mainBackendUrl, wslGatewayLocal, primaryPortOwner });
+    const url = `${mainBackendUrl}/settings`;
+    assert.equal(await h.handlers.get("close-action:get")(mainFrameEvent(url)), "background");
+    assert.equal(await h.handlers.get("close-action:set")(mainFrameEvent(url), "quit"), "quit");
+    assert.deepEqual(lastCall(h.windowCalls, "closeAction.set"), ["closeAction.set", "quit"]);
+    // The registrar never writes the store itself: the window facade does.
+    assert.equal(h.store.writes.some(([key]) => key === "closeAction"), false);
+  }
+});
+
+test("close-action channels refuse every sender that is not the main window", async () => {
+  for (const [channel, args] of CLOSE_ACTION_CHANNELS) {
+    for (const owner of ["other", null]) {
+      const h = closeActionHarness({ owner });
+      await assert.rejects(() => h.handlers.get(channel)(mainFrameEvent(), ...args), MAIN_WINDOW_ONLY(channel));
+      assertCloseActionRefused(h, channel);
+    }
+  }
+});
+
+test("close-action channels refuse a subframe of the main window", async () => {
+  for (const [channel, args] of CLOSE_ACTION_CHANNELS) {
+    const h = closeActionHarness();
+    const event = mainFrameEvent();
+    event.senderFrame = { url: "http://localhost:5476/embedded" }; // not sender.mainFrame
+    await assert.rejects(() => h.handlers.get(channel)(event, ...args), MAIN_WINDOW_ONLY(channel));
+    assertCloseActionRefused(h, channel);
+  }
+});
+
+test("close-action channels refuse a main window navigated off its dashboard", async () => {
+  for (const [channel, args] of CLOSE_ACTION_CHANNELS) {
+    for (const url of ["https://remote.example/settings", "http://localhost:6100/settings", "about:blank", ""]) {
+      const h = closeActionHarness();
+      await assert.rejects(() => h.handlers.get(channel)(mainFrameEvent(url), ...args), MAIN_WINDOW_ONLY(channel));
+      assertCloseActionRefused(h, channel);
+    }
+  }
+});
+
+test("close-action channels refuse when there is no main window", async () => {
+  for (const [channel, args] of CLOSE_ACTION_CHANNELS) {
+    const h = closeActionHarness();
+    h.windows.getMainWindow = () => null;
+    await assert.rejects(() => h.handlers.get(channel)(mainFrameEvent(), ...args), MAIN_WINDOW_ONLY(channel));
+    assertCloseActionRefused(h, channel);
+  }
+});
+
+test("close-action channels never run the port-owner probe", async () => {
+  const h = closeActionHarness();
+  let probes = 0;
+  h.gateway.probePrimaryPortOwner = () => { probes += 1; return Promise.resolve("kirocrew"); };
+  await h.handlers.get("close-action:get")(mainFrameEvent());
+  await h.handlers.get("close-action:set")(mainFrameEvent(), "quit");
+  assert.equal(probes, 0, "the check is synchronous so no write waits on a probe");
 });

@@ -59,6 +59,7 @@ class TestGuestViewCarriesNoSteering:
         self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         specs = _projection_specs(tmp_path, monkeypatch)
+
         def steered(name: str) -> bool:
             return any(
                 "steering" in str(r) or "AGENTS.md" in str(r)

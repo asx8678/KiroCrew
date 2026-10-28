@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import logging
 import re
-import time
 from urllib.parse import urlparse
 
 from aiohttp import web
@@ -27,9 +26,9 @@ _LINK_SUMMARY_PROMPT = (
     "- Output one label per line, in the same order as the input\n"
     "- Each line should be ONLY the label text, nothing else\n"
     "- Be concise: 'Memory V2 Design Doc' not 'A document about the Memory V2 design'\n"
-    "- For CRs: include the feature name, e.g. 'Nav panel link labels CR'\n"
-    "- For tickets: include the topic, e.g. 'OmniScan Cognex deployment'\n"
-    "- If context is insufficient, use the URL type + ID as label, e.g. 'Doc dVbcAXW3'\n\n"
+    "- For pull requests: include the feature name, e.g. 'Nav panel link labels PR'\n"
+    "- For issues: include the topic, e.g. 'Login timeout on mobile'\n"
+    "- If context is insufficient, use the URL type + ID as label, e.g. 'Issue 1234'\n\n"
     "{items}"
 )
 
@@ -59,21 +58,50 @@ def _normalize_link(raw: object) -> dict[str, str]:
     }
 
 
+#: Most characters of a link's url and context the label prompt reads. The in-flight
+#: key and the shared call are built from the same cut (``_bounded_link``), so
+#: nothing they hold grows with the request.
+_LINK_URL_MAX = 500
+_LINK_CONTEXT_MAX = 300
+
+
+def _bounded_link(link: dict) -> dict[str, str]:
+    """The part of ``link`` the label prompt reads: its url and context, cut to their limits.
+
+    Idempotent, so a link it already bounded comes back unchanged: the context is
+    stripped before and after the cut.
+    """
+    return {
+        "url": link.get("url", "")[:_LINK_URL_MAX],
+        "context": link.get("context", "").strip()[:_LINK_CONTEXT_MAX].rstrip(),
+    }
+
+
 def _build_link_summary_prompt(links: list[dict]) -> str:
     """Build prompt for batch link summary generation."""
     items: list[str] = []
     for i, link in enumerate(links):
-        url = _safe_url_for_prompt(link.get("url", "")[:500])
-        ctx = link.get("context", "").strip()[:300]
+        bounded = _bounded_link(link)
+        url = _safe_url_for_prompt(bounded["url"])
+        ctx = bounded["context"]
         ctx_part = f"\n  Context: {ctx}" if ctx else ""
         items.append(f"{i + 1}. URL: {url}{ctx_part}")
     return _LINK_SUMMARY_PROMPT.format(items="\n".join(items))
 
 
-# No model is passed: the one-liner inherits the background session's spec
-# model, which honors an operator's agent.role_models.background pin (a
-# hardcoded id is not governance-aware and 400s on accounts/partitions that do
-# not serve it; the old literal "auto" OVERRODE the pin at the wire).
+# "auto" = inherit the session's governed default (run_bg_oneliner skips the
+# override for auto). A hardcoded model id 400s on accounts/partitions that do
+# not serve it.
+_LINK_SUMMARY_MODEL = "auto"
+#: Bound on one link-label call: the same 30 s the folder icon and folder
+#: suggestion one-liners use.
+_LINK_SUMMARY_TIMEOUT_SECS = 30.0
+#: Link-label calls running now, keyed by their bounded links (``_bounded_link``), so
+#: an identical request awaits the running call instead of starting another. An
+#: entry is removed when its call ends; at most ``_LINK_SUMMARY_INFLIGHT_MAX``
+#: distinct link sets run at once, and a request past that is answered without labels.
+_LINK_SUMMARY_INFLIGHT: dict[tuple[tuple[str, str], ...], asyncio.Task[list[str]]] = {}
+_LINK_SUMMARY_INFLIGHT_MAX = 8
 
 #: Unspaced-script ceiling for the prose guard on a 3-8 word label. The prompt
 #: teaches no character budget (the title's "~4-14 characters" hint is not sent
@@ -105,54 +133,46 @@ _PREAMBLE_RE = re.compile(
 )
 
 
-_LABEL_CACHE: dict[str, tuple[float, str]] = {}
-_LABEL_TTL_SECS = 24 * 60 * 60
-#: An empty label (the model narrated or refused) is cached too, for a shorter
-#: time: otherwise every later batch that carries the same link re-asks the
-#: model for it, and a link the model will not label is re-billed each time.
-_EMPTY_LABEL_TTL_SECS = 60 * 60
-_LABEL_CACHE_MAX = 256
-#: Output ceiling for one labelling call (20 links x 80-char labels is ~1.6 KB).
-_LINK_LABELS_MAX_OUTPUT_BYTES = 8 * 1024
+async def _shared_link_summaries(state: DashboardState, links: list[dict]) -> list[str]:
+    """Labels for ``links``, sharing one running call among identical requests.
 
+    The key and the call's input are the bounded links (``_bounded_link``), the
+    fields the prompt reads, so an entry holds at most ``_LINK_URL_MAX +
+    _LINK_CONTEXT_MAX`` characters per link however long the request's strings are.
+    Labels are positional, so each waiter's labels line up with its own links. The
+    call is shielded, so a request that goes away does not cancel it for the others.
+    Its entry leaves ``_LINK_SUMMARY_INFLIGHT`` when it ends, however it ends.
+    """
+    bounded = [_bounded_link(link) for link in links]
+    key = tuple((link["url"], link["context"]) for link in bounded)
+    task = _LINK_SUMMARY_INFLIGHT.get(key)
+    if task is None:
+        if len(_LINK_SUMMARY_INFLIGHT) >= _LINK_SUMMARY_INFLIGHT_MAX:
+            raise RuntimeError("too many link-label calls in flight")
+        task = asyncio.ensure_future(_resolve_link_summaries(state, bounded))
+        _LINK_SUMMARY_INFLIGHT[key] = task
 
-def _label_key(url: str, context: str) -> str:
-    bare = url.split("?", 1)[0]
-    return hashlib.sha256(f"{bare}\n{context}".encode()).hexdigest()
+        def _forget(done: asyncio.Task[list[str]]) -> None:
+            if _LINK_SUMMARY_INFLIGHT.get(key) is done:
+                del _LINK_SUMMARY_INFLIGHT[key]
 
-
-def _cached_label(url: str, context: str) -> str | None:
-    hit = _LABEL_CACHE.get(_label_key(url, context))
-    if hit is None:
-        return None
-    ttl = _LABEL_TTL_SECS if hit[1] else _EMPTY_LABEL_TTL_SECS
-    if time.time() - hit[0] > ttl:
-        return None
-    return hit[1]
-
-
-def _store_label(url: str, context: str, label: str) -> None:
-    if len(_LABEL_CACHE) >= _LABEL_CACHE_MAX:
-        _LABEL_CACHE.clear()
-    _LABEL_CACHE[_label_key(url, context)] = (time.time(), label)
+        task.add_done_callback(_forget)
+    return list(await asyncio.shield(task))
 
 
 async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> list[str]:
     """Generate summaries for a batch of links using the background session."""
-    missing = [link for link in links if _cached_label(str(link.get("url") or ""), str(link.get("context") or "")) is None]
-    fresh: list[str] = []
-    text = ""
-    if missing:
-        prompt = _build_link_summary_prompt(missing)
-        text = await run_bg_oneliner(
-            # No model: inherit the pinned background spec model.
-            state.sessions,
-            prompt,
-            sel_source="chat_nav",
-            # At most 20 labels of <=80 chars each: anything far past that is a
-            # runaway reply, stopped instead of paid for (the caller fails soft).
-            max_output_bytes=_LINK_LABELS_MAX_OUTPUT_BYTES,
-        )
+    prompt = _build_link_summary_prompt(links)
+    # Link labeling is a trivial classification task — run on the session's
+    # governed default model (``_LINK_SUMMARY_MODEL`` is "auto") via the shared
+    # background one-liner helper (denials are SEL-logged).
+    text = await run_bg_oneliner(
+        state.sessions,
+        prompt,
+        model=_LINK_SUMMARY_MODEL,
+        sel_source="chat_nav",
+        timeout=_LINK_SUMMARY_TIMEOUT_SECS,
+    )
 
     # Parse: one label per line. The frontend merges the reply POSITIONALLY
     # (label i -> link i), so alignment matters as much as content.
@@ -181,10 +201,8 @@ async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> l
         ln, redacted_cred = redact_credentials(ln)
         if redacted_url or redacted_cred:
             sel().log_tool_invocation(
-                session_key=BACKGROUND_KEY,
-                tool_name="llm_output_redaction",
-                source="chat_nav",
-                outcome="redacted",
+                session_key=BACKGROUND_KEY, tool_name="llm_output_redaction",
+                source="chat_nav", outcome="redacted",
                 metadata={"redacted_url": bool(redacted_url), "redacted_cred": bool(redacted_cred)},
             )
         if looks_like_prose(ln, max_unspaced_chars=_LINK_LABEL_MAX_UNSPACED_CHARS):
@@ -202,25 +220,7 @@ async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> l
             results.append("")
             continue
         results.append(ln[:80])
-    fresh = results
-    if len(missing) == len(links):
-        for link, label in zip(missing, fresh):
-            _store_label(str(link.get("url") or ""), str(link.get("context") or ""), label)
-        return fresh
-    out: list[str] = []
-    fresh_i = 0
-    for link in links:
-        url = str(link.get("url") or "")
-        context = str(link.get("context") or "")
-        cached = _cached_label(url, context)
-        if cached is not None:
-            out.append(cached)
-            continue
-        label = fresh[fresh_i] if fresh_i < len(fresh) else ""
-        fresh_i += 1
-        _store_label(url, context, label)
-        out.append(label)
-    return out
+    return results
 
 
 async def api_chat_nav_resolve_links(request: web.Request) -> web.Response:
@@ -248,7 +248,7 @@ async def api_chat_nav_resolve_links(request: web.Request) -> web.Response:
     links = [_normalize_link(x) for x in links[:20]]
 
     try:
-        summaries = await _resolve_link_summaries(state, links)
+        summaries = await _shared_link_summaries(state, links)
     except Exception as exc:
         # Cosmetic link-label enrichment must never emit a 5xx: a resolver
         # failure (e.g. an LLM/provider error on the shared background session)
@@ -259,11 +259,8 @@ async def api_chat_nav_resolve_links(request: web.Request) -> web.Response:
         logger.warning("Link summary resolution failed: %s", type(exc).__name__, exc_info=True)
         try:
             sel().log_tool_invocation(
-                session_key=BACKGROUND_KEY,
-                tool_name="llm_link_summary",
-                source="chat_nav",
-                outcome="error",
-                error=type(exc).__name__,
+                session_key=BACKGROUND_KEY, tool_name="llm_link_summary",
+                source="chat_nav", outcome="error", error=type(exc).__name__,
             )
         except Exception:
             # Best-effort audit: a SEL emit failure must not defeat fail-soft.
@@ -274,4 +271,4 @@ async def api_chat_nav_resolve_links(request: web.Request) -> web.Response:
     while len(summaries) < len(links):
         summaries.append("")
 
-    return web.json_response({"summaries": summaries[: len(links)]})
+    return web.json_response({"summaries": summaries[:len(links)]})

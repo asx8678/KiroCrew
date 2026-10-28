@@ -13,8 +13,8 @@ from typing import Any
 
 import pytest
 
-from kiro_crew.apps.builtins.mochi.queue_file import write_queue_atomic
 from kiro_crew.apps.builtins.mochi.hooks import _PET_HIDDEN_GRACE_MS
+from kiro_crew.apps.builtins.mochi.queue_file import write_queue_atomic
 from kiro_crew.apps.builtins.mochi.queue_poller import QueuePoller
 
 

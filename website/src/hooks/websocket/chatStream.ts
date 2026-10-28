@@ -6,15 +6,22 @@ import { store, type AppDispatch } from '../../store'
 import { markSlotUnread } from '../../store/dashboardSlice'
 import { sseChatMessage, appendSlotMessage, setSlotStatusDetail, sseToolActivity, queueEntryQuote } from '../../store/chatSlice'
 import { dispatchMcNotification, APPROVAL_KIND, shouldChimeOnPermissionRow } from '../notificationEvent'
-import { chatMessageMarksUnread, unreadWatermarkTs } from '../unreadOnAttention'
+import { chatMessageMarksUnread, isMemberThreadSlot, memberThreadRowMarksUnread, noteMemberThreadRow, unreadWatermarkTs } from '../unreadOnAttention'
+import { isSlotMuted } from '../sessionMute'
+import { isTerminalErrorRow, noteTurnErrorRow, takeTurnErrored } from '../turnError'
 import { noteUnsavedRowTs } from '../../lib/slotReadRelay'
 import { emitThemeSound } from '../themeSound'
+import { isWindowAway } from '../windowAway'
+import { nativeNotificationPermitted, postNativeNotification } from '../../lib/nativeNotify'
+import { i18nT } from '../../i18n/t'
 import { isReconcileNote } from '../../lib/noteContract'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
 import { deriveToolCallTitle } from '../../utils/toolCallTitle'
+import { sessionDisplayTitle } from '../../utils/sessionDisplayTitle'
 import { attendArrival } from './attention'
 import { emitToolCall } from './browserEvents'
 import type { StreamBuffers } from './streamBuffers'
+import { batchedUnlessOpen } from '../../lib/streamBatch'
 import type { VoicePlayback } from './voicePlayback'
 import type { FrameData } from './frames'
 
@@ -37,13 +44,13 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
   return useMemo<ChatStream>(() => ({
     onChatMessage(data) {
       buffers.flushChunks()
-      dispatch(sseChatMessage(data))
+      dispatch(batchedUnlessOpen(data.slot, sseChatMessage(data)))
       // Approval-blocked chime for an INTERACTIVE chat. The chat runner
       // parks its turn on this `permission` row and emits no `approval`
       // frame for it (that frame is the coordinator registry's, and chimes
       // on its own), so this row is where the sound is synthesized — the
-      // `chat_done` / `question_card` layering: client-side, sound only,
-      // no feed row, no toast. The row is delivered once, so one frame is
+      // `chat_done` / `question_card` layering: client-side, no feed row,
+      // and the OS toast below rides the same gate. The row is delivered once, so one frame is
       // one sound; a row carrying `resolved` — the batch-rejection
       // re-append, or a turn with no budget left to wait, decided before
       // the append — and a reconnect replay stay silent. A Slack post
@@ -51,6 +58,28 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
       // `approval_resolved`; that arrival chime is the accepted residual.
       if (data.role === 'permission' && shouldChimeOnPermissionRow({ meta: data.meta, reconnecting: reconnectingRef.current })) {
         dispatchMcNotification(APPROVAL_KIND)
+        // The same row is the OS toast for a user away from the window: no
+        // feed note exists for it, so `useNativeNotification` never sees it.
+        // One toast per pending prompt (the tag names slot and request, so
+        // every window that receives the row collapses onto one banner),
+        // silent because WebAudio owns the sound, and only with the OS
+        // permission granted. Neither mute applies (the session's own per-row
+        // mute or its creator's): a prompt is the session waiting on the
+        // user, as for turn-done, so no `isSlotMuted` gate here.
+        if (data.slot && nativeNotificationPermitted() && isWindowAway()) {
+          // A session missing from the slot list keeps its key: its title is
+          // unknown, not absent.
+          const approvalSlot = store.getState().dashboard.slots.find(s => s.key === data.slot)
+          const slotTitle = approvalSlot ? sessionDisplayTitle(approvalSlot) : data.slot
+          const requestId = String(data.meta?.approval_id ?? data.ts ?? '')
+          // Session name as the title, status as the body: the chat-done
+          // toast's layout, so both banners from one chat read alike.
+          postNativeNotification(slotTitle, {
+            body: i18nT('hooks.useWebSocket.approval_waiting', { name: data.content || i18nT('hooks.useWebSocket.unknown') }),
+            silent: true,
+            tag: `kirocrew-approval:${data.slot}:${requestId}`,
+          })
+        }
       }
       // Re-rank the sidebar the instant a session sees a message, instead of waiting
       // for the next full slots push. `last_ts` moves for agent output too (it feeds
@@ -69,9 +98,28 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
       // relays later carry its ts explicitly (see noteUnsavedRowTs).
       if (data.slot && unreadWatermarkTs(data.role, data.ts) === undefined && data.ts) noteUnsavedRowTs(data.slot, data.ts)
       // The "only when done or waiting" opt-in leaves routine rows unbadged.
+      // A member DM thread badges only on a row the crewmate wrote to the
+      // user (`memberThreadRowMarksUnread`): its tool calls are its own work,
+      // not a message, so they must not light the Crewmates rail.
+      // Recorded whether or not the thread is on screen: the `chat_done`
+      // badge for a member thread asks "did this turn say anything", and a
+      // row the user watched arrive still counts as said.
+      if (data.slot && isMemberThreadSlot(data.slot, store.getState().dashboard.slots)) noteMemberThreadRow(data.slot, data.role, data.meta?.notice)
+      // Recorded on or off screen, like the member record: the turn's
+      // `chat_done` reads it to exempt a failed turn from the mute.
+      if (data.slot) noteTurnErrorRow(data.slot, data)
       attendArrival(data.slot, data.ts, reconnectingRef.current, slot => {
-        if (chatMessageMarksUnread(data.role)) {
-          dispatch(markSlotUnread({ slot, ts: unreadWatermarkTs(data.role, data.ts), localTs: data.ts || undefined }))
+        const slots = store.getState().dashboard.slots
+        const marks = isMemberThreadSlot(slot, slots)
+          ? memberThreadRowMarksUnread(data.role, data.meta?.notice)
+          : chatMessageMarksUnread(data.role, data.meta?.notice)
+        // Criterion 7: a muted session (per row or by its creator) never becomes
+        // unread from its own activity. This is the chat_message half of the
+        // two automatic markSlotUnread sites; turnCompletion.ts has the other.
+        // A terminal error row is exempt: the worker has stopped, and a
+        // silenced failure stalls it unseen just as a silenced approval would.
+        if (marks && (!isSlotMuted(slots, slot) || isTerminalErrorRow(data))) {
+          dispatch(batchedUnlessOpen(slot, markSlotUnread({ slot, ts: unreadWatermarkTs(data.role, data.ts), localTs: data.ts || undefined })))
         }
       })
       // Theme audio: an agent reply arriving is the `message-received`
@@ -85,7 +133,11 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
         voice.resetForNewTurn()
       }
       if (!isPassiveNote && data.slot && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) {
-        dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', ts: Date.now() }))
+        dispatch(batchedUnlessOpen(data.slot, setSlotStatusDetail({ slot: data.slot, kind: 'thinking' })))
+        // A new turn starts clean: an error row appended outside a turn (an
+        // archive that failed after cancelling the turn) has no chat_done of
+        // its own to take it, and must not break the mute on this turn.
+        takeTurnErrored(data.slot)
       }
     },
     onSteerPush(data) {
@@ -113,6 +165,9 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
       // which is keyed on `mid`, resolves this row -- without it that patch
       // matches nothing and the state never moves until a reload.
       const steerMid = (data as { mid?: unknown }).mid
+      // Whether this steer can be taken back while it waits (the gateway stamps it
+      // only where the harness can), so another tab draws the same controls.
+      const steerRetract = (data as { steerRetract?: unknown }).steerRetract === true
       const steerMeta = (data as { meta?: unknown }).meta
       const steerFiles = steerMeta && typeof steerMeta === 'object' ? (steerMeta as { files?: unknown }).files : undefined
       const steerDirs = steerMeta && typeof steerMeta === 'object' ? (steerMeta as { dirs?: unknown }).dirs : undefined
@@ -121,7 +176,7 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
       const steerQuote = queueEntryQuote(steerMeta).quote
       dispatch(appendSlotMessage({
         slot: (data as { slot?: string }).slot || store.getState().chat.activeSlot || '',
-        message: { role: 'user', content: (data as { content?: string }).content || '', cls: 'msg msg-u', meta: { steer: true, ...(typeof steerSid === 'string' && steerSid ? { sendId: steerSid } : {}), ...(typeof steerState === 'string' && steerState ? { steerState } : {}), ...(typeof steerMid === 'string' && steerMid ? { mid: steerMid } : {}), ...(Array.isArray(steerFiles) ? { files: steerFiles } : {}), ...(Array.isArray(steerDirs) ? { dirs: steerDirs } : {}), ...(steerQuote ? { quote: steerQuote } : {}) }, ts: (data as { ts?: string }).ts },
+        message: { role: 'user', content: (data as { content?: string }).content || '', cls: 'msg msg-u', meta: { steer: true, ...(typeof steerSid === 'string' && steerSid ? { sendId: steerSid } : {}), ...(typeof steerState === 'string' && steerState ? { steerState } : {}), ...(typeof steerMid === 'string' && steerMid ? { mid: steerMid } : {}), ...(steerRetract ? { steerRetract: true } : {}), ...(Array.isArray(steerFiles) ? { files: steerFiles } : {}), ...(Array.isArray(steerDirs) ? { dirs: steerDirs } : {}), ...(steerQuote ? { quote: steerQuote } : {}) }, ts: (data as { ts?: string }).ts },
       }))
       // Steering is the other way to type into a busy session, so it
       // settles the rank exactly like a queued send. The server appends a
@@ -140,11 +195,10 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
       // and recomputing the O(N) displayItems / index maps — on every token.
       const cs = data.slot
       if (cs) {
+        // The flush also moves the slot's status to `streaming` (see
+        // store/streamFlush.ts), so a chunk costs no dispatch of its own.
         const entry = buffers.bufferChunk(cs, data.seq, data.content ?? '', data.gen)
         if (!entry) return
-        if (store.getState().chat.slotStatusDetail[cs]?.kind !== 'streaming') {
-          dispatch(setSlotStatusDetail({ slot: cs, kind: 'streaming', ts: Date.now() }))
-        }
         buffers.drainOrScheduleChunks(entry)
       }
     },
@@ -155,25 +209,15 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
       // dispatch recomputes the O(N) displayItems on each.
       const thinkSlot = data.slot as string | undefined
       const thinkText = (data as { content?: string }).content || ''
+      // The flush moves the status to 'thinking' only on a genuine kind
+      // TRANSITION (from neither 'streaming' nor 'thinking'), so a long
+      // reasoning stream does not rewrite the entry, and with it the
+      // slotStatusDetail map identity, on every frame.
       if (thinkSlot && thinkText) buffers.bufferThinking(thinkSlot, thinkText)
-      // Dispatch the status detail only on a genuine kind TRANSITION into
-      // 'thinking'. Guarding merely on `!== 'streaming'` would not
-      // self-limit — 'thinking' is itself `!== 'streaming'`, so it would
-      // re-dispatch on EVERY thought frame with a fresh `ts`. Because
-      // setSlotStatusDetail replaces slotStatusDetail[slot] wholesale, that
-      // bumps the map identity per frame and re-renders every whole-map
-      // subscriber (ChatSidebar, CommandPalette) for the duration of the
-      // model's reasoning. The sibling chat_chunk guard writes 'streaming'
-      // and so is naturally idempotent; this is the same shape, made
-      // explicit.
-      const detailKind = data.slot ? store.getState().chat.slotStatusDetail[data.slot]?.kind : undefined
-      if (data.slot && detailKind !== 'streaming' && detailKind !== 'thinking') {
-        dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', ts: Date.now() }))
-      }
     },
     onToolCall(data) {
       emitToolCall(data)
-      dispatch(sseToolActivity({ ...data as { slot: string; tool: string; kind: string; purpose: string; input_preview: string; is_shell?: boolean; tool_name?: string; mcp_server?: string }, auto: (data as Record<string, unknown>).auto === true, tool_call_id: (data as Record<string, unknown>).tool_call_id as string | undefined, is_update: (data as Record<string, unknown>).is_update === true, is_shell: (data as Record<string, unknown>).is_shell === true }))
+      dispatch(batchedUnlessOpen(data.slot, sseToolActivity({ ...data as { slot: string; tool: string; kind: string; purpose: string; input_preview: string; is_shell?: boolean; tool_name?: string; mcp_server?: string }, auto: (data as Record<string, unknown>).auto === true, tool_call_id: (data as Record<string, unknown>).tool_call_id as string | undefined, is_update: (data as Record<string, unknown>).is_update === true, is_shell: (data as Record<string, unknown>).is_shell === true })))
       if (data.slot) {
         // A refinement (`is_update`) carries only the fields it refines,
         // so merge it into the live status the way sseToolActivity merges
@@ -218,11 +262,16 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
         // is not localized, is stored as a string.
         const derivedAction = derivedInfo.action
         const derivedTitle = derivedInfo.derived && !derivedAction ? sanitizeLlmOutput(derivedInfo.title) : ''
-        const prev = store.getState().chat.slotStatusDetail[data.slot]
+        // A buffered label or chunk since the tool call has moved the line
+        // off this tool, so a refinement then has nothing to merge into.
+        const prev = buffers.hasPendingStatus(data.slot) ? undefined : store.getState().chat.slotStatusDetail[data.slot]
         const mergeInto = isUpdate && tcid && prev?.kind === 'tool' && prev.toolCallId === tcid
           ? prev
           : undefined
-        dispatch(setSlotStatusDetail({
+        // This write is newer than everything buffered for the slot, even
+        // when it equals the stored entry and so leaves its identity alone.
+        buffers.supersedePendingStatus(data.slot)
+        dispatch(batchedUnlessOpen(data.slot, setSlotStatusDetail({
           slot: data.slot,
           kind: 'tool',
           purpose: purpose || mergeInto?.purpose || '',
@@ -234,8 +283,7 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
               ? { derivedAction: mergeInto.derivedAction, derivedMore: mergeInto.derivedMore || 0 }
               : {}),
           ...(tcid ? { toolCallId: tcid } : {}),
-          ts: Date.now(),
-        }))
+        })))
       }
       // Note: do NOT dispatch sseChatMessage here. The backend persists the
       // tool message via slot.append and broadcasts it as 'chat_message'.

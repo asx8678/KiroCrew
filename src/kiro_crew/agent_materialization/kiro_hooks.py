@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Sequence
+from contextvars import ContextVar
 from pathlib import Path
 
 from kiro_crew import agent as agent_mod
@@ -254,6 +255,12 @@ _KAS_TRIGGER_CANONICAL = {
 # ``PostFileSave``, ``PostFileDelete``, ``Manual``) have no kiro-cli event name, so
 # a document carrying one stays in Crew's stored spec and is left out of the
 # kiro-cli emission.
+#
+# plugin_import.AGENT_HOOK_EVENT_EQUIVALENT is the same map minus ``SessionStart``.
+# This map has it because ``agentSpawn`` is kiro-cli's name for that trigger. Plugin
+# import reports a source ``SessionStart`` as having no counterpart; whether it
+# should is an open maintainer question. test_plugin_import pins that one-row
+# difference.
 _KAS_TRIGGER_TO_EVENT = {
     "PreToolUse": "preToolUse",
     "PostToolUse": "postToolUse",
@@ -301,6 +308,27 @@ _KAS_DOCUMENT_FIELD_LIMITS: tuple[tuple[str, int], ...] = (
 )
 
 
+# Set only by :func:`unsent_hook_documents`, a read for the Hooks page. That read
+# validates the same field the install pass already validated and audited, so a
+# rejection it meets is one the audit trail holds already; logging and auditing it
+# again would add a line per page load for a single authored mistake.
+_document_audit_muted: ContextVar[bool] = ContextVar(
+    "kiro_hooks_document_audit_muted", default=False
+)
+
+
+def _document_warning(msg: str, *args: object) -> None:
+    """Warn about a rejected hook document, unless this is the Hooks-page read."""
+    if not _document_audit_muted.get():
+        agent_mod.logger.warning(msg, *args)
+
+
+def _document_rejected(event: str, value: str, reason: str) -> None:
+    """SEL-audit a rejected hook document, unless this is the Hooks-page read."""
+    if not _document_audit_muted.get():
+        agent_mod._sel_hook_rejected(event, value, reason)
+
+
 def _hook_matcher_ok(matcher: object) -> bool:
     """Whether a present ``matcher`` passes the object form's rules.
 
@@ -325,42 +353,42 @@ def _event_for_hook_trigger(trigger: object) -> str | None:
 def _hook_document_action(action: object, *, index: int) -> dict | None:
     """Validate a document's ``action``, returning the normalized copy or None."""
     if not isinstance(action, dict):
-        agent_mod.logger.warning("kiro_hooks[%d]: action is not an object, skipping", index)
-        agent_mod._sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, str(action), "action is not an object")
+        _document_warning("kiro_hooks[%d]: action is not an object, skipping", index)
+        _document_rejected(_HOOK_SPEC_AUDIT_TAG, str(action), "action is not an object")
         return None
     action_type = action.get("type")
     # The membership test runs against a frozenset, so an unhashable value
     # (a list, a dict) would raise out of a normalizer whose contract is to
     # warn and skip. Screen the type first.
     if not isinstance(action_type, str) or action_type not in _KAS_ACTION_TYPES:
-        agent_mod.logger.warning(
+        _document_warning(
             "kiro_hooks[%d]: unknown action type %s, skipping",
             index,
             agent_mod._hook_diagnostic(action_type),
         )
-        agent_mod._sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, str(action_type), "unknown action type")
+        _document_rejected(_HOOK_SPEC_AUDIT_TAG, str(action_type), "unknown action type")
         return None
     payload_key = "command" if action_type == "command" else "prompt"
     payload = action.get(payload_key)
     if not isinstance(payload, str) or not payload:
-        agent_mod.logger.warning(
+        _document_warning(
             "kiro_hooks[%d]: %s action needs a non-empty %s, skipping",
             index,
             action_type,
             payload_key,
         )
-        agent_mod._sel_hook_rejected(
+        _document_rejected(
             _HOOK_SPEC_AUDIT_TAG, str(payload), f"{action_type} action without {payload_key}"
         )
         return None
     if len(payload) > _MAX_HOOK_PAYLOAD_LEN:
-        agent_mod.logger.warning(
+        _document_warning(
             "kiro_hooks[%d]: %s is longer than %d characters, skipping",
             index,
             payload_key,
             _MAX_HOOK_PAYLOAD_LEN,
         )
-        agent_mod._sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, payload, f"{payload_key} too long")
+        _document_rejected(_HOOK_SPEC_AUDIT_TAG, payload, f"{payload_key} too long")
         return None
     return {"type": action_type, payload_key: payload}
 
@@ -368,10 +396,8 @@ def _hook_document_action(action: object, *, index: int) -> dict | None:
 def _hook_document_from_document(entry: object, *, index: int) -> dict | None:
     """Validate one KAS hook document, returning the normalized copy or None."""
     if not isinstance(entry, dict):
-        agent_mod.logger.warning("kiro_hooks[%d]: hook document is not an object, skipping", index)
-        agent_mod._sel_hook_rejected(
-            _HOOK_SPEC_AUDIT_TAG, str(entry), "hook document is not an object"
-        )
+        _document_warning("kiro_hooks[%d]: hook document is not an object, skipping", index)
+        _document_rejected(_HOOK_SPEC_AUDIT_TAG, str(entry), "hook document is not an object")
         return None
     # ``"matcher": null`` is how JSON spells an optional the author left out, so
     # a null reads as absent. Without this it is a present value of the wrong
@@ -382,22 +408,20 @@ def _hook_document_from_document(entry: object, *, index: int) -> dict | None:
         _KAS_TRIGGER_CANONICAL.get(trigger_raw.lower()) if isinstance(trigger_raw, str) else None
     )
     if trigger is None:
-        agent_mod.logger.warning(
+        _document_warning(
             "kiro_hooks[%d]: unknown trigger %s, skipping",
             index,
             agent_mod._hook_diagnostic(trigger_raw),
         )
-        agent_mod._sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, str(trigger_raw), "unknown trigger")
+        _document_rejected(_HOOK_SPEC_AUDIT_TAG, str(trigger_raw), "unknown trigger")
         return None
     action = _hook_document_action(entry.get("action"), index=index)
     if action is None:
         return None
     for field, expected in _KAS_DOCUMENT_FIELD_TYPES:
         if field in entry and not isinstance(entry[field], expected):
-            agent_mod.logger.warning(
-                "kiro_hooks[%d]: %s has the wrong type, skipping", index, field
-            )
-            agent_mod._sel_hook_rejected(
+            _document_warning("kiro_hooks[%d]: %s has the wrong type, skipping", index, field)
+            _document_rejected(
                 _HOOK_SPEC_AUDIT_TAG, str(entry.get(field)), f"{field} has the wrong type"
             )
             return None
@@ -406,33 +430,29 @@ def _hook_document_from_document(entry: object, *, index: int) -> dict | None:
         or isinstance(entry["timeout"], bool)
         or entry["timeout"] <= 0
     ):
-        agent_mod.logger.warning(
-            "kiro_hooks[%d]: timeout must be a positive integer, skipping", index
-        )
-        agent_mod._sel_hook_rejected(
+        _document_warning("kiro_hooks[%d]: timeout must be a positive integer, skipping", index)
+        _document_rejected(
             _HOOK_SPEC_AUDIT_TAG, str(entry.get("timeout")), "timeout not a positive integer"
         )
         return None
     for field, limit in _KAS_DOCUMENT_FIELD_LIMITS:
         value = entry.get(field)
         if isinstance(value, str) and len(value) > limit:
-            agent_mod.logger.warning(
+            _document_warning(
                 "kiro_hooks[%d]: %s is longer than %d characters, skipping", index, field, limit
             )
-            agent_mod._sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, value, f"{field} too long")
+            _document_rejected(_HOOK_SPEC_AUDIT_TAG, value, f"{field} too long")
             return None
     name = entry.get("name")
     if name is not None and not name:
-        agent_mod.logger.warning("kiro_hooks[%d]: name is empty, skipping", index)
-        agent_mod._sel_hook_rejected(_HOOK_SPEC_AUDIT_TAG, "", "name is empty")
+        _document_warning("kiro_hooks[%d]: name is empty, skipping", index)
+        _document_rejected(_HOOK_SPEC_AUDIT_TAG, "", "name is empty")
         return None
     if "matcher" in entry and not _hook_matcher_ok(entry["matcher"]):
-        agent_mod.logger.warning(
+        _document_warning(
             "kiro_hooks[%d]: matcher contains disallowed characters or is too long, skipping", index
         )
-        agent_mod._sel_hook_rejected(
-            _HOOK_SPEC_AUDIT_TAG, str(entry.get("matcher")), "invalid matcher"
-        )
+        _document_rejected(_HOOK_SPEC_AUDIT_TAG, str(entry.get("matcher")), "invalid matcher")
         return None
     doc: dict = {
         "name": name if isinstance(name, str) else f"{trigger}-{index}",
@@ -452,14 +472,12 @@ def _hook_document_from_document(entry: object, *, index: int) -> dict | None:
 def _hook_documents_from_array_form(hooks: list) -> list[dict]:
     """Normalize a KAS array of hook documents to the document list."""
     if len(hooks) > _MAX_SPEC_HOOK_DOCUMENTS:
-        agent_mod.logger.warning(
+        _document_warning(
             "kiro_hooks: %d documents exceeds the limit of %d, ignoring the remainder",
             len(hooks),
             _MAX_SPEC_HOOK_DOCUMENTS,
         )
-        agent_mod._sel_hook_rejected(
-            _HOOK_SPEC_AUDIT_TAG, str(len(hooks)), "document limit exceeded"
-        )
+        _document_rejected(_HOOK_SPEC_AUDIT_TAG, str(len(hooks)), "document limit exceeded")
     docs: list[dict] = []
     for index, entry in enumerate(hooks[:_MAX_SPEC_HOOK_DOCUMENTS]):
         doc = _hook_document_from_document(entry, index=index)
@@ -484,10 +502,8 @@ def normalize_spec_hooks(value: object) -> list[dict]:
     """
     if isinstance(value, list):
         return _hook_documents_from_array_form(value)
-    agent_mod.logger.warning("kiro_hooks is not an array of hook documents, ignoring")
-    agent_mod._sel_hook_rejected(
-        _HOOK_SPEC_AUDIT_TAG, str(value), "hooks is not an array of hook documents"
-    )
+    _document_warning("kiro_hooks is not an array of hook documents, ignoring")
+    _document_rejected(_HOOK_SPEC_AUDIT_TAG, str(value), "hooks is not an array of hook documents")
     return []
 
 
@@ -629,6 +645,98 @@ def hook_documents_suppressed_commands(hooks: object) -> dict[str, str]:
     return suppressed
 
 
+# Why a document that validated is left out of the kiro-cli spec. These are wire
+# values: the Hooks page keys its copy on them.
+UNSENT_DISABLED = "disabled"
+UNSENT_CONFIRM = "confirm"
+UNSENT_TRIGGER = "trigger"
+UNSENT_AGENT_ACTION = "agent_action"
+
+
+def hook_document_unsent_reason(doc: dict) -> str | None:
+    """Why :func:`hook_documents_to_object_form` leaves *doc* out, or None.
+
+    The one place that decision is made, so the Hooks page reports the reason
+    the emission acted on rather than a second reading of the same fields. The
+    order is the emission's: ``enabled: false`` outranks ``confirm: true``, and
+    both outrank expressibility. A trigger kiro-cli has no event for outranks an
+    ``agent`` action on the same document.
+    """
+    if doc.get("enabled") is False:
+        return UNSENT_DISABLED
+    if doc.get("confirm") is True:
+        return UNSENT_CONFIRM
+    if _event_for_hook_trigger(doc.get("trigger")) is None:
+        return UNSENT_TRIGGER
+    raw_action = doc.get("action")
+    action: dict = raw_action if isinstance(raw_action, dict) else {}
+    if action.get("type") != "command" or not isinstance(action.get("command"), str):
+        return UNSENT_AGENT_ACTION
+    return None
+
+
+def unsent_hook_documents(hooks: object) -> list[dict]:
+    """The documents in an array-form ``hooks`` that validate but reach no kiro-cli spec.
+
+    Each item is ``{name, trigger, matcher?, action, reason}``, with *reason* from
+    :func:`hook_document_unsent_reason`. Empty for the object form, which drops
+    nothing for these reasons, and for anything that is not a list.
+
+    Validation runs exactly as on install, through :func:`normalize_spec_hooks`,
+    with its warnings and audit lines muted: the install pass already wrote them,
+    and this is a read the Hooks page makes on every load. A document that fails
+    validation is not here, because it is not a hook Crew accepted.
+    """
+    if not isinstance(hooks, list):
+        return []
+    token = _document_audit_muted.set(True)
+    try:
+        documents = normalize_spec_hooks(hooks)
+    finally:
+        _document_audit_muted.reset(token)
+    unsent: list[dict] = []
+    for doc in documents:
+        reason = hook_document_unsent_reason(doc)
+        if reason is None:
+            continue
+        item = {key: doc[key] for key in ("name", "trigger", "matcher", "action") if key in doc}
+        item["reason"] = reason
+        unsent.append(item)
+    return unsent
+
+
+def unsent_kiro_hook_rows() -> list[dict[str, str]]:
+    """The Hooks page's rows for ``agent.kiro_hooks`` documents kiro-cli is not handed.
+
+    Read from ``config.json``, the field :func:`_apply_user_kiro_hooks` reads, and
+    judged by :func:`hook_document_unsent_reason`, the rule the kiro-cli spec is
+    built with. An ``agent`` action's prompt fills ``command``: either one is what
+    the author asked to run. Returned UNREDACTED: the dashboard handler that sends
+    these is the registered redaction sink, and redacts ``name``, ``matcher`` and
+    ``command`` before they leave.
+    """
+    agent_cfg = agent_mod._load_json(agent_mod._mc_config_path()).get("agent")
+    if not isinstance(agent_cfg, dict):
+        return []
+    rows: list[dict[str, str]] = []
+    for doc in unsent_hook_documents(agent_cfg.get("kiro_hooks")):
+        raw_action = doc.get("action")
+        action: dict = raw_action if isinstance(raw_action, dict) else {}
+        action_type = str(action.get("type") or "")
+        payload = action.get("command") if action_type == "command" else action.get("prompt")
+        rows.append(
+            {
+                "name": str(doc.get("name") or ""),
+                "trigger": str(doc.get("trigger") or ""),
+                "matcher": str(doc.get("matcher") or ""),
+                "action_type": action_type,
+                "command": str(payload or ""),
+                "reason": str(doc.get("reason") or ""),
+            }
+        )
+    return rows
+
+
 def hook_documents_to_object_form(docs: Sequence[dict]) -> dict[str, list[dict]]:
     """Derive the kiro-cli object form from normalized hook documents.
 
@@ -649,11 +757,12 @@ def hook_documents_to_object_form(docs: Sequence[dict]) -> dict[str, list[dict]]
         action: dict = raw_action if isinstance(raw_action, dict) else {}
         event = _event_for_hook_trigger(doc.get("trigger"))
         command = action.get("command")
+        reason = hook_document_unsent_reason(doc)
         # ``enabled`` and ``confirm`` each grant LESS execution than the object
         # form can express, so neither may be dropped the way a label is: an
         # entry emitted without them runs unconditionally and unprompted. A hook
         # the author switched off, or asked to be prompted for, is left out.
-        if doc.get("enabled") is False:
+        if reason == UNSENT_DISABLED:
             # A chosen steady state, re-read on every refresh: INFO, not a
             # warning an operator learns to scroll past. The SEL line stays,
             # because what is installed differs from what was authored.
@@ -663,7 +772,7 @@ def hook_documents_to_object_form(docs: Sequence[dict]) -> dict[str, list[dict]]
             )
             agent_mod._sel_hook_rejected(str(doc.get("trigger")), str(command), "hook is disabled")
             continue
-        if doc.get("confirm") is True:
+        if reason == UNSENT_CONFIRM:
             # Unlike ``enabled: false``, this author wanted the hook to run —
             # with a prompt kiro-cli cannot give. The hook not firing is the
             # surprise, so it warns at the same level as an inexpressible
@@ -677,7 +786,9 @@ def hook_documents_to_object_form(docs: Sequence[dict]) -> dict[str, list[dict]]
                 str(doc.get("trigger")), str(command), "hook asks to be confirmed"
             )
             continue
-        if event is None or action.get("type") != "command" or not isinstance(command, str):
+        # ``reason`` already holds both cases; the two extra tests only narrow
+        # ``event`` and ``command`` for the entry built below.
+        if reason is not None or event is None or not isinstance(command, str):
             agent_mod.logger.warning(
                 "kiro_hooks: hook %s has trigger %s and action type %s, which no kiro-cli hook "
                 "event can express, so it does not run there",
@@ -1107,6 +1218,68 @@ def _merge_kiro_hooks(hooks: dict, user_hooks: dict) -> dict:
     return merged
 
 
+def _user_kiro_hooks_locked() -> bool:
+    """Whether an enterprise build withholds the user's kiro hooks from the agent.
+
+    kiro-cli runs these scripts itself, so the Crew script-hook gate never sees
+    them. In an enterprise build they follow ``capabilities.script_hooks`` like
+    every other hook (RFC enterprise edition, Red "Hooks by name"), asked on the
+    host key because the agent file is built for the whole host. An unreadable
+    answer withholds them. An ``oss`` build returns False without asking.
+    """
+    from kiro_crew.edition_locks import locked_off
+
+    if not locked_off():
+        return False
+    from kiro_crew.hooks import _script_hooks_capability_denied
+    from kiro_crew.platform.governance_profiles import HOST_SESSION_KEY
+
+    try:
+        reason = _script_hooks_capability_denied(HOST_SESSION_KEY)
+    except Exception:
+        reason = "governance unavailable (fail-closed)"
+    if reason is None:
+        return False
+    agent_mod.logger.info("kiro_hooks: user hooks not installed: %s", reason)
+    agent_mod._sel_hook_rejected("user_hooks", "", reason)
+    return True
+
+
+def _drop_refused_kiro_hook_events(hooks: dict) -> dict:
+    """*hooks* without the events the policy's ``script_hooks`` events list refuses.
+
+    Enterprise builds only, for the reason :func:`_user_kiro_hooks_locked` gives;
+    an ``oss`` build returns *hooks* without asking. kiro-cli spells an event
+    ``preToolUse`` where a policy writes ``PreToolUse``; the identifier matcher is
+    case-insensitive, so one list covers both. An unreadable answer drops the event.
+    """
+    from kiro_crew.edition_locks import locked_off
+
+    if not locked_off():
+        return hooks
+    from kiro_crew.hook_event_governance import event_refusal
+    from kiro_crew.platform.governance_profiles import HOST_SESSION_KEY
+
+    kept: dict = {}
+    for event, entries in hooks.items():
+        try:
+            reason = event_refusal(HOST_SESSION_KEY, str(event))
+        except Exception:
+            reason = "governance unavailable (fail-closed)"
+        if reason is None:
+            kept[event] = entries
+            continue
+        # Event keys come from config before event-name validation, so both values
+        # go through the same diagnostic scrub as the neighbouring rejections.
+        agent_mod.logger.info(
+            "kiro_hooks[%s]: not installed: %s",
+            agent_mod._hook_diagnostic(event),
+            agent_mod._hook_diagnostic(reason),
+        )
+        agent_mod._sel_hook_rejected(str(event), "", reason)
+    return kept
+
+
 def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
     """Merge user-defined kiro_hooks from kirocrew config into *config* (additive).
 
@@ -1127,6 +1300,8 @@ def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
     ``_MAX_TOTAL_USER_HOOKS``) are enforced across both sources combined,
     not per-source.
     """
+    if _user_kiro_hooks_locked():
+        return
     agent_cfg = mc_cfg.get("agent") if isinstance(mc_cfg.get("agent"), dict) else {}
     user_hooks = agent_cfg.get("kiro_hooks") if isinstance(agent_cfg, dict) else None
     autoimport_enabled = True
@@ -1321,6 +1496,7 @@ def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
                 continue
             combined_user_hooks.setdefault(event, []).extend(entries)
 
+    combined_user_hooks = _drop_refused_kiro_hook_events(combined_user_hooks)
     config["hooks"] = _merge_kiro_hooks(config.get("hooks", {}), combined_user_hooks)
 
     after = sum(len(v) for v in config["hooks"].values() if isinstance(v, list))

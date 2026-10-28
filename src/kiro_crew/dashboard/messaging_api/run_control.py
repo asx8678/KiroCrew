@@ -37,12 +37,15 @@ if TYPE_CHECKING:
         _run_belongs_to_caller,
         _sel,
         _spawn_on_loop,
+        _stopped_before_start,
+        body_int,
         dashboard_slot_key,
         effective_session_key,
         internal_memory_scope,
         logger,
         read_state,
         record_panel_dismissal_outcome,
+        spawn_parent_claim,
         subagent_event_slot,
         warm_project_agents_for_spawn,
     )
@@ -312,8 +315,16 @@ async def api_spawn_steer(request: web.Request) -> web.Response:
 async def api_spawn_release(request: web.Request) -> web.Response:
     """POST /api/spawn/{agent_id}/release — end a continuable conversation.
 
-    Deletes the persisted session mapping and the on-disk session files.
+    Deletes the persisted session mapping and the on-disk session files. A
+    backend that owns its own session store answers ``not_disposed``: Crew
+    forgot the conversation, but nothing deleted that backend's session.
     Refuses while a run is in flight on the conversation.
+
+    A spawn that was accepted and has not started is cancelled instead: it
+    never starts, and the answer says ``cancelled``. That is the one control a
+    parent has over a run the gate is still holding, which otherwise keeps the
+    parent attached until it starts on its own. A run that is resuming already
+    started, so it takes the release path like any run in flight.
     """
     state: DashboardState = request.app["state"]
     if not state.subagents:
@@ -322,11 +333,32 @@ async def api_spawn_release(request: web.Request) -> web.Response:
             status=503,
         )
     conv_id = request.match_info["agent_id"]
-    ok, detail = state.subagents.release_conversation(conv_id)
+    if state.subagents.get(conv_id) is None:
+        try:
+            queued = await _queued_lookup(request, state, conv_id)
+        except QueuedReadUnavailable:
+            return _queue_unreadable()
+        if queued is not None and not queued.resuming:
+            cancelled = await state.subagents.cancel_queued(
+                conv_id,
+                queued.parent_session_key,
+                stop_origin="cancelled by its parent session",
+            )
+            if cancelled:
+                return web.json_response({"conversation": conv_id, "status": "cancelled"})
+            # It started (or another stop ended it) between the read and the
+            # cancel: the release below answers for whatever it is now.
+    ok, detail = await state.subagents.release_conversation_async(conv_id)
     if not ok:
         if detail.startswith("conversation_busy"):
             return web.json_response({"error": detail, "code": "conversation_busy"}, status=409)
         return web.json_response({"error": detail, "code": "conversation_gone"}, status=404)
+    if detail.startswith("not_disposed"):
+        # Crew forgot it, but the backend's own session store still holds it,
+        # so a later continue may resume it: the status says exactly that.
+        return web.json_response(
+            {"conversation": conv_id, "status": "not_disposed", "detail": detail}
+        )
     return web.json_response({"conversation": conv_id, "status": "released"})
 
 
@@ -356,12 +388,14 @@ async def api_spawn_lost(request: web.Request) -> web.Response:
     if not batch_id or not batch_id.isalnum():
         return web.json_response({"error": "valid batch_id required"}, status=400)
     try:
-        batch_total = max(0, min(int(body.get("batch_total", 0) or 0), 1000))
+        batch_total = max(0, min(body_int(body.get("batch_total", 0) or 0), 1000))
     except (TypeError, ValueError):
         batch_total = 0
     reason = str(body.get("reason", "") or "spawn submission failed")[:300]
     parent_session = str(body.get("parent_session", "") or "")
-    _, refusal = await internal_memory_scope(request, "spawn.batch", claimed_session=parent_session)
+    _, refusal = await internal_memory_scope(
+        request, "spawn.batch", claimed_session=spawn_parent_claim(request, parent_session)
+    )
     if refusal is not None:
         return refusal
     state.subagents.record_lost_submission(
@@ -391,7 +425,9 @@ async def api_spawn_mark_collected(request: web.Request) -> web.Response:
             {"error": "'ids' array required", "code": "ids_required"}, status=400
         )
     parent_session = str(body.get("parent_session", "") or "")
-    _, refusal = await internal_memory_scope(request, "spawn.batch", claimed_session=parent_session)
+    _, refusal = await internal_memory_scope(
+        request, "spawn.batch", claimed_session=spawn_parent_claim(request, parent_session)
+    )
     if refusal is not None:
         return refusal
     slot_name = dashboard_slot_key(parent_session)
@@ -527,6 +563,9 @@ async def _retry_failed_run(state: "DashboardState", agent_id: str, old: Any) ->
         # Like model and the context groups: a retry must run at the SAME
         # effort as the run it replaces, or it is a different experiment.
         reasoning_effort=old.reasoning_effort,
+        # And on the same backend: a retry on the default harness would be a
+        # different experiment, and a quiet one.
+        backend=getattr(old, "backend", None),
         approval_mode=old.approval_mode or None,
         silent=old.silent,
         # A retry must see the SAME context scope as the run it replaces —
@@ -558,6 +597,11 @@ async def _retry_failed_run(state: "DashboardState", agent_id: str, old: Any) ->
         )
     if info.done and info.error:
         return web.json_response({"error": info.error}, status=400)
+    # Stopped before it started: nothing ran, so the claim is left pending for
+    # the caller's ``finally`` to release and the failed run stays retryable.
+    stopped = _stopped_before_start(info)
+    if stopped is not None:
+        return stopped
     state.subagents.settle_retry(old, info.id)
     logger.info("Subagent %s retried as %s (POST /api/spawn/{id}/retry)", agent_id, info.id)
     return web.json_response({"id": info.id, "retried_from": agent_id, "status": "spawned"})
@@ -667,7 +711,16 @@ async def _log_panel_dismissal(state: DashboardState, agent_id: str) -> str:
 
 
 async def api_spawn_delete(request: web.Request) -> web.Response:
-    """DELETE /api/spawn/{agent_id} — cancel a running subagent or remove a finished one."""
+    """DELETE /api/spawn/{agent_id} — cancel a running subagent or remove a finished one.
+
+    A spawn that was accepted and has not started is cancelled too, through the
+    same queued stop ``POST .../release`` uses: it never starts, and the answer
+    says ``cancelled`` with ``queued``. ``GET /api/spawn/{id}`` answers that id
+    as ``queued``, so without this arm the same id fell through to the
+    persisted-dismissal path below, a route for cards of FINISHED runs that an
+    internal caller cannot use. Ownership is unchanged: the route sits behind
+    ``_spawn_scope_refusal``, which owns a queued row by its session key.
+    """
     state: DashboardState = request.app["state"]
     agent_id = request.match_info["agent_id"]
     # Handle native kiro-cli subagents (native:* IDs not in SubagentManager)
@@ -726,6 +779,26 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
         return web.json_response({"error": "not found"}, status=404)
     manager = state.subagents
     info = manager.get(agent_id) if manager is not None else None
+    if manager is not None and info is None:
+        # Not a registered run: a spawn the gate is still holding, or a
+        # persisted record. Only the former is cancelled here. A row that is
+        # resuming already STARTED, so it is not stopped as a queued one and
+        # keeps the answer the arms below give an unregistered id.
+        try:
+            queued = await _queued_lookup(request, state, agent_id)
+        except QueuedReadUnavailable:
+            return _queue_unreadable()
+        if queued is not None and not queued.resuming:
+            cancelled = await manager.cancel_queued(
+                agent_id,
+                queued.parent_session_key,
+                stop_origin="cancelled by its parent session",
+            )
+            if cancelled:
+                return web.json_response({"ok": True, "cancelled": True, "queued": True})
+            # It started (or another stop ended it) between the read and the
+            # cancel: whatever it is now, the paths below answer for it.
+            info = manager.get(agent_id)
     if manager is None or info is None:
         # A card the durable replay rebuilt has no manager entry -- after a
         # gateway restart that is every finished run -- so a flat 404 made those

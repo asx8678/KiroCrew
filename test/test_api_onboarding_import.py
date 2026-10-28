@@ -27,20 +27,9 @@ class _AuditLog:
         self.events.append(event)
 
 
-@pytest.fixture(autouse=True)
-def _isolate_mcp_host_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep ``apply_import``'s MCP sidecar lock off the real ``~/.kiro/settings``.
-
-    ``_write_mcp`` takes the dashboard handler's lock, whose paths the handler
-    binds from ``Path.home()`` when it is imported. The host floor rebinds them
-    only when that module is already loaded, so without this the first MCP write
-    in a worker reaches the operator's real files. A test that patches these names
-    itself still wins, because its own patch runs after this one.
-    """
-    mcp_handlers = importlib.import_module("kiro_crew.dashboard.handlers.mcp")
-    global_mcp = tmp_path / "host-kiro-settings" / "mcp.json"
-    monkeypatch.setattr(mcp_handlers, "_GLOBAL_MCP_JSON", global_mcp)
-    monkeypatch.setattr(mcp_handlers, "_MCP_LOCK_PATH", global_mcp.with_suffix(".lock"))
+# Keep apply_import's MCP sidecar lock off the real ~/.kiro/settings (see the
+# shared fixture in test/conftest.py).
+pytestmark = pytest.mark.usefixtures("isolate_mcp_host_paths")
 
 
 def _handler_module():
@@ -1204,6 +1193,75 @@ def test_handler_category_tables_match_the_backend() -> None:
     }
 
 
+def _mcp_description(count: int, enabled_count: object = None) -> str:
+    """The MCP servers row description ``_scan_response`` projects for one category."""
+    category: dict[str, Any] = {"id": "mcp_servers", "count": count}
+    if enabled_count is not None:
+        category["enabled_count"] = enabled_count
+    plan = {
+        "sources": [{"id": "synthetic", "name": "Synthetic Agent", "categories": [category]}],
+        "skipped": [],
+    }
+    response = _handler_module()._scan_response(plan)
+    return response["sources"][0]["categories"][0]["description"]
+
+
+@pytest.mark.parametrize(
+    ("count", "enabled_count", "description"),
+    [
+        (3, None, "Server definitions, imported disabled"),
+        (3, 0, "Server definitions, imported disabled"),
+        (
+            3,
+            1,
+            "Server definitions; 1 was on in Synthetic Agent and will run,"
+            " the rest arrive disabled",
+        ),
+        (
+            3,
+            2,
+            "Server definitions; 2 were on in Synthetic Agent and will run,"
+            " the rest arrive disabled",
+        ),
+        (3, 3, "Server definitions; all 3 were on in Synthetic Agent and will run"),
+        (1, 1, "Server definitions; 1 was on in Synthetic Agent and will run"),
+    ],
+)
+def test_mcp_description_says_how_many_servers_will_run(
+    count: int, enabled_count: object, description: str
+) -> None:
+    assert _mcp_description(count, enabled_count) == description
+
+
+def test_mcp_enabled_count_is_clamped_to_the_category_count() -> None:
+    assert _mcp_description(2, 5) == (
+        "Server definitions; all 2 were on in Synthetic Agent and will run"
+    )
+
+
+@pytest.mark.parametrize("enabled_count", [-1, "2", True, 1.5, [1]], ids=repr)
+def test_malformed_mcp_enabled_count_keeps_the_plain_description(
+    enabled_count: object,
+) -> None:
+    assert _mcp_description(3, enabled_count) == "Server definitions, imported disabled"
+
+
+def test_enabled_count_on_another_category_does_not_change_its_description() -> None:
+    plan = {
+        "sources": [
+            {
+                "id": "synthetic",
+                "name": "Synthetic Agent",
+                "categories": [{"id": "skills", "count": 2, "enabled_count": 2}],
+            }
+        ],
+        "skipped": [],
+    }
+    category = _handler_module()._scan_response(plan)["sources"][0]["categories"][0]
+    assert category["description"] == "User-authored skills and supporting files"
+    assert "enabled_count" not in category
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("method", "path"),
@@ -1328,3 +1386,79 @@ async def test_every_refusal_carries_a_code(monkeypatch) -> None:
             assert response.status >= 400, body
             assert isinstance(body.get("code"), str) and body["code"], body
             assert isinstance(body.get("error"), str) and body["error"], body
+
+
+def _mcp_only_backend():
+    def preview_import(source_ids=None):
+        return {
+            "sources": [
+                {
+                    "id": "codex",
+                    "categories": [{"id": "mcp_servers", "selected": True}],
+                }
+            ],
+            "selection": [{"source_id": "codex", "category_id": "mcp_servers"}],
+        }
+
+    def apply_import(plan, **kwargs):
+        return {"imported": {"mcp_servers": 1}, "imported_count": 1, "already_imported": 0}
+
+    return SimpleNamespace(preview_import=preview_import, apply_import=apply_import)
+
+
+async def _apply_mcp_import(module) -> dict:
+    async with TestClient(TestServer(_make_app(module))) as client:
+        response = await client.post(
+            "/api/onboarding/import/apply",
+            json={"sources": [{"id": "codex", "categories": ["mcp_servers"]}]},
+            headers={"X-Test-User": "owner"},
+        )
+        assert response.status == 200
+        return await response.json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rebuild", "expected"),
+    [
+        pytest.param(
+            lambda **kw: (kw["_wrote_out"].append(True), Path("/dev/null"))[1],
+            True,
+            id="wrote",
+        ),
+        # The shared-home guard refused: the path comes back and nothing is written.
+        pytest.param(lambda **_: Path("/dev/null"), False, id="declined"),
+    ],
+)
+async def test_apply_reports_whether_the_agent_spec_was_rewritten(
+    monkeypatch, rebuild, expected
+) -> None:
+    import kiro_crew.agent as agent_mod
+
+    module = _handler_module()
+    monkeypatch.setattr(module, "_backend", _mcp_only_backend)
+    monkeypatch.setattr(module, "_sel", lambda: _AuditLog())
+    monkeypatch.setattr(agent_mod, "rebuild_agent_config", rebuild)
+
+    body = await _apply_mcp_import(module)
+
+    assert body["summary"]["imported"] == 1
+    assert body["agent_spec_rewritten"] is expected
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rebuild_keeps_the_import_and_reports_it(monkeypatch) -> None:
+    """The MCP entries already landed, so a rebuild error is a report, not a 500."""
+    import kiro_crew.agent as agent_mod
+
+    def boom(**_):
+        raise RuntimeError("boom")
+
+    module = _handler_module()
+    monkeypatch.setattr(module, "_backend", _mcp_only_backend)
+    monkeypatch.setattr(module, "_sel", lambda: _AuditLog())
+    monkeypatch.setattr(agent_mod, "rebuild_agent_config", boom)
+
+    body = await _apply_mcp_import(module)
+
+    assert body["agent_spec_rewritten"] is False
